@@ -111,6 +111,7 @@ export function renderPanel(manager: WorkflowManager, theme: Theme, width?: numb
     const icon = r.status === "paused" ? "⏸" : "◆";
     const phase = live?.snapshot.currentPhase ? ` · ${live.snapshot.currentPhase}` : "";
     const line = `  ${icon} ${r.workflowName}  ${done}/${agents.length} agents${phase}`;
+    // Truncate line to fit terminal width
     if (line.length > maxWidth) {
       return line.slice(0, maxWidth - 1) + "…";
     }
@@ -119,12 +120,12 @@ export function renderPanel(manager: WorkflowManager, theme: Theme, width?: numb
   // Finished runs leave this live panel but are kept in the navigator. Tell the
   // user so a completed run doesn't look like it vanished.
   const finished = all.filter((r) => r.status !== "running" && r.status !== "paused").length;
-  const hint = theme.fg(
-    "dim",
-    finished > 0
-      ? `  /workflows — open navigator (${finished} finished kept in history)`
-      : "  /workflows — open navigator",
-  );
+  const hintText = finished > 0
+    ? `  /workflows — open navigator (${finished} finished kept in history)`
+    : "  /workflows — open navigator";
+  // Truncate hint text before applying color (theme.fg adds ANSI codes)
+  const truncatedHint = hintText.length > maxWidth ? hintText.slice(0, maxWidth - 1) + "…" : hintText;
+  const hint = theme.fg("dim", truncatedHint);
   return [theme.bold(`Workflows running (${active.length}):`), ...rows, hint];
 }
 
