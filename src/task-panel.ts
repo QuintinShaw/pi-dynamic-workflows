@@ -99,17 +99,22 @@ export function installResultDelivery(pi: ExtensionAPI, manager: WorkflowManager
   });
 }
 
-export function renderPanel(manager: WorkflowManager, theme: Theme): string[] {
+export function renderPanel(manager: WorkflowManager, theme: Theme, width?: number): string[] {
   const all = manager.listRuns();
   const active = all.filter((r) => r.status === "running" || r.status === "paused");
   if (!active.length) return [];
+  const maxWidth = width || 80;
   const rows = active.map((r) => {
     const live = manager.getRun(r.runId);
     const agents = live?.snapshot.agents ?? r.agents;
     const done = agents.filter((a) => a.status === "done").length;
     const icon = r.status === "paused" ? "⏸" : "◆";
     const phase = live?.snapshot.currentPhase ? ` · ${live.snapshot.currentPhase}` : "";
-    return `  ${icon} ${r.workflowName}  ${done}/${agents.length} agents${phase}`;
+    const line = `  ${icon} ${r.workflowName}  ${done}/${agents.length} agents${phase}`;
+    if (line.length > maxWidth) {
+      return line.slice(0, maxWidth - 1) + "…";
+    }
+    return line;
   });
   // Finished runs leave this live panel but are kept in the navigator. Tell the
   // user so a completed run doesn't look like it vanished.
@@ -142,7 +147,7 @@ export function installTaskPanel(
       // Purely informational: it lists running runs and re-renders on events. To
       // open the navigator, the user runs /workflows (the panel takes no input).
       const comp: Component & { dispose?(): void } = {
-        render: () => renderPanel(manager, theme),
+        render: (width: number) => renderPanel(manager, theme, width),
         invalidate: () => {},
         dispose: () => {
           for (const ev of RUN_EVENTS) manager.off(ev, onEvent);
