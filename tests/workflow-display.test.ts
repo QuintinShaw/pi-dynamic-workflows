@@ -341,23 +341,42 @@ describe("createWidgetWorkflowDisplay lifecycle", () => {
     const display = createWidgetWorkflowDisplay(ctx as never, { key: "wf-no-status" });
     assert.equal(setWidget.mock.callCount(), 1, "constructor registers widget once");
 
-    // update() must re-register the widget even when showStatus=false
+    // update() re-registers the widget (invalidation signal to pi-tui)
     const snap = createWorkflowSnapshot(fakeMeta("no-status-wf"));
     display.update(snap);
-    assert.equal(setWidget.mock.callCount(), 2, "update must call setWidget even with showStatus=false");
+    assert.equal(setWidget.mock.callCount(), 2, "update must re-register widget (invalidation signal)");
 
-    // verify the re-registered factory renders the updated snapshot
+    // Extract the re-registered factory and verify it renders the latest snapshot
     const [, factory2] = setWidget.mock.calls[1].arguments;
-    const rendered = factory2(null, { fg: (_c, t) => t, bold: (t) => t });
-    const lines2 = rendered.render(80);
+    assert.equal(typeof factory2, "function", "factory must be a function");
+    const comp2 = factory2(null, { fg: (_c, t) => t, bold: (t) => t });
+    assert.equal(typeof comp2.render, "function", "factory must produce a component with render()");
+
+    // Spy on render to prove it produces updated output
+    const renderSpy = comp2.render;
+    const lines2 = renderSpy(80);
+    assert.ok(lines2.length > 0, "render() returned non-empty lines with showStatus=false");
     assert.ok(
       lines2.some((l) => l.includes("no-status-wf")),
-      "render output must include workflow name",
+      "render output includes snapshot workflow name",
+    );
+    assert.ok(
+      lines2.some((l) => l.includes("0/0")),
+      "render output includes agent count from snapshot",
     );
 
-    // complete() must also re-register
+    // complete() must also re-register the factory
     display.complete(snap);
-    assert.equal(setWidget.mock.callCount(), 3, "complete must call setWidget even with showStatus=false");
+    assert.equal(setWidget.mock.callCount(), 3, "complete must re-register widget (invalidation signal)");
+
+    // Verify the post-complete factory also renders updated content
+    const [, factory3] = setWidget.mock.calls[2].arguments;
+    const comp3 = factory3(null, { fg: (_c, t) => t, bold: (t) => t });
+    const lines3 = comp3.render(80);
+    assert.ok(
+      lines3.some((l) => l.includes("no-status-wf")),
+      "post-complete render shows workflow name",
+    );
   });
 });
 
