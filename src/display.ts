@@ -1,4 +1,4 @@
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import type { AgentHistoryEntry } from "./agent-history.js";
 import type { WorkflowErrorCode } from "./errors.js";
 import type { WorkflowMeta } from "./workflow.js";
@@ -89,18 +89,33 @@ export function createWidgetWorkflowDisplay(
   const placement = options.placement ?? "belowEditor";
   const showStatus = options.showStatus ?? false;
 
-  const render = (snapshot: WorkflowSnapshot, completed = false) => {
-    if (!ctx.hasUI) return;
-    if (showStatus) ctx.ui.setStatus(key, statusLine(snapshot, completed));
-    ctx.ui.setWidget(key, renderWorkflowLines(snapshot, options), { placement });
-  };
+  // Mutable state captured by the component closure so re-renders
+  // always read the latest snapshot even though the factory ran once.
+  let snapshot: WorkflowSnapshot | undefined;
+  let completed = false;
+
+  if (ctx.hasUI) {
+    ctx.ui.setWidget(
+      key,
+      (_tui: unknown, theme: Theme) => ({
+        render: () => (snapshot ? renderWorkflowLines(snapshot, options, theme) : []),
+        invalidate: () => {},
+      }),
+      { placement },
+    );
+  }
 
   return {
-    update(snapshot) {
-      render(snapshot, false);
+    update(s) {
+      snapshot = s;
+      if (!ctx.hasUI) return;
+      if (showStatus) ctx.ui.setStatus(key, statusLine(s, completed));
     },
-    complete(snapshot) {
-      render(snapshot, true);
+    complete(s) {
+      snapshot = s;
+      completed = true;
+      if (!ctx.hasUI) return;
+      if (showStatus) ctx.ui.setStatus(key, statusLine(s, true));
     },
     clear() {
       if (!ctx.hasUI) return;
@@ -142,7 +157,20 @@ export function createToolUpdateWorkflowDisplay(
   };
 }
 
-export function renderWorkflowLines(snapshot: WorkflowSnapshot, options: WorkflowDisplayOptions = {}): string[] {
+/** Minimal theme surface so rendering works without a real Theme (tool output, tests). */
+export interface ThemeLike {
+  fg(color: string, text: string): string;
+  bold(text: string): string;
+}
+
+/** Identity passthrough for contexts where no theme is available (tool text output). */
+const NO_THEME: ThemeLike = { fg: (_c, t) => t, bold: (t) => t };
+
+export function renderWorkflowLines(
+  snapshot: WorkflowSnapshot,
+  options: WorkflowDisplayOptions = {},
+  theme: ThemeLike = NO_THEME,
+): string[] {
   const maxAgents = options.maxAgents ?? 8;
   const showResultPreviews = options.showResultPreviews ?? false;
   const state =
@@ -156,7 +184,7 @@ export function renderWorkflowLines(snapshot: WorkflowSnapshot, options: Workflo
   const costInfo = usage?.cost ? ` · $${usage.cost.toFixed(4)}` : "";
   const tokenInfo = usage ? ` · ${usage.total.toLocaleString()} tokens${costInfo}` : "";
   const lines = [
-    `◆ Workflow: ${snapshot.name} (${snapshot.doneCount}/${snapshot.agentCount} done${state}${tokenInfo})`,
+    theme.bold(`◆ Workflow: ${snapshot.name}`) + ` (${snapshot.doneCount}/${snapshot.agentCount} done${state}${tokenInfo})`,
   ];
 
   const phaseNames = snapshot.phases.length
@@ -174,26 +202,32 @@ export function renderWorkflowLines(snapshot: WorkflowSnapshot, options: Workflo
     const complete = agents.length > 0 && done + errors + skipped === agents.length;
     const marker = running > 0 || (!complete && snapshot.currentPhase === phase) ? "▶" : complete ? "✓" : " ";
     lines.push(
-      `  ${marker} ${phase} ${done}/${agents.length}${running ? ` · ${running} running` : ""}${errors ? ` · ${errors} errors` : ""}${skipped ? ` · ${skipped} skipped` : ""}`,
+      theme.fg("accent", `  ${marker} ${phase}`) +
+        theme.fg(
+          "dim",
+          ` ${done}/${agents.length}${running ? ` · ${running} running` : ""}${errors ? ` · ${errors} errors` : ""}${skipped ? ` · ${skipped} skipped` : ""}`,
+        ),
     );
 
     const visibleAgents = agents.slice(-maxAgents);
     for (const agent of visibleAgents) {
       const order = `[${agent.id}]`;
       const result = showResultPreviews && agent.resultPreview ? ` — ${agent.resultPreview}` : "";
-      const agentTokens = agent.tokens ? ` [${agent.tokens.toLocaleString()} tok]` : "";
-      lines.push(`    ${order} ${statusIcon(agent.status)} ${shorten(agent.label, 48)}${agentTokens}${result}`);
+      const agentTokens = agent.tokens ? theme.fg("dim", ` [${agent.tokens.toLocaleString()} tok]`) : "";
+      lines.push(
+        `    ${order} ${statusIcon(agent.status)} ${shorten(agent.label, 48)}${agentTokens}${result}`,
+      );
     }
     if (agents.length > visibleAgents.length)
-      lines.push(`    … ${agents.length - visibleAgents.length} earlier agents`);
+      lines.push(theme.fg("dim", `    … ${agents.length - visibleAgents.length} earlier agents`));
   }
 
   const unphased = snapshot.agents.filter((agent) => !rendered.has(agent));
   if (unphased.length) {
-    lines.push("  Unphased");
+    lines.push(theme.fg("accent", "  Unphased"));
     for (const agent of unphased.slice(-maxAgents)) {
       const result = showResultPreviews && agent.resultPreview ? ` — ${agent.resultPreview}` : "";
-      const agentTokens = agent.tokens ? ` [${agent.tokens.toLocaleString()} tok]` : "";
+      const agentTokens = agent.tokens ? theme.fg("dim", ` [${agent.tokens.toLocaleString()} tok]`) : "";
       lines.push(`    [${agent.id}] ${statusIcon(agent.status)} ${shorten(agent.label, 48)}${agentTokens}${result}`);
     }
   }
