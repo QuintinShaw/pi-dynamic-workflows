@@ -7,7 +7,7 @@
  */
 
 import type { ExtensionAPI, ExtensionUIContext, Theme } from "@earendil-works/pi-coding-agent";
-import type { Component, TUI } from "@earendil-works/pi-tui";
+import { type Component, type TUI, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { ManagedRun, WorkflowManager } from "./workflow-manager.js";
 import type { WorkflowStorage } from "./workflow-saved.js";
 
@@ -35,6 +35,13 @@ function summarizeResult(result: unknown): string {
   }
   const json = JSON.stringify(result, null, 2);
   return json.length > 400 ? `${json.slice(0, 400)}\n…(truncated)` : json;
+}
+
+function fitLine(line: string, width?: number): string {
+  if (typeof width !== "number" || !Number.isFinite(width)) return line;
+  const maxWidth = Math.max(0, Math.floor(width));
+  if (visibleWidth(line) <= maxWidth) return line;
+  return truncateToWidth(line, maxWidth);
 }
 
 export function deliverText(run: ManagedRun): string {
@@ -99,7 +106,7 @@ export function installResultDelivery(pi: ExtensionAPI, manager: WorkflowManager
   });
 }
 
-export function renderPanel(manager: WorkflowManager, theme: Theme): string[] {
+export function renderPanel(manager: WorkflowManager, theme: Theme, width?: number): string[] {
   const all = manager.listRuns();
   const active = all.filter((r) => r.status === "running" || r.status === "paused");
   if (!active.length) return [];
@@ -120,7 +127,7 @@ export function renderPanel(manager: WorkflowManager, theme: Theme): string[] {
       ? `  /workflows — open navigator (${finished} finished kept in history)`
       : "  /workflows — open navigator",
   );
-  return [theme.bold(`Workflows running (${active.length}):`), ...rows, hint];
+  return [theme.bold(`Workflows running (${active.length}):`), ...rows, hint].map((line) => fitLine(line, width));
 }
 
 /**
@@ -142,7 +149,7 @@ export function installTaskPanel(
       // Purely informational: it lists running runs and re-renders on events. To
       // open the navigator, the user runs /workflows (the panel takes no input).
       const comp: Component & { dispose?(): void } = {
-        render: () => renderPanel(manager, theme),
+        render: (width: number) => renderPanel(manager, theme, width),
         invalidate: () => {},
         dispose: () => {
           for (const ev of RUN_EVENTS) manager.off(ev, onEvent);

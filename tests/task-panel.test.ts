@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { before, describe, it } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { visibleWidth } from "@earendil-works/pi-tui";
 
 type TaskPanelModule = {
   installResultDelivery: (pi: ExtensionAPI, manager: unknown) => void;
@@ -279,6 +280,45 @@ describe("installTaskPanel", () => {
     assert.equal(registeredName, "workflow-tasks");
     assert.equal(registeredPlacement, "belowEditor");
   });
+
+  it("passes the render width through to the task panel", () => {
+    const manager = new EventEmitter() as ReturnType<typeof EventEmitter> & {
+      getRun: (...args: unknown[]) => unknown;
+      listRuns: () => unknown[];
+    };
+    manager.getRun = () => undefined;
+    manager.listRuns = () => [
+      {
+        runId: "a",
+        workflowName: "handle_gh_issues_11_12_with_a_long_suffix",
+        status: "running",
+        agents: [{ status: "done" }, { status: "running" }],
+        logs: [],
+      },
+    ];
+
+    let factory:
+      | ((
+          tui: { requestRender(): void },
+          theme: { fg(color: string, text: string): string; bold(text: string): string },
+        ) => { render(width: number): string[] })
+      | undefined;
+    const ui = {
+      setWidget: (_name: string, registeredFactory: typeof factory) => {
+        factory = registeredFactory;
+      },
+    };
+    const theme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
+
+    mod.installTaskPanel(null, manager, ui);
+    const component = factory?.({ requestRender: () => {} }, theme);
+    const lines = component?.render(24) ?? [];
+
+    assert.ok(lines.length > 0, "panel should render active runs");
+    for (const line of lines) {
+      assert.ok(visibleWidth(line) <= 24, `line exceeds width: ${visibleWidth(line)} > 24`);
+    }
+  });
 });
 
 describe("renderPanel", () => {
@@ -312,5 +352,42 @@ describe("renderPanel", () => {
       getRun: () => undefined,
     };
     assert.deepEqual(renderPanel(manager as never, theme as never), []);
+  });
+
+  it("truncates every rendered line to the requested visible width", async () => {
+    const { renderPanel } = await import("../src/task-panel.js");
+    const ansiTheme = {
+      fg: (_c: string, t: string) => `\x1b[2m${t}\x1b[22m`,
+      bold: (t: string) => `\x1b[1m${t}\x1b[22m`,
+    };
+    const manager = {
+      listRuns: () => [
+        {
+          runId: "a",
+          workflowName: "handle_gh_issues_11_12_中文_🙂_very_long_workflow_name",
+          status: "running",
+          agents: [{ status: "done" }, { status: "running" }],
+          logs: [],
+        },
+        { runId: "b", workflowName: "old", status: "completed", agents: [], logs: [] },
+      ],
+      getRun: () => ({
+        snapshot: {
+          currentPhase: "Issue implementation phase with a very long suffix",
+          agents: [{ status: "done" }, { status: "running" }],
+        },
+      }),
+    };
+
+    const lines = renderPanel(manager as never, ansiTheme as never, 42);
+
+    assert.ok(lines.length > 0, "panel should render active runs");
+    assert.ok(
+      lines.some((line) => line.includes("...")),
+      "at least one line should be truncated",
+    );
+    for (const line of lines) {
+      assert.ok(visibleWidth(line) <= 42, `line exceeds width: ${visibleWidth(line)} > 42`);
+    }
   });
 });
