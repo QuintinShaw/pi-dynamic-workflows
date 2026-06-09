@@ -488,6 +488,43 @@ describe("installWorkflowEditor", () => {
     assert.equal(typeof setFactory, "function", "the argument should be a factory function");
   });
 
+  it("does not replace an existing custom editor component", async () => {
+    const mod = await load();
+    const captured: Array<{ event: string; handler: (...args: unknown[]) => unknown }> = [];
+    let setEditorCalls = 0;
+    let setActiveToolsCalls = 0;
+    const existingEditorFactory = () => ({ kind: "existing-editor" });
+    const pi = {
+      on: (event: string, handler: (...args: unknown[]) => unknown) => {
+        captured.push({ event, handler });
+      },
+      getActiveTools: () => ["bash", "read"],
+      setActiveTools: () => {
+        setActiveToolsCalls++;
+      },
+    } as unknown as ExtensionAPI;
+
+    const ui = {
+      getEditorComponent: () => existingEditorFactory,
+      setEditorComponent: () => {
+        setEditorCalls++;
+      },
+    } as unknown as ExtensionUIContext;
+
+    mod.installWorkflowEditor(pi, ui);
+
+    assert.equal(setEditorCalls, 0, "existing custom editor should not be overwritten");
+
+    const inputHandler = captured.find((h) => h.event === "input")?.handler;
+    assert.ok(inputHandler, "input handler should still be registered");
+    const result = inputHandler({
+      source: "interactive",
+      text: "Please run this workflow.",
+    });
+    assert.equal((result as { action?: string }).action, "transform");
+    assert.equal(setActiveToolsCalls, 1, "workflow trigger should still add the workflow tool");
+  });
+
   it("registers /workflows-trigger and toggles the keyword trigger", async () => {
     const mod = await load();
     const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();

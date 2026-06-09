@@ -308,7 +308,9 @@ export function installWorkflowEditor(
 ): WorkflowModeState {
   const state: WorkflowModeState = { active: false, keywordTriggerEnabled: true };
 
-  ui.setEditorComponent((tui, theme, keybindings) => new WorkflowEditor(tui, theme, keybindings, state));
+  if (!ui.getEditorComponent?.()) {
+    ui.setEditorComponent((tui, theme, keybindings) => new WorkflowEditor(tui, theme, keybindings, state));
+  }
   registerWorkflowTriggerCommand(pi, state);
 
   // Active tools saved while a turn is restricted to `workflow`; restored on turn_end.

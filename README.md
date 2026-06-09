@@ -3,7 +3,7 @@
 [![npm](https://img.shields.io/npm/v/@quintinshaw/pi-dynamic-workflows?color=cb3837&logo=npm)](https://www.npmjs.com/package/@quintinshaw/pi-dynamic-workflows)
 [![license](https://img.shields.io/badge/license-MIT-blue)](#license)
 [![for Pi](https://img.shields.io/badge/for-Pi-7c3aed)](https://pi.dev)
-[![tests](https://img.shields.io/badge/tests-640%20passing-success)](#development)
+[![tests](https://img.shields.io/badge/tests-641%20passing-success)](#development)
 
 > **Claude Code–style dynamic workflows for [Pi](https://pi.dev).**
 > Turn one prompt into a fleet of subagents that fan out in parallel, cross-check each other, and hand back a single synthesized answer.
@@ -35,6 +35,8 @@ Run a workflow to audit every route under src/routes/ for missing auth checks.
 Pi writes the script and runs it in the background — your turn ends immediately and a live panel tracks progress while you keep working. Or just type the word **workflows** in any message to force one. If you only want to discuss workflows without triggering one, run `/workflows-trigger off`, check the current state with `/workflows-trigger status`, and turn it back on with `/workflows-trigger on`.
 
 ![Workflows mode in the input box](https://raw.githubusercontent.com/QuintinShaw/pi-dynamic-workflows/main/docs/media/workflows-mode.jpg)
+
+If another Pi extension has already installed a custom editor component, pi-dynamic-workflows leaves it in place and keeps the submit-time workflow trigger active. In that compatibility mode, the animated keyword highlight and Backspace one-shot disarm affordance are skipped because the existing editor remains responsible for rendering and input handling; use `/workflows-trigger off` when you need to discuss workflow/workflows without auto-triggering. Editor composition is load-order dependent: whichever extension installs a visual editor last owns the editor surface, while pi-dynamic-workflows still keeps its submit-time hook registered.
 
 ## What a workflow looks like
 
@@ -141,7 +143,7 @@ Workflows run in a Node `vm` sandbox; `Date.now()`, `Math.random()`, `new Date()
 
 ```bash
 npm install
-npm test     # biome + tsc + 640 unit tests
+npm test     # biome + tsc + 641 unit tests
 ```
 
 Every feature is also verified end-to-end against a real Pi subagent session before release.
