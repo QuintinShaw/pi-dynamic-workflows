@@ -5,6 +5,7 @@ import { parse } from "acorn";
 import type { TSchema } from "typebox";
 import type { AgentUsage } from "./agent.js";
 import { WorkflowAgent, type WorkflowAgentOptions } from "./agent.js";
+import type { AgentHistoryEntry } from "./agent-history.js";
 import {
   type AgentDefinition,
   type AgentRegistry,
@@ -105,6 +106,7 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
     errorCode?: WorkflowErrorCode;
     recoverable?: boolean;
   }) => void;
+  onAgentHistory?: (event: { label: string; phase?: string; history: AgentHistoryEntry[] }) => void;
   onTokenUsage?: (usage: {
     input: number;
     output: number;
@@ -465,6 +467,9 @@ export async function runWorkflow<T = unknown>(
             },
             onUsage: (u: AgentUsage) => {
               usage = u;
+            },
+            onHistory: (history: AgentHistoryEntry[]) => {
+              options.onAgentHistory?.({ label, phase: assignedPhase, history });
             },
           } as any),
           timeout,

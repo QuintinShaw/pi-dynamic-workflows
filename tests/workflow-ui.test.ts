@@ -77,6 +77,10 @@ function errorDetailManager(): Pick<WorkflowManager, "listRuns" | "getRun"> {
         error: "Subagent produced no assistant output",
         errorCode: WorkflowErrorCode.AGENT_EMPTY_OUTPUT,
         recoverable: true,
+        history: [
+          { role: "assistant", kind: "toolCall", toolName: "read", text: '{"file":"README.md"}' },
+          { role: "tool", kind: "toolResult", toolName: "read", text: "README content" },
+        ],
       },
     ],
     agentCount: 1,
@@ -464,6 +468,9 @@ test("renderNavigator shows agent error diagnostics in detail view", () => {
   assert.match(text, /Subagent produced no assistant output/);
   assert.match(text, /Error code:/);
   assert.match(text, /AGENT_EMPTY_OUTPUT \(recoverable\)/);
+  assert.match(text, /History:/);
+  assert.match(text, /assistant tool read: \{"file":"README.md"\}/);
+  assert.match(text, /tool read: README content/);
 });
 
 test("renderNavigator shows model info in agent rows", () => {

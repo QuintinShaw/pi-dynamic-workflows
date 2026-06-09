@@ -142,6 +142,28 @@ test(
 );
 
 test(
+  "runSync stores compact subagent history for /workflows detail",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(_prompt: string, options: { onHistory?: (history: unknown[]) => void }) {
+          options.onHistory?.([{ role: "assistant", kind: "text", text: "inspecting files" }]);
+          return "ok";
+        },
+      },
+    });
+
+    await manager.runSync(oneAgentScript);
+
+    const run = manager.listRuns().find((r) => r.workflowName === "tracked_demo");
+    const agent = run?.agents[0];
+    assert.equal(agent?.history?.length, 1);
+    assert.equal(agent?.history?.[0]?.text, "inspecting files");
+  }),
+);
+
+test(
   "startInBackground returns immediately with runId and promise",
   withTempCwd(async (cwd) => {
     const manager = new WorkflowManager({ cwd, agent: fakeAgent() });

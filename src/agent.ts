@@ -13,6 +13,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import type { Static, TSchema } from "typebox";
 import { Check, Convert } from "typebox/value";
+import { type AgentHistoryEntry, compactAgentHistory } from "./agent-history.js";
 import { applyToolPolicy } from "./agent-registry.js";
 import { WorkflowError, WorkflowErrorCode } from "./errors.js";
 import { loadModelTierConfig, type ModelTierConfig, resolveTierModel } from "./model-tier-config.js";
@@ -223,6 +224,8 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
   onModelResolved?: (modelId: string) => void;
   /** Called when `model`/`tier`/phase resolved to a spec that wasn't found (fell back to session default). */
   onModelFallback?: (requestedSpec: string) => void;
+  /** Called with a compact snapshot of this subagent's message/tool history. */
+  onHistory?: (history: AgentHistoryEntry[]) => void;
   /** Run this agent in a different working directory (e.g. an isolated worktree). */
   cwd?: string;
   /**
@@ -344,12 +347,25 @@ export class WorkflowAgent {
     });
 
     let removeAbortListener: (() => void) | undefined;
+    let removeHistoryListener: (() => void) | undefined;
+    let lastHistoryEmit = 0;
+    const emitHistory = () => options.onHistory?.(compactAgentHistory(session.messages));
+    const maybeEmitHistory = () => {
+      if (!options.onHistory) return;
+      const now = Date.now();
+      if (now - lastHistoryEmit < 250) return;
+      lastHistoryEmit = now;
+      emitHistory();
+    };
     try {
       if (options.signal?.aborted) throw new Error("Subagent was aborted");
       if (options.signal) {
         const onAbort = () => void session.abort();
         options.signal.addEventListener("abort", onAbort, { once: true });
         removeAbortListener = () => options.signal?.removeEventListener("abort", onAbort);
+      }
+      if (options.onHistory) {
+        removeHistoryListener = session.subscribe(() => maybeEmitHistory());
       }
 
       await session.prompt(this.buildPrompt(prompt, options as AgentRunOptions<any>, Boolean(options.schema)));
@@ -371,6 +387,12 @@ export class WorkflowAgent {
       return text as AgentRunResult<TSchemaDef>;
     } finally {
       removeAbortListener?.();
+      removeHistoryListener?.();
+      try {
+        emitHistory();
+      } catch {
+        // History is diagnostic only; never let it mask the real result/error.
+      }
       // Read real usage before disposing — dispose tears down the session state.
       if (options.onUsage) {
         try {

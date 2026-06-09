@@ -3,7 +3,7 @@
 [![npm](https://img.shields.io/npm/v/@quintinshaw/pi-dynamic-workflows?color=cb3837&logo=npm)](https://www.npmjs.com/package/@quintinshaw/pi-dynamic-workflows)
 [![license](https://img.shields.io/badge/license-MIT-blue)](#license)
 [![for Pi](https://img.shields.io/badge/for-Pi-7c3aed)](https://pi.dev)
-[![tests](https://img.shields.io/badge/tests-641%20passing-success)](#development)
+[![tests](https://img.shields.io/badge/tests-650%20passing-success)](#development)
 
 > **Claude Code–style dynamic workflows for [Pi](https://pi.dev).**
 > Turn one prompt into a fleet of subagents that fan out in parallel, cross-check each other, and hand back a single synthesized answer.
@@ -73,7 +73,7 @@ return await agent('Synthesize and double-check these findings:\n' + findings.jo
 - **Git worktree isolation** — `isolation: "worktree"` gives an agent its own branch, so parallel agents can edit the same files without clobbering each other.
 - **Real token & cost accounting** — read from each subagent's session, not estimated. `budget` gates on the real total and `/workflows` shows the dollar cost.
 - **Background by default** — the turn ends right away, a live "Workflows running" panel tracks runs, and each result is delivered back so the conversation auto-continues when it finishes.
-- **Interactive `/workflows` TUI** — drill runs → phases → agents → detail; pause, stop, restart, and save runs from the keyboard.
+- **Interactive `/workflows` TUI** — drill runs → phases → agents → detail; inspect per-agent failures and compact subagent history; pause, stop, restart, and save runs from the keyboard.
 - **Quality patterns built in** — `verify()`, `judgePanel()`, `loopUntilDry()`, and `completenessCheck()` for adversarial review, best-of-N, and exhaustive discovery.
 - **Ultracode** — `/ultracode` is a standing opt-in that auto-arms an exhaustive multi-agent workflow for every substantive message, the way Claude Code's ultracode does. `/effort high` is the lighter tier.
 - **Bundled `/deep-research` + `/adversarial-review`** — real web search, source cross-checking, and cited reports.
@@ -111,7 +111,7 @@ The same model — on Pi, plus the production pieces a real run needs:
 /adversarial-review <task>  findings vetted by skeptical reviewers
 ```
 
-In the navigator: `↑/↓` select · `enter`/`→` open · `esc`/`←` back · `p` pause · `x` stop · `r` restart · `s` save · `q` quit. Each agent shows the model it ran on.
+In the navigator: `↑/↓` select · `enter`/`→` open · `esc`/`←` back · `p` pause · `x` stop · `r` restart · `s` save · `q` quit. Each agent shows the model it ran on; the detail view shows its prompt, result, error diagnostics, and compact message/tool history.
 
 ## Reference
 
@@ -119,7 +119,7 @@ The full guide — every global, agent option, `agentType` definitions, structur
 
 | Global | What it does |
 | --- | --- |
-| `agent(prompt, opts)` | Spawn an isolated subagent. Returns its final text, or a validated object with `opts.schema`. |
+| `agent(prompt, opts)` | Spawn an isolated subagent. Returns its final text, or a validated object with `opts.schema`; recoverable failures return `null` with diagnostics in `/workflows`. |
 | `parallel(thunks)` | Run `() => agent(...)` thunks concurrently; results in input order. |
 | `pipeline(items, ...stages)` | Fan items through sequential stages `(prev, original, index)`. |
 | `phase(title, { budget? })` | Group agents in the live view; optional per-phase token sub-budget. |
@@ -143,7 +143,7 @@ Workflows run in a Node `vm` sandbox; `Date.now()`, `Math.random()`, `new Date()
 
 ```bash
 npm install
-npm test     # biome + tsc + 641 unit tests
+npm test     # biome + tsc + 650 unit tests
 ```
 
 Every feature is also verified end-to-end against a real Pi subagent session before release.

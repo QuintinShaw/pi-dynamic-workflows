@@ -305,6 +305,31 @@ test("agent() in workflow fires onAgentStart and onAgentEnd callbacks", async ()
   assert.deepEqual(events, ["start:greeter", "end:greeter"]);
 });
 
+test("agent() in workflow forwards compact subagent history snapshots", async () => {
+  const historyRunner = {
+    async run(_prompt: string, options: any) {
+      options.onHistory?.([{ role: "assistant", kind: "text", text: "working" }]);
+      return "done";
+    },
+  };
+  const histories: Array<{ label: string; history: Array<{ text: string }> }> = [];
+
+  await runWorkflow(
+    `export const meta = { name: 'test', description: 't' }
+     await agent('hello', { label: 'greeter' })
+     return 1`,
+    {
+      agent: historyRunner,
+      persistLogs: false,
+      onAgentHistory: (event) => histories.push(event),
+    },
+  );
+
+  assert.equal(histories.length, 1);
+  assert.equal(histories[0].label, "greeter");
+  assert.equal(histories[0].history[0].text, "working");
+});
+
 test("agent() in workflow fires onAgentStart with phase info", async () => {
   const rec = new CallRecordingAgent();
   const starts: Array<{ label: string; phase?: string }> = [];

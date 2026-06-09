@@ -321,6 +321,16 @@ export class WorkflowManager extends EventEmitter {
           this.emit("agentEnd", { runId: managed.runId, ...event });
           progress();
         },
+        onAgentHistory: (event) => {
+          const agent = [...managed.snapshot.agents]
+            .reverse()
+            .find((a) => a.label === event.label && a.status === "running");
+          if (agent) {
+            agent.history = event.history;
+          }
+          this.emit("agentHistory", { runId: managed.runId, ...event });
+          progress();
+        },
         onTokenUsage: (usage) => {
           managed.snapshot.tokenUsage = usage;
           this.emit("tokenUsage", { runId: managed.runId, usage });

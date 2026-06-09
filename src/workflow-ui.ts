@@ -190,6 +190,7 @@ function persistedToSnapshot(p: PersistedRunState): WorkflowSnapshot {
       error: a.error,
       errorCode: a.errorCode,
       recoverable: a.recoverable,
+      history: a.history,
       model: a.model,
     })),
     agentCount: p.agents.length,
@@ -410,6 +411,12 @@ export function renderNavigator(
       body.push(...wrap(a.prompt ?? "", width));
       body.push("", dim("Result:"));
       body.push(...wrap(a.resultPreview ?? "(none)", width));
+      if (a.history?.length) {
+        body.push("", dim("History:"));
+        for (const entry of a.history) {
+          body.push(...wrap(`${historyLabel(entry)}: ${entry.text}`, width));
+        }
+      }
       pushScrollable(body);
     }
   } else if (state.kind === "savedDetail" && state.savedName) {
@@ -431,6 +438,13 @@ export function renderNavigator(
   lines.push("");
   lines.push(footerHint(state, model, theme));
   return lines;
+}
+
+function historyLabel(entry: NonNullable<WorkflowAgentSnapshot["history"]>[number]): string {
+  if (entry.kind === "toolCall") return entry.toolName ? `assistant tool ${entry.toolName}` : "assistant tool";
+  if (entry.role === "tool") return entry.toolName ? `tool ${entry.toolName}` : "tool";
+  if (entry.kind === "error") return `${entry.role} error`;
+  return entry.role;
 }
 
 function footerHint(state: NavigatorState, model: NavigatorModel, theme: ThemeLike): string {

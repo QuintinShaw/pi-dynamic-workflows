@@ -4,6 +4,7 @@
 
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import type { AgentHistoryEntry } from "./agent-history.js";
 import { WORKFLOW_RUNS_DIR } from "./config.js";
 import type { WorkflowErrorCode } from "./errors.js";
 
@@ -19,6 +20,7 @@ export interface PersistedAgentState {
   error?: string;
   errorCode?: WorkflowErrorCode;
   recoverable?: boolean;
+  history?: AgentHistoryEntry[];
   startedAt?: string;
   endedAt?: string;
   /** The model this agent ran on (provider/id), when known. */

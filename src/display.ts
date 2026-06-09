@@ -1,4 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { AgentHistoryEntry } from "./agent-history.js";
 import type { WorkflowErrorCode } from "./errors.js";
 import type { WorkflowMeta } from "./workflow.js";
 
@@ -14,6 +15,7 @@ export interface WorkflowAgentSnapshot {
   error?: string;
   errorCode?: WorkflowErrorCode;
   recoverable?: boolean;
+  history?: AgentHistoryEntry[];
   /** Tokens used by this agent. */
   tokens?: number;
   /** The model this agent ran on (provider/id), when known. */
