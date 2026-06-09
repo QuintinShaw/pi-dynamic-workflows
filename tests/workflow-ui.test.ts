@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { WorkflowSnapshot } from "../src/display.js";
+import { WorkflowErrorCode } from "../src/errors.js";
 import type { PersistedRunState } from "../src/run-persistence.js";
 import type { ManagedRun, WorkflowManager } from "../src/workflow-manager.js";
 import type { SavedWorkflow } from "../src/workflow-saved.js";
@@ -56,6 +57,40 @@ function fakeManager(): Pick<WorkflowManager, "listRuns" | "getRun"> {
     ],
     getRun: (id: string) =>
       id === "run-1" ? ({ runId: "run-1", status: "running", snapshot } as unknown as ManagedRun) : undefined,
+  };
+}
+
+function errorDetailManager(): Pick<WorkflowManager, "listRuns" | "getRun"> {
+  const snapshot: WorkflowSnapshot = {
+    name: "wf",
+    phases: ["P"],
+    currentPhase: "P",
+    logs: [],
+    agents: [
+      {
+        id: 1,
+        label: "empty",
+        phase: "P",
+        prompt: "do it",
+        status: "error",
+        resultPreview: "(none)",
+        error: "Subagent produced no assistant output",
+        errorCode: WorkflowErrorCode.AGENT_EMPTY_OUTPUT,
+        recoverable: true,
+      },
+    ],
+    agentCount: 1,
+    runningCount: 0,
+    doneCount: 0,
+    errorCount: 1,
+  };
+  return {
+    listRuns: () =>
+      [
+        { runId: "r-error", workflowName: "wf", status: "completed", phases: ["P"], agents: snapshot.agents, logs: [] },
+      ] as unknown as PersistedRunState[],
+    getRun: (id: string) =>
+      id === "r-error" ? ({ runId: "r-error", status: "completed", snapshot } as unknown as ManagedRun) : undefined,
   };
 }
 
@@ -415,6 +450,20 @@ test("renderNavigator shows agent detail view", () => {
   assert.match(text, /Model:/);
   assert.match(text, /model/); // shortModel strips provider prefix
   assert.match(text, /j\/k scroll/); // detail view footer
+});
+
+test("renderNavigator shows agent error diagnostics in detail view", () => {
+  const model = new NavigatorModel(errorDetailManager());
+  const state = new NavigatorState();
+  state.drill(model);
+  state.drill(model);
+  state.drill(model);
+
+  const text = renderNavigator(state, model, 80).join("\n");
+  assert.match(text, /Error:/);
+  assert.match(text, /Subagent produced no assistant output/);
+  assert.match(text, /Error code:/);
+  assert.match(text, /AGENT_EMPTY_OUTPUT \(recoverable\)/);
 });
 
 test("renderNavigator shows model info in agent rows", () => {

@@ -361,7 +361,14 @@ export class WorkflowAgent {
         )) as AgentRunResult<TSchemaDef>;
       }
 
-      return this.lastAssistantText(session.messages) as AgentRunResult<TSchemaDef>;
+      const text = this.lastAssistantText(session.messages);
+      if (!text.trim()) {
+        throw new WorkflowError("Subagent produced no assistant output", WorkflowErrorCode.AGENT_EMPTY_OUTPUT, {
+          recoverable: true,
+          agentLabel: options.label,
+        });
+      }
+      return text as AgentRunResult<TSchemaDef>;
     } finally {
       removeAbortListener?.();
       // Read real usage before disposing — dispose tears down the session state.

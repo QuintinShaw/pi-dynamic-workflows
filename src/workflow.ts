@@ -101,6 +101,9 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
     tokens?: number;
     worktree?: string;
     model?: string;
+    error?: string;
+    errorCode?: WorkflowErrorCode;
+    recoverable?: boolean;
   }) => void;
   onTokenUsage?: (usage: {
     input: number;
@@ -398,14 +401,15 @@ export async function runWorkflow<T = unknown>(
     // downstream results served from the journal.
     const cached = options.resumeJournal?.get(callIndex);
     const hashMatches = cached != null && cached.hash === callHash;
-    if (hashMatches && callIndex < state.firstMiss) {
+    const cachedEmptyOutput = hashMatches && isEmptyTextAgentResult(cached.result, agentOptions.schema);
+    if (hashMatches && !cachedEmptyOutput && callIndex < state.firstMiss) {
       options.onAgentStart?.({ label, phase: assignedPhase, prompt, model: displayModel });
       options.onAgentEnd?.({ label, phase: assignedPhase, result: cached.result, tokens: 0, model: displayModel });
       return cached.result;
     }
     // A genuine miss (no journal entry, or the hash changed) marks where the
     // unchanged prefix ends; this call and every later one then run live.
-    if (!hashMatches) state.firstMiss = Math.min(state.firstMiss, callIndex);
+    if (!hashMatches || cachedEmptyOutput) state.firstMiss = Math.min(state.firstMiss, callIndex);
 
     return limiter(async () => {
       const timeout = agentOptions.timeoutMs ?? agentTimeoutMs;
@@ -468,6 +472,12 @@ export async function runWorkflow<T = unknown>(
         );
 
         throwIfAborted();
+        if (isEmptyTextAgentResult(result, agentOptions.schema)) {
+          throw new WorkflowError("Subagent produced no assistant output", WorkflowErrorCode.AGENT_EMPTY_OUTPUT, {
+            recoverable: true,
+            agentLabel: label,
+          });
+        }
 
         const tokens = recordTokens(result);
         options.onAgentJournal?.({ index: callIndex, hash: callHash, result });
@@ -479,7 +489,17 @@ export async function runWorkflow<T = unknown>(
         const workflowError = wrapError(error, { agentLabel: label });
         logger.error(`agent ${label} failed: ${workflowError.message}`);
         const tokens = recordTokens(null);
-        options.onAgentEnd?.({ label, phase: assignedPhase, result: null, tokens, worktree: runCwd });
+        options.onAgentEnd?.({
+          label,
+          phase: assignedPhase,
+          result: null,
+          tokens,
+          worktree: runCwd,
+          model: displayModel,
+          error: workflowError.message,
+          errorCode: workflowError.code,
+          recoverable: workflowError.recoverable,
+        });
 
         // Return null for recoverable errors
         if (workflowError.recoverable) {
@@ -1018,6 +1038,10 @@ function buildAgentInstructions(
   if (options.isolation) lines.push(`Requested isolation: ${options.isolation}`);
   // Note: options.model is applied for real via the session, not injected as prose.
   return lines.length ? lines.join("\n\n") : undefined;
+}
+
+function isEmptyTextAgentResult(result: unknown, schema: TSchema | undefined): boolean {
+  return schema === undefined && typeof result === "string" && result.trim().length === 0;
 }
 
 function estimateTokens(value: unknown): number {

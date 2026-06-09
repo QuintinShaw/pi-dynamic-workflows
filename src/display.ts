@@ -1,4 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { WorkflowErrorCode } from "./errors.js";
 import type { WorkflowMeta } from "./workflow.js";
 
 export type WorkflowAgentStatus = "queued" | "running" | "done" | "error" | "skipped";
@@ -11,6 +12,8 @@ export interface WorkflowAgentSnapshot {
   status: WorkflowAgentStatus;
   resultPreview?: string;
   error?: string;
+  errorCode?: WorkflowErrorCode;
+  recoverable?: boolean;
   /** Tokens used by this agent. */
   tokens?: number;
   /** The model this agent ran on (provider/id), when known. */

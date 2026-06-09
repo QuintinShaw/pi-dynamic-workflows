@@ -15,6 +15,8 @@ export enum WorkflowErrorCode {
   SCRIPT_VALIDATION_ERROR = "SCRIPT_VALIDATION_ERROR",
   /** A schema agent never produced valid structured_output (after repair + extraction). */
   SCHEMA_NONCOMPLIANCE = "SCHEMA_NONCOMPLIANCE",
+  /** A non-schema agent completed without any assistant text output. */
+  AGENT_EMPTY_OUTPUT = "AGENT_EMPTY_OUTPUT",
   /** Agent execution failed. */
   AGENT_EXECUTION_ERROR = "AGENT_EXECUTION_ERROR",
   /** Run state persistence failed. */

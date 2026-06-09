@@ -5,6 +5,7 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { WORKFLOW_RUNS_DIR } from "./config.js";
+import type { WorkflowErrorCode } from "./errors.js";
 
 export type RunStatus = "pending" | "running" | "paused" | "completed" | "failed" | "aborted";
 
@@ -16,6 +17,8 @@ export interface PersistedAgentState {
   status: "queued" | "running" | "done" | "error" | "skipped";
   result?: unknown;
   error?: string;
+  errorCode?: WorkflowErrorCode;
+  recoverable?: boolean;
   startedAt?: string;
   endedAt?: string;
   /** The model this agent ran on (provider/id), when known. */

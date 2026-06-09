@@ -312,6 +312,9 @@ export class WorkflowManager extends EventEmitter {
           if (agent) {
             agent.status = event.result === null ? "error" : "done";
             agent.resultPreview = preview(event.result);
+            agent.error = event.error;
+            agent.errorCode = event.errorCode;
+            agent.recoverable = event.recoverable;
             agent.tokens = event.tokens;
             if (event.model) agent.model = event.model;
           }

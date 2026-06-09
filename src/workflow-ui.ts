@@ -188,6 +188,8 @@ function persistedToSnapshot(p: PersistedRunState): WorkflowSnapshot {
       resultPreview:
         a.result == null ? undefined : String(typeof a.result === "string" ? a.result : JSON.stringify(a.result)),
       error: a.error,
+      errorCode: a.errorCode,
+      recoverable: a.recoverable,
       model: a.model,
     })),
     agentCount: p.agents.length,
@@ -403,6 +405,7 @@ export function renderNavigator(
       body.push(dim("Status: ") + (a.status ?? ""));
       if (a.model) body.push(dim("Model: ") + (shortModel(a.model) ?? ""));
       if (a.error) body.push(dim("Error: ") + a.error);
+      if (a.errorCode) body.push(`${dim("Error code: ")}${a.errorCode}${a.recoverable ? " (recoverable)" : ""}`);
       body.push("", dim("Prompt:"));
       body.push(...wrap(a.prompt ?? "", width));
       body.push("", dim("Result:"));

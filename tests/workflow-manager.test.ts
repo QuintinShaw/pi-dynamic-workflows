@@ -119,6 +119,29 @@ return { a, b }`;
 );
 
 test(
+  "runSync persists recoverable agent error details for /workflows",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run() {
+          throw new Error("agent exploded");
+        },
+      },
+    });
+
+    await manager.runSync(oneAgentScript);
+
+    const run = manager.listRuns().find((r) => r.workflowName === "tracked_demo");
+    const agent = run?.agents[0];
+    assert.equal(agent?.status, "error");
+    assert.equal(agent?.error, "agent exploded");
+    assert.equal(agent?.errorCode, WorkflowErrorCode.AGENT_EXECUTION_ERROR);
+    assert.equal(agent?.recoverable, true);
+  }),
+);
+
+test(
   "startInBackground returns immediately with runId and promise",
   withTempCwd(async (cwd) => {
     const manager = new WorkflowManager({ cwd, agent: fakeAgent() });
