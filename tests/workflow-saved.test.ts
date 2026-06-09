@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { sep } from "node:path";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -59,7 +60,7 @@ test(
       "user",
     );
     assert.equal(saved.location, "user");
-    assert.ok(saved.path.includes(".pi/workflows/saved"), "should contain .pi/workflows/saved");
+    assert.ok(saved.path.includes(`.pi${sep}workflows${sep}saved`), "should contain .pi/workflows/saved");
   }),
 );
 

@@ -1,0 +1,615 @@
+{
+  "generatedAt": "2026-06-09T13:51:07.201Z",
+  "generator": "aicoders-context-extension",
+  "project": {
+    "name": "@quintinshaw/pi-dynamic-workflows",
+    "description": "Claude-Code-style dynamic workflows for Pi — fan a task out across 100s of subagents with real model routing, token/cost accounting, resume, git-worktree isolation, an interactive /workflows TUI, and a real /deep-research.",
+    "type": "pi-extension",
+    "primaryLanguage": "TypeScript",
+    "packageManager": "npm",
+    "reasoning": [
+      "pi package manifest or pi extension/theme keywords detected"
+    ],
+    "keywords": [
+      "pi-package",
+      "pi",
+      "pi-coding-agent",
+      "workflow",
+      "workflows",
+      "dynamic-workflows",
+      "orchestration",
+      "subagents",
+      "multi-agent",
+      "agents",
+      "ai-agents",
+      "parallel",
+      "fan-out",
+      "claude-code",
+      "deep-research",
+      "code-review",
+      "llm"
+    ]
+  },
+  "scripts": {
+    "test": "npm run check && npm run build && npm run test:unit",
+    "test:unit": "tsx --test tests/**/*.test.ts",
+    "check": "biome check .",
+    "format": "biome format --write .",
+    "lint": "biome lint .",
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": [
+    "@biomejs/biome",
+    "@earendil-works/pi-ai",
+    "@earendil-works/pi-coding-agent",
+    "@earendil-works/pi-tui",
+    "acorn",
+    "tsx",
+    "typebox",
+    "typescript"
+  ],
+  "entryPoints": [
+    ". (import) -> ./dist/index.js",
+    ". (types) -> ./dist/index.d.ts",
+    "./dist/index.d.ts",
+    "./dist/index.js",
+    "README.md",
+    "extensions/workflow.ts",
+    "package.json",
+    "src/index.ts"
+  ],
+  "piManifest": {
+    "extensions": [
+      "extensions/workflow.ts"
+    ],
+    "themes": []
+  },
+  "readme": {
+    "summary": [
+      "[](https://www.npmjs.com/package/@quintinshaw/pi-dynamic-workflows) [](license) [](https://pi.dev) [](development)",
+      "Claude Code–style dynamic workflows for Pi. Turn one prompt into a fleet of subagents that fan out in parallel, cross-check each other, and hand back a single synthesized answer.",
+      "Website · npm · Pi package · GitHub",
+      "Instead of one model grinding a task step by step, Pi writes a small JavaScript orchestration script that spawns many subagents at once, keeps the intermediate work in script variables (not your chat context), and returns only the result. It's the \"code mode for subagents\" from Claude Code — on any model Pi can reach."
+    ],
+    "headings": [
+      "pi-dynamic-workflows",
+      "Install",
+      "Try it",
+      "What a workflow looks like",
+      "Highlights",
+      "How it maps to Claude Code dynamic workflows",
+      "Commands",
+      "Reference",
+      "Development",
+      "Credits",
+      "License"
+    ]
+  },
+  "modules": [
+    {
+      "path": "src",
+      "role": "Source module inferred from repository layout.",
+      "files": [
+        "src/adversarial-review.ts",
+        "src/agent-history.ts",
+        "src/agent-registry.ts",
+        "src/agent.ts",
+        "src/builtin-commands.ts",
+        "src/config.ts",
+        "src/deep-research.ts",
+        "src/display.ts",
+        "src/effort-command.ts",
+        "src/errors.ts",
+        "src/index.ts",
+        "src/logger.ts"
+      ],
+      "highlights": [
+        "28 source file(s)",
+        "entry point(s): src/index.ts",
+        "contracts: custom session message adversarial-review, custom session message deep-research, custom session message effort, custom session message workflow-result, custom session message workflow:${wf.name}"
+      ]
+    },
+    {
+      "path": "extensions/workflow.ts",
+      "role": "Source module inferred from repository layout.",
+      "files": [
+        "extensions/workflow.ts"
+      ],
+      "highlights": [
+        "1 source file(s)",
+        "entry point(s): extensions/workflow.ts",
+        "contracts: pi event hook session_start"
+      ]
+    },
+    {
+      "path": "tests",
+      "role": "Source module inferred from repository layout.",
+      "files": [
+        "tests/agent-history.test.ts",
+        "tests/agent-registry.test.ts",
+        "tests/agent.test.ts",
+        "tests/builtin-commands.test.ts",
+        "tests/builtin-workflows.test.ts",
+        "tests/checkpoint.test.ts",
+        "tests/effort-command.test.ts",
+        "tests/helpers/mock-pi.ts",
+        "tests/model-routing.test.ts",
+        "tests/model-tier-config.test.ts",
+        "tests/quality-stdlib.test.ts",
+        "tests/run-persistence.test.ts"
+      ],
+      "highlights": [
+        "31 source file(s)",
+        "contracts: pi event hook agentEnd, pi event hook agentStart, pi event hook complete, pi event hook error, pi event hook error"
+      ]
+    },
+    {
+      "path": "project-root",
+      "role": "Package metadata, README and top-level documentation for installing and loading the pi package.",
+      "files": [
+        "package.json",
+        "README.md",
+        "tsconfig.json"
+      ],
+      "highlights": [
+        "1 documentation file(s)",
+        "entry point(s): README.md, package.json"
+      ]
+    },
+    {
+      "path": "docs",
+      "role": "Documentation module inferred from markdown/doc files.",
+      "files": [
+        "docs/2.0-roadmap.md",
+        "docs/media/demo.gif",
+        "docs/media/workflows-mode.jpg"
+      ],
+      "highlights": [
+        "1 documentation file(s)"
+      ]
+    },
+    {
+      "path": ".github",
+      "role": "Repository automation and CI/CD configuration.",
+      "files": [
+        ".github/workflows/ci.yml",
+        ".github/workflows/release.yml"
+      ],
+      "highlights": []
+    },
+    {
+      "path": "biome.json",
+      "role": "Repository module inferred from file layout.",
+      "files": [
+        "biome.json"
+      ],
+      "highlights": []
+    },
+    {
+      "path": "LICENSE",
+      "role": "Documentation module inferred from markdown/doc files.",
+      "files": [
+        "LICENSE"
+      ],
+      "highlights": [
+        "1 documentation file(s)"
+      ]
+    },
+    {
+      "path": "package-lock.json",
+      "role": "Repository module inferred from file layout.",
+      "files": [
+        "package-lock.json"
+      ],
+      "highlights": []
+    }
+  ],
+  "publicContracts": [
+    {
+      "kind": "custom session message",
+      "name": "adversarial-review",
+      "location": "src/builtin-commands.ts",
+      "detail": "Custom message type emitted into the pi session."
+    },
+    {
+      "kind": "custom session message",
+      "name": "deep-research",
+      "location": "src/builtin-commands.ts",
+      "detail": "Custom message type emitted into the pi session."
+    },
+    {
+      "kind": "custom session message",
+      "name": "effort",
+      "location": "src/effort-command.ts",
+      "detail": "Custom message type emitted into the pi session."
+    },
+    {
+      "kind": "custom session message",
+      "name": "workflow-result",
+      "location": "src/task-panel.ts",
+      "detail": "Custom message type emitted into the pi session."
+    },
+    {
+      "kind": "custom session message",
+      "name": "workflow:${wf.name}",
+      "location": "src/saved-commands.ts",
+      "detail": "Custom message type emitted into the pi session."
+    },
+    {
+      "kind": "custom session message",
+      "name": "workflows",
+      "location": "src/workflow-commands.ts",
+      "detail": "Custom message type emitted into the pi session."
+    },
+    {
+      "kind": "custom session message",
+      "name": "workflows-trigger",
+      "location": "src/workflow-editor.ts",
+      "detail": "Custom message type emitted into the pi session."
+    },
+    {
+      "kind": "package export",
+      "name": ". (import) -> ./dist/index.js",
+      "location": "package.json",
+      "detail": "Declared in package.json exports."
+    },
+    {
+      "kind": "package export",
+      "name": ". (types) -> ./dist/index.d.ts",
+      "location": "package.json",
+      "detail": "Declared in package.json exports."
+    },
+    {
+      "kind": "pi event hook",
+      "name": "agentEnd",
+      "location": "tests/workflow-manager.test.ts",
+      "detail": "Extension subscribes to this pi lifecycle/event hook."
+    },
+    {
+      "kind": "pi event hook",
+      "name": "agentStart",
+      "location": "tests/workflow-manager.test.ts",
+      "detail": "Extension subscribes to this pi lifecycle/event hook."
+    },
+    {
+      "kind": "pi event hook",
+      "name": "complete",
+      "location": "src/task-panel.ts",
+      "detail": "Extension subscribes to this pi lifecycle/event hook."
+    },
+    {
+      "kind": "pi event hook",
+      "name": "complete",
+      "location": "tests/workflow-manager.test.ts",
+      "detail": "Extension subscribes to this pi lifecycle/event hook."
+    },
+    {
+      "kind": "pi event hook",
+      "name": "error",
+      "location": "src/task-panel.ts",
+      "detail": "Extension subscribes to this pi lifecycle/event hook."
+    },
+    {
+      "kind": "pi event hook",
+      "name": "error",
+      "location": "tests/workflow-manager-abort.test.ts",
+      "detail": "Extension subscribes to this pi lifecycle/event hook."
+    },
+    {
+      "kind": "pi event hook",
+      "name": "error",
+      "location": "tests/workflow-manager.test.ts",
+      "detail": "Extension subscribes to this pi lifecycle/event hook."
+    },
+    {
+      "kind": "pi event hook",
+      "name": "input",
+      "location": "src/workflow-editor.ts",
+      "detail": "Extension subscribes to this pi lifecycle/event hook."
+    },
+    {
+      "kind": "pi event hook",
+      "name": "paused",
+      "location": "tests/workflow-manager-abort.test.ts",
+      "detail": "Extension subscribes to this pi lifecycle/event hook."
+    },
+    {
+      "kind": "pi event hook",
+      "name": "paused",
+      "location": "tests/workflow-manager.test.ts",
+      "detail": "Extension subscribes to this pi lifecycle/event hook."
+    },
+    {
+      "kind": "pi event hook",
+      "name": "resumed",
+      "location": "tests/workflow-manager-abort.test.ts",
+      "detail": "Extension subscribes to this pi lifecycle/event hook."
+    },
+    {
+      "kind": "pi event hook",
+      "name": "resumed",
+      "location": "tests/workflow-manager.test.ts",
+      "detail": "Extension subscribes to this pi lifecycle/event hook."
+    },
+    {
+      "kind": "pi event hook",
+      "name": "session_start",
+      "location": "extensions/workflow.ts",
+      "detail": "Extension subscribes to this pi lifecycle/event hook."
+    },
+    {
+      "kind": "pi event hook",
+      "name": "stopped",
+      "location": "tests/workflow-manager-abort.test.ts",
+      "detail": "Extension subscribes to this pi lifecycle/event hook."
+    },
+    {
+      "kind": "pi event hook",
+      "name": "stopped",
+      "location": "tests/workflow-manager.test.ts",
+      "detail": "Extension subscribes to this pi lifecycle/event hook."
+    },
+    {
+      "kind": "pi event hook",
+      "name": "turn_end",
+      "location": "src/workflow-editor.ts",
+      "detail": "Extension subscribes to this pi lifecycle/event hook."
+    },
+    {
+      "kind": "pi event hook",
+      "name": "uncaughtException",
+      "location": "tests/workflow-manager-abort.test.ts",
+      "detail": "Extension subscribes to this pi lifecycle/event hook."
+    },
+    {
+      "kind": "pi event hook",
+      "name": "uncaughtException",
+      "location": "tests/workflow-manager.test.ts",
+      "detail": "Extension subscribes to this pi lifecycle/event hook."
+    },
+    {
+      "kind": "pi extension entry",
+      "name": "extensions/workflow.ts",
+      "location": "package.json",
+      "detail": "Declared in package.json pi.extensions."
+    },
+    {
+      "kind": "slash command",
+      "name": "/adversarial-review",
+      "location": "src/builtin-commands.ts",
+      "detail": "Investigate a task, then cross-check each finding with skeptical reviewers"
+    },
+    {
+      "kind": "slash command",
+      "name": "/deep-research",
+      "location": "src/builtin-commands.ts",
+      "detail": "Research a question across the web with cross-checked sources"
+    },
+    {
+      "kind": "slash command",
+      "name": "/effort",
+      "location": "src/effort-command.ts",
+      "detail": "Standing workflow effort: off | high | ultra — auto-arms a workflow for substantive messages"
+    },
+    {
+      "kind": "slash command",
+      "name": "/ultracode",
+      "location": "src/effort-command.ts",
+      "detail": "Ultracode: standing maximal-effort mode — auto-arms an exhaustive workflow for substantive messages. /ultracode off to stop."
+    },
+    {
+      "kind": "slash command",
+      "name": "/workflows",
+      "location": "src/workflow-commands.ts",
+      "detail": "Manage workflow runs — no args (opens navigator) | status/stop/pause/resume <id> | rm <id> | save <name> [runId]"
+    },
+    {
+      "kind": "slash command",
+      "name": "/workflows-models",
+      "location": "src/workflows-models-command.ts",
+      "detail": "View and edit model tiers used by workflows (small/medium/big)"
+    }
+  ],
+  "securitySignals": [],
+  "dataSignals": [
+    "Slash commands receive user text, inspect repository files and report through ctx.ui.notify."
+  ],
+  "topLevelEntries": [
+    ".git",
+    ".github",
+    ".gitignore",
+    ".pi",
+    "LICENSE",
+    "README.md",
+    "biome.json",
+    "docs",
+    "extensions",
+    "package-lock.json",
+    "package.json",
+    "src",
+    "tests",
+    "tsconfig.json"
+  ],
+  "sourceFiles": [
+    "extensions/workflow.ts",
+    "src/adversarial-review.ts",
+    "src/agent-history.ts",
+    "src/agent-registry.ts",
+    "src/agent.ts",
+    "src/builtin-commands.ts",
+    "src/config.ts",
+    "src/deep-research.ts",
+    "src/display.ts",
+    "src/effort-command.ts",
+    "src/errors.ts",
+    "src/index.ts",
+    "src/logger.ts",
+    "src/model-routing.ts",
+    "src/model-tier-config.ts",
+    "src/run-persistence.ts",
+    "src/saved-commands.ts",
+    "src/structured-output.ts",
+    "src/task-panel.ts",
+    "src/web-tools.ts",
+    "src/workflow-commands.ts",
+    "src/workflow-editor.ts",
+    "src/workflow-manager.ts",
+    "src/workflow-saved.ts",
+    "src/workflow-tool.ts",
+    "src/workflow-ui.ts",
+    "src/workflow.ts",
+    "src/workflows-models-command.ts",
+    "src/worktree.ts",
+    "tests/agent-history.test.ts",
+    "tests/agent-registry.test.ts",
+    "tests/agent.test.ts",
+    "tests/builtin-commands.test.ts",
+    "tests/builtin-workflows.test.ts",
+    "tests/checkpoint.test.ts",
+    "tests/effort-command.test.ts",
+    "tests/helpers/mock-pi.ts",
+    "tests/model-routing.test.ts",
+    "tests/model-tier-config.test.ts",
+    "tests/quality-stdlib.test.ts",
+    "tests/run-persistence.test.ts",
+    "tests/saved-commands.test.ts",
+    "tests/schema-resolution.test.ts",
+    "tests/structured-output.test.ts",
+    "tests/task-panel.test.ts",
+    "tests/utils.test.ts",
+    "tests/web-tools.test.ts",
+    "tests/workflow-commands.test.ts",
+    "tests/workflow-display.test.ts",
+    "tests/workflow-editor.test.ts",
+    "tests/workflow-manager-abort.test.ts",
+    "tests/workflow-manager.test.ts",
+    "tests/workflow-parser.test.ts",
+    "tests/workflow-runtime.test.ts",
+    "tests/workflow-saved.test.ts",
+    "tests/workflow-tool.test.ts",
+    "tests/workflow-tools-available.test.ts",
+    "tests/workflow-ui.test.ts",
+    "tests/workflows-models-command.test.ts",
+    "tests/worktree.test.ts"
+  ],
+  "testFiles": [
+    "tests/agent-history.test.ts",
+    "tests/agent-registry.test.ts",
+    "tests/agent.test.ts",
+    "tests/builtin-commands.test.ts",
+    "tests/builtin-workflows.test.ts",
+    "tests/checkpoint.test.ts",
+    "tests/effort-command.test.ts",
+    "tests/helpers/mock-pi.ts",
+    "tests/model-routing.test.ts",
+    "tests/model-tier-config.test.ts",
+    "tests/quality-stdlib.test.ts",
+    "tests/run-persistence.test.ts",
+    "tests/saved-commands.test.ts",
+    "tests/schema-resolution.test.ts",
+    "tests/structured-output.test.ts",
+    "tests/task-panel.test.ts",
+    "tests/utils.test.ts",
+    "tests/web-tools.test.ts",
+    "tests/workflow-commands.test.ts",
+    "tests/workflow-display.test.ts",
+    "tests/workflow-editor.test.ts",
+    "tests/workflow-manager-abort.test.ts",
+    "tests/workflow-manager.test.ts",
+    "tests/workflow-parser.test.ts",
+    "tests/workflow-runtime.test.ts",
+    "tests/workflow-saved.test.ts",
+    "tests/workflow-tool.test.ts",
+    "tests/workflow-tools-available.test.ts",
+    "tests/workflow-ui.test.ts",
+    "tests/workflows-models-command.test.ts",
+    "tests/worktree.test.ts"
+  ],
+  "documentationFiles": [
+    "docs/2.0-roadmap.md",
+    "LICENSE",
+    "README.md"
+  ],
+  "configFiles": [
+    ".github/workflows/ci.yml",
+    ".github/workflows/release.yml",
+    "package.json",
+    "tsconfig.json"
+  ],
+  "files": [
+    ".github/workflows/ci.yml",
+    ".github/workflows/release.yml",
+    ".gitignore",
+    "biome.json",
+    "docs/2.0-roadmap.md",
+    "docs/media/demo.gif",
+    "docs/media/workflows-mode.jpg",
+    "extensions/workflow.ts",
+    "LICENSE",
+    "package-lock.json",
+    "package.json",
+    "README.md",
+    "src/adversarial-review.ts",
+    "src/agent-history.ts",
+    "src/agent-registry.ts",
+    "src/agent.ts",
+    "src/builtin-commands.ts",
+    "src/config.ts",
+    "src/deep-research.ts",
+    "src/display.ts",
+    "src/effort-command.ts",
+    "src/errors.ts",
+    "src/index.ts",
+    "src/logger.ts",
+    "src/model-routing.ts",
+    "src/model-tier-config.ts",
+    "src/run-persistence.ts",
+    "src/saved-commands.ts",
+    "src/structured-output.ts",
+    "src/task-panel.ts",
+    "src/web-tools.ts",
+    "src/workflow-commands.ts",
+    "src/workflow-editor.ts",
+    "src/workflow-manager.ts",
+    "src/workflow-saved.ts",
+    "src/workflow-tool.ts",
+    "src/workflow-ui.ts",
+    "src/workflow.ts",
+    "src/workflows-models-command.ts",
+    "src/worktree.ts",
+    "tests/agent-history.test.ts",
+    "tests/agent-registry.test.ts",
+    "tests/agent.test.ts",
+    "tests/builtin-commands.test.ts",
+    "tests/builtin-workflows.test.ts",
+    "tests/checkpoint.test.ts",
+    "tests/effort-command.test.ts",
+    "tests/helpers/mock-pi.ts",
+    "tests/model-routing.test.ts",
+    "tests/model-tier-config.test.ts",
+    "tests/quality-stdlib.test.ts",
+    "tests/run-persistence.test.ts",
+    "tests/saved-commands.test.ts",
+    "tests/schema-resolution.test.ts",
+    "tests/structured-output.test.ts",
+    "tests/task-panel.test.ts",
+    "tests/utils.test.ts",
+    "tests/web-tools.test.ts",
+    "tests/workflow-commands.test.ts",
+    "tests/workflow-display.test.ts",
+    "tests/workflow-editor.test.ts",
+    "tests/workflow-manager-abort.test.ts",
+    "tests/workflow-manager.test.ts",
+    "tests/workflow-parser.test.ts",
+    "tests/workflow-runtime.test.ts",
+    "tests/workflow-saved.test.ts",
+    "tests/workflow-tool.test.ts",
+    "tests/workflow-tools-available.test.ts",
+    "tests/workflow-ui.test.ts",
+    "tests/workflows-models-command.test.ts",
+    "tests/worktree.test.ts",
+    "tsconfig.json"
+  ]
+}

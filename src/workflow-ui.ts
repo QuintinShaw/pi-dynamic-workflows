@@ -14,8 +14,8 @@
  */
 
 import type { ExtensionAPI, ExtensionUIContext, Theme } from "@earendil-works/pi-coding-agent";
-import type { Component, TUI } from "@earendil-works/pi-tui";
-import { parseKey } from "@earendil-works/pi-tui";
+import type { Component, Focusable, TUI } from "@earendil-works/pi-tui";
+import { parseKey, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import type { WorkflowAgentSnapshot, WorkflowSnapshot } from "./display.js";
 import type { PersistedRunState } from "./run-persistence.js";
 import { registerSavedWorkflow } from "./saved-commands.js";
@@ -42,6 +42,11 @@ export interface ThemeLike {
 }
 
 const PLAIN: ThemeLike = { fg: (_c, t) => t, bold: (t) => t };
+
+// Border characters for the overlay box
+const BOX_BORDER_LEFT = "│ ";
+const BOX_BORDER_RIGHT = " │";
+const BOX_BORDER_OVERHEAD = BOX_BORDER_LEFT.length + BOX_BORDER_RIGHT.length;
 
 export type ViewKind = "runs" | "phases" | "agents" | "detail" | "savedDetail";
 
@@ -474,21 +479,7 @@ function footerHint(state: NavigatorState, model: NavigatorModel, theme: ThemeLi
 }
 
 function wrap(text: string, width: number): string[] {
-  const w = Math.max(20, width - 2);
-  const out: string[] = [];
-  for (const para of String(text).split("\n")) {
-    if (para.length <= w) {
-      out.push(para);
-      continue;
-    }
-    let rest = para;
-    while (rest.length > w) {
-      out.push(rest.slice(0, w));
-      rest = rest.slice(w);
-    }
-    if (rest) out.push(rest);
-  }
-  return out;
+  return wrapTextWithAnsi(text ?? "", Math.max(20, width));
 }
 
 /** What a key press should do. Pure mapping from a parsed key id to an action. */
@@ -547,9 +538,13 @@ function currentCount(state: NavigatorState, model: NavigatorModel): number {
   return 0;
 }
 
+import type { OverlayAnchor } from "@earendil-works/pi-tui";
+
 export interface NavigatorOptions {
   storage?: WorkflowStorage;
   cwd?: string;
+  /** Overlay anchor position: "center" (default) or "right-center" for sidebar. */
+  anchor?: OverlayAnchor;
 }
 
 /**
@@ -661,15 +656,54 @@ export function openWorkflowNavigator(
         rerender();
       };
 
-      const component: Component & { dispose?(): void } = {
-        render: (width: number) => renderNavigator(state, model, width, theme, tui.terminal?.rows ?? 24),
+      // Wrap the rendered content inside a visual box border for better
+      // screen-boundary contrast. Follows the same pattern as pi-ask-user:
+      //   top border ──╭───╮
+      //   side borders │ … │
+      //   bottom border╰───╯
+      let _focused = false;
+      const component: Component &
+        Focusable &
+        { dispose?(): void } = {
+        get focused(): boolean {
+          return _focused;
+        },
+        set focused(v: boolean) {
+          _focused = v;
+        },
+        render: (width: number) => {
+          // Brighter border when focused, muted when not
+          const borderColor = (s: string) =>
+            _focused ? theme.fg("accent", s) : theme.fg("borderMuted", s);
+          const titleColor = (s: string) =>
+            _focused ? theme.fg("dim", theme.bold(s)) : theme.fg("muted", s);
+          const bgColor = (s: string) => theme.bg("customMessageBg", s);
+          const innerWidth = Math.max(10, width - BOX_BORDER_OVERHEAD);
+          const raw = renderNavigator(state, model, innerWidth, theme, tui.terminal?.rows ?? 24);
+          const title = titleColor(" workflows ");
+          const topBorder =
+            borderColor("╭─") +
+            title +
+            borderColor("─".repeat(Math.max(0, innerWidth - 10))) +
+            borderColor("╮");
+          const botBorder = borderColor("╰" + "─".repeat(Math.max(0, innerWidth + 2)) + "╯");
+          const wrapAndBg = (line: string) => {
+            const padded = truncateToWidth(line, innerWidth, "", true);
+            const fullLine = borderColor(BOX_BORDER_LEFT) + padded + borderColor(BOX_BORDER_RIGHT);
+            // Fill trailing whitespace for consistent background across the width
+            const trailingPad = width - fullLine.length;
+            return bgColor(fullLine + (trailingPad > 0 ? " ".repeat(trailingPad) : ""));
+          };
+          return [bgColor(topBorder), ...raw.map(wrapAndBg), bgColor(botBorder)];
+        },
         handleInput: (data: string) => act(data),
         invalidate: () => {},
         dispose: () => cleanup(),
       };
       return component;
     },
-    // A roomy overlay: ~94% of the terminal so the navigator gets real width/height.
-    { overlay: true, overlayOptions: { width: "94%", maxHeight: "92%", anchor: "center" } },
+    // A roomy overlay with visual margin so borders stand out from the terminal edge.
+    // Supports sidebar mode via opts.anchor="right-center".
+    { overlay: true, overlayOptions: { width: opts.anchor === "right-center" ? "60%" : "94%", maxHeight: "92%", anchor: opts.anchor ?? "center", margin: 1 } },
   );
 }

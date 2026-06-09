@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -369,32 +369,14 @@ test(
 test(
   "createRunPersistence list returns empty array when directory is unreadable",
   withTempCwd(async (cwd) => {
-    const rp = createRunPersistence(cwd);
-    const runsDir = join(cwd, WORKFLOW_RUNS_DIR);
-
-    // Save a run first so directory exists with content
-    rp.save({
-      runId: "invisible",
-      workflowName: "wf",
-      script: "export const meta = { name: 'w', description: 'w' }",
-      status: "completed",
-      phases: [],
-      agents: [],
-      logs: [],
-      startedAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
+    const rp = createRunPersistence(cwd, {
+      readdirSync: () => {
+        throw new Error("EACCES: permission denied, scandir");
+      },
     });
 
-    // Remove read permission from the runs directory
-    chmodSync(runsDir, 0o000);
-
-    try {
-      const runs = rp.list();
-      assert.deepEqual(runs, []);
-    } finally {
-      // Restore permissions so cleanup can remove the temp directory
-      chmodSync(runsDir, 0o755);
-    }
+    const runs = rp.list();
+    assert.deepEqual(runs, []);
   }),
 );
 
