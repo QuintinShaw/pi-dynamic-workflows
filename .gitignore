@@ -10,3 +10,4 @@ dist/
 # Local-only npm clean-room install verifier (not part of the package)
 scripts/verify-npm-install.sh
 __pycache__/
+.context/

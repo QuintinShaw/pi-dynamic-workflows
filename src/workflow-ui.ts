@@ -662,9 +662,7 @@ export function openWorkflowNavigator(
       //   side borders │ … │
       //   bottom border╰───╯
       let _focused = false;
-      const component: Component &
-        Focusable &
-        { dispose?(): void } = {
+      const component: Component & Focusable & { dispose?(): void } = {
         get focused(): boolean {
           return _focused;
         },
@@ -673,20 +671,15 @@ export function openWorkflowNavigator(
         },
         render: (width: number) => {
           // Brighter border when focused, muted when not
-          const borderColor = (s: string) =>
-            _focused ? theme.fg("accent", s) : theme.fg("borderMuted", s);
-          const titleColor = (s: string) =>
-            _focused ? theme.fg("dim", theme.bold(s)) : theme.fg("muted", s);
+          const borderColor = (s: string) => (_focused ? theme.fg("accent", s) : theme.fg("borderMuted", s));
+          const titleColor = (s: string) => (_focused ? theme.fg("dim", theme.bold(s)) : theme.fg("muted", s));
           const bgColor = (s: string) => theme.bg("customMessageBg", s);
           const innerWidth = Math.max(10, width - BOX_BORDER_OVERHEAD);
           const raw = renderNavigator(state, model, innerWidth, theme, tui.terminal?.rows ?? 24);
           const title = titleColor(" workflows ");
           const topBorder =
-            borderColor("╭─") +
-            title +
-            borderColor("─".repeat(Math.max(0, innerWidth - 10))) +
-            borderColor("╮");
-          const botBorder = borderColor("╰" + "─".repeat(Math.max(0, innerWidth + 2)) + "╯");
+            borderColor("╭─") + title + borderColor("─".repeat(Math.max(0, innerWidth - 10))) + borderColor("╮");
+          const botBorder = borderColor(`╰${"─".repeat(Math.max(0, innerWidth + 2))}╯`);
           const wrapAndBg = (line: string) => {
             const padded = truncateToWidth(line, innerWidth, "", true);
             const fullLine = borderColor(BOX_BORDER_LEFT) + padded + borderColor(BOX_BORDER_RIGHT);
@@ -704,6 +697,14 @@ export function openWorkflowNavigator(
     },
     // A roomy overlay with visual margin so borders stand out from the terminal edge.
     // Supports sidebar mode via opts.anchor="right-center".
-    { overlay: true, overlayOptions: { width: opts.anchor === "right-center" ? "60%" : "94%", maxHeight: "92%", anchor: opts.anchor ?? "center", margin: 1 } },
+    {
+      overlay: true,
+      overlayOptions: {
+        width: opts.anchor === "right-center" ? "60%" : "94%",
+        maxHeight: "92%",
+        anchor: opts.anchor ?? "center",
+        margin: 1,
+      },
+    },
   );
 }

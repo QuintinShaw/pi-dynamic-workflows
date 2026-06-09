@@ -227,17 +227,20 @@ describe("createWidgetWorkflowDisplay lifecycle", () => {
     assert.equal(typeof widget, "function", "widget should be a component factory function");
 
     // The component factory produces a Component with a render method
-    const comp = widget(undefined as never, {
-      fg: (_c: string, t: string) => t,
-      bold: (t: string) => t,
-    } as never);
+    const comp = widget(
+      undefined as never,
+      {
+        fg: (_c: string, t: string) => t,
+        bold: (t: string) => t,
+      } as never,
+    );
     assert.ok(comp, "component factory should return a component");
     assert.equal(typeof comp.render, "function", "component should have a render method");
 
     // update doesn't call setWidget again (mutable state)
     const snap = createWorkflowSnapshot(fakeMeta());
     display.update(snap);
-    assert.equal(setWidget.mock.callCount(), 1, "update should NOT call setWidget again");
+    assert.equal(setWidget.mock.callCount(), 2, "update should call setWidget to re-register");
 
     // But the component's render function returns the latest snapshot lines
     const lines = comp.render(80);
@@ -261,7 +264,7 @@ describe("createWidgetWorkflowDisplay lifecycle", () => {
     display.complete(snap);
 
     // Complete updates mutable state, doesn't re-register
-    assert.equal(setWidget.mock.callCount(), 1, "complete should NOT call setWidget again");
+    assert.equal(setWidget.mock.callCount(), 2, "complete should call setWidget to re-register");
   });
 
   it("clear removes widget and status", async () => {
@@ -324,6 +327,38 @@ describe("createWidgetWorkflowDisplay lifecycle", () => {
     const [, statusText] = setStatus.mock.calls[0].arguments;
     assert.ok(statusText.includes("test-wf"), "status should include workflow name");
   });
+
+  it("re-renders via setWidget even when showStatus is false (default)", async () => {
+    const { createWorkflowSnapshot, createWidgetWorkflowDisplay } = await loadDisplay();
+
+    const setWidget = mock.fn();
+    const ctx = {
+      hasUI: true,
+      ui: { setWidget, setStatus: mock.fn() },
+    };
+
+    // showStatus defaults to false
+    const display = createWidgetWorkflowDisplay(ctx as never, { key: "wf-no-status" });
+    assert.equal(setWidget.mock.callCount(), 1, "constructor registers widget once");
+
+    // update() must re-register the widget even when showStatus=false
+    const snap = createWorkflowSnapshot(fakeMeta("no-status-wf"));
+    display.update(snap);
+    assert.equal(setWidget.mock.callCount(), 2, "update must call setWidget even with showStatus=false");
+
+    // verify the re-registered factory renders the updated snapshot
+    const [, factory2] = setWidget.mock.calls[1].arguments;
+    const rendered = factory2(null, { fg: (_c, t) => t, bold: (t) => t });
+    const lines2 = rendered.render(80);
+    assert.ok(
+      lines2.some((l) => l.includes("no-status-wf")),
+      "render output must include workflow name",
+    );
+
+    // complete() must also re-register
+    display.complete(snap);
+    assert.equal(setWidget.mock.callCount(), 3, "complete must call setWidget even with showStatus=false");
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -384,16 +419,16 @@ describe("createToolUpdateWorkflowDisplay lifecycle", () => {
     // Constructor registers the component factory once
     assert.equal(setWidget.mock.callCount(), 1, "constructor should register widget once");
 
-    // update/complete update mutable state, don't re-register
+    // update/complete re-register the widget to trigger re-render
     display.update(createWorkflowSnapshot(fakeMeta()));
-    assert.equal(setWidget.mock.callCount(), 1, "update should NOT call setWidget again");
+    assert.equal(setWidget.mock.callCount(), 2, "update should call setWidget to re-register");
 
     display.complete(createWorkflowSnapshot(fakeMeta("done")));
-    assert.equal(setWidget.mock.callCount(), 1, "complete should NOT call setWidget again");
+    assert.equal(setWidget.mock.callCount(), 3, "complete should call setWidget to re-register");
 
     // clear removes the widget
     display.clear();
-    assert.equal(setWidget.mock.callCount(), 2, "clear should remove widget (2nd call)");
+    assert.equal(setWidget.mock.callCount(), 4, "clear should remove widget (4th call)");
   });
 });
 

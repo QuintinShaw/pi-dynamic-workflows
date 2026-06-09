@@ -1,8 +1,7 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { sep } from "node:path";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import test from "node:test";
 import { WORKFLOW_SAVED_DIR } from "../src/config.js";
 import { createWorkflowStorage } from "../src/workflow-saved.js";

@@ -94,15 +94,14 @@ export function createWidgetWorkflowDisplay(
   let snapshot: WorkflowSnapshot | undefined;
   let completed = false;
 
+  // Store the factory so update()/complete() can re-register it to trigger re-render.
+  const widgetFactory = (_tui: unknown, theme: Theme) => ({
+    render: () => (snapshot ? renderWorkflowLines(snapshot, options, theme) : []),
+    invalidate: () => {},
+  });
+
   if (ctx.hasUI) {
-    ctx.ui.setWidget(
-      key,
-      (_tui: unknown, theme: Theme) => ({
-        render: () => (snapshot ? renderWorkflowLines(snapshot, options, theme) : []),
-        invalidate: () => {},
-      }),
-      { placement },
-    );
+    ctx.ui.setWidget(key, widgetFactory, { placement });
   }
 
   return {
@@ -110,12 +109,14 @@ export function createWidgetWorkflowDisplay(
       snapshot = s;
       if (!ctx.hasUI) return;
       if (showStatus) ctx.ui.setStatus(key, statusLine(s, completed));
+      ctx.ui.setWidget(key, widgetFactory, { placement });
     },
     complete(s) {
       snapshot = s;
       completed = true;
       if (!ctx.hasUI) return;
       if (showStatus) ctx.ui.setStatus(key, statusLine(s, true));
+      ctx.ui.setWidget(key, widgetFactory, { placement });
     },
     clear() {
       if (!ctx.hasUI) return;
@@ -184,7 +185,7 @@ export function renderWorkflowLines(
   const costInfo = usage?.cost ? ` · $${usage.cost.toFixed(4)}` : "";
   const tokenInfo = usage ? ` · ${usage.total.toLocaleString()} tokens${costInfo}` : "";
   const lines = [
-    theme.bold(`◆ Workflow: ${snapshot.name}`) + ` (${snapshot.doneCount}/${snapshot.agentCount} done${state}${tokenInfo})`,
+    `${theme.bold(`◆ Workflow: ${snapshot.name}`)} (${snapshot.doneCount}/${snapshot.agentCount} done${state}${tokenInfo})`,
   ];
 
   const phaseNames = snapshot.phases.length
@@ -214,9 +215,7 @@ export function renderWorkflowLines(
       const order = `[${agent.id}]`;
       const result = showResultPreviews && agent.resultPreview ? ` — ${agent.resultPreview}` : "";
       const agentTokens = agent.tokens ? theme.fg("dim", ` [${agent.tokens.toLocaleString()} tok]`) : "";
-      lines.push(
-        `    ${order} ${statusIcon(agent.status)} ${shorten(agent.label, 48)}${agentTokens}${result}`,
-      );
+      lines.push(`    ${order} ${statusIcon(agent.status)} ${shorten(agent.label, 48)}${agentTokens}${result}`);
     }
     if (agents.length > visibleAgents.length)
       lines.push(theme.fg("dim", `    … ${agents.length - visibleAgents.length} earlier agents`));
