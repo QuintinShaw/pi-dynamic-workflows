@@ -3,7 +3,7 @@
 [![npm](https://img.shields.io/npm/v/@quintinshaw/pi-dynamic-workflows?color=cb3837&logo=npm)](https://www.npmjs.com/package/@quintinshaw/pi-dynamic-workflows)
 [![license](https://img.shields.io/badge/license-MIT-blue)](#license)
 [![for Pi](https://img.shields.io/badge/for-Pi-7c3aed)](https://pi.dev)
-[![tests](https://img.shields.io/badge/tests-631%20passing-success)](#development)
+[![tests](https://img.shields.io/badge/tests-640%20passing-success)](#development)
 
 > **Claude Code–style dynamic workflows for [Pi](https://pi.dev).**
 > Turn one prompt into a fleet of subagents that fan out in parallel, cross-check each other, and hand back a single synthesized answer.
@@ -32,7 +32,7 @@ Ask in plain language:
 Run a workflow to audit every route under src/routes/ for missing auth checks.
 ```
 
-Pi writes the script and runs it in the background — your turn ends immediately and a live panel tracks progress while you keep working. Or just type the word **workflows** in any message to force one:
+Pi writes the script and runs it in the background — your turn ends immediately and a live panel tracks progress while you keep working. Or just type the word **workflows** in any message to force one. If you only want to discuss workflows without triggering one, run `/workflows-trigger off`, check the current state with `/workflows-trigger status`, and turn it back on with `/workflows-trigger on`.
 
 ![Workflows mode in the input box](https://raw.githubusercontent.com/QuintinShaw/pi-dynamic-workflows/main/docs/media/workflows-mode.jpg)
 
@@ -99,6 +99,8 @@ The same model — on Pi, plus the production pieces a real run needs:
 /workflows status <id>      watch a run live; print its result when it finishes
 /workflows save <name>      save the latest run's script as a reusable /<name> command
 /workflows pause|resume|stop|rm <id>
+/workflows-trigger off|on|status
+                            disable, restore, or inspect keyword-triggered workflows mode
 /workflows-models           map the small / medium / big tiers to real models
 /ultracode [off]            ultracode: auto-arm an exhaustive workflow for every substantive message
 /effort off|high|ultra      finer control over the standing opt-in (high = thorough, ultra = ultracode)
@@ -139,7 +141,7 @@ Workflows run in a Node `vm` sandbox; `Date.now()`, `Math.random()`, `new Date()
 
 ```bash
 npm install
-npm test     # biome + tsc + 631 unit tests
+npm test     # biome + tsc + 640 unit tests
 ```
 
 Every feature is also verified end-to-end against a real Pi subagent session before release.

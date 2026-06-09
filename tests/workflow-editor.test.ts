@@ -311,14 +311,20 @@ describe("WorkflowEditor", () => {
     KB = core.KeybindingsManager as unknown as KBManagerClass;
   });
 
-  function createEditor(stateOverrides?: Partial<{ active: boolean }>): {
+  function createEditor(
+    stateOverrides?: Partial<{ active: boolean; keywordTriggerEnabled: boolean; suppressedKeywordText?: string }>,
+  ): {
     editor: InstanceType<Awaited<ReturnType<typeof load>>["WorkflowEditor"]>;
-    state: { active: boolean };
+    state: { active: boolean; keywordTriggerEnabled: boolean; suppressedKeywordText?: string };
   } {
     const tui = createMockTui();
     const theme = makeTheme();
     const kb = new KB();
-    const state: { active: boolean } = { active: false, ...stateOverrides };
+    const state: { active: boolean; keywordTriggerEnabled: boolean; suppressedKeywordText?: string } = {
+      active: false,
+      keywordTriggerEnabled: true,
+      ...stateOverrides,
+    };
     const editor = new mod.WorkflowEditor(tui, theme, kb, state);
     return { editor, state };
   }
@@ -327,6 +333,7 @@ describe("WorkflowEditor", () => {
     const { editor, state } = createEditor();
     assert.ok(editor instanceof mod.WorkflowEditor);
     assert.equal(state.active, false);
+    assert.equal(state.keywordTriggerEnabled, true);
   });
 
   it("render() returns an array of strings", () => {
@@ -345,6 +352,15 @@ describe("WorkflowEditor", () => {
     assert.equal(editor.isActive(), true, "should be active after typing trigger");
   });
 
+  it("isActive() returns false when the keyword trigger is disabled", () => {
+    const { editor, state } = createEditor({ keywordTriggerEnabled: false });
+    editor.setText("run a workflow test");
+    assert.equal(editor.isActive(), false, "keyword trigger off should suppress workflow mode");
+
+    state.keywordTriggerEnabled = true;
+    assert.equal(editor.isActive(), true, "re-enabling the keyword trigger should re-arm matching text");
+  });
+
   it("isActive() returns false after backspace disarms trigger", () => {
     const { editor } = createEditor();
     editor.setText("workflow");
@@ -353,6 +369,49 @@ describe("WorkflowEditor", () => {
     // Backspace (DEL = \x7f) when cursor is right after "workflow" should disarm
     editor.handleInput("\x7f");
     assert.equal(editor.isActive(), false, "should be inactive after backspace disarm");
+  });
+
+  it("backspace disarm records the exact text to suppress on submit", () => {
+    const { editor, state } = createEditor();
+    editor.setText("please discuss workflows");
+    assert.equal(editor.isActive(), true, "active after typing trigger");
+
+    editor.handleInput("\x7f");
+    assert.equal(editor.isActive(), false, "should be inactive after backspace disarm");
+    assert.equal(state.suppressedKeywordText, "please discuss workflows");
+
+    editor.handleInput("!");
+    assert.equal(state.suppressedKeywordText, undefined, "editing after disarm should clear one-shot suppression");
+    assert.equal(editor.isActive(), true, "a changed trigger text should re-arm");
+  });
+
+  it("re-arms changed trigger text after an interactively typed trigger was disarmed", () => {
+    const { editor, state } = createEditor();
+    editor.handleInput("please discuss workflows");
+    assert.equal(editor.isActive(), true, "active after typing trigger");
+
+    editor.handleInput("\x7f");
+    assert.equal(editor.isActive(), false, "backspace should disarm the current text");
+    assert.equal(state.suppressedKeywordText, "please discuss workflows");
+
+    editor.handleInput(" workflow");
+    assert.equal(state.suppressedKeywordText, undefined, "changed trigger text should clear one-shot suppression");
+    assert.equal(editor.isActive(), true, "changed trigger text should visually re-arm");
+  });
+
+  it("submit after backspace disarm preserves suppression for the input hook", () => {
+    const { editor, state } = createEditor();
+    editor.setText("please discuss workflows");
+    editor.handleInput("\x7f");
+
+    let submittedText: string | undefined;
+    editor.onSubmit = (text: string) => {
+      submittedText = text;
+    };
+    editor.handleInput("\r");
+
+    assert.equal(submittedText, "please discuss workflows");
+    assert.equal(state.suppressedKeywordText, "please discuss workflows");
   });
 
   it("handleInput calls onSubmit when Enter is pressed", () => {
@@ -429,6 +488,42 @@ describe("installWorkflowEditor", () => {
     assert.equal(typeof setFactory, "function", "the argument should be a factory function");
   });
 
+  it("registers /workflows-trigger and toggles the keyword trigger", async () => {
+    const mod = await load();
+    const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
+    const sent: Array<{ content?: string }> = [];
+    const pi = {
+      on: () => {},
+      registerCommand: (name: string, command: { handler: (args: string, ctx: unknown) => Promise<void> }) => {
+        commands.set(name, command);
+      },
+      sendMessage: (message: { content?: string }) => {
+        sent.push(message);
+      },
+      getActiveTools: () => [],
+      setActiveTools: () => {},
+    } as unknown as ExtensionAPI;
+
+    const ui = {
+      setEditorComponent: () => {},
+    } as unknown as ExtensionUIContext;
+
+    const state = mod.installWorkflowEditor(pi, ui);
+    assert.equal(state.keywordTriggerEnabled, true, "keyword trigger should default on");
+
+    const command = commands.get("workflows-trigger");
+    assert.ok(command, "should register /workflows-trigger");
+
+    await command.handler("off", {});
+    assert.equal(state.keywordTriggerEnabled, false);
+    assert.equal(state.active, false);
+    assert.match(sent.at(-1)?.content ?? "", /keyword trigger off/i);
+
+    await command.handler("on", {});
+    assert.equal(state.keywordTriggerEnabled, true);
+    assert.match(sent.at(-1)?.content ?? "", /keyword trigger on/i);
+  });
+
   it("saves active tools and adds WORKFLOW_TOOL_NAME on triggered input", async () => {
     const mod = await load();
     let savedTools: string[] = [];
@@ -488,6 +583,149 @@ describe("installWorkflowEditor", () => {
     );
     assert.ok(resultTrigger.text?.includes("run a workflow test"), "transformed text should include original prompt");
     assert.ok(savedTools.includes("workflow"), `saved tools (${savedTools.join(", ")}) should include "workflow"`);
+  });
+
+  it("does not transform keyword-triggered input when /workflows-trigger is off", async () => {
+    const mod = await load();
+    const captured: Array<{ event: string; handler: (...args: unknown[]) => unknown }> = [];
+    const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
+    let setActiveToolsCalls = 0;
+    const pi = {
+      on: (event: string, handler: (...args: unknown[]) => unknown) => {
+        captured.push({ event, handler });
+      },
+      registerCommand: (name: string, command: { handler: (args: string, ctx: unknown) => Promise<void> }) => {
+        commands.set(name, command);
+      },
+      sendMessage: () => {},
+      getActiveTools: () => ["bash", "read"],
+      setActiveTools: () => {
+        setActiveToolsCalls++;
+      },
+    } as unknown as ExtensionAPI;
+
+    const ui = {
+      setEditorComponent: () => {},
+    } as unknown as ExtensionUIContext;
+
+    mod.installWorkflowEditor(pi, ui);
+    await commands.get("workflows-trigger")?.handler("off", {});
+
+    const inputHandler = captured.find((h) => h.event === "input")?.handler;
+    assert.ok(inputHandler, "input handler should be registered");
+    const result = inputHandler({
+      source: "interactive",
+      text: "Please discuss workflows as a normal topic.",
+    });
+
+    assert.deepEqual(result, { action: "continue" });
+    assert.equal(setActiveToolsCalls, 0);
+  });
+
+  it("does not transform one-shot backspace-suppressed keyword input", async () => {
+    const mod = await load();
+    const captured: Array<{ event: string; handler: (...args: unknown[]) => unknown }> = [];
+    let setActiveToolsCalls = 0;
+    const pi = {
+      on: (event: string, handler: (...args: unknown[]) => unknown) => {
+        captured.push({ event, handler });
+      },
+      registerCommand: () => {},
+      sendMessage: () => {},
+      getActiveTools: () => ["bash", "read"],
+      setActiveTools: () => {
+        setActiveToolsCalls++;
+      },
+    } as unknown as ExtensionAPI;
+
+    const ui = {
+      setEditorComponent: () => {},
+    } as unknown as ExtensionUIContext;
+
+    const state = mod.installWorkflowEditor(pi, ui);
+    state.suppressedKeywordText = "Please discuss workflows as a normal topic.";
+
+    const inputHandler = captured.find((h) => h.event === "input")?.handler;
+    assert.ok(inputHandler, "input handler should be registered");
+    const result = inputHandler({
+      source: "interactive",
+      text: "Please discuss workflows as a normal topic.",
+    });
+
+    assert.deepEqual(result, { action: "continue" });
+    assert.equal(setActiveToolsCalls, 0);
+    assert.equal(state.suppressedKeywordText, undefined, "suppression should be consumed after one submit");
+  });
+
+  it("transforms the same keyword input later when it was not just suppressed", async () => {
+    const mod = await load();
+    const captured: Array<{ event: string; handler: (...args: unknown[]) => unknown }> = [];
+    const pi = {
+      on: (event: string, handler: (...args: unknown[]) => unknown) => {
+        captured.push({ event, handler });
+      },
+      registerCommand: () => {},
+      sendMessage: () => {},
+      getActiveTools: () => ["bash", "read"],
+      setActiveTools: () => {},
+    } as unknown as ExtensionAPI;
+
+    const ui = {
+      setEditorComponent: () => {},
+    } as unknown as ExtensionUIContext;
+
+    mod.installWorkflowEditor(pi, ui);
+
+    const text = "Please discuss workflows as a normal topic.";
+    const inputHandler = captured.find((h) => h.event === "input")?.handler;
+    assert.ok(inputHandler, "input handler should be registered");
+    const result = inputHandler({ source: "interactive", text });
+
+    assert.deepEqual(result, {
+      action: "transform",
+      text: mod.buildForcedWorkflowPrompt(text),
+    });
+  });
+
+  it("still transforms effort-armed input when the keyword trigger is off", async () => {
+    const mod = await load();
+    const { createEffortState, effortDirective } = await import("../src/effort-command.js");
+    const captured: Array<{ event: string; handler: (...args: unknown[]) => unknown }> = [];
+    const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
+    const effort = createEffortState();
+    effort.level = "high";
+    let tools: string[] = [];
+    const pi = {
+      on: (event: string, handler: (...args: unknown[]) => unknown) => {
+        captured.push({ event, handler });
+      },
+      registerCommand: (name: string, command: { handler: (args: string, ctx: unknown) => Promise<void> }) => {
+        commands.set(name, command);
+      },
+      sendMessage: () => {},
+      getActiveTools: () => ["bash", "read"],
+      setActiveTools: (next: string[]) => {
+        tools = next;
+      },
+    } as unknown as ExtensionAPI;
+
+    const ui = {
+      setEditorComponent: () => {},
+    } as unknown as ExtensionUIContext;
+
+    mod.installWorkflowEditor(pi, ui, effort);
+    await commands.get("workflows-trigger")?.handler("off", {});
+
+    const text = "Please discuss workflows as a normal topic.";
+    const inputHandler = captured.find((h) => h.event === "input")?.handler;
+    assert.ok(inputHandler, "input handler should be registered");
+    const result = inputHandler({ source: "interactive", text });
+
+    assert.deepEqual(result, {
+      action: "transform",
+      text: mod.buildForcedWorkflowPrompt(text, effortDirective("high")),
+    });
+    assert.ok(tools.includes(mod.WORKFLOW_TOOL_NAME), "effort mode should still add the workflow tool");
   });
 
   it("restores original tools on turn_end after a triggered turn", async () => {

@@ -82,6 +82,7 @@ export {
   hasTrigger,
   installWorkflowEditor,
   RAINBOW,
+  registerWorkflowTriggerCommand,
   tokenizeAnsi,
   WorkflowEditor,
   type WorkflowModeState,

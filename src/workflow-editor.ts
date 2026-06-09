@@ -16,7 +16,12 @@
  * inherited untouched.
  */
 
-import { CustomEditor, type ExtensionAPI, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import {
+  CustomEditor,
+  type ExtensionAPI,
+  type ExtensionCommandContext,
+  type ExtensionUIContext,
+} from "@earendil-works/pi-coding-agent";
 import type { EditorTheme, TUI } from "@earendil-works/pi-tui";
 import { type EffortState, effortDirective, isSubstantive } from "./effort-command.js";
 
@@ -47,6 +52,8 @@ export function endsWithTrigger(textBeforeCursor: string): boolean {
 /** Shared, mutable view of whether "workflows mode" is currently armed. */
 export interface WorkflowModeState {
   active: boolean;
+  keywordTriggerEnabled: boolean;
+  suppressedKeywordText?: string;
 }
 
 interface AnsiToken {
@@ -159,13 +166,14 @@ export class WorkflowEditor extends CustomEditor {
 
   /** Highlighted/armed: a trigger is present and the user hasn't toggled it off. */
   isActive(): boolean {
-    return !this.disabled && hasTrigger(this.getText());
+    return this.modeState.keywordTriggerEnabled && !this.disabled && hasTrigger(this.getText());
   }
 
   override handleInput(data: string): void {
     // First Backspace right after a trigger word disarms (non-destructive).
     if (isBackspace(data) && this.isActive() && this.cursorAfterTrigger()) {
       this.disabled = true;
+      this.modeState.suppressedKeywordText = this.getText().trim();
       this.syncState();
       this.tui.requestRender();
       return;
@@ -175,8 +183,16 @@ export class WorkflowEditor extends CustomEditor {
     const after = this.getText();
     if (after !== before) {
       const now = hasTrigger(after);
+      const normalizedAfter = after.trim();
+      const suppressionCleared =
+        this.modeState.suppressedKeywordText !== undefined &&
+        normalizedAfter !== "" &&
+        normalizedAfter !== this.modeState.suppressedKeywordText;
+      if (suppressionCleared) {
+        this.modeState.suppressedKeywordText = undefined;
+      }
       // A freshly typed trigger re-arms a previously disabled box.
-      if (now && !this.wasTriggered) this.disabled = false;
+      if (now && (!this.wasTriggered || suppressionCleared)) this.disabled = false;
       this.wasTriggered = now;
     }
     this.syncState();
@@ -255,14 +271,45 @@ export function buildForcedWorkflowPrompt(text: string, extraDirective?: string)
 /** The exact name of the workflow tool that workflows mode forces. */
 export const WORKFLOW_TOOL_NAME = "workflow";
 
+export function registerWorkflowTriggerCommand(pi: ExtensionAPI, state: WorkflowModeState): void {
+  pi.registerCommand?.("workflows-trigger", {
+    description: "Keyword workflow trigger: on | off | status",
+    async handler(args: string, _ctx: ExtensionCommandContext) {
+      const arg = args.trim().toLowerCase();
+      const say = (content: string) => pi.sendMessage({ customType: "workflows-trigger", content, display: true });
+      if (arg === "on") {
+        state.keywordTriggerEnabled = true;
+        state.suppressedKeywordText = undefined;
+        await say(
+          "Workflows keyword trigger on — mentioning workflow/workflows in an interactive message will auto-arm workflows mode.",
+        );
+        return;
+      }
+      if (arg === "off") {
+        state.keywordTriggerEnabled = false;
+        state.active = false;
+        state.suppressedKeywordText = undefined;
+        await say(
+          "Workflows keyword trigger off — messages can mention workflow/workflows without forcing the workflow tool. Use /workflows-trigger on to restore.",
+        );
+        return;
+      }
+      await say(
+        `Workflows keyword trigger is ${state.keywordTriggerEnabled ? "on" : "off"}. Usage: /workflows-trigger on | off | status`,
+      );
+    },
+  });
+}
+
 export function installWorkflowEditor(
   pi: ExtensionAPI,
   ui: ExtensionUIContext,
   effort?: EffortState,
 ): WorkflowModeState {
-  const state: WorkflowModeState = { active: false };
+  const state: WorkflowModeState = { active: false, keywordTriggerEnabled: true };
 
   ui.setEditorComponent((tui, theme, keybindings) => new WorkflowEditor(tui, theme, keybindings, state));
+  registerWorkflowTriggerCommand(pi, state);
 
   // Active tools saved while a turn is restricted to `workflow`; restored on turn_end.
   let savedTools: string[] | undefined;
@@ -282,7 +329,10 @@ export function installWorkflowEditor(
     if (event.source !== "interactive" || !event.text) return { action: "continue" } as const;
     // Arm either when the user typed the "workflow(s)" trigger, or when standing
     // effort mode is on and the message is a substantive request.
-    const triggered = hasTrigger(event.text);
+    const normalizedText = event.text.trim();
+    const suppressed = state.suppressedKeywordText === normalizedText;
+    if (suppressed) state.suppressedKeywordText = undefined;
+    const triggered = state.keywordTriggerEnabled && !suppressed && hasTrigger(event.text);
     const byEffort = !triggered && !!effort && effort.level !== "off" && isSubstantive(event.text);
     if (!triggered && !byEffort) return { action: "continue" } as const;
     try {
