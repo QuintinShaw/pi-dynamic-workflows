@@ -4,7 +4,7 @@
 
 import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { WORKFLOW_RUNS_DIR } from "./config.js";
+import { workflowProjectPaths } from "./workflow-paths.js";
 
 export interface WorkflowLogger {
   log(message: string): void;
@@ -30,6 +30,7 @@ export function createWorkflowLogger(options: WorkflowLoggerOptions = {}): Workf
   const persistLogs = options.persist ?? true;
   const cwd = options.cwd ?? process.cwd();
   const runId = options.runId ?? `run-${Date.now()}`;
+  const runsDir = workflowProjectPaths(cwd).runsDir;
   let logFile: string | null = null;
 
   const write = (level: string, message: string) => {
@@ -63,7 +64,6 @@ export function createWorkflowLogger(options: WorkflowLoggerOptions = {}): Workf
     persist() {
       if (!persistLogs) return null;
       try {
-        const runsDir = join(cwd, WORKFLOW_RUNS_DIR);
         mkdirSync(runsDir, { recursive: true });
         logFile = join(runsDir, `${runId}.log`);
         writeFileSync(logFile, `${logs.join("\n")}\n`);
@@ -77,7 +77,6 @@ export function createWorkflowLogger(options: WorkflowLoggerOptions = {}): Workf
   // Initialize log file if persisting
   if (persistLogs) {
     try {
-      const runsDir = join(cwd, WORKFLOW_RUNS_DIR);
       mkdirSync(runsDir, { recursive: true });
       logFile = join(runsDir, `${runId}.log`);
     } catch {

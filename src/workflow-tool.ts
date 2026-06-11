@@ -123,7 +123,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       cwd: options.cwd,
       concurrency: options.concurrency,
       loadSavedWorkflow: (name: string) => storage.load(name)?.script,
-      defaultAgentTimeoutMs: resolveDefaultAgentTimeoutMs(options.defaultAgentTimeoutMs),
+      defaultAgentTimeoutMs: resolveDefaultAgentTimeoutMs(options.defaultAgentTimeoutMs, options.cwd ?? process.cwd()),
     });
 
   return defineTool({
@@ -297,9 +297,9 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
   });
 }
 
-function resolveDefaultAgentTimeoutMs(explicit: number | null | undefined): number | null {
+function resolveDefaultAgentTimeoutMs(explicit: number | null | undefined, cwd: string): number | null {
   if (explicit !== undefined) return explicit;
-  return loadWorkflowSettings().defaultAgentTimeoutMs ?? null;
+  return loadWorkflowSettings({ cwd }).defaultAgentTimeoutMs ?? null;
 }
 
 /**

@@ -393,7 +393,7 @@ export class WorkflowManager extends EventEmitter {
         runId: managed.runId,
         workflowName: managed.snapshot.name,
         // Persist the real script + journal so the run can be resumed. Runs live
-        // under .pi/workflows/runs/ — protect via directory permissions, not blanking.
+        // in workflow run storage — protect via directory permissions, not blanking.
         script: managed.script,
         args: managed.args,
         sessionId: this.sessionId,

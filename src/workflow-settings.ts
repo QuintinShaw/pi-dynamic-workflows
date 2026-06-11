@@ -6,9 +6,8 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { WORKFLOW_SETTINGS_FILE } from "./config.js";
+import { workflowHomeDir, workflowProjectPaths } from "./workflow-paths.js";
 
 export interface WorkflowSettings {
   keywordTriggerEnabled?: boolean;
@@ -20,30 +19,76 @@ export interface WorkflowSettingsStore {
   save(settings: WorkflowSettings): void;
 }
 
+export interface WorkflowSettingsOptions {
+  /** Explicit settings path, primarily for tests and migrations. */
+  settingsPath?: string;
+  /** Project cwd whose project-level settings should override global settings. */
+  cwd?: string;
+  /** Explicit project settings path, primarily for tests. */
+  projectSettingsPath?: string;
+  /** Save destination when using saveWorkflowSettings with cwd. Default: global. */
+  scope?: "global" | "project";
+}
+
 /** Path to the user-level workflow settings JSON file (~/.pi/workflows/settings.json). */
 export function getWorkflowSettingsPath(): string {
-  return join(homedir(), WORKFLOW_SETTINGS_FILE);
+  return join(workflowHomeDir(), "settings.json");
+}
+
+/** Path to this project's optional workflow settings override. */
+export function getWorkflowProjectSettingsPath(cwd: string): string {
+  return workflowProjectPaths(cwd).settingsPath;
 }
 
 /** Load settings from disk. Missing, corrupt, or invalid files resolve to {}. */
-export function loadWorkflowSettings(settingsPath?: string): WorkflowSettings {
-  const path = settingsPath ?? getWorkflowSettingsPath();
+export function loadWorkflowSettings(settingsPathOrOptions?: string | WorkflowSettingsOptions): WorkflowSettings {
+  const options = normalizeOptions(settingsPathOrOptions);
+  const globalSettings = readSettings(options.settingsPath ?? getWorkflowSettingsPath());
+  const projectPath =
+    options.projectSettingsPath ?? (options.cwd ? getWorkflowProjectSettingsPath(options.cwd) : undefined);
+  if (!projectPath) return globalSettings;
+  return { ...globalSettings, ...readSettings(projectPath) };
+}
+
+/** Merge known settings into the user-level settings file. */
+export function saveWorkflowSettings(
+  settings: WorkflowSettings,
+  settingsPathOrOptions?: string | WorkflowSettingsOptions,
+): void {
+  const options = normalizeOptions(settingsPathOrOptions);
+  const projectPath =
+    options.projectSettingsPath ?? (options.cwd ? getWorkflowProjectSettingsPath(options.cwd) : undefined);
+  const path =
+    options.scope === "project" && projectPath ? projectPath : (options.settingsPath ?? getWorkflowSettingsPath());
+  const dir = dirname(path);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+
+  const existing = readObject(path);
+  writeFileSync(path, `${JSON.stringify({ ...existing, ...normalizeSettings(settings) }, null, 2)}\n`, "utf-8");
+}
+
+/** Save a global preference and update an existing project override if one is present. */
+export function saveWorkflowSettingsForCwd(settings: WorkflowSettings, cwd: string): void {
+  saveWorkflowSettings(settings);
+  const projectPath = getWorkflowProjectSettingsPath(cwd);
+  if (existsSync(projectPath)) {
+    saveWorkflowSettings(settings, { projectSettingsPath: projectPath, scope: "project" });
+  }
+}
+
+function normalizeOptions(settingsPathOrOptions?: string | WorkflowSettingsOptions): WorkflowSettingsOptions {
+  return typeof settingsPathOrOptions === "string"
+    ? { settingsPath: settingsPathOrOptions }
+    : (settingsPathOrOptions ?? {});
+}
+
+function readSettings(path: string): WorkflowSettings {
   if (!existsSync(path)) return {};
   try {
     return normalizeSettings(JSON.parse(readFileSync(path, "utf-8")));
   } catch {
     return {};
   }
-}
-
-/** Merge known settings into the user-level settings file. */
-export function saveWorkflowSettings(settings: WorkflowSettings, settingsPath?: string): void {
-  const path = settingsPath ?? getWorkflowSettingsPath();
-  const dir = dirname(path);
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-
-  const existing = readObject(path);
-  writeFileSync(path, `${JSON.stringify({ ...existing, ...normalizeSettings(settings) }, null, 2)}\n`, "utf-8");
 }
 
 function normalizeSettings(value: unknown): WorkflowSettings {

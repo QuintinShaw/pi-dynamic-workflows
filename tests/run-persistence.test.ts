@@ -1,19 +1,25 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { WORKFLOW_RUNS_DIR } from "../src/config.js";
 import { createRunPersistence, generateRunId, type PersistedRunState } from "../src/run-persistence.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
+import { workflowProjectPaths } from "../src/workflow-paths.js";
 
 function withTempCwd(fn: (cwd: string) => Promise<void>) {
   return async () => {
     const cwd = mkdtempSync(join(tmpdir(), "pi-dw-rp-"));
+    const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-home-"));
+    const origHome = process.env.HOME;
+    process.env.HOME = fakeHome;
     try {
       await fn(cwd);
     } finally {
+      process.env.HOME = origHome;
       rmSync(cwd, { recursive: true, force: true });
+      rmSync(fakeHome, { recursive: true, force: true });
     }
   };
 }
@@ -22,7 +28,7 @@ test(
   "createRunPersistence creates runs directory on first save",
   withTempCwd(async (cwd) => {
     const rp = createRunPersistence(cwd);
-    const runsDir = join(cwd, WORKFLOW_RUNS_DIR);
+    const runsDir = workflowProjectPaths(cwd).runsDir;
     assert.equal(existsSync(runsDir), false, "dir should not exist yet");
     rp.save({
       runId: "test-1",
@@ -37,6 +43,7 @@ test(
     });
     assert.ok(existsSync(runsDir), "dir should be created");
     assert.ok(existsSync(join(runsDir, "test-1.json")), "run file should exist");
+    assert.equal(existsSync(join(cwd, WORKFLOW_RUNS_DIR)), false, "legacy project runs dir should not be created");
   }),
 );
 
@@ -112,12 +119,42 @@ test(
 );
 
 test(
+  "createRunPersistence reads legacy project run files",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd);
+    const legacyRunsDir = join(cwd, WORKFLOW_RUNS_DIR);
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    mkdirSync(legacyRunsDir, { recursive: true });
+    writeFileSync(
+      join(legacyRunsDir, "legacy-run.json"),
+      JSON.stringify({
+        runId: "legacy-run",
+        workflowName: "legacy",
+        script: "export const meta = { name: 'legacy', description: 'legacy' }",
+        status: "completed",
+        phases: [],
+        agents: [],
+        logs: [],
+        startedAt: "2024-01-01T00:00:00.000Z",
+        updatedAt: "2024-01-01T00:00:00.000Z",
+      }),
+    );
+
+    assert.equal(rp.load("legacy-run")?.workflowName, "legacy");
+    assert.equal(
+      rp.list().some((run) => run.runId === "legacy-run"),
+      true,
+    );
+  }),
+);
+
+test(
   "createRunPersistence list returns runs sorted by updatedAt descending",
   withTempCwd(async (cwd) => {
     const rp = createRunPersistence(cwd);
     // Save with explicit updatedAt values to guarantee order
     // (save() overwrites updatedAt, so we need to write files directly)
-    const runsDir = join(cwd, WORKFLOW_RUNS_DIR);
+    const runsDir = workflowProjectPaths(cwd).runsDir;
     const { mkdirSync, writeFileSync } = await import("node:fs");
     mkdirSync(runsDir, { recursive: true });
     const makeFile = (runId: string, date: string) => {
@@ -154,6 +191,7 @@ test(
     const rp = createRunPersistence(cwd);
     const runs = rp.list();
     assert.deepEqual(runs, []);
+    assert.equal(existsSync(workflowProjectPaths(cwd).runsDir), false, "list should not create the runs dir");
   }),
 );
 
@@ -174,7 +212,7 @@ test(
       updatedAt: "2024-01-01T00:00:00.000Z",
     });
     // Write a corrupted file
-    const runsDir = join(cwd, WORKFLOW_RUNS_DIR);
+    const runsDir = workflowProjectPaths(cwd).runsDir;
     const { writeFileSync } = await import("node:fs");
     writeFileSync(join(runsDir, "corrupted.json"), "not valid json{{{");
     writeFileSync(join(runsDir, "empty.json"), "");
@@ -200,10 +238,37 @@ test(
       startedAt: "2024-01-01T00:00:00.000Z",
       updatedAt: "2024-01-01T00:00:00.000Z",
     });
-    assert.ok(existsSync(join(cwd, WORKFLOW_RUNS_DIR, "delete-me.json")), "existsSync() should succeed");
+    assert.ok(existsSync(join(workflowProjectPaths(cwd).runsDir, "delete-me.json")), "existsSync() should succeed");
     const deleted = rp.delete("delete-me");
     assert.equal(deleted, true);
     assert.equal(rp.load("delete-me"), null);
+  }),
+);
+
+test(
+  "createRunPersistence delete removes legacy project run files",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd);
+    const legacyRunsDir = join(cwd, WORKFLOW_RUNS_DIR);
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    mkdirSync(legacyRunsDir, { recursive: true });
+    writeFileSync(
+      join(legacyRunsDir, "delete-legacy.json"),
+      JSON.stringify({
+        runId: "delete-legacy",
+        workflowName: "legacy",
+        script: "export const meta = { name: 'legacy', description: 'legacy' }",
+        status: "completed",
+        phases: [],
+        agents: [],
+        logs: [],
+        startedAt: "2024-01-01T00:00:00.000Z",
+        updatedAt: "2024-01-01T00:00:00.000Z",
+      }),
+    );
+
+    assert.equal(rp.delete("delete-legacy"), true);
+    assert.equal(existsSync(join(legacyRunsDir, "delete-legacy.json")), false);
   }),
 );
 
@@ -220,7 +285,7 @@ test(
   "createRunPersistence getRunsDir returns the runs directory path",
   withTempCwd(async (cwd) => {
     const rp = createRunPersistence(cwd);
-    assert.equal(rp.getRunsDir(), join(cwd, WORKFLOW_RUNS_DIR));
+    assert.equal(rp.getRunsDir(), workflowProjectPaths(cwd).runsDir);
   }),
 );
 
@@ -438,7 +503,7 @@ test(
       agents: [],
       logs: [],
     } as PersistedRunState);
-    const runsDir = join(cwd, WORKFLOW_RUNS_DIR);
+    const runsDir = workflowProjectPaths(cwd).runsDir;
     assert.ok(existsSync(join(runsDir, "r1.json")), "primary written");
     assert.ok(existsSync(join(runsDir, "r1.json.bak")), ".bak written");
     assert.equal(existsSync(join(runsDir, "r1.json.tmp")), false, "no leftover .tmp");
@@ -458,7 +523,7 @@ test(
       logs: [],
     } as PersistedRunState);
     // Corrupt the primary; the .bak from the good save should still load.
-    writeFileSync(join(cwd, WORKFLOW_RUNS_DIR, "r1.json"), "{ truncated", "utf-8");
+    writeFileSync(join(workflowProjectPaths(cwd).runsDir, "r1.json"), "{ truncated", "utf-8");
     const loaded = rp.load("r1");
     assert.equal(loaded?.runId, "r1", "load falls back to the intact .bak");
   }),
@@ -477,7 +542,7 @@ test(
       logs: [],
     } as PersistedRunState);
     rp.delete("r1");
-    const runsDir = join(cwd, WORKFLOW_RUNS_DIR);
+    const runsDir = workflowProjectPaths(cwd).runsDir;
     assert.equal(existsSync(join(runsDir, "r1.json")), false);
     assert.equal(existsSync(join(runsDir, "r1.json.bak")), false, ".bak cleaned up");
   }),
@@ -509,16 +574,70 @@ test(
     const rp = createRunPersistence(cwd);
     const lease = rp.acquireRunLease("lease-1");
     assert.ok(lease, "first acquire should succeed");
-    assert.equal(existsSync(join(cwd, WORKFLOW_RUNS_DIR, "lease-1.lock")), true, "lock file is created");
+    assert.equal(existsSync(join(workflowProjectPaths(cwd).runsDir, "lease-1.lock")), true, "lock file is created");
 
     const second = rp.acquireRunLease("lease-1");
     assert.equal(second, null, "second acquire should be refused while owner pid is alive");
 
     rp.releaseRunLease({ ...lease, token: "wrong-token" });
-    assert.equal(existsSync(join(cwd, WORKFLOW_RUNS_DIR, "lease-1.lock")), true, "wrong token does not release");
+    assert.equal(
+      existsSync(join(workflowProjectPaths(cwd).runsDir, "lease-1.lock")),
+      true,
+      "wrong token does not release",
+    );
 
     rp.releaseRunLease(lease);
-    assert.equal(existsSync(join(cwd, WORKFLOW_RUNS_DIR, "lease-1.lock")), false, "owner token releases");
+    assert.equal(existsSync(join(workflowProjectPaths(cwd).runsDir, "lease-1.lock")), false, "owner token releases");
+  }),
+);
+
+test(
+  "run lease refuses while a legacy project lock owner is alive",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd);
+    const legacyRunsDir = join(cwd, WORKFLOW_RUNS_DIR);
+    mkdirSync(legacyRunsDir, { recursive: true });
+    writeFileSync(
+      join(legacyRunsDir, "legacy-live.lock"),
+      JSON.stringify({
+        runId: "legacy-live",
+        runPath: join(legacyRunsDir, "legacy-live.json"),
+        pid: process.pid,
+        startedAt: "2024-01-01T00:00:00.000Z",
+        token: "legacy-owner",
+      }),
+      "utf-8",
+    );
+
+    assert.equal(rp.acquireRunLease("legacy-live"), null);
+    assert.equal(existsSync(join(workflowProjectPaths(cwd).runsDir, "legacy-live.lock")), false);
+  }),
+);
+
+test(
+  "run lease removes a stale legacy project lock before acquiring the new lock",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd);
+    const legacyRunsDir = join(cwd, WORKFLOW_RUNS_DIR);
+    const primaryRunsDir = workflowProjectPaths(cwd).runsDir;
+    mkdirSync(legacyRunsDir, { recursive: true });
+    writeFileSync(
+      join(legacyRunsDir, "legacy-stale.lock"),
+      JSON.stringify({
+        runId: "legacy-stale",
+        runPath: join(legacyRunsDir, "legacy-stale.json"),
+        pid: 2147483647,
+        startedAt: "2024-01-01T00:00:00.000Z",
+        token: "legacy-stale",
+      }),
+      "utf-8",
+    );
+
+    const lease = rp.acquireRunLease("legacy-stale");
+    assert.ok(lease, "dead-pid legacy lock should not block the new owner");
+    assert.equal(existsSync(join(legacyRunsDir, "legacy-stale.lock")), false);
+    assert.equal(existsSync(join(primaryRunsDir, "legacy-stale.lock")), true);
+    rp.releaseRunLease(lease);
   }),
 );
 
@@ -526,7 +645,7 @@ test(
   "run lease steals a stale lock whose pid is dead",
   withTempCwd(async (cwd) => {
     const rp = createRunPersistence(cwd);
-    const runsDir = join(cwd, WORKFLOW_RUNS_DIR);
+    const runsDir = workflowProjectPaths(cwd).runsDir;
     rp.save({
       runId: "stale-lock",
       workflowName: "w",
@@ -571,7 +690,7 @@ test(
     const lease = rp.acquireRunLease("delete-lock");
     assert.ok(lease, "lease exists before delete");
     rp.delete("delete-lock");
-    assert.equal(existsSync(join(cwd, WORKFLOW_RUNS_DIR, "delete-lock.lock")), false, "lock cleaned up");
+    assert.equal(existsSync(join(workflowProjectPaths(cwd).runsDir, "delete-lock.lock")), false, "lock cleaned up");
   }),
 );
 
@@ -591,6 +710,46 @@ test(
     // A fresh manager (the previous process died) should recover the orphan.
     new WorkflowManager({ cwd });
     assert.equal(rp.load("stale")?.status, "paused", "stale running -> paused (journal preserved for resume)");
+  }),
+);
+
+test(
+  "WorkflowManager does not recover a legacy running run while its legacy lock owner is alive",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd);
+    const legacyRunsDir = join(cwd, WORKFLOW_RUNS_DIR);
+    mkdirSync(legacyRunsDir, { recursive: true });
+    writeFileSync(
+      join(legacyRunsDir, "legacy-live.json"),
+      JSON.stringify({
+        runId: "legacy-live",
+        workflowName: "w",
+        status: "running",
+        script: "export const meta = { name: 'w', description: 'd' }\nawait agent('x',{label:'x'})\nreturn 1",
+        phases: [],
+        agents: [],
+        logs: [],
+        startedAt: "2024-01-01T00:00:00.000Z",
+        updatedAt: "2024-01-01T00:00:00.000Z",
+      }),
+      "utf-8",
+    );
+    writeFileSync(
+      join(legacyRunsDir, "legacy-live.lock"),
+      JSON.stringify({
+        runId: "legacy-live",
+        runPath: join(legacyRunsDir, "legacy-live.json"),
+        pid: process.pid,
+        startedAt: "2024-01-01T00:00:00.000Z",
+        token: "legacy-owner",
+      }),
+      "utf-8",
+    );
+
+    new WorkflowManager({ cwd });
+
+    assert.equal(rp.load("legacy-live")?.status, "running");
+    assert.equal(existsSync(join(workflowProjectPaths(cwd).runsDir, "legacy-live.json")), false);
   }),
 );
 

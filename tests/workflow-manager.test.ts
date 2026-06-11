@@ -66,14 +66,19 @@ phase('Work')
 const a = await agent('do it', { label: 'a' })
 return { a }`;
 
-/** Run each manager test in its own temp cwd so .pi/workflows/runs is isolated. */
+/** Run each manager test with isolated cwd and HOME so workflow state is isolated. */
 function withTempCwd(fn: (cwd: string) => Promise<void>) {
   return async () => {
     const cwd = mkdtempSync(join(tmpdir(), "pi-dw-mgr-"));
+    const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-home-"));
+    const origHome = process.env.HOME;
+    process.env.HOME = fakeHome;
     try {
       await fn(cwd);
     } finally {
+      process.env.HOME = origHome;
       rmSync(cwd, { recursive: true, force: true });
+      rmSync(fakeHome, { recursive: true, force: true });
     }
   };
 }

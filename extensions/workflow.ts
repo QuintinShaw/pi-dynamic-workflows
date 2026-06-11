@@ -12,6 +12,7 @@ import {
   registerEffortCommand,
   registerWorkflowCommands,
   registerWorkflowModelsCommand,
+  saveWorkflowSettingsForCwd,
   WorkflowManager,
 } from "../src/index.js";
 
@@ -20,7 +21,7 @@ export default function extension(pi: ExtensionAPI) {
   // so background runs started by the tool are reachable from the command.
   const cwd = process.cwd();
   const storage = createWorkflowStorage(cwd);
-  const settings = loadWorkflowSettings();
+  const settings = loadWorkflowSettings({ cwd });
   const manager = new WorkflowManager({
     cwd,
     loadSavedWorkflow: (name) => storage.load(name)?.script,
@@ -63,7 +64,12 @@ export default function extension(pi: ExtensionAPI) {
     // Live "workflows running" panel below the input (focus + enter to open).
     installTaskPanel(pi, manager, ctx.ui, { storage, cwd });
     if (!editorInstalled) {
-      installWorkflowEditor(pi, ctx.ui, effort);
+      installWorkflowEditor(pi, ctx.ui, effort, {
+        settingsStore: {
+          load: () => loadWorkflowSettings({ cwd }),
+          save: (nextSettings) => saveWorkflowSettingsForCwd(nextSettings, cwd),
+        },
+      });
       editorInstalled = true;
     }
   });

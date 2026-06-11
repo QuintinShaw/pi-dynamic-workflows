@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 import test from "node:test";
 import { WORKFLOW_SAVED_DIR } from "../src/config.js";
+import { workflowProjectPaths } from "../src/workflow-paths.js";
 import { createWorkflowStorage } from "../src/workflow-saved.js";
 
 /**
@@ -40,9 +41,10 @@ test(
     assert.equal(saved.location, "project");
     assert.ok(saved.path.endsWith("test-wf.json"), "should end with test-wf.json");
     assert.ok(saved.savedAt, "should have savedAt timestamp");
-    const dir = join(cwd, WORKFLOW_SAVED_DIR);
+    const dir = workflowProjectPaths(cwd).savedDir;
     assert.ok(existsSync(dir), "project saved dir should exist");
     assert.ok(existsSync(join(dir, "test-wf.json")), "file should exist");
+    assert.equal(existsSync(join(cwd, WORKFLOW_SAVED_DIR)), false, "legacy project saved dir should not be created");
   }),
 );
 
@@ -111,6 +113,39 @@ test(
     assert.ok(loaded, "should load successfully");
     assert.equal(loaded?.script, "user script");
     assert.equal(loaded?.location, "user");
+  }),
+);
+
+test(
+  "createWorkflowStorage load reads legacy project workflows before user workflows",
+  withIsolatedHome(async (cwd) => {
+    const storage = createWorkflowStorage(cwd);
+    const legacyProjectDir = join(cwd, WORKFLOW_SAVED_DIR);
+    mkdirSync(legacyProjectDir, { recursive: true });
+    writeFileSync(
+      join(legacyProjectDir, "shared.json"),
+      JSON.stringify({
+        name: "shared",
+        description: "Legacy project version",
+        script: "legacy project script",
+        location: "project",
+        savedAt: "2024-01-01T00:00:00.000Z",
+        path: join(legacyProjectDir, "shared.json"),
+      }),
+      "utf-8",
+    );
+    storage.save(
+      {
+        name: "shared",
+        description: "User version",
+        script: "user script",
+      },
+      "user",
+    );
+
+    const loaded = storage.load("shared");
+    assert.equal(loaded?.script, "legacy project script");
+    assert.equal(loaded?.location, "project");
   }),
 );
 
@@ -200,6 +235,17 @@ test(
 );
 
 test(
+  "createWorkflowStorage rejects path-unsafe workflow names",
+  withIsolatedHome(async (cwd) => {
+    const storage = createWorkflowStorage(cwd);
+    assert.throws(() => storage.save({ name: "../escape", description: "bad", script: "bad" }), /path-safe name/);
+    assert.equal(storage.load("../escape"), null);
+    assert.equal(storage.delete("../escape"), false);
+    assert.equal(existsSync(join(workflowProjectPaths(cwd).rootDir, "escape.json")), false);
+  }),
+);
+
+test(
   "createWorkflowStorage file contents are valid JSON with expected fields",
   withIsolatedHome(async (cwd) => {
     const storage = createWorkflowStorage(cwd);
@@ -208,7 +254,7 @@ test(
       description: "desc",
       script: "export const meta = { name: 'c', description: 'c' }",
     });
-    const filePath = join(cwd, WORKFLOW_SAVED_DIR, "check-json.json");
+    const filePath = join(workflowProjectPaths(cwd).savedDir, "check-json.json");
     const raw = JSON.parse(readFileSync(filePath, "utf-8"));
     assert.equal(raw.name, "check-json");
     assert.equal(raw.description, "desc");
@@ -222,8 +268,7 @@ test(
   "createWorkflowStorage handles corrupted files gracefully",
   withIsolatedHome(async (cwd) => {
     const storage = createWorkflowStorage(cwd);
-    const { mkdirSync, writeFileSync } = await import("node:fs");
-    const projectDir = join(cwd, WORKFLOW_SAVED_DIR);
+    const projectDir = workflowProjectPaths(cwd).savedDir;
     mkdirSync(projectDir, { recursive: true });
     writeFileSync(join(projectDir, "corrupted.json"), "not valid json{{{");
 
@@ -232,5 +277,28 @@ test(
     const list = storage.list();
     assert.ok(Array.isArray(list), "list should be an array");
     assert.equal(list.length, 0); // only corrupted file
+  }),
+);
+
+test(
+  "createWorkflowStorage skips legacy files with unsafe workflow names",
+  withIsolatedHome(async (cwd) => {
+    const storage = createWorkflowStorage(cwd);
+    const projectDir = workflowProjectPaths(cwd).savedDir;
+    mkdirSync(projectDir, { recursive: true });
+    writeFileSync(
+      join(projectDir, "unsafe.json"),
+      JSON.stringify({
+        name: "../unsafe",
+        description: "unsafe",
+        script: "unsafe",
+        location: "project",
+        savedAt: "2024-01-01T00:00:00.000Z",
+        path: join(projectDir, "unsafe.json"),
+      }),
+      "utf-8",
+    );
+
+    assert.deepEqual(storage.list(), []);
   }),
 );

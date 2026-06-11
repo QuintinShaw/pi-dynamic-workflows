@@ -210,12 +210,18 @@ export function registerWorkflowCommands(
             ctx.ui.notify(runIdArg ? `No run ${runIdArg} with a script` : "No saved run to save", "error");
             return;
           }
-          const saved = storage.save({
-            name,
-            description: run.workflowName,
-            script: run.script,
-            location: "project",
-          });
+          let saved: ReturnType<WorkflowStorage["save"]>;
+          try {
+            saved = storage.save({
+              name,
+              description: run.workflowName,
+              script: run.script,
+              location: "project",
+            });
+          } catch (error) {
+            ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+            return;
+          }
           registerSavedWorkflow(pi, opts.cwd ?? process.cwd(), saved, undefined, () =>
             storage.list().some((w) => w.name === saved.name),
           );

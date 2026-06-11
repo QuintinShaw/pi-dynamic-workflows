@@ -92,10 +92,25 @@ export {
 } from "./workflow-editor.js";
 export type { ManagedRun, WorkflowManagerOptions } from "./workflow-manager.js";
 export { WorkflowManager } from "./workflow-manager.js";
+export type { WorkflowProjectPaths } from "./workflow-paths.js";
+export {
+  WORKFLOW_HOME_RELATIVE_DIR,
+  WORKFLOW_PROJECTS_SUBDIR,
+  workflowHomeDir,
+  workflowProjectKey,
+  workflowProjectPaths,
+  workflowUserSavedDir,
+} from "./workflow-paths.js";
 export type { SavedWorkflow, WorkflowStorage } from "./workflow-saved.js";
-export { createWorkflowStorage } from "./workflow-saved.js";
-export type { WorkflowSettings, WorkflowSettingsStore } from "./workflow-settings.js";
-export { getWorkflowSettingsPath, loadWorkflowSettings, saveWorkflowSettings } from "./workflow-settings.js";
+export { assertSafeSavedWorkflowName, createWorkflowStorage, isSafeSavedWorkflowName } from "./workflow-saved.js";
+export type { WorkflowSettings, WorkflowSettingsOptions, WorkflowSettingsStore } from "./workflow-settings.js";
+export {
+  getWorkflowProjectSettingsPath,
+  getWorkflowSettingsPath,
+  loadWorkflowSettings,
+  saveWorkflowSettings,
+  saveWorkflowSettingsForCwd,
+} from "./workflow-settings.js";
 export type { WorkflowToolInput, WorkflowToolOptions } from "./workflow-tool.js";
 export { backgroundStartedText, createWorkflowTool } from "./workflow-tool.js";
 export {

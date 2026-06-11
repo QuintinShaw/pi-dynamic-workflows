@@ -14,10 +14,10 @@ export const MAX_CONCURRENCY = 16;
 /** Default token budget if none specified. */
 export const DEFAULT_TOKEN_BUDGET = null;
 
-/** Directory for persisting workflow run state. */
+/** Legacy project-relative directory for persisted workflow run state. New writes use workflowProjectPaths(). */
 export const WORKFLOW_RUNS_DIR = ".pi/workflows/runs";
 
-/** Directory for saved workflow commands. */
+/** Legacy project-relative directory for saved workflow commands. New writes use workflowProjectPaths(). */
 export const WORKFLOW_SAVED_DIR = ".pi/workflows/saved";
 
 /** User-level saved workflows directory. */

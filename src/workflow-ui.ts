@@ -637,12 +637,18 @@ export function openWorkflowNavigator(
             } else {
               const storage = opts.storage;
               const name = run.workflowName || "workflow";
-              const saved = storage.save({
-                name,
-                description: run.workflowName,
-                script: run.script,
-                location: "project",
-              });
+              let saved: ReturnType<WorkflowStorage["save"]>;
+              try {
+                saved = storage.save({
+                  name,
+                  description: run.workflowName,
+                  script: run.script,
+                  location: "project",
+                });
+              } catch (error) {
+                ui.notify(error instanceof Error ? error.message : String(error), "error");
+                break;
+              }
               registerSavedWorkflow(pi, opts.cwd ?? process.cwd(), saved, undefined, () =>
                 storage.list().some((w) => w.name === saved.name),
               );

@@ -4,7 +4,7 @@
 
 import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { USER_WORKFLOW_SAVED_DIR, WORKFLOW_SAVED_DIR } from "./config.js";
+import { workflowProjectPaths, workflowUserSavedDir } from "./workflow-paths.js";
 
 export interface SavedWorkflow {
   /** Command name (filename without extension). */
@@ -34,9 +34,28 @@ export interface WorkflowStorage {
   delete(name: string, location?: "project" | "user"): boolean;
 }
 
+export function isSafeSavedWorkflowName(name: string): boolean {
+  return (
+    name.length > 0 &&
+    name.length <= 128 &&
+    name.trim() === name &&
+    name !== "." &&
+    name !== ".." &&
+    !/[/\\\0]/.test(name)
+  );
+}
+
+export function assertSafeSavedWorkflowName(name: string): void {
+  if (!isSafeSavedWorkflowName(name)) {
+    throw new Error("Saved workflow name must be a non-empty path-safe name without slashes.");
+  }
+}
+
 export function createWorkflowStorage(cwd: string): WorkflowStorage {
-  const projectDir = join(cwd, WORKFLOW_SAVED_DIR);
-  const userDir = USER_WORKFLOW_SAVED_DIR.replace("~", process.env.HOME ?? "");
+  const paths = workflowProjectPaths(cwd);
+  const projectDir = paths.savedDir;
+  const legacyProjectDir = paths.legacySavedDir;
+  const userDir = workflowUserSavedDir();
 
   const ensureDir = (dir: string) => {
     if (!existsSync(dir)) {
@@ -45,14 +64,22 @@ export function createWorkflowStorage(cwd: string): WorkflowStorage {
   };
 
   const workflowPath = (name: string, location: "project" | "user") => {
+    assertSafeSavedWorkflowName(name);
     const dir = location === "project" ? projectDir : userDir;
     return join(dir, `${name}.json`);
+  };
+  const legacyProjectWorkflowPath = (name: string) => {
+    assertSafeSavedWorkflowName(name);
+    return join(legacyProjectDir, `${name}.json`);
   };
 
   const loadFromFile = (path: string, location: "project" | "user"): SavedWorkflow | null => {
     try {
       if (!existsSync(path)) return null;
       const data = JSON.parse(readFileSync(path, "utf-8"));
+      if (!data || typeof data !== "object" || !isSafeSavedWorkflowName((data as { name?: string }).name ?? "")) {
+        return null;
+      }
       return {
         ...data,
         location,
@@ -65,6 +92,7 @@ export function createWorkflowStorage(cwd: string): WorkflowStorage {
 
   return {
     save(workflow, location = "project") {
+      assertSafeSavedWorkflowName(workflow.name);
       const dir = location === "project" ? projectDir : userDir;
       ensureDir(dir);
 
@@ -81,10 +109,14 @@ export function createWorkflowStorage(cwd: string): WorkflowStorage {
     },
 
     load(name: string): SavedWorkflow | null {
+      if (!isSafeSavedWorkflowName(name)) return null;
       // Project takes precedence over user
       const projectPath = workflowPath(name, "project");
       const project = loadFromFile(projectPath, "project");
       if (project) return project;
+
+      const legacyProject = loadFromFile(legacyProjectWorkflowPath(name), "project");
+      if (legacyProject) return legacyProject;
 
       const userPath = workflowPath(name, "user");
       return loadFromFile(userPath, "user");
@@ -93,26 +125,28 @@ export function createWorkflowStorage(cwd: string): WorkflowStorage {
     list(): SavedWorkflow[] {
       const workflows: SavedWorkflow[] = [];
 
-      // Load project workflows
-      if (existsSync(projectDir)) {
-        for (const file of readdirSync(projectDir).filter((f) => f.endsWith(".json"))) {
-          const wf = loadFromFile(join(projectDir, file), "project");
-          if (wf) workflows.push(wf);
+      const seen = new Set<string>();
+      const addDir = (dir: string, location: "project" | "user") => {
+        if (!existsSync(dir)) return;
+        for (const file of readdirSync(dir).filter((f) => f.endsWith(".json"))) {
+          const wf = loadFromFile(join(dir, file), location);
+          if (wf && !seen.has(wf.name)) {
+            seen.add(wf.name);
+            workflows.push(wf);
+          }
         }
-      }
+      };
 
-      // Load user workflows
-      if (existsSync(userDir)) {
-        for (const file of readdirSync(userDir).filter((f) => f.endsWith(".json"))) {
-          const wf = loadFromFile(join(userDir, file), "user");
-          if (wf) workflows.push(wf);
-        }
-      }
+      // Priority order mirrors load(): project > legacy project > user.
+      addDir(projectDir, "project");
+      addDir(legacyProjectDir, "project");
+      addDir(userDir, "user");
 
       return workflows.sort((a, b) => a.name.localeCompare(b.name));
     },
 
     delete(name: string, location?: "project" | "user"): boolean {
+      if (!isSafeSavedWorkflowName(name)) return false;
       const locations = location ? [location] : (["project", "user"] as const);
       let deleted = false;
 
@@ -121,6 +155,13 @@ export function createWorkflowStorage(cwd: string): WorkflowStorage {
         if (existsSync(path)) {
           unlinkSync(path);
           deleted = true;
+        }
+        if (loc === "project") {
+          const legacyPath = legacyProjectWorkflowPath(name);
+          if (existsSync(legacyPath)) {
+            unlinkSync(legacyPath);
+            deleted = true;
+          }
         }
       }
 

@@ -3,7 +3,7 @@
 [![npm](https://img.shields.io/npm/v/@quintinshaw/pi-dynamic-workflows?color=cb3837&logo=npm)](https://www.npmjs.com/package/@quintinshaw/pi-dynamic-workflows)
 [![license](https://img.shields.io/badge/license-MIT-blue)](#license)
 [![for Pi](https://img.shields.io/badge/for-Pi-7c3aed)](https://pi.dev)
-[![tests](https://img.shields.io/badge/tests-665%20passing-success)](#development)
+[![tests](https://img.shields.io/badge/tests-679%20passing-success)](#development)
 
 > **Claude Code–style dynamic workflows for [Pi](https://pi.dev).**
 > Turn one prompt into a fleet of subagents that fan out in parallel, cross-check each other, and hand back a single synthesized answer.
@@ -113,6 +113,10 @@ The same model — on Pi, plus the production pieces a real run needs:
 
 In the navigator: `↑/↓` select · `enter`/`→` open · `esc`/`←` back · `p` pause · `x` stop · `r` restart · `s` save · `q` quit. Each agent shows the model it ran on; the detail view shows its prompt, result, error diagnostics, and compact message/tool history.
 
+## Storage
+
+Workflow state is stored under `~/.pi/workflows` so projects do not accumulate extension-owned `.pi/workflows` directories. Global settings and model tiers live at `~/.pi/workflows/settings.json` and `~/.pi/workflows/model-tiers.json`; project-scoped run history, resume journals, locks, and saved workflow overrides live under `~/.pi/workflows/projects/<project>/`. Older project-local `.pi/workflows/runs` and `.pi/workflows/saved` data is still read as a fallback, but new writes go to the user-level workflow store.
+
 ## Reference
 
 The full guide — every global, agent option, `agentType` definitions, structured output, and determinism — lives on the **[website](https://quintinshaw.github.io/pi-dynamic-workflows/)**. The essentials:
@@ -145,7 +149,7 @@ Workflows run in a Node `vm` sandbox; `Date.now()`, `Math.random()`, `new Date()
 
 ```bash
 npm install
-npm test     # biome + tsc + 665 unit tests
+npm test     # biome + tsc + 679 unit tests
 ```
 
 Every feature is also verified end-to-end against a real Pi subagent session before release.
