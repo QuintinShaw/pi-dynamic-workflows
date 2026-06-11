@@ -64,6 +64,15 @@ function createMockPi(initialTools: string[] = [...DEFAULT_PI_TOOLS]): MockPi {
   };
 }
 
+function testSettingsOptions(keywordTriggerEnabled = true) {
+  return {
+    settingsStore: {
+      load: () => ({ keywordTriggerEnabled }),
+      save: () => {},
+    },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Test: installWorkflowEditor keeps default tools available
 // ---------------------------------------------------------------------------
@@ -78,7 +87,12 @@ describe("installWorkflowEditor - tool availability", () => {
       setEditorComponent: mock.fn(),
     };
 
-    installWorkflowEditor(mockPi as unknown as ExtensionAPI, ui as unknown as ExtensionUIContext);
+    installWorkflowEditor(
+      mockPi as unknown as ExtensionAPI,
+      ui as unknown as ExtensionUIContext,
+      undefined,
+      testSettingsOptions(),
+    );
 
     // Simulate user submitting a message with "workflow" keyword
     const inputHandlers = mockPi.handlers.input;
@@ -134,7 +148,12 @@ describe("installWorkflowEditor - tool availability", () => {
       setEditorComponent: mock.fn(),
     };
 
-    installWorkflowEditor(mockPi as unknown as ExtensionAPI, ui as unknown as ExtensionUIContext);
+    installWorkflowEditor(
+      mockPi as unknown as ExtensionAPI,
+      ui as unknown as ExtensionUIContext,
+      undefined,
+      testSettingsOptions(),
+    );
 
     // Trigger input with "workflows"
     const inputHandlers = mockPi.handlers.input;
@@ -170,7 +189,12 @@ describe("installWorkflowEditor - tool availability", () => {
       setEditorComponent: mock.fn(),
     };
 
-    installWorkflowEditor(mockPi as unknown as ExtensionAPI, ui as unknown as ExtensionUIContext);
+    installWorkflowEditor(
+      mockPi as unknown as ExtensionAPI,
+      ui as unknown as ExtensionUIContext,
+      undefined,
+      testSettingsOptions(),
+    );
 
     // Simulate user submitting a slash command
     const inputHandlers = mockPi.handlers.input;
@@ -195,7 +219,12 @@ describe("installWorkflowEditor - tool availability", () => {
       setEditorComponent: mock.fn(),
     };
 
-    installWorkflowEditor(mockPi as unknown as ExtensionAPI, ui as unknown as ExtensionUIContext);
+    installWorkflowEditor(
+      mockPi as unknown as ExtensionAPI,
+      ui as unknown as ExtensionUIContext,
+      undefined,
+      testSettingsOptions(),
+    );
 
     const inputHandlers = mockPi.handlers.input;
     const result = inputHandlers[0]({
@@ -216,7 +245,12 @@ describe("installWorkflowEditor - tool availability", () => {
       setEditorComponent: mock.fn(),
     };
 
-    installWorkflowEditor(mockPi as unknown as ExtensionAPI, ui as unknown as ExtensionUIContext);
+    installWorkflowEditor(
+      mockPi as unknown as ExtensionAPI,
+      ui as unknown as ExtensionUIContext,
+      undefined,
+      testSettingsOptions(),
+    );
 
     const inputHandlers = mockPi.handlers.input;
     const result = inputHandlers[0]({
@@ -239,7 +273,12 @@ describe("installWorkflowEditor - tool availability", () => {
       setEditorComponent: mock.fn(),
     };
 
-    installWorkflowEditor(mockPi as unknown as ExtensionAPI, ui as unknown as ExtensionUIContext);
+    installWorkflowEditor(
+      mockPi as unknown as ExtensionAPI,
+      ui as unknown as ExtensionUIContext,
+      undefined,
+      testSettingsOptions(),
+    );
 
     const inputHandlers = mockPi.handlers.input;
     assert.doesNotThrow(() => {
@@ -262,7 +301,12 @@ describe("installWorkflowEditor - tool availability", () => {
       setEditorComponent: mock.fn(),
     };
 
-    installWorkflowEditor(mockPi as unknown as ExtensionAPI, ui as unknown as ExtensionUIContext);
+    installWorkflowEditor(
+      mockPi as unknown as ExtensionAPI,
+      ui as unknown as ExtensionUIContext,
+      undefined,
+      testSettingsOptions(),
+    );
 
     const inputHandlers = mockPi.handlers.input;
     // Should not throw — the catch block handles it
@@ -285,7 +329,12 @@ describe("installWorkflowEditor - tool availability", () => {
       setEditorComponent: mock.fn(),
     };
 
-    installWorkflowEditor(mockPi as unknown as ExtensionAPI, ui as unknown as ExtensionUIContext);
+    installWorkflowEditor(
+      mockPi as unknown as ExtensionAPI,
+      ui as unknown as ExtensionUIContext,
+      undefined,
+      testSettingsOptions(),
+    );
 
     // First trigger
     const inputHandlers = mockPi.handlers.input;
@@ -319,7 +368,12 @@ describe("installWorkflowEditor - tool availability", () => {
     for (const keyword of ["workflow", "workflows", "WORKFLOW", "WorkFlows"]) {
       const mockPi = createMockPi();
       const ui = { setEditorComponent: mock.fn() };
-      installWorkflowEditor(mockPi as unknown as ExtensionAPI, ui as unknown as ExtensionUIContext);
+      installWorkflowEditor(
+        mockPi as unknown as ExtensionAPI,
+        ui as unknown as ExtensionUIContext,
+        undefined,
+        testSettingsOptions(),
+      );
 
       mockPi.setActiveTools.mock.resetCalls();
 
@@ -343,7 +397,12 @@ describe("installWorkflowEditor - tool availability", () => {
     const setEditorComponent = mock.fn();
     const ui = { setEditorComponent };
 
-    const state = installWorkflowEditor(mockPi as unknown as ExtensionAPI, ui as unknown as ExtensionUIContext);
+    const state = installWorkflowEditor(
+      mockPi as unknown as ExtensionAPI,
+      ui as unknown as ExtensionUIContext,
+      undefined,
+      testSettingsOptions(),
+    );
 
     assert.equal(setEditorComponent.mock.callCount(), 1);
     assert.ok(state, "should return a WorkflowModeState");
@@ -359,6 +418,8 @@ describe("installWorkflowEditor - tool availability", () => {
     const state: WorkflowModeState = installWorkflowEditor(
       mockPi as unknown as ExtensionAPI,
       ui as unknown as ExtensionUIContext,
+      undefined,
+      testSettingsOptions(),
     );
 
     assert.equal(typeof state.active, "boolean");

@@ -60,6 +60,35 @@ async function load() {
   return import("../src/workflow-editor.js");
 }
 
+function testSettingsOptions(keywordTriggerEnabled = true) {
+  return {
+    settingsStore: {
+      load: () => ({ keywordTriggerEnabled }),
+      save: () => {},
+    },
+  };
+}
+
+function memorySettingsOptions(keywordTriggerEnabled = true) {
+  let settings = { keywordTriggerEnabled };
+  const saved: Array<{ keywordTriggerEnabled?: boolean }> = [];
+  return {
+    options: {
+      settingsStore: {
+        load: () => ({ ...settings }),
+        save: (next: { keywordTriggerEnabled?: boolean }) => {
+          settings = { ...settings, ...next };
+          saved.push(next);
+        },
+      },
+    },
+    get settings() {
+      return settings;
+    },
+    saved,
+  };
+}
+
 describe("hasTrigger", () => {
   it('returns true for "workflow"', async () => {
     const { hasTrigger } = await load();
@@ -460,7 +489,7 @@ describe("installWorkflowEditor", () => {
       setEditorComponent: (_factory: unknown) => {},
     } as unknown as ExtensionUIContext;
 
-    mod.installWorkflowEditor(pi, ui);
+    mod.installWorkflowEditor(pi, ui, undefined, testSettingsOptions());
 
     const events = registered.map((r) => r.event);
     assert.ok(events.includes("input"), 'should register "input" hook');
@@ -482,7 +511,7 @@ describe("installWorkflowEditor", () => {
       },
     } as unknown as ExtensionUIContext;
 
-    mod.installWorkflowEditor(pi, ui);
+    mod.installWorkflowEditor(pi, ui, undefined, testSettingsOptions());
 
     assert.notEqual(setFactory, undefined, "setEditorComponent should have been called");
     assert.equal(typeof setFactory, "function", "the argument should be a factory function");
@@ -511,7 +540,7 @@ describe("installWorkflowEditor", () => {
       },
     } as unknown as ExtensionUIContext;
 
-    mod.installWorkflowEditor(pi, ui);
+    mod.installWorkflowEditor(pi, ui, undefined, testSettingsOptions());
 
     assert.equal(setEditorCalls, 0, "existing custom editor should not be overwritten");
 
@@ -526,6 +555,81 @@ describe("installWorkflowEditor", () => {
   });
 
   it("registers /workflows-trigger and toggles the keyword trigger", async () => {
+    const mod = await load();
+    const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
+    const sent: Array<{ content?: string }> = [];
+    const store = memorySettingsOptions();
+    const pi = {
+      on: () => {},
+      registerCommand: (name: string, command: { handler: (args: string, ctx: unknown) => Promise<void> }) => {
+        commands.set(name, command);
+      },
+      sendMessage: (message: { content?: string }) => {
+        sent.push(message);
+      },
+      getActiveTools: () => [],
+      setActiveTools: () => {},
+    } as unknown as ExtensionAPI;
+
+    const ui = {
+      setEditorComponent: () => {},
+    } as unknown as ExtensionUIContext;
+
+    const state = mod.installWorkflowEditor(pi, ui, undefined, store.options);
+    assert.equal(state.keywordTriggerEnabled, true, "keyword trigger should default on");
+
+    const command = commands.get("workflows-trigger");
+    assert.ok(command, "should register /workflows-trigger");
+
+    await command.handler("off", {});
+    assert.equal(state.keywordTriggerEnabled, false);
+    assert.equal(state.active, false);
+    assert.deepEqual(store.settings, { keywordTriggerEnabled: false });
+    assert.match(sent.at(-1)?.content ?? "", /keyword trigger off/i);
+    assert.match(sent.at(-1)?.content ?? "", /saved for new sessions/i);
+
+    await command.handler("on", {});
+    assert.equal(state.keywordTriggerEnabled, true);
+    assert.deepEqual(store.settings, { keywordTriggerEnabled: true });
+    assert.match(sent.at(-1)?.content ?? "", /keyword trigger on/i);
+    assert.match(sent.at(-1)?.content ?? "", /saved for new sessions/i);
+  });
+
+  it("loads the persisted keyword trigger preference on install", async () => {
+    const mod = await load();
+    const captured: Array<{ event: string; handler: (...args: unknown[]) => unknown }> = [];
+    let setActiveToolsCalls = 0;
+    const pi = {
+      on: (event: string, handler: (...args: unknown[]) => unknown) => {
+        captured.push({ event, handler });
+      },
+      registerCommand: () => {},
+      sendMessage: () => {},
+      getActiveTools: () => ["bash", "read"],
+      setActiveTools: () => {
+        setActiveToolsCalls++;
+      },
+    } as unknown as ExtensionAPI;
+
+    const ui = {
+      setEditorComponent: () => {},
+    } as unknown as ExtensionUIContext;
+
+    const state = mod.installWorkflowEditor(pi, ui, undefined, testSettingsOptions(false));
+    assert.equal(state.keywordTriggerEnabled, false, "persisted off should apply to new sessions");
+
+    const inputHandler = captured.find((h) => h.event === "input")?.handler;
+    assert.ok(inputHandler, "input handler should be registered");
+    const result = inputHandler({
+      source: "interactive",
+      text: "Please discuss workflows as a normal topic.",
+    });
+
+    assert.deepEqual(result, { action: "continue" });
+    assert.equal(setActiveToolsCalls, 0);
+  });
+
+  it("keeps session trigger state when saving the preference fails", async () => {
     const mod = await load();
     const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
     const sent: Array<{ content?: string }> = [];
@@ -545,20 +649,27 @@ describe("installWorkflowEditor", () => {
       setEditorComponent: () => {},
     } as unknown as ExtensionUIContext;
 
-    const state = mod.installWorkflowEditor(pi, ui);
-    assert.equal(state.keywordTriggerEnabled, true, "keyword trigger should default on");
-
+    const state = mod.installWorkflowEditor(pi, ui, undefined, {
+      settingsStore: {
+        load: () => ({ keywordTriggerEnabled: true }),
+        save: () => {
+          throw new Error("write failed");
+        },
+      },
+    });
     const command = commands.get("workflows-trigger");
     assert.ok(command, "should register /workflows-trigger");
 
     await command.handler("off", {});
+
     assert.equal(state.keywordTriggerEnabled, false);
     assert.equal(state.active, false);
-    assert.match(sent.at(-1)?.content ?? "", /keyword trigger off/i);
+    assert.match(sent.at(-1)?.content ?? "", /could not be saved/i);
 
     await command.handler("on", {});
+
     assert.equal(state.keywordTriggerEnabled, true);
-    assert.match(sent.at(-1)?.content ?? "", /keyword trigger on/i);
+    assert.match(sent.at(-1)?.content ?? "", /could not be saved/i);
   });
 
   it("saves active tools and adds WORKFLOW_TOOL_NAME on triggered input", async () => {
@@ -576,7 +687,7 @@ describe("installWorkflowEditor", () => {
       setEditorComponent: () => {},
     } as unknown as ExtensionUIContext;
 
-    mod.installWorkflowEditor(pi, ui);
+    mod.installWorkflowEditor(pi, ui, undefined, testSettingsOptions());
 
     // Simulate the "input" event — find the registered handler
     // We need to actually invoke the handler the install sets up.
@@ -598,7 +709,7 @@ describe("installWorkflowEditor", () => {
     } as unknown as ExtensionUIContext;
 
     savedTools = [];
-    mod.installWorkflowEditor(pi2, ui2);
+    mod.installWorkflowEditor(pi2, ui2, undefined, testSettingsOptions());
 
     const inputHandler = captured.find((c) => c.event === "input")?.handler as
       | ((event: { source?: string; text?: string }) => { action: string; text?: string })
@@ -645,7 +756,7 @@ describe("installWorkflowEditor", () => {
       setEditorComponent: () => {},
     } as unknown as ExtensionUIContext;
 
-    mod.installWorkflowEditor(pi, ui);
+    mod.installWorkflowEditor(pi, ui, undefined, testSettingsOptions());
     await commands.get("workflows-trigger")?.handler("off", {});
 
     const inputHandler = captured.find((h) => h.event === "input")?.handler;
@@ -679,7 +790,7 @@ describe("installWorkflowEditor", () => {
       setEditorComponent: () => {},
     } as unknown as ExtensionUIContext;
 
-    const state = mod.installWorkflowEditor(pi, ui);
+    const state = mod.installWorkflowEditor(pi, ui, undefined, testSettingsOptions());
     state.suppressedKeywordText = "Please discuss workflows as a normal topic.";
 
     const inputHandler = captured.find((h) => h.event === "input")?.handler;
@@ -711,7 +822,7 @@ describe("installWorkflowEditor", () => {
       setEditorComponent: () => {},
     } as unknown as ExtensionUIContext;
 
-    mod.installWorkflowEditor(pi, ui);
+    mod.installWorkflowEditor(pi, ui, undefined, testSettingsOptions());
 
     const text = "Please discuss workflows as a normal topic.";
     const inputHandler = captured.find((h) => h.event === "input")?.handler;
@@ -750,7 +861,7 @@ describe("installWorkflowEditor", () => {
       setEditorComponent: () => {},
     } as unknown as ExtensionUIContext;
 
-    mod.installWorkflowEditor(pi, ui, effort);
+    mod.installWorkflowEditor(pi, ui, effort, testSettingsOptions());
     await commands.get("workflows-trigger")?.handler("off", {});
 
     const text = "Please discuss workflows as a normal topic.";
@@ -784,7 +895,7 @@ describe("installWorkflowEditor", () => {
       setEditorComponent: () => {},
     } as unknown as ExtensionUIContext;
 
-    mod.installWorkflowEditor(pi, ui);
+    mod.installWorkflowEditor(pi, ui, undefined, testSettingsOptions());
 
     const inputHandler = captured.find((c) => c.event === "input")?.handler;
     const turnEndHandler = captured.find((c) => c.event === "turn_end")?.handler;
@@ -822,7 +933,7 @@ describe("installWorkflowEditor", () => {
       setEditorComponent: () => {},
     } as unknown as ExtensionUIContext;
 
-    mod.installWorkflowEditor(pi, ui);
+    mod.installWorkflowEditor(pi, ui, undefined, testSettingsOptions());
 
     const inputHandler = captured.find((c) => c.event === "input")?.handler;
     assert.notEqual(inputHandler, undefined);
@@ -847,7 +958,7 @@ describe("installWorkflowEditor", () => {
       setEditorComponent: () => {},
     } as unknown as ExtensionUIContext;
 
-    mod.installWorkflowEditor(pi, ui);
+    mod.installWorkflowEditor(pi, ui, undefined, testSettingsOptions());
 
     const inputHandler = captured.find((c) => c.event === "input")?.handler as
       | ((event: { source?: string; text?: string }) => { action: string })

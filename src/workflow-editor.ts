@@ -24,6 +24,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import type { EditorTheme, TUI } from "@earendil-works/pi-tui";
 import { type EffortState, effortDirective, isSubstantive } from "./effort-command.js";
+import { loadWorkflowSettings, saveWorkflowSettings, type WorkflowSettings } from "./workflow-settings.js";
 
 // A trigger is `workflow`/`workflows` (substring, case-insensitive) that is NOT
 // immediately preceded by `/` — so a slash command like `/workflows` or `/workflow`
@@ -54,6 +55,15 @@ export interface WorkflowModeState {
   active: boolean;
   keywordTriggerEnabled: boolean;
   suppressedKeywordText?: string;
+}
+
+export interface WorkflowSettingsStore {
+  load(): WorkflowSettings;
+  save(settings: WorkflowSettings): void;
+}
+
+export interface InstallWorkflowEditorOptions {
+  settingsStore?: WorkflowSettingsStore;
 }
 
 interface AnsiToken {
@@ -271,7 +281,11 @@ export function buildForcedWorkflowPrompt(text: string, extraDirective?: string)
 /** The exact name of the workflow tool that workflows mode forces. */
 export const WORKFLOW_TOOL_NAME = "workflow";
 
-export function registerWorkflowTriggerCommand(pi: ExtensionAPI, state: WorkflowModeState): void {
+export function registerWorkflowTriggerCommand(
+  pi: ExtensionAPI,
+  state: WorkflowModeState,
+  settingsStore: WorkflowSettingsStore = DEFAULT_SETTINGS_STORE,
+): void {
   pi.registerCommand?.("workflows-trigger", {
     description: "Keyword workflow trigger: on | off | status",
     async handler(args: string, _ctx: ExtensionCommandContext) {
@@ -280,8 +294,11 @@ export function registerWorkflowTriggerCommand(pi: ExtensionAPI, state: Workflow
       if (arg === "on") {
         state.keywordTriggerEnabled = true;
         state.suppressedKeywordText = undefined;
+        const saved = persistKeywordTrigger(settingsStore, true);
         await say(
-          "Workflows keyword trigger on — mentioning workflow/workflows in an interactive message will auto-arm workflows mode.",
+          saved
+            ? "Workflows keyword trigger on — mentioning workflow/workflows in an interactive message will auto-arm workflows mode. Saved for new sessions."
+            : "Workflows keyword trigger on for this session, but the preference could not be saved.",
         );
         return;
       }
@@ -289,13 +306,16 @@ export function registerWorkflowTriggerCommand(pi: ExtensionAPI, state: Workflow
         state.keywordTriggerEnabled = false;
         state.active = false;
         state.suppressedKeywordText = undefined;
+        const saved = persistKeywordTrigger(settingsStore, false);
         await say(
-          "Workflows keyword trigger off — messages can mention workflow/workflows without forcing the workflow tool. Use /workflows-trigger on to restore.",
+          saved
+            ? "Workflows keyword trigger off — messages can mention workflow/workflows without forcing the workflow tool. Saved for new sessions. Use /workflows-trigger on to restore."
+            : "Workflows keyword trigger off for this session, but the preference could not be saved. Use /workflows-trigger on to restore.",
         );
         return;
       }
       await say(
-        `Workflows keyword trigger is ${state.keywordTriggerEnabled ? "on" : "off"}. Usage: /workflows-trigger on | off | status`,
+        `Workflows keyword trigger is ${state.keywordTriggerEnabled ? "on" : "off"}. Changes are saved for new sessions. Usage: /workflows-trigger on | off | status`,
       );
     },
   });
@@ -305,13 +325,18 @@ export function installWorkflowEditor(
   pi: ExtensionAPI,
   ui: ExtensionUIContext,
   effort?: EffortState,
+  options: InstallWorkflowEditorOptions = {},
 ): WorkflowModeState {
-  const state: WorkflowModeState = { active: false, keywordTriggerEnabled: true };
+  const settingsStore = options.settingsStore ?? DEFAULT_SETTINGS_STORE;
+  const state: WorkflowModeState = {
+    active: false,
+    keywordTriggerEnabled: loadInitialKeywordTrigger(settingsStore),
+  };
 
   if (!ui.getEditorComponent?.()) {
     ui.setEditorComponent((tui, theme, keybindings) => new WorkflowEditor(tui, theme, keybindings, state));
   }
-  registerWorkflowTriggerCommand(pi, state);
+  registerWorkflowTriggerCommand(pi, state, settingsStore);
 
   // Active tools saved while a turn is restricted to `workflow`; restored on turn_end.
   let savedTools: string[] | undefined;
@@ -366,4 +391,26 @@ export function installWorkflowEditor(
   });
 
   return state;
+}
+
+const DEFAULT_SETTINGS_STORE: WorkflowSettingsStore = {
+  load: loadWorkflowSettings,
+  save: saveWorkflowSettings,
+};
+
+function loadInitialKeywordTrigger(settingsStore: WorkflowSettingsStore): boolean {
+  try {
+    return settingsStore.load().keywordTriggerEnabled ?? true;
+  } catch {
+    return true;
+  }
+}
+
+function persistKeywordTrigger(settingsStore: WorkflowSettingsStore, enabled: boolean): boolean {
+  try {
+    settingsStore.save({ keywordTriggerEnabled: enabled });
+    return true;
+  } catch {
+    return false;
+  }
 }
