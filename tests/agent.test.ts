@@ -499,20 +499,63 @@ test("agent() accumulates usage across multiple agents", async () => {
 test("agent() with timeout should handle gracefully (timeout returns null)", async () => {
   const slow = {
     async run() {
-      await new Promise((r) => setTimeout(r, 20000));
+      await new Promise((r) => setTimeout(r, 50));
       return "slow";
     },
   };
+  let errorMessage = "";
   const result = await runWorkflow<unknown>(
     `export const meta = { name: 'test', description: 't' }
      let val = null
      try { val = await agent('slow', { label: 's', timeoutMs: 5 }) } catch (e) { val = 'error:' + (e && e.message || e) }
      return { val }`,
-    { agent: slow, persistLogs: false },
+    {
+      agent: slow,
+      persistLogs: false,
+      onAgentEnd: (event) => {
+        if (event.error) errorMessage = event.error;
+      },
+    },
   );
   const r = result.result as { val: unknown };
   // agent() catches timeout internally (recoverable) and returns null
   assert.equal(r.val, null, "timeout agent should return null (recoverable)");
+  assert.match(errorMessage, /timed out after 5ms/);
+  assert.match(errorMessage, /raise or omit timeoutMs\/agentTimeoutMs/);
+});
+
+test("agent() default timeout is unbounded", async () => {
+  const slow = {
+    async run() {
+      await new Promise((r) => setTimeout(r, 25));
+      return "slow";
+    },
+  };
+  const result = await runWorkflow<{ val: string }>(
+    `export const meta = { name: 'test', description: 't' }
+     const val = await agent('slow', { label: 's' })
+     return { val }`,
+    { agent: slow, persistLogs: false },
+  );
+
+  assert.equal(result.result.val, "slow");
+});
+
+test("agent() timeoutMs null overrides a run-level timeout", async () => {
+  const slow = {
+    async run() {
+      await new Promise((r) => setTimeout(r, 25));
+      return "slow";
+    },
+  };
+  const result = await runWorkflow<{ val: string }>(
+    `export const meta = { name: 'test', description: 't' }
+     const val = await agent('slow', { label: 's', timeoutMs: null })
+     return { val }`,
+    { agent: slow, agentTimeoutMs: 5, persistLogs: false },
+  );
+
+  assert.equal(result.result.val, "slow");
 });
 
 test("agent() with parallel invokes all agents", async () => {

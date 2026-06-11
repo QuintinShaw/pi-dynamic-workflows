@@ -6,6 +6,7 @@ import {
   installResultDelivery,
   installTaskPanel,
   installWorkflowEditor,
+  loadWorkflowSettings,
   registerAllSavedWorkflows,
   registerBuiltinWorkflows,
   registerEffortCommand,
@@ -19,7 +20,12 @@ export default function extension(pi: ExtensionAPI) {
   // so background runs started by the tool are reachable from the command.
   const cwd = process.cwd();
   const storage = createWorkflowStorage(cwd);
-  const manager = new WorkflowManager({ cwd, loadSavedWorkflow: (name) => storage.load(name)?.script });
+  const settings = loadWorkflowSettings();
+  const manager = new WorkflowManager({
+    cwd,
+    loadSavedWorkflow: (name) => storage.load(name)?.script,
+    defaultAgentTimeoutMs: settings.defaultAgentTimeoutMs ?? null,
+  });
 
   const workflowTool = createWorkflowTool({ cwd, manager, storage });
   pi.registerTool(workflowTool);

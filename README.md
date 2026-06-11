@@ -3,7 +3,7 @@
 [![npm](https://img.shields.io/npm/v/@quintinshaw/pi-dynamic-workflows?color=cb3837&logo=npm)](https://www.npmjs.com/package/@quintinshaw/pi-dynamic-workflows)
 [![license](https://img.shields.io/badge/license-MIT-blue)](#license)
 [![for Pi](https://img.shields.io/badge/for-Pi-7c3aed)](https://pi.dev)
-[![tests](https://img.shields.io/badge/tests-658%20passing-success)](#development)
+[![tests](https://img.shields.io/badge/tests-665%20passing-success)](#development)
 
 > **Claude Code–style dynamic workflows for [Pi](https://pi.dev).**
 > Turn one prompt into a fleet of subagents that fan out in parallel, cross-check each other, and hand back a single synthesized answer.
@@ -71,7 +71,7 @@ return await agent('Synthesize and double-check these findings:\n' + findings.jo
 - **Real model routing** — `small` / `medium` / `big` tiers (or an exact `model`) per agent. It actually switches the subagent's model — cheap work on a light one, hard synthesis on a big one.
 - **Journaled resume** — an interrupted run replays finished agents from a journal (no re-run, no tokens) and runs only what's left or what you changed.
 - **Git worktree isolation** — `isolation: "worktree"` gives an agent its own branch, so parallel agents can edit the same files without clobbering each other.
-- **Real token & cost accounting** — read from each subagent's session, not estimated. `budget` gates on the real total and `/workflows` shows the dollar cost.
+- **Real token & cost accounting** — read from each subagent's session, not estimated. Runs have no default token cap; `tokenBudget`, phase budgets, and `budget` let you add explicit gates when you want them.
 - **Background by default** — the turn ends right away, a live "Workflows running" panel tracks runs, and each result is delivered back so the conversation auto-continues when it finishes.
 - **Interactive `/workflows` TUI** — drill runs → phases → agents → detail; inspect per-agent failures and compact subagent history; pause, stop, restart, and save runs from the keyboard.
 - **Quality patterns built in** — `verify()`, `judgePanel()`, `loopUntilDry()`, and `completenessCheck()` for adversarial review, best-of-N, and exhaustive discovery.
@@ -135,7 +135,9 @@ The full guide — every global, agent option, `agentType` definitions, structur
 | `agentType` | A named definition (`.pi/agents/<name>.md`) binding tools + model + role prompt. |
 | `isolation: "worktree"` | Run in a throwaway git worktree for conflict-free parallel edits. |
 | `schema` | JSON Schema → the subagent returns a validated object. |
-| `label` / `phase` / `timeoutMs` | Display label / phase override / per-agent timeout. |
+| `label` / `phase` / `timeoutMs` | Display label / phase override / optional per-agent hard timeout. Omit `timeoutMs` for no hard timeout. |
+
+By default, workflows do not set a run-wide token budget or per-agent hard timeout. Use the `workflow` tool's `tokenBudget` / `agentTimeoutMs`, per-phase budgets, or per-agent `timeoutMs` only when you want an explicit cap. A global fallback timeout can also be set in `~/.pi/workflows/settings.json` as `{ "defaultAgentTimeoutMs": 600000 }`; set it to `null` or omit it for no default hard timeout.
 
 Workflows run in a Node `vm` sandbox; `Date.now()`, `Math.random()`, `new Date()`, and `require`/`import`/`fs`/network are unavailable, so runs stay reproducible — which is what makes resume reliable.
 
@@ -143,7 +145,7 @@ Workflows run in a Node `vm` sandbox; `Date.now()`, `Math.random()`, `new Date()
 
 ```bash
 npm install
-npm test     # biome + tsc + 658 unit tests
+npm test     # biome + tsc + 665 unit tests
 ```
 
 Every feature is also verified end-to-end against a real Pi subagent session before release.

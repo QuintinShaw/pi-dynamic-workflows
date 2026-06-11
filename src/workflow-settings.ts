@@ -12,6 +12,12 @@ import { WORKFLOW_SETTINGS_FILE } from "./config.js";
 
 export interface WorkflowSettings {
   keywordTriggerEnabled?: boolean;
+  defaultAgentTimeoutMs?: number | null;
+}
+
+export interface WorkflowSettingsStore {
+  load(): WorkflowSettings;
+  save(settings: WorkflowSettings): void;
 }
 
 /** Path to the user-level workflow settings JSON file (~/.pi/workflows/settings.json). */
@@ -43,7 +49,20 @@ export function saveWorkflowSettings(settings: WorkflowSettings, settingsPath?: 
 function normalizeSettings(value: unknown): WorkflowSettings {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   const raw = value as Record<string, unknown>;
-  return typeof raw.keywordTriggerEnabled === "boolean" ? { keywordTriggerEnabled: raw.keywordTriggerEnabled } : {};
+  const settings: WorkflowSettings = {};
+  if (typeof raw.keywordTriggerEnabled === "boolean") {
+    settings.keywordTriggerEnabled = raw.keywordTriggerEnabled;
+  }
+  if (raw.defaultAgentTimeoutMs === null) {
+    settings.defaultAgentTimeoutMs = null;
+  } else if (
+    typeof raw.defaultAgentTimeoutMs === "number" &&
+    Number.isFinite(raw.defaultAgentTimeoutMs) &&
+    raw.defaultAgentTimeoutMs > 0
+  ) {
+    settings.defaultAgentTimeoutMs = raw.defaultAgentTimeoutMs;
+  }
+  return settings;
 }
 
 function readObject(path: string): Record<string, unknown> {

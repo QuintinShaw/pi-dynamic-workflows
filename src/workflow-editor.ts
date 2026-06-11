@@ -24,7 +24,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import type { EditorTheme, TUI } from "@earendil-works/pi-tui";
 import { type EffortState, effortDirective, isSubstantive } from "./effort-command.js";
-import { loadWorkflowSettings, saveWorkflowSettings, type WorkflowSettings } from "./workflow-settings.js";
+import { loadWorkflowSettings, saveWorkflowSettings, type WorkflowSettingsStore } from "./workflow-settings.js";
 
 // A trigger is `workflow`/`workflows` (substring, case-insensitive) that is NOT
 // immediately preceded by `/` — so a slash command like `/workflows` or `/workflow`
@@ -55,11 +55,6 @@ export interface WorkflowModeState {
   active: boolean;
   keywordTriggerEnabled: boolean;
   suppressedKeywordText?: string;
-}
-
-export interface WorkflowSettingsStore {
-  load(): WorkflowSettings;
-  save(settings: WorkflowSettings): void;
 }
 
 export interface InstallWorkflowEditorOptions {

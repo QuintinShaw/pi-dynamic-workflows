@@ -64,6 +64,21 @@ test("createWorkflowTool promptGuidelines mention model routing", () => {
   assert.ok(all.includes("small") || all.includes("medium") || all.includes("big"), "should mention tier names");
 });
 
+test("createWorkflowTool promptGuidelines keep budget and timeout unbounded by default", () => {
+  const tool = createWorkflowTool();
+  const all = tool.promptGuidelines.join(" ");
+  assert.match(all, /do not set tokenBudget or agentTimeoutMs/i);
+  assert.match(all, /defaults are unbounded/i);
+});
+
+test("createWorkflowTool schema describes unbounded default timeout", () => {
+  const tool = createWorkflowTool();
+  const parameters = tool.parameters as { properties?: Record<string, { description?: string }> };
+  const description = parameters.properties?.agentTimeoutMs?.description ?? "";
+  assert.match(description, /Omit for no hard timeout/i);
+  assert.match(description, /only when the user asks/i);
+});
+
 // ─── modelRoutingGuideline ──────────────────────────────────────────────────────
 
 test("modelRoutingGuideline mentions all three tier names", () => {

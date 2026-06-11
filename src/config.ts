@@ -5,8 +5,8 @@
 /** Maximum number of agents allowed per workflow run. */
 export const MAX_AGENTS_PER_RUN = 1000;
 
-/** Default timeout for a single agent in milliseconds (5 minutes). */
-export const DEFAULT_AGENT_TIMEOUT_MS = 5 * 60 * 1000;
+/** Default timeout for a single agent in milliseconds. null means no hard timeout. */
+export const DEFAULT_AGENT_TIMEOUT_MS = null;
 
 /** Maximum concurrent agents (matches Claude Code limit). */
 export const MAX_CONCURRENCY = 16;

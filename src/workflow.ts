@@ -70,8 +70,8 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   signal?: AbortSignal;
   /** Maximum number of agents allowed in this run. Default: 1000 */
   maxAgents?: number;
-  /** Timeout per agent in milliseconds. Default: 5 minutes */
-  agentTimeoutMs?: number;
+  /** Timeout per agent in milliseconds. null/omitted means no hard timeout. */
+  agentTimeoutMs?: number | null;
   /** Whether to persist logs to disk. Default: true */
   persistLogs?: boolean;
   /** Run ID for persistence. Auto-generated if not provided. */
@@ -162,8 +162,8 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
    * and falls back to default tools/model (with the name as a prose hint).
    */
   agentType?: string;
-  /** Override timeout for this specific agent. */
-  timeoutMs?: number;
+  /** Override timeout for this specific agent. null means no hard timeout. */
+  timeoutMs?: number | null;
 }
 
 /** Options for a human checkpoint() — a deterministic, journaled, replayable gate. */
@@ -248,7 +248,7 @@ export async function runWorkflow<T = unknown>(
   // Per-phase model routing from meta.phases[].model, with meta.model as the default.
   const routingConfig = parseModelRoutingFromMeta(meta.phases, meta.model);
   const maxAgents = options.maxAgents ?? MAX_AGENTS_PER_RUN;
-  const agentTimeoutMs = options.agentTimeoutMs ?? DEFAULT_AGENT_TIMEOUT_MS;
+  const agentTimeoutMs = options.agentTimeoutMs !== undefined ? options.agentTimeoutMs : DEFAULT_AGENT_TIMEOUT_MS;
   const runId = options.runId ?? `run-${started.toString(36)}`;
   const baseCwd = options.cwd ?? process.cwd();
   // Snapshot the agentType registry ONCE per run so two agent() calls can't
@@ -414,7 +414,7 @@ export async function runWorkflow<T = unknown>(
     if (!hashMatches || cachedEmptyOutput) state.firstMiss = Math.min(state.firstMiss, callIndex);
 
     return limiter(async () => {
-      const timeout = agentOptions.timeoutMs ?? agentTimeoutMs;
+      const timeout = agentOptions.timeoutMs !== undefined ? agentOptions.timeoutMs : agentTimeoutMs;
 
       options.onAgentStart?.({ label, phase: assignedPhase, prompt, model: displayModel });
 
@@ -473,7 +473,7 @@ export async function runWorkflow<T = unknown>(
             },
           } as any),
           timeout,
-          `Agent "${label}" timed out after ${timeout}ms`,
+          label,
         );
 
         throwIfAborted();
@@ -1056,12 +1056,20 @@ function estimateTokens(value: unknown): number {
 /**
  * Run a promise with a timeout.
  */
-async function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+async function withTimeout<T>(promise: Promise<T>, ms: number | null, label: string): Promise<T> {
+  if (ms === null) return promise;
+
   let timeoutId: NodeJS.Timeout | undefined;
 
   const timeoutPromise = new Promise<never>((_, reject) => {
     timeoutId = setTimeout(() => {
-      reject(new WorkflowError(message, WorkflowErrorCode.AGENT_TIMEOUT, { recoverable: true }));
+      reject(
+        new WorkflowError(
+          `Agent "${label}" timed out after ${ms}ms; raise or omit timeoutMs/agentTimeoutMs to allow longer runs`,
+          WorkflowErrorCode.AGENT_TIMEOUT,
+          { recoverable: true },
+        ),
+      );
     }, ms);
   });
 

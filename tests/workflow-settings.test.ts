@@ -35,6 +35,16 @@ describe("workflow settings", () => {
     });
   });
 
+  it("saves and loads default agent timeout preference", () => {
+    withSettingsPath((settingsPath) => {
+      saveWorkflowSettings({ defaultAgentTimeoutMs: 600000 }, settingsPath);
+      assert.deepEqual(loadWorkflowSettings(settingsPath), { defaultAgentTimeoutMs: 600000 });
+
+      saveWorkflowSettings({ defaultAgentTimeoutMs: null }, settingsPath);
+      assert.deepEqual(loadWorkflowSettings(settingsPath), { defaultAgentTimeoutMs: null });
+    });
+  });
+
   it("preserves unknown settings when saving known settings", () => {
     withSettingsPath((settingsPath) => {
       saveWorkflowSettings({ keywordTriggerEnabled: true }, settingsPath);
@@ -57,6 +67,12 @@ describe("workflow settings", () => {
       assert.deepEqual(loadWorkflowSettings(settingsPath), {});
 
       writeFileSync(settingsPath, JSON.stringify({ keywordTriggerEnabled: "off" }), "utf-8");
+      assert.deepEqual(loadWorkflowSettings(settingsPath), {});
+
+      writeFileSync(settingsPath, JSON.stringify({ defaultAgentTimeoutMs: 0 }), "utf-8");
+      assert.deepEqual(loadWorkflowSettings(settingsPath), {});
+
+      writeFileSync(settingsPath, JSON.stringify({ defaultAgentTimeoutMs: -1 }), "utf-8");
       assert.deepEqual(loadWorkflowSettings(settingsPath), {});
     });
   });

@@ -44,6 +44,23 @@ function deferredAgent() {
   };
 }
 
+function delayedAgent(delayMs: number, result: unknown = "slow") {
+  return {
+    async run(_prompt: string, options?: { onUsage?: (u: AgentUsage) => void }) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      options?.onUsage?.({
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        total: 0,
+        cost: 0,
+      });
+      return result;
+    },
+  };
+}
+
 const oneAgentScript = `export const meta = { name: 'tracked_demo', description: 'one agent' }
 phase('Work')
 const a = await agent('do it', { label: 'a' })
@@ -85,6 +102,34 @@ test(
     assert.equal(runs[0].workflowName, "tracked_demo");
     assert.equal(runs[0].status, "completed");
     assert.equal(runs[0].tokenUsage?.total, 140, "token usage is persisted for the navigator");
+  }),
+);
+
+test(
+  "manager defaultAgentTimeoutMs applies when run options omit agentTimeoutMs",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: delayedAgent(25), defaultAgentTimeoutMs: 5 });
+
+    const result = await manager.runSync(oneAgentScript);
+
+    assert.equal((result.result as { a: unknown }).a, null);
+    const agent = manager.listRuns()[0]?.agents[0];
+    assert.equal(agent?.status, "error");
+    assert.match(agent?.error ?? "", /timed out after 5ms/);
+    assert.match(agent?.error ?? "", /raise or omit timeoutMs\/agentTimeoutMs/);
+  }),
+);
+
+test(
+  "run option agentTimeoutMs overrides manager defaultAgentTimeoutMs",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: delayedAgent(25), defaultAgentTimeoutMs: 5 });
+
+    const result = await manager.runSync(oneAgentScript, undefined, { agentTimeoutMs: null });
+
+    assert.equal((result.result as { a: unknown }).a, "slow");
+    const agent = manager.listRuns()[0]?.agents[0];
+    assert.equal(agent?.status, "done");
   }),
 );
 

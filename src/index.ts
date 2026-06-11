@@ -89,13 +89,12 @@ export {
   tokenizeAnsi,
   WorkflowEditor,
   type WorkflowModeState,
-  type WorkflowSettingsStore,
 } from "./workflow-editor.js";
 export type { ManagedRun, WorkflowManagerOptions } from "./workflow-manager.js";
 export { WorkflowManager } from "./workflow-manager.js";
 export type { SavedWorkflow, WorkflowStorage } from "./workflow-saved.js";
 export { createWorkflowStorage } from "./workflow-saved.js";
-export type { WorkflowSettings } from "./workflow-settings.js";
+export type { WorkflowSettings, WorkflowSettingsStore } from "./workflow-settings.js";
 export { getWorkflowSettingsPath, loadWorkflowSettings, saveWorkflowSettings } from "./workflow-settings.js";
 export type { WorkflowToolInput, WorkflowToolOptions } from "./workflow-tool.js";
 export { backgroundStartedText, createWorkflowTool } from "./workflow-tool.js";

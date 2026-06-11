@@ -14,6 +14,7 @@ import { WorkflowError, WorkflowErrorCode } from "./errors.js";
 import { parseWorkflowScript, type WorkflowRunResult } from "./workflow.js";
 import { WorkflowManager } from "./workflow-manager.js";
 import { createWorkflowStorage, type WorkflowStorage } from "./workflow-saved.js";
+import { loadWorkflowSettings } from "./workflow-settings.js";
 
 /**
  * Model routing guideline for workflow authors.
@@ -82,7 +83,8 @@ const workflowToolSchema = Type.Object({
   ),
   agentTimeoutMs: Type.Optional(
     Type.Number({
-      description: "Timeout per agent in milliseconds. Default: 300000 (5 minutes).",
+      description:
+        "Timeout per agent in milliseconds. Omit for no hard timeout by default. Set only when the user asks to bound time.",
     }),
   ),
   tokenBudget: Type.Optional(
@@ -109,6 +111,8 @@ export interface WorkflowToolOptions {
   manager?: WorkflowManager;
   /** Shared saved-workflow storage. */
   storage?: WorkflowStorage;
+  /** Default per-agent timeout for runs created by this tool. null means no hard timeout. */
+  defaultAgentTimeoutMs?: number | null;
 }
 
 export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefinition<typeof workflowToolSchema, any> {
@@ -119,6 +123,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       cwd: options.cwd,
       concurrency: options.concurrency,
       loadSavedWorkflow: (name: string) => storage.load(name)?.script,
+      defaultAgentTimeoutMs: resolveDefaultAgentTimeoutMs(options.defaultAgentTimeoutMs),
     });
 
   return defineTool({
@@ -138,6 +143,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       "For workflow, available globals are agent(prompt, opts), parallel(thunks), pipeline(items, ...stages), phase(title), log(message), args, cwd, process.cwd(), and budget. Every workflow must call agent() at least once; do not use workflow only to declare phases or return a static object.",
       "For workflow, prefer the built-in quality helpers when they fit (each is built on agent()/parallel() and returns plain data): verify(item, {reviewers, threshold, lens}) for adversarial fact-checking; judgePanel(attempts, {judges, rubric}) to score N candidates and return the best; loopUntilDry({round, key, consecutiveEmpty}) to keep finding until rounds stop yielding new items; completenessCheck(args, results) as a final 'what's missing' critic.",
       "For workflow, when meta.phases declares more than one phase, call phase('Exact Title') at the start of each phase's work (or set opts.phase on each agent) so every agent groups under the correct phase; never declare a phase you don't switch into — a declared phase with no agents shows as 0/0 and any agent you forgot to move stays in the previous phase.",
+      "For workflow, do not set tokenBudget or agentTimeoutMs unless the user explicitly asks to cap spend or time; the defaults are unbounded.",
       "For workflow, to bound spend: pass tokenBudget for a hard run-wide cap; carve a per-phase ceiling with phase('Name', {budget: N}) (that phase throws at its sub-budget without touching the run total — wrap its work in try/catch so later phases proceed); use retry(thunk, {attempts, until}) for bounded retry, and gate(thunk, validator, {attempts}) when a validator's feedback should steer the next attempt. To degrade gracefully, branch on budget.remaining() to skip optional rounds or choose a lighter tier.",
       "For workflow, prefer it for decomposable work: repository inspection, independent research/checks, multi-perspective review, or fan-out/fan-in synthesis. Do not use it for a single quick file read/edit or when ordinary tools are enough.",
       "For workflow, parallel() takes functions, not promises: use `await parallel(items.map(item => () => agent('...', { label: '...' })))`, never `await parallel(items.map(item => agent(...)))`. Results are returned in input order.",
@@ -289,6 +295,11 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       return new Text(clean || theme.fg("muted", "workflow"), 0, 0);
     },
   });
+}
+
+function resolveDefaultAgentTimeoutMs(explicit: number | null | undefined): number | null {
+  if (explicit !== undefined) return explicit;
+  return loadWorkflowSettings().defaultAgentTimeoutMs ?? null;
 }
 
 /**
