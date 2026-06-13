@@ -77,7 +77,7 @@ interface AgentRow {
 }
 
 /** Short, human-friendly model label: drop the provider prefix for display. */
-function shortModel(model: string | undefined): string | undefined {
+export function shortModel(model: string | undefined): string | undefined {
   if (!model) return undefined;
   const slash = model.indexOf("/");
   return slash > 0 ? model.slice(slash + 1) : model;

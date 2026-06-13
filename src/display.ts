@@ -246,7 +246,7 @@ function statusLine(snapshot: WorkflowSnapshot, completed: boolean): string {
   return `workflow ${snapshot.name}: ${snapshot.doneCount}/${snapshot.agentCount} done`;
 }
 
-function statusIcon(status: WorkflowAgentStatus): string {
+export function statusIcon(status: WorkflowAgentStatus): string {
   switch (status) {
     case "queued":
       return "○";
@@ -265,7 +265,7 @@ function unique(values: string[]): string[] {
   return [...new Set(values)];
 }
 
-function shorten(value: string, max: number): string {
+export function shorten(value: string, max: number): string {
   const text = value.replace(/\s+/g, " ").trim();
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }

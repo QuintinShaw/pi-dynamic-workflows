@@ -85,6 +85,7 @@ export {
   type InstallWorkflowEditorOptions,
   installWorkflowEditor,
   RAINBOW,
+  registerWorkflowProgressCommands,
   registerWorkflowTriggerCommand,
   tokenizeAnsi,
   WorkflowEditor,

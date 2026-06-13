@@ -12,6 +12,10 @@ import { workflowHomeDir, workflowProjectPaths } from "./workflow-paths.js";
 export interface WorkflowSettings {
   keywordTriggerEnabled?: boolean;
   defaultAgentTimeoutMs?: number | null;
+  /** Bottom task-panel display mode: "compact" (default, one line per run) | "detailed". */
+  progressPanelMode?: "compact" | "detailed";
+  /** Max agents shown per phase in detailed progress mode (default 8). */
+  progressPanelMaxAgents?: number;
 }
 
 export interface WorkflowSettingsStore {
@@ -106,6 +110,16 @@ function normalizeSettings(value: unknown): WorkflowSettings {
     raw.defaultAgentTimeoutMs > 0
   ) {
     settings.defaultAgentTimeoutMs = raw.defaultAgentTimeoutMs;
+  }
+  if (raw.progressPanelMode === "compact" || raw.progressPanelMode === "detailed") {
+    settings.progressPanelMode = raw.progressPanelMode;
+  }
+  if (
+    typeof raw.progressPanelMaxAgents === "number" &&
+    Number.isFinite(raw.progressPanelMaxAgents) &&
+    raw.progressPanelMaxAgents >= 1
+  ) {
+    settings.progressPanelMaxAgents = Math.min(1000, Math.floor(raw.progressPanelMaxAgents));
   }
   return settings;
 }

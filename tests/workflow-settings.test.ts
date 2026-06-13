@@ -131,6 +131,42 @@ describe("workflow settings", () => {
     });
   });
 
+  it("saves and loads the progress panel mode", () => {
+    withSettingsPath((settingsPath) => {
+      saveWorkflowSettings({ progressPanelMode: "detailed" }, settingsPath);
+      assert.deepEqual(loadWorkflowSettings(settingsPath), { progressPanelMode: "detailed" });
+
+      saveWorkflowSettings({ progressPanelMode: "compact" }, settingsPath);
+      assert.deepEqual(loadWorkflowSettings(settingsPath), { progressPanelMode: "compact" });
+    });
+  });
+
+  it("rejects an invalid progress panel mode", () => {
+    withSettingsPath((settingsPath) => {
+      mkdirSync(dirname(settingsPath), { recursive: true });
+      writeFileSync(settingsPath, JSON.stringify({ progressPanelMode: "verbose" }), "utf-8");
+      assert.deepEqual(loadWorkflowSettings(settingsPath), {});
+    });
+  });
+
+  it("clamps and floors progressPanelMaxAgents into [1, 1000]", () => {
+    withSettingsPath((settingsPath) => {
+      mkdirSync(dirname(settingsPath), { recursive: true });
+
+      writeFileSync(settingsPath, JSON.stringify({ progressPanelMaxAgents: 12.7 }), "utf-8");
+      assert.deepEqual(loadWorkflowSettings(settingsPath), { progressPanelMaxAgents: 12 });
+
+      writeFileSync(settingsPath, JSON.stringify({ progressPanelMaxAgents: 5000 }), "utf-8");
+      assert.deepEqual(loadWorkflowSettings(settingsPath), { progressPanelMaxAgents: 1000 });
+
+      writeFileSync(settingsPath, JSON.stringify({ progressPanelMaxAgents: 0 }), "utf-8");
+      assert.deepEqual(loadWorkflowSettings(settingsPath), {});
+
+      writeFileSync(settingsPath, JSON.stringify({ progressPanelMaxAgents: "8" }), "utf-8");
+      assert.deepEqual(loadWorkflowSettings(settingsPath), {});
+    });
+  });
+
   it("ignores corrupt or invalid settings", () => {
     withSettingsPath((settingsPath) => {
       mkdirSync(dirname(settingsPath), { recursive: true });

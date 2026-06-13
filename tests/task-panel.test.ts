@@ -391,3 +391,214 @@ describe("renderPanel", () => {
     }
   });
 });
+
+// ─── token/s rolling-window math ────────────────────────────────────────────────
+
+describe("token rate", () => {
+  it("returns 0 with fewer than two samples and after clearing", async () => {
+    const { sampleTokens, tokensPerSecond, clearTokenSamples } = await import("../src/task-panel.js");
+    clearTokenSamples("rate-a");
+    assert.equal(tokensPerSecond("rate-a"), 0);
+    sampleTokens("rate-a", 100, 1000);
+    assert.equal(tokensPerSecond("rate-a"), 0);
+    sampleTokens("rate-a", 1100, 2000);
+    assert.equal(tokensPerSecond("rate-a"), 1000, "1000 tokens over 1s = 1000 tok/s");
+    clearTokenSamples("rate-a");
+    assert.equal(tokensPerSecond("rate-a"), 0, "cleared samples reset the rate");
+  });
+
+  it("computes the rate over the oldest-to-newest window", async () => {
+    const { sampleTokens, tokensPerSecond, clearTokenSamples } = await import("../src/task-panel.js");
+    clearTokenSamples("rate-b");
+    sampleTokens("rate-b", 0, 1000);
+    sampleTokens("rate-b", 1000, 2000);
+    sampleTokens("rate-b", 1500, 3000);
+    // (1500 - 0) tokens over (3000 - 1000) ms = 750 tok/s
+    assert.equal(tokensPerSecond("rate-b"), 750);
+  });
+
+  it("decays to 0 when the total plateaus (stall detection)", async () => {
+    const { sampleTokens, tokensPerSecond, clearTokenSamples } = await import("../src/task-panel.js");
+    clearTokenSamples("rate-c");
+    sampleTokens("rate-c", 0, 0);
+    sampleTokens("rate-c", 1000, 1000);
+    assert.equal(tokensPerSecond("rate-c"), 1000);
+    // A stall: same total sampled > 10s later ages out the growth window → 0 tok/s.
+    sampleTokens("rate-c", 1000, 12000);
+    assert.equal(tokensPerSecond("rate-c"), 0, "stalled agent shows 0 tok/s");
+  });
+});
+
+// ─── detailed progress panel ─────────────────────────────────────────────────────
+
+describe("renderPanelDetailed", () => {
+  const theme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
+
+  // `blueTokens` drives the first agent's live token count; the run aggregate and
+  // token/s are summed from per-agent tokens (the run-level tokenUsage aggregate is
+  // not live — see renderPanelDetailed), so growing blueTokens grows the rate.
+  function detailedManager(blueTokens: number, status = "running") {
+    const snapshot = {
+      name: "auth_audit",
+      phases: ["Scan", "Review"],
+      currentPhase: "Scan",
+      logs: [],
+      agents: [
+        {
+          id: 1,
+          label: "discover_routes",
+          status: "done",
+          phase: "Scan",
+          tokens: blueTokens,
+          model: "anthropic/claude-haiku-4-5",
+        },
+        { id: 2, label: "audit_auth", status: "running", phase: "Scan", tokens: 1800 },
+        { id: 3, label: "scan_middleware", status: "queued", phase: "Scan" },
+        { id: 4, label: "cross_check", status: "queued", phase: "Review" },
+      ],
+      // Only `cost` is read from the run-level aggregate (it lands when the run ends).
+      tokenUsage: { total: 0, input: 0, output: 0, cost: 0.02 },
+    };
+    return {
+      listRuns: () => [
+        { runId: "r1", workflowName: "auth_audit", status, agents: snapshot.agents, tokenUsage: snapshot.tokenUsage },
+      ],
+      getRun: (id: string) => (id === "r1" ? { snapshot, status } : undefined),
+    };
+  }
+
+  it("renders aggregate tokens, cost, phases, and per-agent rows", async () => {
+    const { renderPanelDetailed, clearTokenSamples } = await import("../src/task-panel.js");
+    clearTokenSamples("r1");
+    // discover_routes 2100 + audit_auth 1800 = 3900 → "3.9K tok" aggregate.
+    const lines = renderPanelDetailed(detailedManager(2100) as never, theme as never, undefined, 8, 1000);
+    const text = lines.join("\n");
+
+    assert.ok(/auth_audit/.test(text), "shows the run name");
+    assert.ok(/1\/4 agents/.test(text), "shows done/total agents");
+    assert.ok(/3\.9K tok/.test(text), "shows aggregate tokens summed from per-agent tokens");
+    assert.ok(/\$0\.02/.test(text), "shows cost");
+    // Phase headers
+    assert.ok(
+      lines.some((l) => l.includes("▶ Scan") && /1\/3 agents/.test(l) && /3\.9K tok/.test(l)),
+      "Scan phase header with subtotal",
+    );
+    assert.ok(
+      lines.some((l) => l.includes("Review") && /0\/1 agents/.test(l)),
+      "Review phase header",
+    );
+    // Agent rows: status icons + label + tokens + model
+    assert.ok(
+      lines.some((l) => l.includes("[1] ✓ discover_routes") && /2\.1K tok/.test(l) && /claude-haiku-4-5/.test(l)),
+      "done agent row with model",
+    );
+    assert.ok(
+      lines.some((l) => l.includes("[2] ● audit_auth") && /1\.8K tok/.test(l)),
+      "running agent row",
+    );
+    assert.ok(
+      lines.some((l) => l.includes("[3] ○ scan_middleware")),
+      "queued agent row",
+    );
+  });
+
+  it("shows a live token/s after two growing samples", async () => {
+    const { renderPanelDetailed, clearTokenSamples } = await import("../src/task-panel.js");
+    clearTokenSamples("r1");
+    // aggregate goes 3900 → 5900 over 1s = 2000 tok/s
+    renderPanelDetailed(detailedManager(2100) as never, theme as never, undefined, 8, 1000);
+    const lines = renderPanelDetailed(detailedManager(4100) as never, theme as never, undefined, 8, 2000);
+    assert.ok(
+      lines.some((l) => /2000 tok\/s/.test(l)),
+      `expected a tok/s readout, got:\n${lines.join("\n")}`,
+    );
+  });
+
+  it("caps agents per phase and reports the overflow", async () => {
+    const { renderPanelDetailed, clearTokenSamples } = await import("../src/task-panel.js");
+    clearTokenSamples("r1");
+    const lines = renderPanelDetailed(detailedManager(12400) as never, theme as never, undefined, 2, 1000);
+    const text = lines.join("\n");
+    // Scan has 3 agents, cap 2 → most recent 2 shown + "… 1 earlier agents"
+    assert.ok(/… 1 earlier agents/.test(text), "overflow line present");
+    assert.ok(!/discover_routes/.test(text), "oldest agent hidden when capped");
+    assert.ok(/audit_auth/.test(text) && /scan_middleware/.test(text), "most recent agents shown");
+  });
+
+  it("suppresses tok/s for paused runs", async () => {
+    const { renderPanelDetailed, clearTokenSamples } = await import("../src/task-panel.js");
+    clearTokenSamples("r1");
+    renderPanelDetailed(detailedManager(1000, "paused") as never, theme as never, undefined, 8, 1000);
+    const lines = renderPanelDetailed(detailedManager(3000, "paused") as never, theme as never, undefined, 8, 2000);
+    assert.ok(!lines.some((l) => /tok\/s/.test(l)), "paused run shows no token rate");
+  });
+});
+
+// ─── mode selection in installTaskPanel ───────────────────────────────────────────
+
+describe("installTaskPanel mode selection", () => {
+  const theme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
+
+  function activeManager() {
+    const manager = new EventEmitter() as ReturnType<typeof EventEmitter> & {
+      getRun: (id: string) => unknown;
+      listRuns: () => unknown[];
+    };
+    const snapshot = {
+      name: "wf",
+      phases: ["P1"],
+      currentPhase: "P1",
+      logs: [],
+      agents: [{ id: 1, label: "a", status: "running", phase: "P1", tokens: 500 }],
+      tokenUsage: { total: 500, input: 250, output: 250 },
+    };
+    manager.listRuns = () => [
+      { runId: "r1", workflowName: "wf", status: "running", agents: snapshot.agents, tokenUsage: snapshot.tokenUsage },
+    ];
+    manager.getRun = (id: string) => (id === "r1" ? { snapshot, status: "running" } : undefined);
+    return manager;
+  }
+
+  function captureRender(loadSettings?: () => Record<string, unknown>) {
+    const manager = activeManager();
+    let factory:
+      | ((tui: { requestRender(): void }, theme: unknown) => { render(w: number): string[]; dispose?(): void })
+      | undefined;
+    const ui = {
+      setWidget: (_n: string, f: typeof factory) => {
+        factory = f;
+      },
+    };
+    mod.installTaskPanel(null, manager as never, ui as never, { loadSettings } as never);
+    const comp = factory?.({ requestRender: () => {} }, theme);
+    const lines = comp?.render(120) ?? [];
+    comp?.dispose?.();
+    return lines;
+  }
+
+  it("uses compact rendering when no loadSettings is provided", () => {
+    const lines = captureRender();
+    assert.ok(
+      lines.some((l) => /1 agents/.test(l)),
+      "compact one-liner",
+    );
+    assert.ok(!lines.some((l) => /▶ P1/.test(l)), "no per-phase detail in compact");
+  });
+
+  it("uses compact rendering when the mode is compact", () => {
+    const lines = captureRender(() => ({ progressPanelMode: "compact" }));
+    assert.ok(!lines.some((l) => /▶ P1/.test(l)), "no per-phase detail in compact");
+  });
+
+  it("uses detailed rendering when the mode is detailed", () => {
+    const lines = captureRender(() => ({ progressPanelMode: "detailed" }));
+    assert.ok(
+      lines.some((l) => /▶ P1/.test(l)),
+      "per-phase detail in detailed mode",
+    );
+    assert.ok(
+      lines.some((l) => /\[1\] ● a/.test(l)),
+      "per-agent row in detailed mode",
+    );
+  });
+});

@@ -62,7 +62,9 @@ export default function extension(pi: ExtensionAPI) {
     // Deliver a background run's result into the conversation when it finishes.
     installResultDelivery(pi, manager);
     // Live "workflows running" panel below the input (focus + enter to open).
-    installTaskPanel(pi, manager, ctx.ui, { storage, cwd });
+    // Pass a live settings loader so /workflows-progress (compact|detailed) takes
+    // effect without a restart.
+    installTaskPanel(pi, manager, ctx.ui, { storage, cwd, loadSettings: () => loadWorkflowSettings({ cwd }) });
     if (!editorInstalled) {
       installWorkflowEditor(pi, ctx.ui, effort, {
         settingsStore: {

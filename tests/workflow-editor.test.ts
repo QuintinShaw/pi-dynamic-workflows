@@ -970,3 +970,71 @@ describe("installWorkflowEditor", () => {
     assert.deepEqual(result, { action: "continue" }, "non-interactive source should return continue");
   });
 });
+
+describe("registerWorkflowProgressCommands", () => {
+  function setup() {
+    const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
+    const sent: Array<{ content?: string }> = [];
+    let settings: Record<string, unknown> = {};
+    const pi = {
+      registerCommand: (name: string, command: { handler: (args: string, ctx: unknown) => Promise<void> }) => {
+        commands.set(name, command);
+      },
+      sendMessage: (message: { content?: string }) => {
+        sent.push(message);
+      },
+    } as unknown as ExtensionAPI;
+    const settingsStore = {
+      load: () => ({ ...settings }),
+      save: (next: Record<string, unknown>) => {
+        settings = { ...settings, ...next };
+      },
+    };
+    return { commands, sent, settingsStore, getSettings: () => settings, pi };
+  }
+
+  it("persists a valid mode and reports the current one on status", async () => {
+    const mod = await load();
+    const { commands, sent, settingsStore, getSettings, pi } = setup();
+    mod.registerWorkflowProgressCommands(pi, settingsStore);
+
+    const cmd = commands.get("workflows-progress");
+    assert.ok(cmd, "registers /workflows-progress");
+
+    await cmd.handler("detailed", {});
+    assert.deepEqual(getSettings(), { progressPanelMode: "detailed" });
+    assert.match(sent.at(-1)?.content ?? "", /detailed/i);
+
+    await cmd.handler("status", {});
+    assert.match(sent.at(-1)?.content ?? "", /panel is detailed/i);
+  });
+
+  it("ignores an invalid mode without persisting", async () => {
+    const mod = await load();
+    const { commands, sent, settingsStore, getSettings, pi } = setup();
+    mod.registerWorkflowProgressCommands(pi, settingsStore);
+
+    await commands.get("workflows-progress")?.handler("verbose", {});
+    assert.deepEqual(getSettings(), {}, "invalid mode is not saved");
+    assert.match(sent.at(-1)?.content ?? "", /Usage:/);
+  });
+
+  it("clamps and persists the per-phase agent cap, rejecting non-numbers", async () => {
+    const mod = await load();
+    const { commands, sent, settingsStore, getSettings, pi } = setup();
+    mod.registerWorkflowProgressCommands(pi, settingsStore);
+
+    const cmd = commands.get("workflows-progress-max");
+    assert.ok(cmd, "registers /workflows-progress-max");
+
+    await cmd.handler("5000", {});
+    assert.deepEqual(getSettings(), { progressPanelMaxAgents: 1000 }, "clamps to 1000");
+
+    await cmd.handler("abc", {});
+    assert.match(sent.at(-1)?.content ?? "", /Invalid value/);
+    assert.deepEqual(getSettings(), { progressPanelMaxAgents: 1000 }, "invalid value does not overwrite");
+
+    await cmd.handler("0", {});
+    assert.match(sent.at(-1)?.content ?? "", /Invalid value/);
+  });
+});
