@@ -7,17 +7,15 @@ import { WORKFLOW_RUNS_DIR } from "../src/config.js";
 import { createRunPersistence, generateRunId, type PersistedRunState } from "../src/run-persistence.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { workflowProjectPaths } from "../src/workflow-paths.js";
+import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
 function withTempCwd(fn: (cwd: string) => Promise<void>) {
   return async () => {
     const cwd = mkdtempSync(join(tmpdir(), "pi-dw-rp-"));
     const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-home-"));
-    const origHome = process.env.HOME;
-    process.env.HOME = fakeHome;
     try {
-      await fn(cwd);
+      await withFakeHomeAsync(fakeHome, () => fn(cwd));
     } finally {
-      process.env.HOME = origHome;
       rmSync(cwd, { recursive: true, force: true });
       rmSync(fakeHome, { recursive: true, force: true });
     }

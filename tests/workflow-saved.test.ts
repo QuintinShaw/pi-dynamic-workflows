@@ -6,6 +6,7 @@ import test from "node:test";
 import { WORKFLOW_SAVED_DIR } from "../src/config.js";
 import { workflowProjectPaths } from "../src/workflow-paths.js";
 import { createWorkflowStorage } from "../src/workflow-saved.js";
+import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
 /**
  * Run tests with HOME overridden to a temp directory so the user-level
@@ -14,14 +15,10 @@ import { createWorkflowStorage } from "../src/workflow-saved.js";
 function withIsolatedHome(fn: (cwd: string) => Promise<void>) {
   return async () => {
     const cwd = mkdtempSync(join(tmpdir(), "pi-dw-ws-"));
-    const origHome = process.env.HOME;
-    // Create a fake home with .pi/workflows/saved subdir
     const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-home-"));
-    process.env.HOME = fakeHome;
     try {
-      await fn(cwd);
+      await withFakeHomeAsync(fakeHome, () => fn(cwd));
     } finally {
-      process.env.HOME = origHome;
       rmSync(cwd, { recursive: true, force: true });
       rmSync(fakeHome, { recursive: true, force: true });
     }

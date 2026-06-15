@@ -26,6 +26,8 @@ export default function extension(pi: ExtensionAPI) {
     cwd,
     loadSavedWorkflow: (name) => storage.load(name)?.script,
     defaultAgentTimeoutMs: settings.defaultAgentTimeoutMs ?? null,
+    concurrency: settings.defaultConcurrency,
+    defaultAgentRetries: settings.defaultAgentRetries,
   });
 
   const workflowTool = createWorkflowTool({ cwd, manager, storage });

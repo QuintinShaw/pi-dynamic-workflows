@@ -7,11 +7,16 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { MAX_AGENT_RETRIES, MAX_CONCURRENCY } from "./config.js";
 import { workflowHomeDir, workflowProjectPaths } from "./workflow-paths.js";
 
 export interface WorkflowSettings {
   keywordTriggerEnabled?: boolean;
   defaultAgentTimeoutMs?: number | null;
+  /** Default max concurrent agents per run. Clamped to the runtime maximum. */
+  defaultConcurrency?: number;
+  /** Default retry attempts after recoverable agent failures. */
+  defaultAgentRetries?: number;
   /** Bottom task-panel display mode: "compact" (default, one line per run) | "detailed". */
   progressPanelMode?: "compact" | "detailed";
   /** Max agents shown per phase in detailed progress mode (default 8). */
@@ -111,6 +116,10 @@ function normalizeSettings(value: unknown): WorkflowSettings {
   ) {
     settings.defaultAgentTimeoutMs = raw.defaultAgentTimeoutMs;
   }
+  const defaultConcurrency = normalizeInteger(raw.defaultConcurrency, 1, MAX_CONCURRENCY);
+  if (defaultConcurrency !== undefined) settings.defaultConcurrency = defaultConcurrency;
+  const defaultAgentRetries = normalizeInteger(raw.defaultAgentRetries, 0, MAX_AGENT_RETRIES);
+  if (defaultAgentRetries !== undefined) settings.defaultAgentRetries = defaultAgentRetries;
   if (raw.progressPanelMode === "compact" || raw.progressPanelMode === "detailed") {
     settings.progressPanelMode = raw.progressPanelMode;
   }
@@ -122,6 +131,11 @@ function normalizeSettings(value: unknown): WorkflowSettings {
     settings.progressPanelMaxAgents = Math.min(1000, Math.floor(raw.progressPanelMaxAgents));
   }
   return settings;
+}
+
+function normalizeInteger(value: unknown, min: number, max: number): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < min) return undefined;
+  return Math.min(max, Math.floor(value));
 }
 
 function readObject(path: string): Record<string, unknown> {

@@ -13,7 +13,7 @@ import {
   loadAgentRegistry,
   resolveAgentType,
 } from "./agent-registry.js";
-import { DEFAULT_AGENT_TIMEOUT_MS, MAX_AGENTS_PER_RUN, MAX_CONCURRENCY } from "./config.js";
+import { DEFAULT_AGENT_TIMEOUT_MS, MAX_AGENT_RETRIES, MAX_AGENTS_PER_RUN, MAX_CONCURRENCY } from "./config.js";
 import { WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
 import { createWorkflowLogger } from "./logger.js";
 import { parseModelRoutingFromMeta, resolveModelForPhase } from "./model-routing.js";
@@ -66,6 +66,8 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
    */
   agentRegistry?: AgentRegistry;
   concurrency?: number;
+  /** Retry attempts after a recoverable agent failure. Default 0. */
+  agentRetries?: number;
   tokenBudget?: number | null;
   signal?: AbortSignal;
   /** Maximum number of agents allowed in this run. Default: 1000 */
@@ -164,6 +166,8 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
   agentType?: string;
   /** Override timeout for this specific agent. null means no hard timeout. */
   timeoutMs?: number | null;
+  /** Retry attempts after a recoverable failure for this specific agent. */
+  retries?: number;
 }
 
 /** Options for a human checkpoint() — a deterministic, journaled, replayable gate. */
@@ -277,9 +281,8 @@ export async function runWorkflow<T = unknown>(
   };
 
   const agentRunner = options.agent ?? new WorkflowAgent(options);
-  const concurrency = Math.max(
-    1,
-    Math.min(options.concurrency ?? Math.max(1, (globalThis.navigator?.hardwareConcurrency ?? 8) - 2), MAX_CONCURRENCY),
+  const concurrency = normalizeConcurrency(
+    options.concurrency ?? Math.max(1, (globalThis.navigator?.hardwareConcurrency ?? 8) - 2),
   );
   // Global caps + budget are shared with any nested workflow() so they hold across nesting.
   const shared: SharedRuntime = options.sharedRuntime ?? {
@@ -415,6 +418,8 @@ export async function runWorkflow<T = unknown>(
 
     return limiter(async () => {
       const timeout = agentOptions.timeoutMs !== undefined ? agentOptions.timeoutMs : agentTimeoutMs;
+      const retryAttempts = normalizeAgentRetries(agentOptions.retries ?? options.agentRetries ?? 0);
+      const maxAttempts = retryAttempts + 1;
 
       options.onAgentStart?.({ label, phase: assignedPhase, prompt, model: displayModel });
 
@@ -427,7 +432,8 @@ export async function runWorkflow<T = unknown>(
       const runCwd = worktree?.isolated ? worktree.cwd : undefined;
 
       // Captured from the subagent's real session usage; falls back to an
-      // estimate when the provider reports no usage (total === 0).
+      // estimate when the provider reports no usage (total === 0). Usage is reset
+      // per retry attempt so a failed attempt does not double-count the next one.
       let usage: AgentUsage | undefined;
       const recordTokens = (result: unknown): number => {
         const tokens = usage && usage.total > 0 ? usage.total : estimateTokens(result) + estimateTokens(prompt);
@@ -444,73 +450,96 @@ export async function runWorkflow<T = unknown>(
       };
 
       try {
-        throwIfAborted();
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+          usage = undefined;
+          try {
+            throwIfAborted();
 
-        // Run agent with timeout
-        const result = await withTimeout(
-          agentRunner.run(prompt, {
-            label,
-            schema: agentOptions.schema,
-            signal: options.signal,
-            instructions: buildAgentInstructions(assignedPhase, agentOptions, agentDef),
-            model: modelSpec,
-            tier: agentOptions.tier,
-            toolNames: agentDef?.tools,
-            disallowedToolNames: agentDef?.disallowedTools,
-            cwd: runCwd,
-            onModelResolved: (id: string) => {
-              displayModel = id;
-            },
-            onModelFallback: (spec: string) => {
-              // Make the silent degrade visible in /workflows, not just console.
-              log(`${label}: model "${spec}" unavailable — using the session default`);
-            },
-            onUsage: (u: AgentUsage) => {
-              usage = u;
-            },
-            onHistory: (history: AgentHistoryEntry[]) => {
-              options.onAgentHistory?.({ label, phase: assignedPhase, history });
-            },
-          } as any),
-          timeout,
-          label,
-        );
+            // Run agent with timeout
+            const result = await withTimeout(
+              agentRunner.run(prompt, {
+                label,
+                schema: agentOptions.schema,
+                signal: options.signal,
+                instructions: buildAgentInstructions(assignedPhase, agentOptions, agentDef),
+                model: modelSpec,
+                tier: agentOptions.tier,
+                toolNames: agentDef?.tools,
+                disallowedToolNames: agentDef?.disallowedTools,
+                cwd: runCwd,
+                onModelResolved: (id: string) => {
+                  displayModel = id;
+                },
+                onModelFallback: (spec: string) => {
+                  // Make the silent degrade visible in /workflows, not just console.
+                  log(`${label}: model "${spec}" unavailable — using the session default`);
+                },
+                onUsage: (u: AgentUsage) => {
+                  usage = u;
+                },
+                onHistory: (history: AgentHistoryEntry[]) => {
+                  options.onAgentHistory?.({ label, phase: assignedPhase, history });
+                },
+              } as any),
+              timeout,
+              label,
+            );
 
-        throwIfAborted();
-        if (isEmptyTextAgentResult(result, agentOptions.schema)) {
-          throw new WorkflowError("Subagent produced no assistant output", WorkflowErrorCode.AGENT_EMPTY_OUTPUT, {
-            recoverable: true,
-            agentLabel: label,
-          });
+            throwIfAborted();
+            if (isEmptyTextAgentResult(result, agentOptions.schema)) {
+              throw new WorkflowError("Subagent produced no assistant output", WorkflowErrorCode.AGENT_EMPTY_OUTPUT, {
+                recoverable: true,
+                agentLabel: label,
+              });
+            }
+
+            const tokens = recordTokens(result);
+            options.onAgentJournal?.({ index: callIndex, hash: callHash, result });
+            options.onAgentEnd?.({
+              label,
+              phase: assignedPhase,
+              result,
+              tokens,
+              worktree: runCwd,
+              model: displayModel,
+            });
+            return result;
+          } catch (error) {
+            if (options.signal?.aborted) throw error;
+
+            const workflowError = wrapError(error, { agentLabel: label });
+            logger.error(`agent ${label} attempt ${attempt}/${maxAttempts} failed: ${workflowError.message}`);
+            const tokens = recordTokens(null);
+
+            if (workflowError.recoverable && attempt < maxAttempts) {
+              log(
+                `agent "${label}" attempt ${attempt}/${maxAttempts} failed: ${workflowError.code} ${workflowError.message}; retrying`,
+              );
+              continue;
+            }
+
+            options.onAgentEnd?.({
+              label,
+              phase: assignedPhase,
+              result: null,
+              tokens,
+              worktree: runCwd,
+              model: displayModel,
+              error: workflowError.message,
+              errorCode: workflowError.code,
+              recoverable: workflowError.recoverable,
+            });
+
+            if (workflowError.recoverable) {
+              log(
+                `agent "${label}" exhausted ${maxAttempts} attempt${maxAttempts === 1 ? "" : "s"}: ${workflowError.code} ${workflowError.message}`,
+              );
+              return null;
+            }
+            throw workflowError;
+          }
         }
-
-        const tokens = recordTokens(result);
-        options.onAgentJournal?.({ index: callIndex, hash: callHash, result });
-        options.onAgentEnd?.({ label, phase: assignedPhase, result, tokens, worktree: runCwd, model: displayModel });
-        return result;
-      } catch (error) {
-        if (options.signal?.aborted) throw error;
-
-        const workflowError = wrapError(error, { agentLabel: label });
-        logger.error(`agent ${label} failed: ${workflowError.message}`);
-        const tokens = recordTokens(null);
-        options.onAgentEnd?.({
-          label,
-          phase: assignedPhase,
-          result: null,
-          tokens,
-          worktree: runCwd,
-          model: displayModel,
-          error: workflowError.message,
-          errorCode: workflowError.code,
-          recoverable: workflowError.recoverable,
-        });
-
-        // Return null for recoverable errors
-        if (workflowError.recoverable) {
-          return null;
-        }
-        throw workflowError;
+        return null;
       } finally {
         // Always tear down the worktree, even on timeout/abort.
         if (worktree?.isolated) await removeWorktree(worktree);
@@ -1051,6 +1080,16 @@ function isEmptyTextAgentResult(result: unknown, schema: TSchema | undefined): b
 
 function estimateTokens(value: unknown): number {
   return Math.ceil(JSON.stringify(value ?? "").length / 4);
+}
+
+function normalizeConcurrency(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 1) return 1;
+  return Math.min(MAX_CONCURRENCY, Math.floor(value));
+}
+
+function normalizeAgentRetries(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return 0;
+  return Math.min(MAX_AGENT_RETRIES, Math.floor(value));
 }
 
 /**

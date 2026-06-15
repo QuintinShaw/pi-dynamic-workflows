@@ -11,6 +11,7 @@ import {
   saveWorkflowSettings,
   saveWorkflowSettingsForCwd,
 } from "../src/workflow-settings.js";
+import { withFakeHome } from "./helpers/fake-home.js";
 
 function withSettingsPath(fn: (settingsPath: string) => void): void {
   const dir = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-settings-"));
@@ -51,28 +52,42 @@ describe("workflow settings", () => {
     });
   });
 
+  it("normalizes default concurrency and agent retries", () => {
+    withSettingsPath((settingsPath) => {
+      mkdirSync(dirname(settingsPath), { recursive: true });
+
+      writeFileSync(settingsPath, JSON.stringify({ defaultConcurrency: 4.9, defaultAgentRetries: 2.8 }), "utf-8");
+      assert.deepEqual(loadWorkflowSettings(settingsPath), { defaultConcurrency: 4, defaultAgentRetries: 2 });
+
+      writeFileSync(settingsPath, JSON.stringify({ defaultConcurrency: 99, defaultAgentRetries: 99 }), "utf-8");
+      assert.deepEqual(loadWorkflowSettings(settingsPath), { defaultConcurrency: 16, defaultAgentRetries: 3 });
+
+      writeFileSync(settingsPath, JSON.stringify({ defaultConcurrency: 0, defaultAgentRetries: -1 }), "utf-8");
+      assert.deepEqual(loadWorkflowSettings(settingsPath), {});
+    });
+  });
+
   it("merges project settings over global settings when cwd is provided", () => {
     const dir = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-project-settings-"));
     const cwd = join(dir, "project");
     const fakeHome = join(dir, "home");
-    const origHome = process.env.HOME;
-    process.env.HOME = fakeHome;
-    const globalPath = getWorkflowSettingsPath();
-    const projectPath = getWorkflowProjectSettingsPath(cwd);
     try {
-      saveWorkflowSettings({ keywordTriggerEnabled: true, defaultAgentTimeoutMs: 600000 }, globalPath);
-      saveWorkflowSettings({ keywordTriggerEnabled: false }, { cwd, settingsPath: globalPath, scope: "project" });
+      withFakeHome(fakeHome, () => {
+        const globalPath = getWorkflowSettingsPath();
+        const projectPath = getWorkflowProjectSettingsPath(cwd);
+        saveWorkflowSettings({ keywordTriggerEnabled: true, defaultAgentTimeoutMs: 600000 }, globalPath);
+        saveWorkflowSettings({ keywordTriggerEnabled: false }, { cwd, settingsPath: globalPath, scope: "project" });
 
-      assert.deepEqual(loadWorkflowSettings(globalPath), {
-        keywordTriggerEnabled: true,
-        defaultAgentTimeoutMs: 600000,
-      });
-      assert.deepEqual(loadWorkflowSettings({ cwd, settingsPath: globalPath, projectSettingsPath: projectPath }), {
-        keywordTriggerEnabled: false,
-        defaultAgentTimeoutMs: 600000,
+        assert.deepEqual(loadWorkflowSettings(globalPath), {
+          keywordTriggerEnabled: true,
+          defaultAgentTimeoutMs: 600000,
+        });
+        assert.deepEqual(loadWorkflowSettings({ cwd, settingsPath: globalPath, projectSettingsPath: projectPath }), {
+          keywordTriggerEnabled: false,
+          defaultAgentTimeoutMs: 600000,
+        });
       });
     } finally {
-      process.env.HOME = origHome;
       rmSync(dir, { recursive: true, force: true });
     }
   });
@@ -81,15 +96,14 @@ describe("workflow settings", () => {
     const dir = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-project-settings-"));
     const cwd = join(dir, "project");
     const fakeHome = join(dir, "home");
-    const origHome = process.env.HOME;
-    process.env.HOME = fakeHome;
     try {
-      saveWorkflowSettingsForCwd({ keywordTriggerEnabled: false }, cwd);
+      withFakeHome(fakeHome, () => {
+        saveWorkflowSettingsForCwd({ keywordTriggerEnabled: false }, cwd);
 
-      assert.deepEqual(loadWorkflowSettings({ cwd }), { keywordTriggerEnabled: false });
-      assert.equal(existsSync(getWorkflowProjectSettingsPath(cwd)), false);
+        assert.deepEqual(loadWorkflowSettings({ cwd }), { keywordTriggerEnabled: false });
+        assert.equal(existsSync(getWorkflowProjectSettingsPath(cwd)), false);
+      });
     } finally {
-      process.env.HOME = origHome;
       rmSync(dir, { recursive: true, force: true });
     }
   });
@@ -98,20 +112,19 @@ describe("workflow settings", () => {
     const dir = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-project-settings-"));
     const cwd = join(dir, "project");
     const fakeHome = join(dir, "home");
-    const origHome = process.env.HOME;
-    process.env.HOME = fakeHome;
     try {
-      saveWorkflowSettings({ keywordTriggerEnabled: false }, { cwd, scope: "project" });
+      withFakeHome(fakeHome, () => {
+        saveWorkflowSettings({ keywordTriggerEnabled: false }, { cwd, scope: "project" });
 
-      saveWorkflowSettingsForCwd({ keywordTriggerEnabled: true }, cwd);
+        saveWorkflowSettingsForCwd({ keywordTriggerEnabled: true }, cwd);
 
-      assert.deepEqual(loadWorkflowSettings(), { keywordTriggerEnabled: true });
-      assert.deepEqual(loadWorkflowSettings({ cwd }), { keywordTriggerEnabled: true });
-      assert.deepEqual(loadWorkflowSettings({ projectSettingsPath: getWorkflowProjectSettingsPath(cwd) }), {
-        keywordTriggerEnabled: true,
+        assert.deepEqual(loadWorkflowSettings(), { keywordTriggerEnabled: true });
+        assert.deepEqual(loadWorkflowSettings({ cwd }), { keywordTriggerEnabled: true });
+        assert.deepEqual(loadWorkflowSettings({ projectSettingsPath: getWorkflowProjectSettingsPath(cwd) }), {
+          keywordTriggerEnabled: true,
+        });
       });
     } finally {
-      process.env.HOME = origHome;
       rmSync(dir, { recursive: true, force: true });
     }
   });

@@ -81,6 +81,18 @@ const workflowToolSchema = Type.Object({
       description: "Maximum number of agents allowed in this run. Default: 1000.",
     }),
   ),
+  concurrency: Type.Optional(
+    Type.Number({
+      description:
+        "Maximum concurrent agents for this run. Clamped to the runtime maximum. Use when provider/transport stability matters.",
+    }),
+  ),
+  agentRetries: Type.Optional(
+    Type.Number({
+      description:
+        "Retry attempts for recoverable agent failures such as timeout, connection failure, or empty assistant output. Default 0 unless configured.",
+    }),
+  ),
   agentTimeoutMs: Type.Optional(
     Type.Number({
       description:
@@ -100,6 +112,8 @@ export type WorkflowToolInput = {
   args?: unknown;
   background?: boolean;
   maxAgents?: number;
+  concurrency?: number;
+  agentRetries?: number;
   agentTimeoutMs?: number;
   tokenBudget?: number;
 };
@@ -113,17 +127,24 @@ export interface WorkflowToolOptions {
   storage?: WorkflowStorage;
   /** Default per-agent timeout for runs created by this tool. null means no hard timeout. */
   defaultAgentTimeoutMs?: number | null;
+  /** Default max concurrent agents when no tool-level concurrency is passed. */
+  defaultConcurrency?: number;
+  /** Default retry attempts after recoverable agent failures. */
+  defaultAgentRetries?: number;
 }
 
 export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefinition<typeof workflowToolSchema, any> {
   const storage = options.storage ?? createWorkflowStorage(options.cwd ?? process.cwd());
+  const cwd = options.cwd ?? process.cwd();
+  const defaults = resolveWorkflowToolDefaults(options, cwd);
   const manager =
     options.manager ??
     new WorkflowManager({
       cwd: options.cwd,
-      concurrency: options.concurrency,
+      concurrency: defaults.concurrency,
       loadSavedWorkflow: (name: string) => storage.load(name)?.script,
-      defaultAgentTimeoutMs: resolveDefaultAgentTimeoutMs(options.defaultAgentTimeoutMs, options.cwd ?? process.cwd()),
+      defaultAgentTimeoutMs: defaults.agentTimeoutMs,
+      defaultAgentRetries: defaults.agentRetries,
     });
 
   return defineTool({
@@ -149,6 +170,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       "For workflow, parallel() takes functions, not promises: use `await parallel(items.map(item => () => agent('...', { label: '...' })))`, never `await parallel(items.map(item => agent(...)))`. Results are returned in input order.",
       "For workflow, pipeline(items, ...stages) runs each item through stages sequentially, while different items may run concurrently. Each stage receives (previousValue, originalItem, index).",
       "For workflow, every agent() call should include a unique short label option, 2-5 words, such as { label: 'repo inventory' } or { label: 'source modules' }; unique labels make live status and error reporting readable.",
+      "For workflow, use low concurrency and agentRetries for unstable provider/transport fan-out runs; retries apply only to recoverable agent failures and still require explicit null handling after exhaustion.",
       "For workflow, failed agent(), parallel(), or pipeline() branches return null and log the failure unless the workflow is aborted. Check for nulls before synthesizing conclusions.",
       "For workflow, include a final synthesis/assertion agent when combining multiple subagent results; return a compact JSON-serializable value with ok/verdict plus the important outputs.",
       "For workflow, if agent() needs machine-readable output, pass a plain JSON Schema via opts.schema; agent() will return the validated object. Use JSON Schema syntax, not TypeScript or TypeBox constructors.",
@@ -184,6 +206,8 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       if (params.background ?? true) {
         const { runId } = manager.startInBackground(script, params.args, {
           maxAgents: params.maxAgents,
+          concurrency: params.concurrency,
+          agentRetries: params.agentRetries,
           agentTimeoutMs: params.agentTimeoutMs,
           tokenBudget: params.tokenBudget,
         });
@@ -209,6 +233,8 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       try {
         result = await manager.runSync(script, params.args, {
           maxAgents: params.maxAgents,
+          concurrency: params.concurrency,
+          agentRetries: params.agentRetries,
           agentTimeoutMs: params.agentTimeoutMs,
           tokenBudget: params.tokenBudget,
           confirm,
@@ -297,9 +323,19 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
   });
 }
 
-function resolveDefaultAgentTimeoutMs(explicit: number | null | undefined, cwd: string): number | null {
-  if (explicit !== undefined) return explicit;
-  return loadWorkflowSettings({ cwd }).defaultAgentTimeoutMs ?? null;
+function resolveWorkflowToolDefaults(
+  options: WorkflowToolOptions,
+  cwd: string,
+): { agentTimeoutMs: number | null; concurrency?: number; agentRetries: number } {
+  const settings = loadWorkflowSettings({ cwd });
+  return {
+    agentTimeoutMs:
+      options.defaultAgentTimeoutMs !== undefined
+        ? options.defaultAgentTimeoutMs
+        : (settings.defaultAgentTimeoutMs ?? null),
+    concurrency: options.defaultConcurrency ?? options.concurrency ?? settings.defaultConcurrency,
+    agentRetries: options.defaultAgentRetries ?? settings.defaultAgentRetries ?? 0,
+  };
 }
 
 /**

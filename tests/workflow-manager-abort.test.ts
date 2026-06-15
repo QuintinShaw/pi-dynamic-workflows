@@ -6,6 +6,7 @@ import test from "node:test";
 import type { AgentUsage } from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
+import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -56,12 +57,9 @@ function withTempCwd(fn: (cwd: string) => Promise<void>) {
   return async () => {
     const cwd = mkdtempSync(join(tmpdir(), "pi-dw-abort-"));
     const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-home-"));
-    const origHome = process.env.HOME;
-    process.env.HOME = fakeHome;
     try {
-      await fn(cwd);
+      await withFakeHomeAsync(fakeHome, () => fn(cwd));
     } finally {
-      process.env.HOME = origHome;
       rmSync(cwd, { recursive: true, force: true });
       rmSync(fakeHome, { recursive: true, force: true });
     }

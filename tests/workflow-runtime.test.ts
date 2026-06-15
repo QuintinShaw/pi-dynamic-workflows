@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { AgentUsage } from "../src/agent.js";
+import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { type JournalEntry, runWorkflow } from "../src/workflow.js";
 
 /** Agent runner that counts real invocations and echoes a per-call result. */
@@ -39,6 +40,151 @@ const twoAgentScript = `export const meta = { name: 'usage_demo', description: '
 const a = await agent('first', { label: 'a' })
 const b = await agent('second', { label: 'b' })
 return { a, b }`;
+
+function createDeferred<T = void>(): { promise: Promise<T>; resolve: (value: T | PromiseLike<T>) => void } {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+test("runWorkflow concurrency caps parallel agents", async () => {
+  let active = 0;
+  let maxActive = 0;
+  const release = createDeferred<void>();
+  const started: Array<string> = [];
+  const runner = {
+    async run(prompt: string) {
+      active++;
+      maxActive = Math.max(maxActive, active);
+      started.push(prompt);
+      await release.promise;
+      active--;
+      return `ok:${prompt}`;
+    },
+  };
+  const script = `export const meta = { name: 'concurrency_cap', description: 'cap parallelism' }
+const xs = await parallel(['a','b','c','d'].map((p) => () => agent(p, { label: p })))
+return xs`;
+
+  const run = runWorkflow(script, { agent: runner, concurrency: 2, persistLogs: false });
+  while (started.length < 2) await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(started.length, 2, "only the first two agents should start before the gate opens");
+  release.resolve();
+  const result = await run;
+
+  assert.equal(maxActive, 2);
+  assert.deepEqual(result.result, ["ok:a", "ok:b", "ok:c", "ok:d"]);
+  assert.equal(result.agentCount, 4);
+});
+
+test("runWorkflow retries recoverable empty output then succeeds", async () => {
+  let calls = 0;
+  const journal: JournalEntry[] = [];
+  const result = await runWorkflow(
+    `export const meta = { name: 'retry_success', description: 'retry success' }
+const a = await agent('work', { label: 'a' })
+return a`,
+    {
+      agent: {
+        async run() {
+          calls++;
+          return calls === 1 ? "" : "ok";
+        },
+      },
+      agentRetries: 1,
+      persistLogs: false,
+      onAgentJournal: (entry) => journal.push(entry),
+    },
+  );
+
+  assert.equal(result.result, "ok");
+  assert.equal(calls, 2);
+  assert.equal(result.agentCount, 1, "retries should not allocate extra logical agent slots");
+  assert.equal(journal.length, 1, "only the final success is journaled");
+});
+
+test("runWorkflow returns null when recoverable retries are exhausted", async () => {
+  let calls = 0;
+  const logs: string[] = [];
+  const journal: JournalEntry[] = [];
+  const result = await runWorkflow(
+    `export const meta = { name: 'retry_exhausted', description: 'retry exhausted' }
+const a = await agent('work', { label: 'a' })
+return a`,
+    {
+      agent: {
+        async run() {
+          calls++;
+          return "";
+        },
+      },
+      agentRetries: 1,
+      persistLogs: false,
+      onLog: (message) => logs.push(message),
+      onAgentJournal: (entry) => journal.push(entry),
+    },
+  );
+
+  assert.equal(result.result, null);
+  assert.equal(calls, 2);
+  assert.equal(result.agentCount, 1);
+  assert.equal(journal.length, 0, "failed/null recoverable results are not journaled");
+  assert.ok(
+    logs.some((message) => /retrying/i.test(message)),
+    "logs should mention retrying",
+  );
+  assert.ok(
+    logs.some((message) => /exhausted/i.test(message)),
+    "logs should mention exhaustion",
+  );
+});
+
+test("runWorkflow does not retry nonrecoverable errors", async () => {
+  let calls = 0;
+  await assert.rejects(
+    runWorkflow(
+      `export const meta = { name: 'no_retry_nonrecoverable', description: 'nonrecoverable' }
+const a = await agent('work', { label: 'a' })
+return a`,
+      {
+        agent: {
+          async run() {
+            calls++;
+            throw new WorkflowError("hard stop", WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, { recoverable: false });
+          },
+        },
+        agentRetries: 2,
+        persistLogs: false,
+      },
+    ),
+    (error: unknown) => error instanceof WorkflowError && error.code === WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+  );
+  assert.equal(calls, 1);
+});
+
+test("per-agent retries override run-level retries", async () => {
+  let calls = 0;
+  const result = await runWorkflow(
+    `export const meta = { name: 'agent_retry_override', description: 'override' }
+const a = await agent('work', { label: 'a', retries: 1 })
+return a`,
+    {
+      agent: {
+        async run() {
+          calls++;
+          return calls === 1 ? "" : "ok";
+        },
+      },
+      agentRetries: 0,
+      persistLogs: false,
+    },
+  );
+
+  assert.equal(result.result, "ok");
+  assert.equal(calls, 2);
+});
 
 test("runWorkflow accumulates real per-agent usage (incl. cost + cache tokens)", async () => {
   const result = await runWorkflow(twoAgentScript, {

@@ -9,7 +9,7 @@
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
-import { USER_WORKFLOW_SAVED_DIR, WORKFLOW_RUNS_DIR, WORKFLOW_SAVED_DIR } from "./config.js";
+import { WORKFLOW_RUNS_DIR, WORKFLOW_SAVED_DIR } from "./config.js";
 
 export const WORKFLOW_HOME_RELATIVE_DIR = ".pi/workflows";
 export const WORKFLOW_PROJECTS_SUBDIR = "projects";
@@ -29,7 +29,7 @@ export function workflowHomeDir(): string {
 }
 
 export function workflowUserSavedDir(): string {
-  return USER_WORKFLOW_SAVED_DIR.replace("~", homedir());
+  return join(workflowHomeDir(), "saved");
 }
 
 export function workflowProjectKey(cwd: string): string {

@@ -11,16 +11,14 @@ import {
   workflowProjectPaths,
   workflowUserSavedDir,
 } from "../src/workflow-paths.js";
+import { withFakeHome } from "./helpers/fake-home.js";
 
 function withIsolatedHome(fn: (home: string, cwd: string) => void): void {
   const home = mkdtempSync(join(tmpdir(), "pi-dw-home-"));
   const cwd = mkdtempSync(join(tmpdir(), "pi-dw-project-"));
-  const origHome = process.env.HOME;
-  process.env.HOME = home;
   try {
-    fn(home, cwd);
+    withFakeHome(home, () => fn(home, cwd));
   } finally {
-    process.env.HOME = origHome;
     rmSync(home, { recursive: true, force: true });
     rmSync(cwd, { recursive: true, force: true });
   }

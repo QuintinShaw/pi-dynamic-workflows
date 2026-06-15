@@ -54,6 +54,10 @@ export interface ExecOptions {
   onProgress?: (snapshot: WorkflowSnapshot) => void;
   /** Hard token budget for this run; once spent reaches it, agent() throws. */
   tokenBudget?: number | null;
+  /** Max concurrent agents for this execution. */
+  concurrency?: number;
+  /** Retry attempts after recoverable agent failures for this execution. */
+  agentRetries?: number;
   /** Resolve a checkpoint() question with a human reply (only for UI-bearing runs). */
   confirm?: (promptText: string, options: unknown) => Promise<unknown>;
 }
@@ -71,6 +75,8 @@ export interface WorkflowManagerOptions {
   sessionId?: string;
   /** Default per-agent timeout when a run does not pass agentTimeoutMs. null means no hard timeout. */
   defaultAgentTimeoutMs?: number | null;
+  /** Default retry attempts after recoverable agent failures. */
+  defaultAgentRetries?: number;
 }
 
 export class WorkflowManager extends EventEmitter {
@@ -85,6 +91,7 @@ export class WorkflowManager extends EventEmitter {
   /** The current pi session id; runs are stamped with it and listRuns() filters by it. */
   private sessionId?: string;
   private defaultAgentTimeoutMs: number | null;
+  private defaultAgentRetries: number;
 
   constructor(options: WorkflowManagerOptions = {}) {
     super();
@@ -95,6 +102,7 @@ export class WorkflowManager extends EventEmitter {
     this.mainModel = options.mainModel;
     this.sessionId = options.sessionId;
     this.defaultAgentTimeoutMs = options.defaultAgentTimeoutMs ?? null;
+    this.defaultAgentRetries = options.defaultAgentRetries ?? 0;
     this.persistence = createRunPersistence(this.cwd);
     this.recoverStaleRuns();
   }
@@ -256,8 +264,20 @@ export class WorkflowManager extends EventEmitter {
     args?: unknown,
     exec: ExecOptions = {},
   ): Promise<WorkflowRunResult> {
-    const { resumeJournal, maxAgents, agentTimeoutMs, externalSignal, onProgress, tokenBudget, confirm } = exec;
+    const {
+      resumeJournal,
+      maxAgents,
+      agentTimeoutMs,
+      externalSignal,
+      onProgress,
+      tokenBudget,
+      concurrency,
+      agentRetries,
+      confirm,
+    } = exec;
     const resolvedAgentTimeoutMs = agentTimeoutMs !== undefined ? agentTimeoutMs : this.defaultAgentTimeoutMs;
+    const resolvedConcurrency = concurrency ?? this.concurrency;
+    const resolvedAgentRetries = agentRetries ?? this.defaultAgentRetries;
     const progress = () => onProgress?.(managed.snapshot);
     // Let a host abort (e.g. Esc during a blocking tool call) cancel this run.
     if (externalSignal) {
@@ -271,7 +291,8 @@ export class WorkflowManager extends EventEmitter {
         agent: this.agent,
         mainModel: this.mainModel,
         signal: managed.controller.signal,
-        concurrency: this.concurrency,
+        concurrency: resolvedConcurrency,
+        agentRetries: resolvedAgentRetries,
         maxAgents,
         agentTimeoutMs: resolvedAgentTimeoutMs,
         tokenBudget,

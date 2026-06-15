@@ -6,6 +6,7 @@ import test from "node:test";
 import type { AgentUsage } from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
+import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
 /** Agent runner that reports fixed usage so token accounting is exercised. */
 function fakeAgent(usage: Partial<AgentUsage> = {}, result: unknown = "ok") {
@@ -71,12 +72,9 @@ function withTempCwd(fn: (cwd: string) => Promise<void>) {
   return async () => {
     const cwd = mkdtempSync(join(tmpdir(), "pi-dw-mgr-"));
     const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-home-"));
-    const origHome = process.env.HOME;
-    process.env.HOME = fakeHome;
     try {
-      await fn(cwd);
+      await withFakeHomeAsync(fakeHome, () => fn(cwd));
     } finally {
-      process.env.HOME = origHome;
       rmSync(cwd, { recursive: true, force: true });
       rmSync(fakeHome, { recursive: true, force: true });
     }
@@ -135,6 +133,62 @@ test(
     assert.equal((result.result as { a: unknown }).a, "slow");
     const agent = manager.listRuns()[0]?.agents[0];
     assert.equal(agent?.status, "done");
+  }),
+);
+
+test(
+  "manager forwards exec concurrency and agentRetries to runtime",
+  withTempCwd(async (cwd) => {
+    let active = 0;
+    let maxActive = 0;
+    const callsByPrompt = new Map<string, number>();
+    const manager = new WorkflowManager({
+      cwd,
+      concurrency: 8,
+      defaultAgentRetries: 0,
+      agent: {
+        async run(prompt: string) {
+          active++;
+          maxActive = Math.max(maxActive, active);
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          active--;
+          const calls = (callsByPrompt.get(prompt) ?? 0) + 1;
+          callsByPrompt.set(prompt, calls);
+          return calls === 1 ? "" : `ok:${prompt}`;
+        },
+      },
+    });
+    const script = `export const meta = { name: 'forwarding', description: 'manager controls' }
+const xs = await parallel(['a','b'].map((p) => () => agent(p, { label: p })))
+return xs`;
+
+    const result = await manager.runSync(script, undefined, { concurrency: 1, agentRetries: 1 });
+
+    assert.deepEqual(result.result, ["ok:a", "ok:b"]);
+    assert.equal(maxActive, 1, "exec concurrency should override the manager default");
+    assert.deepEqual([...callsByPrompt.values()], [2, 2], "exec agentRetries should be forwarded");
+  }),
+);
+
+test(
+  "manager defaultAgentRetries applies when run options omit agentRetries",
+  withTempCwd(async (cwd) => {
+    let calls = 0;
+    const manager = new WorkflowManager({
+      cwd,
+      defaultAgentRetries: 1,
+      agent: {
+        async run() {
+          calls++;
+          return calls === 1 ? "" : "ok";
+        },
+      },
+    });
+
+    const result = await manager.runSync(oneAgentScript);
+
+    assert.equal((result.result as { a: unknown }).a, "ok");
+    assert.equal(calls, 2);
   }),
 );
 

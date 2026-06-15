@@ -11,6 +11,9 @@ export const DEFAULT_AGENT_TIMEOUT_MS = null;
 /** Maximum concurrent agents (matches Claude Code limit). */
 export const MAX_CONCURRENCY = 16;
 
+/** Maximum automatic retry attempts after a recoverable agent failure. */
+export const MAX_AGENT_RETRIES = 3;
+
 /** Default token budget if none specified. */
 export const DEFAULT_TOKEN_BUDGET = null;
 
