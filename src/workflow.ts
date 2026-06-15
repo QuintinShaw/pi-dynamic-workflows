@@ -155,7 +155,7 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
    * no configured entry it falls back to the session's main model.
    */
   tier?: string;
-  isolation?: "worktree";
+  isolation?: "worktree" | "process";
   /**
    * Name of a registered subagent definition (`.pi/agents/<name>.md`, project >
    * user). Binds that definition's tool allow/denylist, model, and body prompt
@@ -467,6 +467,7 @@ export async function runWorkflow<T = unknown>(
                 toolNames: agentDef?.tools,
                 disallowedToolNames: agentDef?.disallowedTools,
                 cwd: runCwd,
+                isolation: agentOptions.isolation,
                 onModelResolved: (id: string) => {
                   displayModel = id;
                 },

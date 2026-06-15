@@ -21,6 +21,10 @@ export enum WorkflowErrorCode {
   AGENT_EXECUTION_ERROR = "AGENT_EXECUTION_ERROR",
   /** Run state persistence failed. */
   PERSISTENCE_ERROR = "PERSISTENCE_ERROR",
+  /** Failed to spawn child process agent. */
+  SPAWN_ERROR = "SPAWN_ERROR",
+  /** Child process agent failed. */
+  AGENT_FAILED = "AGENT_FAILED",
   /** Unknown error. */
   UNKNOWN = "UNKNOWN",
 }

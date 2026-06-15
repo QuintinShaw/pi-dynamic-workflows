@@ -18,6 +18,7 @@ import { applyToolPolicy } from "./agent-registry.js";
 import { WorkflowError, WorkflowErrorCode } from "./errors.js";
 import { loadModelTierConfig, type ModelTierConfig, resolveTierModel } from "./model-tier-config.js";
 import { createStructuredOutputTool, type StructuredOutputCapture } from "./structured-output.js";
+import { runAgentInProcess } from "./process-agent.js";
 
 /**
  * Find a JSON object/array in free-form text: a fenced ```json block if present,
@@ -243,6 +244,14 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
    * structured_output) before falling back to strict prose extraction. Default 2.
    */
   maxSchemaRetries?: number;
+  /**
+   * Run this agent in a separate OS process for crash and memory isolation.
+   * When set to "process", the agent is spawned as a child process via
+   * child_process.spawn() instead of using an in-memory session.
+   * This provides full isolation at the cost of higher overhead per agent.
+   * Default: "session" (in-memory, same PID).
+   */
+  isolation?: "session" | "process";
 }
 
 export type AgentRunResult<TSchemaDef extends TSchema | undefined> = TSchemaDef extends TSchema
@@ -331,6 +340,40 @@ export class WorkflowAgent {
     }
 
     const agentDir = getAgentDir();
+
+    // Process isolation: run agent in a separate OS process
+    if (options.isolation === "process") {
+      const result = await runAgentInProcess({
+        prompt: this.buildPrompt(prompt, options as AgentRunOptions<any>, Boolean(options.schema)),
+        cwd: runCwd,
+        model: resolvedModel ? `${resolvedModel.provider}/${resolvedModel.id}` : undefined,
+        signal: options.signal,
+        onHistory: (entry) => options.onHistory?.([entry as unknown as AgentHistoryEntry]),
+      });
+      if (options.onUsage) {
+        options.onUsage(result.usage);
+      }
+      if (options.schema) {
+        // For process isolation with schema, the output is plain text
+        // We skip structured output since cross-process schema validation
+        // would require IPC. The workflow author should use in-memory
+        // isolation when structured output is required.
+        throw new WorkflowError(
+          "Process isolation does not support structured output yet. Use isolation: 'session' with schema.",
+          WorkflowErrorCode.SCHEMA_NONCOMPLIANCE,
+          { recoverable: false, agentLabel: options.label },
+        );
+      }
+      const text = result.output;
+      if (!text.trim()) {
+        throw new WorkflowError("Process agent produced no output", WorkflowErrorCode.AGENT_EMPTY_OUTPUT, {
+          recoverable: true,
+          agentLabel: options.label,
+        });
+      }
+      return text as AgentRunResult<TSchemaDef>;
+    }
+
     const { session } = await createAgentSession({
       cwd: runCwd,
       agentDir,
