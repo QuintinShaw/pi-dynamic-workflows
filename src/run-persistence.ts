@@ -36,6 +36,10 @@ export interface PersistedRunState {
    * the navigator shows only the current session's runs (undefined = legacy/global). */
   sessionId?: string;
   status: RunStatus;
+  /** Why a paused run is paused (e.g. "usage_limit" when a provider quota was hit). */
+  pauseReason?: string;
+  /** Provider reset hint for a usage-limit pause, e.g. "Resets in ~3h" (verbatim). */
+  resetHint?: string;
   phases: string[];
   currentPhase?: string;
   agents: PersistedAgentState[];

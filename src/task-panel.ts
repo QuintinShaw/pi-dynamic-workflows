@@ -129,6 +129,33 @@ export function installResultDelivery(pi: ExtensionAPI, manager: WorkflowManager
     if (!manager.getRun(runId)?.background) return;
     deliver(`✗ Background workflow ${runId} failed: ${error?.message ?? "unknown error"}`);
   });
+  // A provider usage/quota limit checkpoints the run as paused (not failed): tell the
+  // user it is resumable once their budget refills, rather than letting it look dead.
+  // Manual pause() also emits "paused" but with no reason — guard so only the
+  // usage-limit case delivers a message.
+  manager.on(
+    "paused",
+    ({
+      runId,
+      reason,
+      error,
+      resetHint,
+    }: {
+      runId: string;
+      reason?: string;
+      error?: { message?: string };
+      resetHint?: string;
+    }) => {
+      if (reason !== "usage_limit") return;
+      if (!manager.getRun(runId)?.background) return;
+      const when = resetHint ? ` (${resetHint})` : "";
+      const cause = error?.message ?? "provider usage limit reached";
+      deliver(
+        `⏸ Background workflow ${runId} paused: ${cause}${when}. ` +
+          `Completed steps are saved — run /workflows resume ${runId} once your usage limit resets.`,
+      );
+    },
+  );
 }
 
 export function renderPanel(manager: WorkflowManager, theme: Theme, width?: number): string[] {

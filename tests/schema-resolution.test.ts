@@ -1,7 +1,14 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { Type } from "typebox";
-import { extractValidated, resolveStructuredOutput, type StructuredSession } from "../src/agent.js";
+import {
+  extractValidated,
+  lastAssistantError,
+  resolveStructuredOutput,
+  type StructuredSession,
+  throwIfProviderLimit,
+} from "../src/agent.js";
+import { WorkflowErrorCode } from "../src/errors.js";
 import type { StructuredOutputCapture } from "../src/structured-output.js";
 
 const Schema = Type.Object({ word: Type.String() });
@@ -93,6 +100,78 @@ describe("resolveStructuredOutput", () => {
     await assert.rejects(
       () => resolveStructuredOutput(session, capture, Schema, { ...opts, signal: ctrl.signal }, noText),
       /aborted/i,
+    );
+  });
+
+  it("surfaces a provider usage limit hit during repair as PROVIDER_USAGE_LIMIT (not SCHEMA_NONCOMPLIANCE)", async () => {
+    const { session, capture } = makeSession();
+    // The repair re-prompts ran but the turn ended in a buried provider limit.
+    session.messages = [
+      {
+        role: "assistant",
+        content: [],
+        stopReason: "error",
+        errorMessage: "Codex usage limit reached. Resets in ~3h.",
+      },
+    ];
+    await assert.rejects(
+      () => resolveStructuredOutput(session, capture, Schema, opts, () => "no json at all"),
+      (err: unknown) => {
+        assert.equal((err as { code?: string }).code, WorkflowErrorCode.PROVIDER_USAGE_LIMIT);
+        assert.equal((err as { recoverable?: boolean }).recoverable, false);
+        return true;
+      },
+    );
+  });
+});
+
+describe("lastAssistantError / throwIfProviderLimit", () => {
+  it("reads stopReason/errorMessage off the most recent assistant message", () => {
+    const messages = [
+      { role: "user", content: [] },
+      { role: "assistant", content: [], stopReason: "error", errorMessage: "boom" },
+    ];
+    assert.deepEqual(lastAssistantError(messages), { stopReason: "error", errorMessage: "boom" });
+  });
+
+  it("throws PROVIDER_USAGE_LIMIT only when stopReason is error AND the message matches a limit", () => {
+    assert.throws(
+      () =>
+        throwIfProviderLimit(
+          [
+            {
+              role: "assistant",
+              content: [],
+              stopReason: "error",
+              errorMessage: "usage limit reached. Resets in ~3h.",
+            },
+          ],
+          "lbl",
+        ),
+      (err: unknown) => {
+        assert.equal((err as { code?: string }).code, WorkflowErrorCode.PROVIDER_USAGE_LIMIT);
+        assert.equal((err as { resetHint?: string }).resetHint, "Resets in ~3h");
+        assert.equal((err as { agentLabel?: string }).agentLabel, "lbl");
+        return true;
+      },
+    );
+  });
+
+  it("does not throw for a successful turn whose text merely mentions 'rate limit'", () => {
+    assert.doesNotThrow(() =>
+      throwIfProviderLimit([
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "I handled the rate limit gracefully" }],
+          stopReason: "stop",
+        },
+      ]),
+    );
+  });
+
+  it("does not throw for a non-limit error turn", () => {
+    assert.doesNotThrow(() =>
+      throwIfProviderLimit([{ role: "assistant", content: [], stopReason: "error", errorMessage: "network blip" }]),
     );
   });
 });

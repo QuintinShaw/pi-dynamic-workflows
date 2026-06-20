@@ -15,7 +15,7 @@ import type { Static, TSchema } from "typebox";
 import { Check, Convert } from "typebox/value";
 import { type AgentHistoryEntry, compactAgentHistory } from "./agent-history.js";
 import { applyToolPolicy } from "./agent-registry.js";
-import { WorkflowError, WorkflowErrorCode } from "./errors.js";
+import { classifyProviderLimit, WorkflowError, WorkflowErrorCode } from "./errors.js";
 import { loadModelTierConfig, type ModelTierConfig, resolveTierModel } from "./model-tier-config.js";
 import { createStructuredOutputTool, type StructuredOutputCapture } from "./structured-output.js";
 
@@ -60,6 +60,40 @@ export function extractValidated<T>(text: string, schema: TSchema): T | undefine
     // typebox can throw on exotic schemas; treat as no match.
   }
   return undefined;
+}
+
+/**
+ * The last assistant message's terminal metadata (stopReason/errorMessage). The pi
+ * SDK does NOT throw provider usage/quota limits — it records them as an assistant
+ * message with stopReason "error" and an errorMessage. This is the only place that
+ * metadata is observable to the workflow layer.
+ */
+export function lastAssistantError(messages: unknown[]): { stopReason?: string; errorMessage?: string } | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i] as Partial<AssistantMessage> | undefined;
+    if (message?.role !== "assistant") continue;
+    return { stopReason: message.stopReason, errorMessage: message.errorMessage };
+  }
+  return undefined;
+}
+
+/**
+ * If the subagent's turn ended in a provider usage/quota/rate-limit error, throw a
+ * PROVIDER_USAGE_LIMIT WorkflowError carrying the real provider message + reset hint.
+ * Gated on stopReason === "error" so a successful turn whose text merely mentions
+ * "rate limit" is never misclassified. recoverable:false so the run checkpoints
+ * (paused) rather than being retried into the same wall or collapsed to a silent null.
+ */
+export function throwIfProviderLimit(messages: unknown[], label?: string): void {
+  const err = lastAssistantError(messages);
+  if (err?.stopReason !== "error") return;
+  const { matched, resetHint } = classifyProviderLimit(err.errorMessage);
+  if (!matched) return;
+  throw new WorkflowError(
+    err.errorMessage ?? "Provider usage/quota limit reached",
+    WorkflowErrorCode.PROVIDER_USAGE_LIMIT,
+    { recoverable: false, agentLabel: label, resetHint },
+  );
 }
 
 /** Minimal session surface resolveStructuredOutput needs (real session or a test double). */
@@ -108,6 +142,10 @@ export async function resolveStructuredOutput<T>(
     );
     return extracted;
   }
+
+  // A repair re-prompt can itself hit the provider limit. Surface that as the real
+  // (recoverable) cause instead of the misleading non-recoverable SCHEMA_NONCOMPLIANCE.
+  throwIfProviderLimit(session.messages, options.label);
 
   throw new WorkflowError(
     "Subagent did not produce valid structured_output after repair attempts",
@@ -370,6 +408,12 @@ export class WorkflowAgent {
 
       await session.prompt(this.buildPrompt(prompt, options as AgentRunOptions<any>, Boolean(options.schema)));
       if (options.signal?.aborted) throw new Error("Subagent was aborted");
+
+      // The SDK buries a provider usage/quota limit in the assistant message rather
+      // than throwing; detect it here (before the schema/empty-text branches) so it
+      // is classified as a recoverable checkpoint, not a SCHEMA_NONCOMPLIANCE failure
+      // (schema path) or a silent empty-output null (non-schema path).
+      throwIfProviderLimit(session.messages, options.label);
 
       if (options.schema) {
         return (await resolveStructuredOutput(session, capture, options.schema, options, (m) =>

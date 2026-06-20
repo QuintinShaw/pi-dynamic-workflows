@@ -11,6 +11,12 @@ export enum WorkflowErrorCode {
   AGENT_LIMIT_EXCEEDED = "AGENT_LIMIT_EXCEEDED",
   /** Token budget exhausted. */
   TOKEN_BUDGET_EXHAUSTED = "TOKEN_BUDGET_EXHAUSTED",
+  /**
+   * The provider's subscription/usage/quota/rate limit was hit. Distinct from the
+   * user's self-imposed TOKEN_BUDGET_EXHAUSTED: a provider limit refills on its own,
+   * so the run is checkpointed (paused) and replayed by resume() rather than failed.
+   */
+  PROVIDER_USAGE_LIMIT = "PROVIDER_USAGE_LIMIT",
   /** Script validation failed. */
   SCRIPT_VALIDATION_ERROR = "SCRIPT_VALIDATION_ERROR",
   /** A schema agent never produced valid structured_output (after repair + extraction). */
@@ -30,11 +36,13 @@ export class WorkflowError extends Error {
   readonly recoverable: boolean;
   readonly agentLabel?: string;
   readonly details?: unknown;
+  /** For PROVIDER_USAGE_LIMIT: the provider's human reset hint, e.g. "Resets in ~3h" (verbatim). */
+  readonly resetHint?: string;
 
   constructor(
     message: string,
     code: WorkflowErrorCode,
-    options: { recoverable?: boolean; agentLabel?: string; details?: unknown } = {},
+    options: { recoverable?: boolean; agentLabel?: string; details?: unknown; resetHint?: string } = {},
   ) {
     super(message);
     this.name = "WorkflowError";
@@ -42,11 +50,39 @@ export class WorkflowError extends Error {
     this.recoverable = options.recoverable ?? false;
     this.agentLabel = options.agentLabel;
     this.details = options.details;
+    this.resetHint = options.resetHint;
   }
 }
 
 export function isWorkflowError(error: unknown): error is WorkflowError {
   return error instanceof WorkflowError;
+}
+
+export function isProviderUsageLimit(error: unknown): error is WorkflowError {
+  return isWorkflowError(error) && error.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT;
+}
+
+/**
+ * Detect a provider subscription/usage/quota/rate-limit exhaustion from free-form
+ * error text, and extract the provider's human reset hint when present.
+ *
+ * The pi SDK does NOT throw these — it records them as an assistant message with
+ * stopReason "error" and an errorMessage like "Codex usage limit reached (plus
+ * plan). Resets in ~3h.". Callers reading message metadata MUST gate on
+ * stopReason === "error" before trusting this, so a task whose own output merely
+ * mentions "rate limit" is never misclassified. Patterns mirror the SDK's own
+ * non-retryable-limit table. Deliberately excludes transient overloaded/5xx
+ * errors, which stay recoverable and keep retrying.
+ */
+export function classifyProviderLimit(text: string | undefined): { matched: boolean; resetHint?: string } {
+  if (!text) return { matched: false };
+  const matched =
+    /usage limit|limit reached|insufficient[_\s]?quota|quota exceeded|exceeded your current quota|out of budget|available balance|\bquota\b|rate.?limit|too many requests|\b429\b|GoUsageLimitError|FreeUsageLimitError|\bbilling\b/i.test(
+      text,
+    );
+  if (!matched) return { matched: false };
+  const reset = text.match(/resets?\s+(?:in|at)\s+[^.\n]+/i);
+  return { matched: true, resetHint: reset?.[0]?.trim() };
 }
 
 export function isAbortError(error: unknown): boolean {
@@ -79,6 +115,21 @@ export function wrapError(error: unknown, context?: { agentLabel?: string }): Wo
       WorkflowErrorCode.AGENT_TIMEOUT,
       { recoverable: true, agentLabel: context?.agentLabel },
     );
+  }
+
+  // Defense-in-depth: today the SDK buries provider usage/quota limits in an
+  // assistant message (detected in agent.ts), but a future SDK might throw them.
+  // Classify a thrown limit here too — recoverable:false so the run checkpoints
+  // (paused) instead of being retried into the same wall or silently nulled.
+  if (error instanceof Error) {
+    const limit = classifyProviderLimit(error.message);
+    if (limit.matched) {
+      return new WorkflowError(error.message, WorkflowErrorCode.PROVIDER_USAGE_LIMIT, {
+        recoverable: false,
+        agentLabel: context?.agentLabel,
+        resetHint: limit.resetHint,
+      });
+    }
   }
 
   return new WorkflowError(

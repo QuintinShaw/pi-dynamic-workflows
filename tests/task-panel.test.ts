@@ -235,6 +235,50 @@ describe("installResultDelivery", () => {
     assert.equal(calls.length, 0);
   });
 
+  // ── Paused (usage-limit checkpoint) event ──
+
+  it("delivers a resumable checkpoint message on a usage-limit paused event", () => {
+    const pi = createMockPi();
+    const manager = createMockManager(makeRun());
+
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    manager.emit("paused", {
+      runId: "test-run-1",
+      reason: "usage_limit",
+      error: { message: "Codex usage limit reached (plus plan)." },
+      resetHint: "Resets in ~3h",
+    });
+
+    const calls = (pi as unknown as { _calls: { content: string }[] })._calls;
+    assert.equal(calls.length, 1);
+    assert.ok(calls[0].content.includes("paused"), "should say paused");
+    assert.ok(calls[0].content.includes("/workflows resume test-run-1"), "should name the resume command");
+    assert.ok(calls[0].content.includes("Resets in ~3h"), "should include the reset hint");
+    assert.ok(!calls[0].content.includes("failed"), "should not say failed");
+  });
+
+  it("ignores a manual pause (no reason) — no delivery", () => {
+    const pi = createMockPi();
+    const manager = createMockManager(makeRun());
+
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    manager.emit("paused", { runId: "test-run-1" });
+
+    const calls = (pi as unknown as { _calls: { content: string }[] })._calls;
+    assert.equal(calls.length, 0);
+  });
+
+  it("skips usage-limit pause delivery for foreground runs", () => {
+    const pi = createMockPi();
+    const manager = createMockManager(makeRun({ background: false }));
+
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    manager.emit("paused", { runId: "test-run-1", reason: "usage_limit", error: { message: "usage limit" } });
+
+    const calls = (pi as unknown as { _calls: { content: string }[] })._calls;
+    assert.equal(calls.length, 0);
+  });
+
   // ── Holder refresh on re-call ──
 
   it("refreshes holder.pi on second call for stale ctx recovery", () => {

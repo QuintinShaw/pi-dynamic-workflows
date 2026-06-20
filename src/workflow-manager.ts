@@ -383,16 +383,32 @@ export class WorkflowManager extends EventEmitter {
               { recoverable: true },
             );
 
+      const usageLimitPaused =
+        !managed.controller.signal.aborted && workflowError.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT;
       if (managed.controller.signal.aborted) {
         // Intentional abort (pause/stop/Esc) — preserve status set by pause()/stop()
         if (managed.status === "running") {
           managed.status = "aborted";
         }
+      } else if (usageLimitPaused) {
+        // Provider quota/usage limit: NOT a failure. Checkpoint the run as paused so
+        // the persisted journal (completed agent results) is replayed by resume()
+        // once the budget refills — instead of the user starting from scratch.
+        managed.status = "paused";
       } else {
         managed.status = "failed";
       }
       managed.error = workflowError;
-      this.emit("error", { runId: managed.runId, error: workflowError });
+      if (usageLimitPaused) {
+        this.emit("paused", {
+          runId: managed.runId,
+          reason: "usage_limit",
+          error: workflowError,
+          resetHint: workflowError.resetHint,
+        });
+      } else {
+        this.emit("error", { runId: managed.runId, error: workflowError });
+      }
 
       // Persist final state
       this.persistRun(managed);
@@ -420,6 +436,16 @@ export class WorkflowManager extends EventEmitter {
         sessionId: this.sessionId,
         journal: managed.journal,
         status: managed.status,
+        // Why a usage-limit pause happened, so the navigator / a future cold start
+        // can show it and (eventually) re-arm resume after the budget refills.
+        pauseReason:
+          managed.status === "paused" && managed.error?.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT
+            ? "usage_limit"
+            : undefined,
+        resetHint:
+          managed.status === "paused" && managed.error?.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT
+            ? managed.error.resetHint
+            : undefined,
         phases: managed.snapshot.phases,
         currentPhase: managed.snapshot.currentPhase,
         agents: managed.snapshot.agents.map((a) => ({

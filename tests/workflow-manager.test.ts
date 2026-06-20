@@ -842,6 +842,81 @@ return { a, b }`;
 );
 
 test(
+  "a provider usage limit pauses the run (not failed) and is resumable, replaying the journal",
+  withTempCwd(async (cwd) => {
+    let limitActive = true;
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt: string) {
+          if (prompt.includes("second") && limitActive) {
+            throw new WorkflowError(
+              "Codex usage limit reached (plus plan). Resets in ~3h.",
+              WorkflowErrorCode.PROVIDER_USAGE_LIMIT,
+              { recoverable: false, resetHint: "Resets in ~3h" },
+            );
+          }
+          return prompt.includes("first") ? "first-result" : "second-result";
+        },
+      },
+    });
+    const pausedEvents: Array<{ runId: string; reason?: string; resetHint?: string }> = [];
+    manager.on("paused", (e: { runId: string; reason?: string; resetHint?: string }) => pausedEvents.push(e));
+
+    const twoAgentScript = `export const meta = { name: 'quota_demo', description: 'two agents' }
+const a = await agent('first', { label: 'first' })
+const b = await agent('second', { label: 'second' })
+return { a, b }`;
+
+    const { runId, promise } = manager.startInBackground(twoAgentScript);
+    await promise.catch(() => {}); // settles: rejects with PROVIDER_USAGE_LIMIT
+
+    // The run is checkpointed as paused, not failed.
+    assert.equal(manager.getRun(runId)?.status, "paused");
+    const persisted = manager.listRuns().find((r) => r.runId === runId);
+    assert.equal(persisted?.status, "paused");
+    assert.equal(persisted?.pauseReason, "usage_limit");
+    assert.equal(persisted?.resetHint, "Resets in ~3h");
+    assert.ok((persisted?.journal?.length ?? 0) >= 1, "agent 1's result should be journaled");
+
+    // A 'paused' event with reason usage_limit fired (not 'error').
+    assert.equal(pausedEvents.length, 1);
+    assert.equal(pausedEvents[0].reason, "usage_limit");
+    assert.equal(pausedEvents[0].resetHint, "Resets in ~3h");
+
+    // After the budget refills, resume replays agent 1 and runs agent 2 live to completion.
+    limitActive = false;
+    const resumed = await manager.resume(runId);
+    assert.equal(resumed, true);
+    await new Promise((r) => setTimeout(r, 50));
+    const finalRun = manager.getRun(runId);
+    assert.equal(finalRun?.status, "completed", "resumed run completes once the limit clears");
+    assert.equal(finalRun?.result?.result?.a, "first-result");
+    assert.equal(finalRun?.result?.result?.b, "second-result");
+  }),
+);
+
+test(
+  "a non-quota non-recoverable agent error still fails the run (control)",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run() {
+          throw new WorkflowError("schema bad", WorkflowErrorCode.SCHEMA_NONCOMPLIANCE, { recoverable: false });
+        },
+      },
+    });
+    manager.on("error", () => {});
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    await promise.catch(() => {});
+    assert.equal(manager.getRun(runId)?.status, "failed");
+    const persisted = manager.listRuns().find((r) => r.runId === runId);
+    assert.equal(persisted?.pauseReason, undefined, "a real failure carries no usage-limit pause reason");
+  }),
+);
+
+test(
   "resume returns false for completed run",
   withTempCwd(async (cwd) => {
     const manager = new WorkflowManager({ cwd, agent: fakeAgent() });
