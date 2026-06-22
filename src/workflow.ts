@@ -644,8 +644,8 @@ export async function runWorkflow<T = unknown>(
     item: unknown,
     opts: { reviewers?: number; threshold?: number; lens?: string | string[] } = {},
   ) => {
-    const reviewers = Math.max(1, opts.reviewers ?? 2);
-    const threshold = opts.threshold ?? 0.5;
+    const reviewers = Math.max(1, opts.reviewers ?? 3);
+    const threshold = opts.threshold ?? 0.66;
     const lenses = opts.lens ? (Array.isArray(opts.lens) ? opts.lens : [opts.lens]) : [];
     const claim = typeof item === "string" ? item : JSON.stringify(item);
     const votes = (

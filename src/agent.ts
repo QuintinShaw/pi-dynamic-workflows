@@ -459,6 +459,10 @@ export class WorkflowAgent {
 
   private buildPrompt(prompt: string, options: AgentRunOptions<any>, structured: boolean): string {
     const parts = [
+      // Unconditional subagent framing: every worker (schema or not) is told it is a
+      // subagent whose only meaningful output is its returned result, with no parent
+      // conversation or repo context it wasn't explicitly given.
+      "You are a subagent inside a deterministic workflow. The orchestrator does not see this conversation — only your final result is returned to it. Do the work with the tools provided, then return your findings concisely; do not ask the user questions, and do not assume any parent conversation or repository context you weren't given in this prompt.",
       this.instructions,
       options.instructions,
       options.label ? `Task label: ${options.label}` : undefined,
