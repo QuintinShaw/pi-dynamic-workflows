@@ -424,6 +424,10 @@ export async function runWorkflow<T = unknown>(
       options.onAgentStart?.({ label, phase: assignedPhase, prompt, model: displayModel });
 
       // Optional per-agent worktree isolation (deterministic name -> stable resume keys).
+      // Precedence: explicit call-site isolation > agentDef isolation.
+      // Note: passing { isolation: undefined } falls through ?? to the def's value — there
+      // is no sentinel to suppress a def's isolation at the call site. Remove the agentType
+      // or override with a def that has no isolation field if opt-out is needed.
       let worktree: Worktree | undefined;
       const resolvedIsolation = agentOptions.isolation ?? agentDef?.isolation;
       if (resolvedIsolation === "worktree") {
@@ -462,7 +466,7 @@ export async function runWorkflow<T = unknown>(
                 label,
                 schema: agentOptions.schema,
                 signal: options.signal,
-                instructions: buildAgentInstructions(assignedPhase, agentOptions, agentDef),
+                instructions: buildAgentInstructions(assignedPhase, agentOptions, agentDef, resolvedIsolation),
                 model: modelSpec,
                 tier: agentOptions.tier,
                 toolNames: agentDef?.tools,
@@ -1063,6 +1067,7 @@ function buildAgentInstructions(
   phase: string | undefined,
   options: AgentOptions,
   def: AgentDefinition | undefined,
+  resolvedIsolation?: "worktree",
 ): string | undefined {
   const lines: string[] = [];
   // A resolved agentType binds a real role prompt (the definition body). Only
@@ -1070,7 +1075,9 @@ function buildAgentInstructions(
   if (def?.prompt) lines.push(def.prompt);
   else if (options.agentType) lines.push(`Act as workflow subagent type: ${options.agentType}`);
   if (phase) lines.push(`Workflow phase: ${phase}`);
-  if (options.isolation) lines.push(`Requested isolation: ${options.isolation}`);
+  // Use resolvedIsolation so the annotation fires whether isolation came from
+  // the call site or from the agentDef's isolation field.
+  if (resolvedIsolation) lines.push(`Requested isolation: ${resolvedIsolation}`);
   // Note: options.model is applied for real via the session, not injected as prose.
   return lines.length ? lines.join("\n\n") : undefined;
 }
