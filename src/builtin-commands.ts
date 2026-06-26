@@ -1,11 +1,12 @@
 /**
  * Bundled workflow commands: `/deep-research`, `/adversarial-review`,
- * `/multi-perspective`, and `/codebase-audit`.
+ * `/code-review`, `/multi-perspective`, and `/codebase-audit`.
  * They run a generated workflow script and print the final report.
  */
 
 import { createCodingTools, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { generateAdversarialReviewWorkflow, generateMultiPerspectiveWorkflow } from "./adversarial-review.js";
+import { generateCodeReviewWorkflow } from "./code-review.js";
 import { generateCodebaseAuditWorkflow, generateDeepResearchWorkflow } from "./deep-research.js";
 import { createWebTools } from "./web-tools.js";
 import { runWorkflow, type WorkflowRunResult } from "./workflow.js";
@@ -80,6 +81,29 @@ export function registerBuiltinWorkflows(pi: ExtensionAPI, opts: { cwd: string }
         } catch (error) {
           ctx.ui.setStatus("adversarial-review", undefined);
           ctx.ui.notify(`adversarial-review failed: ${error instanceof Error ? error.message : error}`, "error");
+        }
+      },
+    });
+  }
+
+  if (!alreadyRegistered(pi, "code-review")) {
+    pi.registerCommand("code-review", {
+      description: "Run a 7-angle parallel code review with adversarial verification against a diff or path",
+      async handler(args: string, ctx: ExtensionCommandContext) {
+        const target = args.trim() || ".";
+        ctx.ui.notify("Reviewing code across 7 parallel angles…", "info");
+        try {
+          const result = await runWorkflow(generateCodeReviewWorkflow(), {
+            cwd,
+            args: { target },
+            tools: createCodingTools(cwd),
+            onPhase: (title) => ctx.ui.setStatus("code-review", `review: ${title}`),
+          });
+          ctx.ui.setStatus("code-review", undefined);
+          await pi.sendMessage({ customType: "code-review", content: reportText(result), display: true });
+        } catch (error) {
+          ctx.ui.setStatus("code-review", undefined);
+          ctx.ui.notify(`code-review failed: ${error instanceof Error ? error.message : error}`, "error");
         }
       },
     });

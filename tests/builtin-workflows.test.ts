@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { generateAdversarialReviewWorkflow, generateMultiPerspectiveWorkflow } from "../src/adversarial-review.js";
+import { generateCodeReviewWorkflow } from "../src/code-review.js";
 import { generateCodebaseAuditWorkflow, generateDeepResearchWorkflow } from "../src/deep-research.js";
 import { createWebTools } from "../src/web-tools.js";
 import { parseWorkflowScript } from "../src/workflow.js";
@@ -41,6 +42,34 @@ test("generateAdversarialReviewWorkflow phases are Investigate, Refute, Consensu
     meta.phases?.map((p) => p.title),
     ["Investigate", "Refute", "Consensus"],
   );
+});
+
+// ─── Code Review ────────────────────────────────────────────────────────────────
+
+test("generateCodeReviewWorkflow produces a valid, parseable script", () => {
+  const { meta, body } = parseWorkflowScript(generateCodeReviewWorkflow());
+  assert.equal(meta.name, "code_review");
+  assert.deepEqual(
+    meta.phases?.map((p) => p.title),
+    ["Gather", "Angles", "Verify", "Report"],
+  );
+  assert.match(body, /args && args\.target/);
+  assert.match(body, /parallel\(/);
+  assert.match(body, /!gathered \|\| !gathered\.diff/);
+});
+
+test("generateCodeReviewWorkflow contains the 7 review angles and verifier verdicts", () => {
+  const body = generateCodeReviewWorkflow();
+  assert.match(body, /angle-A/);
+  assert.match(body, /angle-B/);
+  assert.match(body, /angle-C/);
+  assert.match(body, /angle-D/);
+  assert.match(body, /angle-E/);
+  assert.match(body, /angle-F/);
+  assert.match(body, /angle-G/);
+  assert.match(body, /CONFIRMED/);
+  assert.match(body, /PLAUSIBLE/);
+  assert.match(body, /REFUTED/);
 });
 
 // ─── Codebase Audit ─────────────────────────────────────────────────────────────
