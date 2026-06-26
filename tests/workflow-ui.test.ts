@@ -660,3 +660,153 @@ test("renderNavigator footer hint changes based on item under cursor", () => {
   assert.notEqual(savedText.indexOf("x delete"), -1, "saved item should show x delete");
   assert.equal(savedText.indexOf("x stop"), -1, "saved item should NOT show x stop");
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Issue #6: Search/filter
+// ═══════════════════════════════════════════════════════════════════════════
+
+test("keyToAction '/' in runs view returns filter action", () => {
+  assert.deepEqual(keyToAction("/", "runs"), { type: "filter" });
+});
+
+test("keyToAction '/' outside runs view returns none", () => {
+  assert.deepEqual(keyToAction("/", "phases"), { type: "none" });
+  assert.deepEqual(keyToAction("/", "savedDetail"), { type: "none" });
+});
+
+test("renderNavigator shows filter indicator when filterText is set", () => {
+  const model = new NavigatorModel(fakeManager(), savedStorage());
+  const state = new NavigatorState();
+  state.filterText = "audi";
+  state.filterActive = false;
+
+  const text = renderNavigator(state, model, 80).join("\n");
+  assert.match(text, /Filter: audi/);
+});
+
+test("renderNavigator shows filter indicator when filterActive is true", () => {
+  const model = new NavigatorModel(fakeManager(), savedStorage());
+  const state = new NavigatorState();
+  state.filterActive = true;
+
+  const text = renderNavigator(state, model, 80).join("\n");
+  assert.match(text, /Filter:/);
+});
+
+test("renderNavigator filters runs by name when filterText is set", () => {
+  const model = new NavigatorModel(fakeManager(), savedStorage());
+  const state = new NavigatorState();
+  state.filterText = "audit";
+
+  const lines = renderNavigator(state, model, 80);
+  const text = lines.join("\n");
+  assert.match(text, /audit/); // the matching run
+  // saved items should be filtered out since they don't match "audit"
+  assert.ok(!text.includes("❯ deploy"), "deploy saved should not appear");
+  assert.ok(!text.includes("❯ analyze"), "analyze saved should not appear");
+});
+
+test("renderNavigator filters saved workflows by name when filterText is set", () => {
+  const model = new NavigatorModel(fakeManager(), savedStorage());
+  const state = new NavigatorState();
+  state.filterText = "deploy";
+
+  const text = renderNavigator(state, model, 80).join("\n");
+  assert.match(text, /deploy/);
+  // "audit" run should still show because we search runs separately
+  assert.ok(!text.includes("analyze"), "analyze should not appear when filtering for deploy");
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Issue #7: Rename
+// ═══════════════════════════════════════════════════════════════════════════
+
+test("keyToAction 'n' on savedDetail returns rename action", () => {
+  assert.deepEqual(keyToAction("n", "savedDetail"), { type: "rename" });
+});
+
+test("keyToAction 'n' on saved item in runs view returns rename action", () => {
+  assert.deepEqual(keyToAction("n", "runs", "saved"), { type: "rename" });
+});
+
+test("keyToAction 'n' on run item returns none", () => {
+  assert.deepEqual(keyToAction("n", "runs", "run"), { type: "none" });
+  assert.deepEqual(keyToAction("n", "phases"), { type: "none" });
+});
+
+test("renderNavigator shows rename prompt when inputMode is set", () => {
+  const model = new NavigatorModel(fakeManager(), savedStorage());
+  const state = new NavigatorState();
+  state.inputMode = { type: "rename", buffer: "newname", target: "deploy" };
+
+  const text = renderNavigator(state, model, 80).join("\n");
+  assert.match(text, /Rename to: newname/);
+  assert.match(text, /enter confirm/);
+  assert.match(text, /esc cancel/);
+});
+
+test("renderNavigator savedDetail footer shows 'n rename'", () => {
+  const model = new NavigatorModel(fakeManager(), savedStorage());
+  const state = new NavigatorState();
+  state.cursor = 1;
+  state.drill(model);
+  assert.equal(state.kind, "savedDetail");
+
+  const text = renderNavigator(state, model, 80).join("\n");
+  assert.match(text, /n rename/);
+});
+
+test("NavigatorModel renameSaved delegates to storage", () => {
+  let renamedOld: string | undefined;
+  let renamedNew: string | undefined;
+  const storage = {
+    list: () => [] as SavedWorkflow[],
+    delete: () => true,
+    rename: (oldName: string, newName: string) => {
+      renamedOld = oldName;
+      renamedNew = newName;
+      return true;
+    },
+  };
+  const model = new NavigatorModel(fakeManager(), storage);
+  const result = model.renameSaved("foo", "bar");
+  assert.equal(result, true);
+  assert.equal(renamedOld, "foo");
+  assert.equal(renamedNew, "bar");
+});
+
+test("NavigatorModel renameSaved returns false when no storage", () => {
+  const model = new NavigatorModel(fakeManager());
+  assert.equal(model.renameSaved("foo", "bar"), false);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Issue #8: Confirmation dialogs
+// ═══════════════════════════════════════════════════════════════════════════
+
+test("renderNavigator footer shows pending confirm message for deleteSaved", () => {
+  const model = new NavigatorModel(fakeManager(), savedStorage());
+  const state = new NavigatorState();
+  state.pendingConfirm = { action: "deleteSaved", label: "deploy" };
+
+  const text = renderNavigator(state, model, 80).join("\n");
+  assert.match(text, /x confirm delete \/deploy/);
+  assert.match(text, /any other key cancel/);
+});
+
+test("renderNavigator footer shows pending confirm message for stop", () => {
+  const model = new NavigatorModel(fakeManager());
+  const state = new NavigatorState();
+  state.pendingConfirm = { action: "stop", label: "run-1" };
+
+  const text = renderNavigator(state, model, 80).join("\n");
+  assert.match(text, /x confirm stop run-1/);
+  assert.match(text, /any other key cancel/);
+});
+
+test("renderNavigator runs footer shows '/ filter' hint", () => {
+  const model = new NavigatorModel(fakeManager());
+  const state = new NavigatorState();
+  const text = renderNavigator(state, model, 80).join("\n");
+  assert.match(text, /\/ filter/);
+});

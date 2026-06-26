@@ -278,6 +278,81 @@ test(
 );
 
 test(
+  "createWorkflowStorage rename moves a project workflow to a new name",
+  withIsolatedHome(async (cwd) => {
+    const storage = createWorkflowStorage(cwd);
+    storage.save({ name: "original", description: "orig", script: "orig script" });
+
+    const result = storage.rename("original", "renamed");
+    assert.equal(result, true, "rename should return true");
+
+    assert.equal(storage.load("original"), null, "old name should not exist");
+    const loaded = storage.load("renamed");
+    assert.ok(loaded, "new name should be loadable");
+    assert.equal(loaded?.name, "renamed");
+    assert.equal(loaded?.script, "orig script");
+  }),
+);
+
+test(
+  "createWorkflowStorage rename returns false for nonexistent workflow",
+  withIsolatedHome(async (cwd) => {
+    const storage = createWorkflowStorage(cwd);
+    assert.equal(storage.rename("no-such", "new-name"), false);
+  }),
+);
+
+test(
+  "createWorkflowStorage rename returns false when new name already exists",
+  withIsolatedHome(async (cwd) => {
+    const storage = createWorkflowStorage(cwd);
+    storage.save({ name: "wf-a", description: "a", script: "a" });
+    storage.save({ name: "wf-b", description: "b", script: "b" });
+
+    const result = storage.rename("wf-a", "wf-b");
+    assert.equal(result, false, "should not overwrite existing workflow");
+    // Both should still exist
+    assert.ok(storage.load("wf-a"), "original should still exist");
+    assert.ok(storage.load("wf-b"), "target should still exist unchanged");
+  }),
+);
+
+test(
+  "createWorkflowStorage rename returns false when old and new names are the same",
+  withIsolatedHome(async (cwd) => {
+    const storage = createWorkflowStorage(cwd);
+    storage.save({ name: "same", description: "s", script: "s" });
+    assert.equal(storage.rename("same", "same"), false);
+  }),
+);
+
+test(
+  "createWorkflowStorage rename rejects unsafe names",
+  withIsolatedHome(async (cwd) => {
+    const storage = createWorkflowStorage(cwd);
+    storage.save({ name: "valid", description: "v", script: "v" });
+    assert.equal(storage.rename("valid", "../escape"), false, "should reject unsafe new name");
+    assert.equal(storage.rename("../escape", "valid"), false, "should reject unsafe old name");
+  }),
+);
+
+test(
+  "createWorkflowStorage rename works for user-location workflows",
+  withIsolatedHome(async (cwd) => {
+    const storage = createWorkflowStorage(cwd);
+    storage.save({ name: "user-wf", description: "u", script: "u script" }, "user");
+
+    const result = storage.rename("user-wf", "user-wf-renamed");
+    assert.equal(result, true);
+    assert.equal(storage.load("user-wf"), null);
+    const loaded = storage.load("user-wf-renamed");
+    assert.ok(loaded);
+    assert.equal(loaded?.location, "user");
+    assert.equal(loaded?.script, "u script");
+  }),
+);
+
+test(
   "createWorkflowStorage skips legacy files with unsafe workflow names",
   withIsolatedHome(async (cwd) => {
     const storage = createWorkflowStorage(cwd);

@@ -32,6 +32,8 @@ export interface WorkflowStorage {
   list(): SavedWorkflow[];
   /** Delete a saved workflow. */
   delete(name: string, location?: "project" | "user"): boolean;
+  /** Rename a saved workflow. Returns true if renamed, false if not found or name conflicts. */
+  rename(oldName: string, newName: string, location?: "project" | "user"): boolean;
 }
 
 export function isSafeSavedWorkflowName(name: string): boolean {
@@ -166,6 +168,27 @@ export function createWorkflowStorage(cwd: string): WorkflowStorage {
       }
 
       return deleted;
+    },
+
+    rename(oldName: string, newName: string, location?: "project" | "user"): boolean {
+      if (!isSafeSavedWorkflowName(oldName) || !isSafeSavedWorkflowName(newName)) return false;
+      if (oldName === newName) return false;
+      const locs = location ? [location] : (["project", "user"] as const);
+      for (const loc of locs) {
+        const path = workflowPath(oldName, loc);
+        const wf = loadFromFile(path, loc);
+        if (!wf) continue;
+        // Check new name not already taken in either location
+        const newPath = workflowPath(newName, loc);
+        if (existsSync(newPath)) return false;
+        const dir = loc === "project" ? projectDir : userDir;
+        ensureDir(dir);
+        const renamed: SavedWorkflow = { ...wf, name: newName, path: newPath };
+        writeFileSync(newPath, JSON.stringify(renamed, null, 2));
+        unlinkSync(path);
+        return true;
+      }
+      return false;
     },
   };
 }

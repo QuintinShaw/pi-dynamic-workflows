@@ -87,7 +87,11 @@ export function shortModel(model: string | undefined): string | undefined {
 export class NavigatorModel {
   constructor(
     private readonly manager: Pick<WorkflowManager, "listRuns" | "getRun">,
-    private readonly storage?: { list(): SavedWorkflow[]; delete(name: string, location?: string): boolean },
+    private readonly storage?: {
+      list(): SavedWorkflow[];
+      delete(name: string, location?: string): boolean;
+      rename(oldName: string, newName: string): boolean;
+    },
   ) {}
 
   private snapshot(runId: string): { snapshot: WorkflowSnapshot; status: string } | undefined {
@@ -124,6 +128,12 @@ export class NavigatorModel {
   deleteSaved(name: string): boolean {
     if (!this.storage) return false;
     return this.storage.delete(name);
+  }
+
+  /** Rename a saved workflow. Returns true if successful. */
+  renameSaved(oldName: string, newName: string): boolean {
+    if (!this.storage) return false;
+    return this.storage.rename(oldName, newName);
   }
 
   runName(runId: string): string {
@@ -211,6 +221,10 @@ function persistedToSnapshot(p: PersistedRunState): WorkflowSnapshot {
 export class NavigatorState {
   private stack: StackFrame[] = [{ kind: "runs", cursor: 0 }];
   scroll = 0;
+  filterText = "";
+  filterActive = false;
+  inputMode?: { type: "rename"; buffer: string; target: string };
+  pendingConfirm?: { action: "deleteSaved" | "stop"; label: string };
 
   private top(): StackFrame {
     return this.stack[this.stack.length - 1];
@@ -361,29 +375,45 @@ export function renderNavigator(
   if (state.kind === "runs") {
     const runs = model.runs();
     const saved = model.saved();
+    const filterLower = state.filterText.toLowerCase();
+    const filteredRuns = filterLower
+      ? runs.filter((r) => r.name.toLowerCase().includes(filterLower) || r.runId.toLowerCase().includes(filterLower))
+      : runs;
+    const filteredSaved = filterLower
+      ? saved.filter(
+          (w) =>
+            w.name.toLowerCase().includes(filterLower) || (w.description ?? "").toLowerCase().includes(filterLower),
+        )
+      : saved;
     const total = runs.length + saved.length;
     state.clamp(total);
     lines.push(theme.bold("Workflows"));
+    if (state.filterActive || state.filterText) {
+      lines.push(dim(`  Filter: ${state.filterText}█`));
+    }
     if (total === 0) {
       lines.push(dim("  No runs yet. Start one with a background workflow."));
     }
     // Render runs
-    runs.forEach((r, i) => {
+    filteredRuns.forEach((r, _i) => {
+      const origIdx = runs.indexOf(r);
       const icon = STATUS_ICON[r.status] ?? "?";
       const meta = [`${r.done}/${r.total}`, fmtTokens(r.tokens), r.cost > 0 ? `$${r.cost.toFixed(4)}` : ""]
         .filter(Boolean)
         .join(" · ");
-      lines.push(sel(i, `${icon} ${r.name}  ${dim(`${r.runId} · ${r.status} · ${meta}`)}`));
+      lines.push(sel(origIdx, `${icon} ${r.name}  ${dim(`${r.runId} · ${r.status} · ${meta}`)}`));
     });
     // Render saved workflows after a separator
-    if (saved.length > 0) {
-      const sepOffset = runs.length;
-      if (runs.length > 0) lines.push(dim("  ── saved ──"));
-      saved.forEach((w, i) => {
+    if (filteredSaved.length > 0) {
+      if (filteredRuns.length > 0) lines.push(dim("  ── saved ──"));
+      filteredSaved.forEach((w) => {
+        const origIdx = runs.length + saved.indexOf(w);
         const loc = w.location === "user" ? "~" : ".";
         const desc = w.description ? dim(`  ${w.description}`) : "";
-        lines.push(sel(sepOffset + i, `${w.name}${desc}  ${dim(loc)}`));
+        lines.push(sel(origIdx, `${w.name}${desc}  ${dim(loc)}`));
       });
+    } else if (saved.length > 0 && filterLower) {
+      // Have saved items but all filtered out — still show separator if runs are shown
     }
   } else if (state.kind === "phases" && state.runId) {
     const phases = model.phases(state.runId);
@@ -440,6 +470,11 @@ export function renderNavigator(
     }
   }
 
+  if (state.inputMode?.type === "rename") {
+    lines.push("");
+    lines.push(dim(`  Rename to: ${state.inputMode.buffer}█  (enter confirm · esc cancel)`));
+  }
+
   lines.push("");
   lines.push(footerHint(state, model, theme));
   return lines;
@@ -453,21 +488,28 @@ function historyLabel(entry: NonNullable<WorkflowAgentSnapshot["history"]>[numbe
 }
 
 function footerHint(state: NavigatorState, model: NavigatorModel, theme: ThemeLike): string {
+  if (state.pendingConfirm) {
+    const msg =
+      state.pendingConfirm.action === "deleteSaved"
+        ? `delete /${state.pendingConfirm.label}`
+        : `stop ${state.pendingConfirm.label}`;
+    return theme.fg("dim", `x confirm ${msg} · any other key cancel`);
+  }
   const parts: string[] = [];
   switch (state.kind) {
     case "detail":
       parts.push("j/k scroll", "esc back");
       break;
     case "savedDetail":
-      parts.push("j/k scroll", "esc back", "x delete");
+      parts.push("j/k scroll", "esc back", "n rename", "x delete");
       break;
     case "runs": {
       const itemKind = model.saved().length > 0 ? state.itemKindAt(model, state.cursor) : "run";
-      parts.push("↑/↓ select", "enter open", "esc back");
+      parts.push("↑/↓ select", "enter open", "/ filter", "esc back");
       if (itemKind === "run") {
         parts.push("p pause", "x stop", "r restart", "s save");
       } else {
-        parts.push("x delete");
+        parts.push("n rename", "x delete");
       }
       parts.push("q quit");
       break;
@@ -493,6 +535,8 @@ export type NavAction =
   | { type: "restart" }
   | { type: "save" }
   | { type: "deleteSaved" }
+  | { type: "filter" }
+  | { type: "rename" }
   | { type: "none" };
 
 export function keyToAction(keyId: string | undefined, kind: ViewKind, itemKind?: "run" | "saved"): NavAction {
@@ -526,6 +570,12 @@ export function keyToAction(keyId: string | undefined, kind: ViewKind, itemKind?
     case "s":
       if (itemKind === "saved") return { type: "none" };
       return { type: "save" };
+    case "/":
+      if (kind === "runs") return { type: "filter" };
+      return { type: "none" };
+    case "n":
+      if (kind === "savedDetail" || itemKind === "saved") return { type: "rename" };
+      return { type: "none" };
     default:
       return { type: "none" };
   }
@@ -571,6 +621,83 @@ export function openWorkflowNavigator(
       };
 
       const act = (data: string) => {
+        // Filter input mode
+        if (state.filterActive) {
+          const key = parseKey(data);
+          if (key === "escape" || key === "esc") {
+            state.filterText = "";
+            state.filterActive = false;
+            state.clamp(currentCount(state, model));
+            rerender();
+            return;
+          }
+          if (key === "backspace" || key === "delete") {
+            state.filterText = state.filterText.slice(0, -1);
+            if (!state.filterText) state.filterActive = false;
+            state.clamp(currentCount(state, model));
+            rerender();
+            return;
+          }
+          if (key === "enter" || key === "return") {
+            state.filterActive = false;
+            rerender();
+            return;
+          }
+          if (data.length === 1 && data >= " ") {
+            state.filterText += data;
+            state.cursor = 0;
+            rerender();
+            return;
+          }
+          rerender();
+          return;
+        }
+
+        // Rename input mode
+        if (state.inputMode?.type === "rename") {
+          const key = parseKey(data);
+          if (key === "escape" || key === "esc") {
+            state.inputMode = undefined;
+            rerender();
+            return;
+          }
+          if (key === "enter" || key === "return") {
+            const newName = state.inputMode.buffer.trim();
+            const oldName = state.inputMode.target;
+            state.inputMode = undefined;
+            if (newName && newName !== oldName) {
+              if (model.renameSaved(oldName, newName)) {
+                ui.notify(`Renamed /${oldName} → /${newName}`, "info");
+                state.back();
+              } else {
+                ui.notify(`Could not rename — name may already be taken`, "warning");
+              }
+            }
+            rerender();
+            return;
+          }
+          if (key === "backspace" || key === "delete") {
+            state.inputMode.buffer = state.inputMode.buffer.slice(0, -1);
+            rerender();
+            return;
+          }
+          if (data.length === 1 && data >= " ") {
+            state.inputMode.buffer += data;
+            rerender();
+            return;
+          }
+          rerender();
+          return;
+        }
+
+        // Clear any pending confirmation if the user presses a non-confirming key
+        const parsedKey = parseKey(data);
+        if (state.pendingConfirm && parsedKey !== "x") {
+          state.pendingConfirm = undefined;
+          rerender();
+          return;
+        }
+
         const itemKind = state.kind === "runs" ? state.itemKindAt(model, state.cursor) : undefined;
         const action = keyToAction(parseKey(data), state.kind, itemKind);
         switch (action.type) {
@@ -591,19 +718,27 @@ export function openWorkflowNavigator(
             done(undefined);
             return;
           case "deleteSaved": {
+            let targetName: string | undefined;
             if (state.kind === "runs") {
               const saved = model.saved();
               const runCount = model.runs().length;
               const item = saved[state.cursor - runCount];
-              if (item) {
-                model.deleteSaved(item.name);
-                ui.notify(`Deleted /${item.name}`, "info");
-              }
+              targetName = item?.name;
             } else if (state.kind === "savedDetail" && state.savedName) {
-              model.deleteSaved(state.savedName);
-              ui.notify(`Deleted /${state.savedName}`, "info");
-              state.back();
+              targetName = state.savedName;
             }
+            if (!targetName) break;
+            if (!state.pendingConfirm) {
+              state.pendingConfirm = { action: "deleteSaved", label: targetName };
+              ui.notify(`Press x again to delete /${targetName}`, "warning");
+              rerender();
+              return;
+            }
+            // Confirmed — execute
+            state.pendingConfirm = undefined;
+            model.deleteSaved(targetName);
+            ui.notify(`Deleted /${targetName}`, "info");
+            if (state.kind === "savedDetail") state.back();
             break;
           }
           case "pause": {
@@ -613,8 +748,38 @@ export function openWorkflowNavigator(
           }
           case "stop": {
             const id = state.activeRunId(model);
-            if (id) ui.notify(manager.stop(id) ? `Stopped ${id}` : `Cannot stop ${id}`, "info");
+            if (!id) break;
+            if (!state.pendingConfirm) {
+              state.pendingConfirm = { action: "stop", label: id };
+              ui.notify(`Press x again to stop ${id}`, "warning");
+              rerender();
+              return;
+            }
+            state.pendingConfirm = undefined;
+            ui.notify(manager.stop(id) ? `Stopped ${id}` : `Cannot stop ${id}`, "info");
             break;
+          }
+          case "filter":
+            if (state.kind === "runs") {
+              state.filterActive = true;
+              rerender();
+            }
+            return;
+          case "rename": {
+            let targetName: string | undefined;
+            if (state.kind === "savedDetail" && state.savedName) {
+              targetName = state.savedName;
+            } else if (state.kind === "runs") {
+              const saved = model.saved();
+              const runCount = model.runs().length;
+              const item = saved[state.cursor - runCount];
+              targetName = item?.name;
+            }
+            if (targetName) {
+              state.inputMode = { type: "rename", buffer: targetName, target: targetName };
+            }
+            rerender();
+            return;
           }
           case "restart": {
             const id = state.activeRunId(model);
