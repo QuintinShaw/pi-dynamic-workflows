@@ -119,7 +119,21 @@ The same model — on Pi, plus the production pieces a real run needs:
 
 /deep-research <question>   web-researched, source-cross-checked report
 /adversarial-review <task>  findings vetted by skeptical reviewers
+/multi-perspective "<topic>" [angle …]
+                            analyze a topic from several independent angles, then synthesize
+/codebase-audit <scope> "<check>" …
+                            run parallel checks over a scope, then cross-validate and report
 ```
+
+`/multi-perspective` and `/codebase-audit` take quoted arguments so a topic or check can be multiple words:
+
+```
+/multi-perspective "should we use Redis or Postgres for session storage"
+/multi-perspective "JWT vs session cookies" security scalability developer-experience
+/codebase-audit src/ "missing error handling" "unused exports" "inconsistent naming"
+```
+
+`/multi-perspective` needs a topic; with fewer than two angles it defaults to `technical, product, security, user experience, maintainability`. `/codebase-audit` needs a scope and at least one check.
 
 In the navigator: `↑/↓` select · `enter`/`→` open · `esc`/`←` back · `p` pause · `x` stop · `r` restart · `s` save · `q` quit. Each agent shows the model it ran on; the detail view shows its prompt, result, error diagnostics, and compact message/tool history.
 

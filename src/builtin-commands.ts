@@ -1,11 +1,12 @@
 /**
- * Bundled workflow commands: `/deep-research` and `/adversarial-review`.
+ * Bundled workflow commands: `/deep-research`, `/adversarial-review`,
+ * `/multi-perspective`, and `/codebase-audit`.
  * They run a generated workflow script and print the final report.
  */
 
 import { createCodingTools, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { generateAdversarialReviewWorkflow } from "./adversarial-review.js";
-import { generateDeepResearchWorkflow } from "./deep-research.js";
+import { generateAdversarialReviewWorkflow, generateMultiPerspectiveWorkflow } from "./adversarial-review.js";
+import { generateCodebaseAuditWorkflow, generateDeepResearchWorkflow } from "./deep-research.js";
 import { createWebTools } from "./web-tools.js";
 import { runWorkflow, type WorkflowRunResult } from "./workflow.js";
 
@@ -15,6 +16,15 @@ function alreadyRegistered(pi: ExtensionAPI, name: string): boolean {
   } catch {
     return false;
   }
+}
+
+/** Split a command argument string into tokens, respecting single/double quotes. */
+function tokenizeArgs(input: string): string[] {
+  const tokens: string[] = [];
+  for (const m of input.matchAll(/"([^"]*)"|'([^']*)'|(\S+)/g)) {
+    tokens.push(m[1] ?? m[2] ?? m[3] ?? "");
+  }
+  return tokens;
 }
 
 function reportText(result: WorkflowRunResult): string {
@@ -70,6 +80,62 @@ export function registerBuiltinWorkflows(pi: ExtensionAPI, opts: { cwd: string }
         } catch (error) {
           ctx.ui.setStatus("adversarial-review", undefined);
           ctx.ui.notify(`adversarial-review failed: ${error instanceof Error ? error.message : error}`, "error");
+        }
+      },
+    });
+  }
+
+  if (!alreadyRegistered(pi, "multi-perspective")) {
+    pi.registerCommand("multi-perspective", {
+      description: "Analyze a topic from several independent perspectives in parallel, then synthesize",
+      async handler(args: string, ctx: ExtensionCommandContext) {
+        const [topic, ...rest] = tokenizeArgs(args);
+        if (!topic) {
+          return ctx.ui.notify('Usage: /multi-perspective "<topic>" [perspective1] [perspective2] …', "warning");
+        }
+        // Fall back to a broadly-useful default set when fewer than two are given.
+        const perspectives =
+          rest.length >= 2 ? rest : ["technical", "product", "security", "user experience", "maintainability"];
+        ctx.ui.notify(`Analyzing from ${perspectives.length} perspectives…`, "info");
+        try {
+          const result = await runWorkflow(generateMultiPerspectiveWorkflow(topic, perspectives), {
+            cwd,
+            tools: createCodingTools(cwd),
+            onPhase: (title) => ctx.ui.setStatus("multi-perspective", `perspectives: ${title}`),
+          });
+          ctx.ui.setStatus("multi-perspective", undefined);
+          // This workflow returns its prose under `synthesis`, not `report`.
+          const r = result.result as { synthesis?: unknown } | undefined;
+          const content = r && typeof r.synthesis === "string" && r.synthesis.trim() ? r.synthesis : reportText(result);
+          await pi.sendMessage({ customType: "multi-perspective", content, display: true });
+        } catch (error) {
+          ctx.ui.setStatus("multi-perspective", undefined);
+          ctx.ui.notify(`multi-perspective failed: ${error instanceof Error ? error.message : error}`, "error");
+        }
+      },
+    });
+  }
+
+  if (!alreadyRegistered(pi, "codebase-audit")) {
+    pi.registerCommand("codebase-audit", {
+      description: "Run parallel checks against a codebase scope, then cross-validate and report",
+      async handler(args: string, ctx: ExtensionCommandContext) {
+        const [scope, ...checks] = tokenizeArgs(args);
+        if (!scope || checks.length === 0) {
+          return ctx.ui.notify('Usage: /codebase-audit <scope> "<check1>" ["<check2>" …]', "warning");
+        }
+        ctx.ui.notify(`Auditing ${scope} across ${checks.length} checks…`, "info");
+        try {
+          const result = await runWorkflow(generateCodebaseAuditWorkflow(scope, checks), {
+            cwd,
+            tools: createCodingTools(cwd),
+            onPhase: (title) => ctx.ui.setStatus("codebase-audit", `audit: ${title}`),
+          });
+          ctx.ui.setStatus("codebase-audit", undefined);
+          await pi.sendMessage({ customType: "codebase-audit", content: reportText(result), display: true });
+        } catch (error) {
+          ctx.ui.setStatus("codebase-audit", undefined);
+          ctx.ui.notify(`codebase-audit failed: ${error instanceof Error ? error.message : error}`, "error");
         }
       },
     });
