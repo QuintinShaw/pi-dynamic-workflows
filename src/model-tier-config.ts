@@ -53,8 +53,10 @@ export function getModelTierConfigPath(): string {
  * (backward-compatible behaviour). When it is omitted and multiple models are
  * configured, they are spread across tiers so that small/medium/big routing
  * is meaningful out of the box.
+ *
+ * `_availableModels` is injectable for testing; when omitted, reads from the live registry.
  */
-export function buildDefaultTierConfig(currentModelSpec?: string): ModelTierConfig {
+export function buildDefaultTierConfig(currentModelSpec?: string, _availableModels?: string[]): ModelTierConfig {
   if (currentModelSpec !== undefined) {
     return {
       tiers: {
@@ -64,7 +66,7 @@ export function buildDefaultTierConfig(currentModelSpec?: string): ModelTierConf
       },
     };
   }
-  const available = listAvailableModelSpecs();
+  const available = _availableModels ?? listAvailableModelSpecs();
   if (available.length >= 3) {
     return {
       tiers: {
