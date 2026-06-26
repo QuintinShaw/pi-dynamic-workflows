@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -194,6 +195,8 @@ function capturingAgent() {
     toolNames?: string[];
     disallowedToolNames?: string[];
     instructions?: string;
+    cwd?: string;
+    cwdExists?: boolean;
   }> = [];
   const runner = {
     async run(_prompt: string, options: Record<string, unknown>) {
@@ -203,6 +206,8 @@ function capturingAgent() {
         toolNames: options.toolNames as string[] | undefined,
         disallowedToolNames: options.disallowedToolNames as string[] | undefined,
         instructions: options.instructions as string | undefined,
+        cwd: options.cwd as string | undefined,
+        cwdExists: typeof options.cwd === "string" ? existsSync(options.cwd) : undefined,
       });
       return "ok";
     },
@@ -256,6 +261,51 @@ await agent('audit', { label: 'a', agentType: 'security-auditor', tier: 'small' 
 return {}`;
     await runWorkflow(script, { agent: runner, persistLogs: false, agentRegistry: registry });
     assert.equal(seen[0].model, "vendor/auditor-model", "definition model wins over tier");
+  });
+
+  it("agentType isolation: worktree runs the agent in an isolated cwd", async () => {
+    const repo = mkdtempSync(join(tmpdir(), "pi-agent-isolation-"));
+    const git = (...args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "pipe" });
+    try {
+      git("init", "-q");
+      git("config", "user.email", "t@t.t");
+      git("config", "user.name", "t");
+      writeFileSync(join(repo, "file.txt"), "base\n");
+      git("add", ".");
+      git("commit", "-q", "-m", "init");
+
+      const isolatedRegistry: AgentRegistry = new Map([
+        [
+          "isolated-auditor",
+          {
+            name: "isolated-auditor",
+            prompt: "Run isolated.",
+            isolation: "worktree",
+            source: "project",
+          } as AgentDefinition,
+        ],
+      ]);
+      const { seen, runner } = capturingAgent();
+      const script = `export const meta = { name: 'isolated', description: 'agentType isolation' }
+await agent('audit', { label: 'a', agentType: 'isolated-auditor' })
+return {}`;
+
+      await runWorkflow(script, {
+        cwd: repo,
+        runId: "iso-test",
+        agent: runner,
+        persistLogs: false,
+        agentRegistry: isolatedRegistry,
+      });
+
+      assert.equal(seen.length, 1);
+      assert.ok(seen[0].cwd, "isolated agent should receive a cwd");
+      assert.notEqual(seen[0].cwd, repo, "agent cwd should not be the base repo");
+      assert.equal(seen[0].cwdExists, true, "worktree cwd should exist while the agent runs");
+      assert.ok(seen[0].instructions?.includes("Requested isolation: worktree"));
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
   });
 
   it("unknown agentType logs a fallback and binds no tools/model", async () => {
