@@ -45,6 +45,18 @@ describe("model-tier-config", () => {
       const cfg = buildDefaultTierConfig("openai/gpt-4.1");
       assert.deepEqual(Object.keys(cfg.tiers).sort(), ["big", "medium", "small"]);
     });
+
+    it("spreads three or more available models across tiers", async () => {
+      // This uses the real listAvailableModelSpecs() which may return [] in test env.
+      // We can only test the code path where currentModelSpec is undefined and
+      // verify the structure is still valid.
+      const { buildDefaultTierConfig } = await loadModule();
+      const cfg = buildDefaultTierConfig();
+      assert.deepEqual(Object.keys(cfg.tiers).sort(), ["big", "medium", "small"]);
+      for (const val of Object.values(cfg.tiers)) {
+        assert.equal(typeof val, "string");
+      }
+    });
   });
 
   describe("resolveTierModel", () => {

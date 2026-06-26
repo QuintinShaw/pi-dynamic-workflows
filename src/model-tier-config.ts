@@ -48,14 +48,47 @@ export function getModelTierConfigPath(): string {
  * the user's currently active Pi model when known, else the first available
  * model. New users get consistent behaviour (every tier == the model they're
  * already chatting with) and can refine tiers later via `/workflows-models`.
+ *
+ * When `currentModelSpec` is provided, all three tiers are set to that model
+ * (backward-compatible behaviour). When it is omitted and multiple models are
+ * configured, they are spread across tiers so that small/medium/big routing
+ * is meaningful out of the box.
  */
 export function buildDefaultTierConfig(currentModelSpec?: string): ModelTierConfig {
-  const model = currentModelSpec ?? listAvailableModelSpecs()[0] ?? "";
+  if (currentModelSpec !== undefined) {
+    return {
+      tiers: {
+        small: currentModelSpec,
+        medium: currentModelSpec,
+        big: currentModelSpec,
+      },
+    };
+  }
+  const available = listAvailableModelSpecs();
+  if (available.length >= 3) {
+    return {
+      tiers: {
+        small: available[0],
+        medium: available[Math.floor(available.length / 2)],
+        big: available[available.length - 1],
+      },
+    };
+  }
+  if (available.length === 2) {
+    return {
+      tiers: {
+        small: available[0],
+        medium: available[1],
+        big: available[1],
+      },
+    };
+  }
+  const fallback = available[0] ?? "";
   return {
     tiers: {
-      small: model,
-      medium: model,
-      big: model,
+      small: fallback,
+      medium: fallback,
+      big: fallback,
     },
   };
 }
