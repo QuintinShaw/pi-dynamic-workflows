@@ -318,6 +318,20 @@ test(
 );
 
 test(
+  "createWorkflowStorage rename returns false when new name exists in another location",
+  withIsolatedHome(async (cwd) => {
+    const storage = createWorkflowStorage(cwd);
+    storage.save({ name: "project-wf", description: "p", script: "project" }, "project");
+    storage.save({ name: "user-wf", description: "u", script: "user" }, "user");
+
+    const result = storage.rename("project-wf", "user-wf");
+    assert.equal(result, false, "should not shadow an existing user workflow");
+    assert.equal(storage.load("project-wf")?.script, "project");
+    assert.equal(storage.load("user-wf")?.script, "user");
+  }),
+);
+
+test(
   "createWorkflowStorage rename returns false when old and new names are the same",
   withIsolatedHome(async (cwd) => {
     const storage = createWorkflowStorage(cwd);

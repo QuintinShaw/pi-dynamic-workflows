@@ -76,6 +76,8 @@ interface AgentRow {
   model?: string;
 }
 
+type VisibleItem = { kind: "run"; run: RunRow } | { kind: "saved"; saved: SavedWorkflow };
+
 /** Short, human-friendly model label: drop the provider prefix for display. */
 export function shortModel(model: string | undefined): string | undefined {
   if (!model) return undefined;
@@ -260,8 +262,7 @@ export class NavigatorState {
    * runs view. Positions before runs.length are "run"; after are "saved".
    */
   itemKindAt(model: NavigatorModel, cursor: number): ItemKind {
-    const runCount = model.runs().length;
-    return cursor < runCount ? "run" : "saved";
+    return visibleItems(model, this.filterText)[cursor]?.kind ?? "run";
   }
 
   /** Clamp the cursor to [0, count). */
@@ -284,20 +285,14 @@ export class NavigatorState {
   drill(model: NavigatorModel): boolean {
     const t = this.top();
     if (t.kind === "runs") {
-      const runs = model.runs();
-      const saved = model.saved();
-      if (t.cursor < runs.length) {
-        // Drilling into a run
-        const run = runs[t.cursor];
-        if (!run) return false;
-        this.stack.push({ kind: "phases", cursor: 0, runId: run.runId });
+      const item = visibleItems(model, this.filterText)[t.cursor];
+      if (!item) return false;
+      if (item.kind === "run") {
+        this.stack.push({ kind: "phases", cursor: 0, runId: item.run.runId });
         return true;
       }
-      // Drilling into a saved workflow
-      const item = saved[t.cursor - runs.length];
-      if (!item) return false;
       this.scroll = 0;
-      this.stack.push({ kind: "savedDetail", cursor: 0, savedName: item.name });
+      this.stack.push({ kind: "savedDetail", cursor: 0, savedName: item.saved.name });
       return true;
     }
     if (t.kind === "phases" && t.runId) {
@@ -330,8 +325,18 @@ export class NavigatorState {
   activeRunId(model: NavigatorModel): string | undefined {
     if (this.runId) return this.runId;
     if (this.kind === "runs") {
-      const runs = model.runs();
-      if (this.cursor < runs.length) return runs[this.cursor]?.runId;
+      const item = visibleItems(model, this.filterText)[this.cursor];
+      if (item?.kind === "run") return item.run.runId;
+    }
+    return undefined;
+  }
+
+  /** The saved workflow name at cursor in runs/savedDetail views, or undefined. */
+  activeSavedName(model: NavigatorModel): string | undefined {
+    if (this.kind === "savedDetail") return this.savedName;
+    if (this.kind === "runs") {
+      const item = visibleItems(model, this.filterText)[this.cursor];
+      if (item?.kind === "saved") return item.saved.name;
     }
     return undefined;
   }
@@ -375,39 +380,38 @@ export function renderNavigator(
   if (state.kind === "runs") {
     const runs = model.runs();
     const saved = model.saved();
-    const filterLower = state.filterText.toLowerCase();
-    const filteredRuns = filterRuns(runs, filterLower);
-    const filteredSaved = filterSaved(saved, filterLower);
+    const items = visibleItems(model, state.filterText);
     const total = runs.length + saved.length;
-    state.clamp(total);
+    state.clamp(items.length);
     lines.push(theme.bold("Workflows"));
     if (state.filterActive || state.filterText) {
       lines.push(dim(`  Filter: ${state.filterText}█`));
     }
     if (total === 0) {
       lines.push(dim("  No runs yet. Start one with a background workflow."));
+    } else if (items.length === 0) {
+      lines.push(dim("  No workflows match the current filter."));
     }
-    // Render runs
-    filteredRuns.forEach((r, _i) => {
-      const origIdx = runs.indexOf(r);
-      const icon = STATUS_ICON[r.status] ?? "?";
-      const meta = [`${r.done}/${r.total}`, fmtTokens(r.tokens), r.cost > 0 ? `$${r.cost.toFixed(4)}` : ""]
-        .filter(Boolean)
-        .join(" · ");
-      lines.push(sel(origIdx, `${icon} ${r.name}  ${dim(`${r.runId} · ${r.status} · ${meta}`)}`));
-    });
-    // Render saved workflows after a separator
-    if (filteredSaved.length > 0) {
-      if (filteredRuns.length > 0) lines.push(dim("  ── saved ──"));
-      filteredSaved.forEach((w) => {
-        const origIdx = runs.length + saved.indexOf(w);
+    let renderedSavedSeparator = false;
+    items.forEach((item, i) => {
+      if (item.kind === "run") {
+        const r = item.run;
+        const icon = STATUS_ICON[r.status] ?? "?";
+        const meta = [`${r.done}/${r.total}`, fmtTokens(r.tokens), r.cost > 0 ? `$${r.cost.toFixed(4)}` : ""]
+          .filter(Boolean)
+          .join(" · ");
+        lines.push(sel(i, `${icon} ${r.name}  ${dim(`${r.runId} · ${r.status} · ${meta}`)}`));
+      } else {
+        if (!renderedSavedSeparator && i > 0) {
+          lines.push(dim("  ── saved ──"));
+          renderedSavedSeparator = true;
+        }
+        const w = item.saved;
         const loc = w.location === "user" ? "~" : ".";
         const desc = w.description ? dim(`  ${w.description}`) : "";
-        lines.push(sel(origIdx, `${w.name}${desc}  ${dim(loc)}`));
-      });
-    } else if (saved.length > 0 && filterLower) {
-      // Have saved items but all filtered out — still show separator if runs are shown
-    }
+        lines.push(sel(i, `${w.name}${desc}  ${dim(loc)}`));
+      }
+    });
   } else if (state.kind === "phases" && state.runId) {
     const phases = model.phases(state.runId);
     state.clamp(phases.length);
@@ -575,7 +579,9 @@ export function keyToAction(keyId: string | undefined, kind: ViewKind, itemKind?
 }
 
 function filterRuns(runs: RunRow[], lower: string): RunRow[] {
-  return lower ? runs.filter((r) => r.name.toLowerCase().includes(lower) || r.runId.toLowerCase().includes(lower)) : runs;
+  return lower
+    ? runs.filter((r) => r.name.toLowerCase().includes(lower) || r.runId.toLowerCase().includes(lower))
+    : runs;
 }
 
 function filterSaved(saved: SavedWorkflow[], lower: string): SavedWorkflow[] {
@@ -584,10 +590,17 @@ function filterSaved(saved: SavedWorkflow[], lower: string): SavedWorkflow[] {
     : saved;
 }
 
+function visibleItems(model: NavigatorModel, filterText: string): VisibleItem[] {
+  const lower = filterText.toLowerCase();
+  return [
+    ...filterRuns(model.runs(), lower).map((run): VisibleItem => ({ kind: "run", run })),
+    ...filterSaved(model.saved(), lower).map((saved): VisibleItem => ({ kind: "saved", saved })),
+  ];
+}
+
 function currentCount(state: NavigatorState, model: NavigatorModel): number {
   if (state.kind === "runs") {
-    const lower = state.filterText.toLowerCase();
-    return filterRuns(model.runs(), lower).length + filterSaved(model.saved(), lower).length;
+    return visibleItems(model, state.filterText).length;
   }
   if (state.kind === "phases" && state.runId) return model.phases(state.runId).length;
   if (state.kind === "agents" && state.runId && state.phase) return model.agents(state.runId, state.phase).length;
@@ -724,15 +737,7 @@ export function openWorkflowNavigator(
             done(undefined);
             return;
           case "deleteSaved": {
-            let targetName: string | undefined;
-            if (state.kind === "runs") {
-              const saved = model.saved();
-              const runCount = model.runs().length;
-              const item = saved[state.cursor - runCount];
-              targetName = item?.name;
-            } else if (state.kind === "savedDetail" && state.savedName) {
-              targetName = state.savedName;
-            }
+            const targetName = state.activeSavedName(model);
             if (!targetName) break;
             if (!state.pendingConfirm) {
               state.pendingConfirm = { action: "deleteSaved", label: targetName };
@@ -772,15 +777,7 @@ export function openWorkflowNavigator(
             }
             return;
           case "rename": {
-            let targetName: string | undefined;
-            if (state.kind === "savedDetail" && state.savedName) {
-              targetName = state.savedName;
-            } else if (state.kind === "runs") {
-              const saved = model.saved();
-              const runCount = model.runs().length;
-              const item = saved[state.cursor - runCount];
-              targetName = item?.name;
-            }
+            const targetName = state.activeSavedName(model);
             if (targetName) {
               state.inputMode = { type: "rename", buffer: targetName, target: targetName };
             }

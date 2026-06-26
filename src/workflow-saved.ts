@@ -74,6 +74,10 @@ export function createWorkflowStorage(cwd: string): WorkflowStorage {
     assertSafeSavedWorkflowName(name);
     return join(legacyProjectDir, `${name}.json`);
   };
+  const workflowExists = (name: string): boolean =>
+    existsSync(workflowPath(name, "project")) ||
+    existsSync(legacyProjectWorkflowPath(name)) ||
+    existsSync(workflowPath(name, "user"));
 
   const loadFromFile = (path: string, location: "project" | "user"): SavedWorkflow | null => {
     try {
@@ -178,9 +182,10 @@ export function createWorkflowStorage(cwd: string): WorkflowStorage {
         const path = workflowPath(oldName, loc);
         const wf = loadFromFile(path, loc);
         if (!wf) continue;
-        // Check new name not already taken in either location
+        // Check the target name against all load/list locations so renaming
+        // cannot hide or shadow an existing saved workflow.
         const newPath = workflowPath(newName, loc);
-        if (existsSync(newPath)) return false;
+        if (workflowExists(newName)) return false;
         const dir = loc === "project" ? projectDir : userDir;
         ensureDir(dir);
         const renamed: SavedWorkflow = { ...wf, name: newName, path: newPath };

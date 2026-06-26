@@ -138,7 +138,11 @@ function persistedRunManager(): Pick<WorkflowManager, "listRuns" | "getRun"> {
   };
 }
 
-function savedStorage(): { list(): SavedWorkflow[]; delete(name: string, location?: string): boolean } {
+function savedStorage(): {
+  list(): SavedWorkflow[];
+  delete(name: string, location?: string): boolean;
+  rename(oldName: string, newName: string): boolean;
+} {
   return {
     list: () => [
       {
@@ -167,11 +171,16 @@ function savedStorage(): { list(): SavedWorkflow[]; delete(name: string, locatio
       },
     ],
     delete: () => true,
+    rename: () => true,
   };
 }
 
-function emptySavedStorage(): { list(): SavedWorkflow[]; delete(name: string, location?: string): boolean } {
-  return { list: () => [], delete: () => true };
+function emptySavedStorage(): {
+  list(): SavedWorkflow[];
+  delete(name: string, location?: string): boolean;
+  rename(oldName: string, newName: string): boolean;
+} {
+  return { list: () => [], delete: () => true, rename: () => true };
 }
 
 test("NavigatorModel reads runs, phases, agents, and detail", () => {
@@ -715,6 +724,33 @@ test("renderNavigator filters saved workflows by name when filterText is set", (
   assert.match(text, /deploy/);
   // "audit" run should still show because we search runs separately
   assert.ok(!text.includes("analyze"), "analyze should not appear when filtering for deploy");
+});
+
+test("NavigatorState uses filtered visible index when selecting a run", () => {
+  const model = new NavigatorModel(multiRunManager(), savedStorage());
+  const state = new NavigatorState();
+  state.filterText = "b-workflow";
+
+  renderNavigator(state, model, 80);
+
+  assert.equal(state.itemKindAt(model, state.cursor), "run");
+  assert.equal(state.activeRunId(model), "r2");
+  assert.equal(state.drill(model), true);
+  assert.equal(state.runId, "r2");
+});
+
+test("NavigatorState uses filtered visible index when selecting a saved workflow", () => {
+  const model = new NavigatorModel(fakeManager(), savedStorage());
+  const state = new NavigatorState();
+  state.filterText = "backup";
+
+  renderNavigator(state, model, 80);
+
+  assert.equal(state.itemKindAt(model, state.cursor), "saved");
+  assert.equal(state.activeSavedName(model), "backup");
+  assert.equal(state.drill(model), true);
+  assert.equal(state.kind, "savedDetail");
+  assert.equal(state.savedName, "backup");
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
