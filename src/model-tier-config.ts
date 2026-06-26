@@ -44,29 +44,17 @@ export function getModelTierConfigPath(): string {
 // ---------------------------------------------------------------------------
 
 /**
- * Build a default tier config where every tier points at a single model —
- * the user's currently active Pi model when known, else the first available
- * model. New users get consistent behaviour (every tier == the model they're
- * already chatting with) and can refine tiers later via `/workflows-models`.
+ * Build a default tier config. When the available model registry is known,
+ * spread it across tiers so small/medium/big routing is meaningful out of the
+ * box. When the registry is empty or unavailable, fall back to the current Pi
+ * model so fresh installs still get usable tier values.
  *
- * When `currentModelSpec` is provided, all three tiers are set to that model
- * (backward-compatible behaviour). When it is omitted and multiple models are
- * configured, they are spread across tiers so that small/medium/big routing
- * is meaningful out of the box.
- *
- * `_availableModels` is injectable for testing; when omitted, reads from the live registry.
+ * `_availableModels` is injectable for testing and for callers that already
+ * fetched the registry. When omitted and no current model is provided, this
+ * reads from the live registry.
  */
 export function buildDefaultTierConfig(currentModelSpec?: string, _availableModels?: string[]): ModelTierConfig {
-  if (currentModelSpec !== undefined) {
-    return {
-      tiers: {
-        small: currentModelSpec,
-        medium: currentModelSpec,
-        big: currentModelSpec,
-      },
-    };
-  }
-  const available = _availableModels ?? listAvailableModelSpecs();
+  const available = _availableModels ?? (currentModelSpec === undefined ? listAvailableModelSpecs() : []);
   if (available.length >= 3) {
     return {
       tiers: {
@@ -85,7 +73,7 @@ export function buildDefaultTierConfig(currentModelSpec?: string, _availableMode
       },
     };
   }
-  const fallback = available[0] ?? "";
+  const fallback = available[0] ?? currentModelSpec ?? "";
   return {
     tiers: {
       small: fallback,

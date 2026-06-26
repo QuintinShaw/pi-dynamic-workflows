@@ -66,6 +66,16 @@ describe("model-tier-config", () => {
       assert.equal(cfg.tiers.big, "model-c");
     });
 
+    it("spreads available models even when a current model fallback is provided", async () => {
+      const { buildDefaultTierConfig } = await loadModule();
+      const cfg = buildDefaultTierConfig("current-model", ["model-a", "model-b", "model-c"]);
+      assert.deepEqual(cfg.tiers, {
+        small: "model-a",
+        medium: "model-b",
+        big: "model-c",
+      });
+    });
+
     it("spreads two available models: small gets first, medium and big get second", async () => {
       const { buildDefaultTierConfig } = await loadModule();
       const cfg = buildDefaultTierConfig(undefined, ["model-a", "model-b"]);
@@ -90,6 +100,16 @@ describe("model-tier-config", () => {
       for (const val of Object.values(cfg.tiers)) {
         assert.equal(val, "");
       }
+    });
+
+    it("falls back to the current model when no available models are known", async () => {
+      const { buildDefaultTierConfig } = await loadModule();
+      const cfg = buildDefaultTierConfig("current-model", []);
+      assert.deepEqual(cfg.tiers, {
+        small: "current-model",
+        medium: "current-model",
+        big: "current-model",
+      });
     });
   });
 
