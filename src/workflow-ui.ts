@@ -376,15 +376,8 @@ export function renderNavigator(
     const runs = model.runs();
     const saved = model.saved();
     const filterLower = state.filterText.toLowerCase();
-    const filteredRuns = filterLower
-      ? runs.filter((r) => r.name.toLowerCase().includes(filterLower) || r.runId.toLowerCase().includes(filterLower))
-      : runs;
-    const filteredSaved = filterLower
-      ? saved.filter(
-          (w) =>
-            w.name.toLowerCase().includes(filterLower) || (w.description ?? "").toLowerCase().includes(filterLower),
-        )
-      : saved;
+    const filteredRuns = filterRuns(runs, filterLower);
+    const filteredSaved = filterSaved(saved, filterLower);
     const total = runs.length + saved.length;
     state.clamp(total);
     lines.push(theme.bold("Workflows"));
@@ -581,8 +574,21 @@ export function keyToAction(keyId: string | undefined, kind: ViewKind, itemKind?
   }
 }
 
+function filterRuns(runs: RunRow[], lower: string): RunRow[] {
+  return lower ? runs.filter((r) => r.name.toLowerCase().includes(lower) || r.runId.toLowerCase().includes(lower)) : runs;
+}
+
+function filterSaved(saved: SavedWorkflow[], lower: string): SavedWorkflow[] {
+  return lower
+    ? saved.filter((w) => w.name.toLowerCase().includes(lower) || (w.description ?? "").toLowerCase().includes(lower))
+    : saved;
+}
+
 function currentCount(state: NavigatorState, model: NavigatorModel): number {
-  if (state.kind === "runs") return model.runs().length + model.saved().length;
+  if (state.kind === "runs") {
+    const lower = state.filterText.toLowerCase();
+    return filterRuns(model.runs(), lower).length + filterSaved(model.saved(), lower).length;
+  }
   if (state.kind === "phases" && state.runId) return model.phases(state.runId).length;
   if (state.kind === "agents" && state.runId && state.phase) return model.agents(state.runId, state.phase).length;
   return 0;
