@@ -425,7 +425,8 @@ export async function runWorkflow<T = unknown>(
 
       // Optional per-agent worktree isolation (deterministic name -> stable resume keys).
       let worktree: Worktree | undefined;
-      if (agentOptions.isolation === "worktree") {
+      const resolvedIsolation = agentOptions.isolation ?? agentDef?.isolation;
+      if (resolvedIsolation === "worktree") {
         worktree = await createWorktree(baseCwd, `${runId}-${callIndex}-${label}`);
         if (!worktree.isolated) log(`isolation ignored for "${label}" (${worktree.reason})`);
       }

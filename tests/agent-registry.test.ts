@@ -59,6 +59,20 @@ describe("parseAgentDefinition", () => {
     const def = parseAgentDefinition(md, "project", "x.md");
     assert.deepEqual(def?.tools, ["read", "write"]);
   });
+
+  it("parses isolation: worktree from frontmatter", () => {
+    const content = "---\nname: isolated-agent\nisolation: worktree\n---\nBody.";
+    const def = parseAgentDefinition(content, "project", "isolated-agent.md");
+    assert.ok(def);
+    assert.equal(def.isolation, "worktree");
+  });
+
+  it("ignores unknown isolation values", () => {
+    const content = "---\nname: agent\nisolation: unknown-value\n---\nBody.";
+    const def = parseAgentDefinition(content, "project", "agent.md");
+    assert.ok(def);
+    assert.equal(def.isolation, undefined);
+  });
 });
 
 // ── loadAgentRegistry (dir injection) ──────────────────────────────────────
@@ -163,6 +177,11 @@ describe("agentDefinitionKey", () => {
     assert.notEqual(agentDefinitionKey(base), agentDefinitionKey({ ...base, prompt: "p2" }));
     assert.notEqual(agentDefinitionKey(base), agentDefinitionKey({ ...base, model: "m2" }));
     assert.notEqual(agentDefinitionKey(base), agentDefinitionKey({ ...base, tools: ["read", "write"] }));
+  });
+
+  it("changes when isolation changes", () => {
+    const base: AgentDefinition = { name: "x", prompt: "p", source: "project" };
+    assert.notEqual(agentDefinitionKey(base), agentDefinitionKey({ ...base, isolation: "worktree" }));
   });
 });
 
