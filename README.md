@@ -184,6 +184,10 @@ The live "Workflows running" panel is configured in the same `~/.pi/workflows/se
 
 Workflows run in a Node `vm` sandbox; `Date.now()`, `Math.random()`, `new Date()`, and `require`/`import`/`fs`/network are unavailable, so runs stay reproducible — which is what makes resume reliable.
 
+## Default tier assignment
+
+When no `~/.pi/workflows/model-tiers.json` exists, pi-dynamic-workflows builds a default config from the models you have authenticated. The registry returns models grouped by provider, not ranked by capability, so a naive positional spread (`first → small`, `last → big`) can put a mini or flash model in the big slot. To avoid this, `buildDefaultTierConfig` first scans the model list for well-known capability substrings: names containing `mini`, `flash`, `haiku`, `nano`, or `small` are assigned to the small tier, and names containing `opus`, `pro`, `ultra`, `large`, or `plus` are assigned to the big tier (both checks are case-insensitive, first match wins). The medium tier always takes the positional middle element. When no model matches a hint — for example, a list of custom or private model IDs — the function falls back to positional selection so the config is always populated. You can review or override the assignment at any time with `/workflows-models`.
+
 ## Development
 
 ```bash

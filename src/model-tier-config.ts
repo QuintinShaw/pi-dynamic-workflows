@@ -40,6 +40,32 @@ export function getModelTierConfigPath(): string {
 }
 
 // ---------------------------------------------------------------------------
+// Capability hints
+// ---------------------------------------------------------------------------
+
+/**
+ * Substrings that identify small/cheap models (case-insensitive).
+ * Used by `buildDefaultTierConfig` to pick the best small-tier model from the
+ * available registry regardless of the order providers are listed.
+ */
+export const SMALL_MODEL_HINTS = ["mini", "flash", "haiku", "nano", "small"] as const;
+
+/**
+ * Substrings that identify large/capable models (case-insensitive).
+ * Used by `buildDefaultTierConfig` to pick the best big-tier model from the
+ * available registry regardless of the order providers are listed.
+ */
+export const BIG_MODEL_HINTS = ["opus", "pro", "ultra", "large", "plus"] as const;
+
+/**
+ * Return the first model in `available` whose name (lower-cased) contains any
+ * of the given hint substrings, or `undefined` if none match.
+ */
+function findByHints(available: string[], hints: readonly string[]): string | undefined {
+  return available.find((model) => hints.some((hint) => model.toLowerCase().includes(hint)));
+}
+
+// ---------------------------------------------------------------------------
 // Defaults
 // ---------------------------------------------------------------------------
 
@@ -48,6 +74,13 @@ export function getModelTierConfigPath(): string {
  * spread it across tiers so small/medium/big routing is meaningful out of the
  * box. When the registry is empty or unavailable, fall back to the current Pi
  * model so fresh installs still get usable tier values.
+ *
+ * For the small tier, `SMALL_MODEL_HINTS` substring matching is tried first so
+ * that a mini/flash/haiku model is always assigned to small even when the
+ * registry returns models grouped by provider rather than ordered by capability.
+ * Likewise, `BIG_MODEL_HINTS` is tried for the big tier. Both fall back to
+ * positional selection (`available[0]` / `available[last]`) when no hint
+ * matches. The medium tier is always the positional middle element.
  *
  * `_availableModels` is injectable for testing and for callers that already
  * fetched the registry. When omitted and no current model is provided, this
@@ -58,9 +91,9 @@ export function buildDefaultTierConfig(currentModelSpec?: string, _availableMode
   if (available.length >= 3) {
     return {
       tiers: {
-        small: available[0],
+        small: findByHints(available, SMALL_MODEL_HINTS) ?? available[0],
         medium: available[Math.floor(available.length / 2)],
-        big: available[available.length - 1],
+        big: findByHints(available, BIG_MODEL_HINTS) ?? available[available.length - 1],
       },
     };
   }

@@ -3,9 +3,10 @@
  *
  * Covers:
  * 1. buildDefaultTierConfig — all tiers default to the given model
- * 2. resolveTierModel logic
- * 3. save/load round-trip + all validation/error paths (scoped to a temp dir)
- * 4. sortedTierNames helper
+ * 2. buildDefaultTierConfig — capability-hint ordering (SMALL_MODEL_HINTS / BIG_MODEL_HINTS)
+ * 3. resolveTierModel logic
+ * 4. save/load round-trip + all validation/error paths (scoped to a temp dir)
+ * 5. sortedTierNames helper
  *
  * All tier configs are single-model-per-tier (Record<string, string>).
  */
@@ -110,6 +111,39 @@ describe("model-tier-config", () => {
         medium: "current-model",
         big: "current-model",
       });
+    });
+
+    // -----------------------------------------------------------------------
+    // Capability-hint ordering (SMALL_MODEL_HINTS / BIG_MODEL_HINTS)
+    // -----------------------------------------------------------------------
+
+    it("assigns small via SMALL_MODEL_HINTS even when mini model is not first in list", async () => {
+      // Simulates a provider-grouped registry: ["gpt-4o", "gpt-4o-mini", "claude-3-5-sonnet"]
+      // Without hint matching, positional would set small="gpt-4o" and big="claude-3-5-sonnet".
+      // With hint matching, "mini" wins for small regardless of position.
+      const { buildDefaultTierConfig } = await loadModule();
+      const cfg = buildDefaultTierConfig(undefined, ["gpt-4o-mini", "claude-3-5-sonnet", "gpt-4o"]);
+      assert.equal(cfg.tiers.small, "gpt-4o-mini");
+      assert.equal(cfg.tiers.medium, "claude-3-5-sonnet");
+      assert.equal(cfg.tiers.big, "gpt-4o");
+    });
+
+    it("assigns small and big via hints when both hint sets match, ignoring list position", async () => {
+      // "claude-3-opus" is at index 0 but should be big; "gpt-4o-mini" is at index 2 but should be small.
+      const { buildDefaultTierConfig } = await loadModule();
+      const cfg = buildDefaultTierConfig(undefined, ["claude-3-opus", "claude-3-5-sonnet", "gpt-4o-mini"]);
+      assert.equal(cfg.tiers.small, "gpt-4o-mini");
+      assert.equal(cfg.tiers.medium, "claude-3-5-sonnet");
+      assert.equal(cfg.tiers.big, "claude-3-opus");
+    });
+
+    it("falls back to positional for small/big when no hint matches", async () => {
+      // Generic names have no hint substrings — positional behaviour must be preserved.
+      const { buildDefaultTierConfig } = await loadModule();
+      const cfg = buildDefaultTierConfig(undefined, ["model-a", "model-b", "model-c"]);
+      assert.equal(cfg.tiers.small, "model-a");
+      assert.equal(cfg.tiers.medium, "model-b");
+      assert.equal(cfg.tiers.big, "model-c");
     });
   });
 
