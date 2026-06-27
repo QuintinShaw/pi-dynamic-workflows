@@ -1,6 +1,5 @@
 export type { AdversarialReviewConfig } from "./adversarial-review.js";
 export { generateAdversarialReviewWorkflow, generateMultiPerspectiveWorkflow } from "./adversarial-review.js";
-export { generateCodeReviewWorkflow } from "./code-review.js";
 export type { AgentRunOptions, AgentRunResult, WorkflowAgentOptions } from "./agent.js";
 export { listAvailableModelSpecs, WorkflowAgent } from "./agent.js";
 export type { AgentHistoryEntry, AgentHistoryKind, AgentHistoryRole } from "./agent-history.js";
@@ -8,6 +7,7 @@ export { compactAgentHistory } from "./agent-history.js";
 export type { AgentDefinition, AgentRegistry } from "./agent-registry.js";
 export { applyToolPolicy, listAgentTypes, loadAgentRegistry, resolveAgentType } from "./agent-registry.js";
 export { registerBuiltinWorkflows } from "./builtin-commands.js";
+export { generateCodeReviewWorkflow } from "./code-review.js";
 export * from "./config.js";
 export type { DeepResearchConfig } from "./deep-research.js";
 export { generateCodebaseAuditWorkflow, generateDeepResearchWorkflow } from "./deep-research.js";

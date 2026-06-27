@@ -1847,3 +1847,127 @@ return results`;
     assert.equal(result.agentCount, 0, "no agents should run with empty parallel");
   }),
 );
+
+// ─── Auto-resume tests ─────────────────────────────────────────────────────────
+
+test("parseResetHintMs parses hour strings, minute strings, and falls back for garbage", () => {
+  // Access the private method via type cast — it's internal but we want unit coverage.
+  const manager = new WorkflowManager({ cwd: "/tmp" });
+  const parse = (hint: string | undefined): number =>
+    (manager as unknown as { parseResetHintMs(h: string | undefined): number }).parseResetHintMs(hint);
+
+  assert.equal(parse("2h"), 2 * 60 * 60 * 1000, "'2h' should parse to 7 200 000 ms");
+  assert.equal(parse("30min"), 30 * 60 * 1000, "'30min' should parse to 1 800 000 ms");
+  // When both h and min appear, the hour match wins (first branch taken).
+  assert.equal(parse("1h30min"), 1 * 60 * 60 * 1000, "'1h30min' hour match wins → 3 600 000 ms");
+  // Garbage and undefined fall back to the 60-minute default.
+  assert.equal(parse(undefined), 60 * 60 * 1000, "undefined hint → default 60 min");
+  assert.equal(parse("garbage"), 60 * 60 * 1000, "unrecognized string → default 60 min");
+});
+
+test(
+  "scheduleAutoResume: exponential backoff doubles the delay on each attempt",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd });
+    const mgr = manager as unknown as {
+      autoResumeTimers: Map<string, ReturnType<typeof setTimeout>>;
+      autoResumeAttempts: Map<string, number>;
+      scheduleAutoResume(runId: string, hint?: string): void;
+      cancelAutoResume(runId: string): void;
+    };
+
+    const runId = "backoff-test-1";
+    const capturedDelays: number[] = [];
+    const capturedHandles: ReturnType<typeof setTimeout>[] = [];
+
+    const origSetTimeout = globalThis.setTimeout;
+    // Intercept setTimeout to record delays without letting timers actually fire.
+    (globalThis as Record<string, unknown>).setTimeout = (fn: () => void, delay: number) => {
+      capturedDelays.push(delay);
+      const handle = origSetTimeout(() => {}, 99_999_999);
+      capturedHandles.push(handle);
+      return handle;
+    };
+
+    try {
+      // Simulate attempt 0, 1, 2 by manually setting the attempt counter each time.
+      for (let attempt = 0; attempt < 3; attempt++) {
+        mgr.autoResumeAttempts.set(runId, attempt);
+        mgr.scheduleAutoResume(runId, "1h");
+      }
+    } finally {
+      (globalThis as Record<string, unknown>).setTimeout = origSetTimeout;
+      for (const h of capturedHandles) clearTimeout(h);
+      mgr.cancelAutoResume(runId);
+    }
+
+    // 1h = 3 600 000 ms; attempt 0 → 1h, attempt 1 → 2h, attempt 2 → 4h.
+    assert.equal(capturedDelays.length, 3, "should have captured three timer delays");
+    assert.equal(capturedDelays[0], 60 * 60 * 1000, "attempt 0 delay = 1h");
+    assert.equal(capturedDelays[1], 2 * 60 * 60 * 1000, "attempt 1 delay = 2h (doubled)");
+    assert.equal(capturedDelays[2], 4 * 60 * 60 * 1000, "attempt 2 delay = 4h (doubled again)");
+  }),
+);
+
+test(
+  "scheduleAutoResume: stops scheduling after MAX_AUTO_RESUME_ATTEMPTS (5) attempts",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd });
+    const mgr = manager as unknown as {
+      autoResumeTimers: Map<string, ReturnType<typeof setTimeout>>;
+      autoResumeAttempts: Map<string, number>;
+      scheduleAutoResume(runId: string, hint?: string): void;
+    };
+
+    const runId = "cap-test-1";
+    // Simulate that MAX_AUTO_RESUME_ATTEMPTS (5) have already been made.
+    mgr.autoResumeAttempts.set(runId, 5);
+    mgr.scheduleAutoResume(runId, "1h");
+
+    assert.equal(
+      mgr.autoResumeTimers.has(runId),
+      false,
+      "no timer should be scheduled once the attempt cap is reached",
+    );
+  }),
+);
+
+test(
+  "recoverStaleRuns re-arms an auto-resume timer for usage-limit paused runs",
+  withTempCwd(async (cwd) => {
+    // Pre-populate persistence with a usage-limit paused run via a first manager.
+    const seed = new WorkflowManager({ cwd });
+    const runId = "stale-usage-limit-1";
+    seed.getPersistence().save({
+      runId,
+      workflowName: "quota_run",
+      script: oneAgentScript,
+      args: undefined,
+      status: "paused",
+      pauseReason: "usage_limit",
+      resetHint: "Resets in ~1h",
+      phases: [],
+      agents: [],
+      logs: [],
+      startedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+
+    // Constructing a new manager over the same cwd triggers recoverStaleRuns().
+    const manager = new WorkflowManager({ cwd });
+    const mgr = manager as unknown as {
+      autoResumeTimers: Map<string, ReturnType<typeof setTimeout>>;
+      cancelAutoResume(runId: string): void;
+    };
+
+    try {
+      assert.ok(
+        mgr.autoResumeTimers.has(runId),
+        "recoverStaleRuns should schedule an auto-resume timer for usage-limit paused runs",
+      );
+    } finally {
+      // Cancel the timer so the test process can exit cleanly.
+      mgr.cancelAutoResume(runId);
+    }
+  }),
+);

@@ -3,12 +3,18 @@ import test from "node:test";
 import { registerBuiltinWorkflows } from "../src/builtin-commands.js";
 import { makeCommandRegistryPi, makeNotifyCtx } from "./helpers/mock-pi.js";
 
-test("registerBuiltinWorkflows registers all four built-in workflow commands", () => {
+test("registerBuiltinWorkflows registers all five built-in workflow commands", () => {
   const { pi, commands } = makeCommandRegistryPi();
   registerBuiltinWorkflows(pi, { cwd: "/tmp" });
-  assert.equal(commands.length, 4);
+  assert.equal(commands.length, 5);
   const names = commands.map((c) => c.name).sort();
-  assert.deepEqual(names, ["adversarial-review", "codebase-audit", "deep-research", "multi-perspective"]);
+  assert.deepEqual(names, [
+    "adversarial-review",
+    "code-review",
+    "codebase-audit",
+    "deep-research",
+    "multi-perspective",
+  ]);
 });
 
 test("registerBuiltinWorkflows is idempotent — skips already registered commands", () => {
@@ -17,6 +23,7 @@ test("registerBuiltinWorkflows is idempotent — skips already registered comman
     "adversarial-review",
     "multi-perspective",
     "codebase-audit",
+    "code-review",
   ]);
   registerBuiltinWorkflows(pi, { cwd: "/tmp" });
   assert.equal(commands.length, 0, "should not re-register when already present");
@@ -27,7 +34,7 @@ test("registerBuiltinWorkflows registers only missing commands", () => {
   registerBuiltinWorkflows(pi, { cwd: "/tmp" });
   assert.deepEqual(
     commands.map((c) => c.name).sort(),
-    ["codebase-audit", "multi-perspective"],
+    ["code-review", "codebase-audit", "multi-perspective"],
     "should only register the commands that aren't already present",
   );
 });
