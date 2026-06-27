@@ -6,7 +6,6 @@ import type { TSchema } from "typebox";
 import type { AgentUsage } from "./agent.js";
 import { WorkflowAgent, type WorkflowAgentOptions } from "./agent.js";
 import type { AgentHistoryEntry } from "./agent-history.js";
-import { createSharedStoreTools, SharedStore } from "./shared-store.js";
 import {
   type AgentDefinition,
   type AgentRegistry,
@@ -18,6 +17,7 @@ import { DEFAULT_AGENT_TIMEOUT_MS, MAX_AGENT_RETRIES, MAX_AGENTS_PER_RUN, MAX_CO
 import { WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
 import { createWorkflowLogger } from "./logger.js";
 import { parseModelRoutingFromMeta, resolveModelForPhase } from "./model-routing.js";
+import { createSharedStoreTools, SharedStore } from "./shared-store.js";
 import { createWorktree, removeWorktree, type Worktree } from "./worktree.js";
 
 export interface WorkflowMetaPhase {
