@@ -193,6 +193,23 @@ export function createWorkflowStorage(cwd: string): WorkflowStorage {
         unlinkSync(path);
         return true;
       }
+      // Legacy project directory: workflows saved before the new project-scoped
+      // path was introduced live in legacyProjectDir. The delete method already
+      // handles this dir; rename must do the same so that a legacy-dir workflow
+      // can be renamed without requiring a manual storage migration.
+      if (!location || location === "project") {
+        const legacyPath = legacyProjectWorkflowPath(oldName);
+        const wf = loadFromFile(legacyPath, "project");
+        if (wf) {
+          if (workflowExists(newName)) return false;
+          const newPath = workflowPath(newName, "project");
+          ensureDir(projectDir);
+          const renamed: SavedWorkflow = { ...wf, name: newName, path: newPath };
+          writeFileSync(newPath, JSON.stringify(renamed, null, 2));
+          unlinkSync(legacyPath);
+          return true;
+        }
+      }
       return false;
     },
   };

@@ -686,6 +686,19 @@ export function openWorkflowNavigator(
             state.inputMode = undefined;
             if (newName && newName !== oldName) {
               if (model.renameSaved(oldName, newName)) {
+                // Re-register the slash command under the new name so /<newName>
+                // works immediately without requiring a session reload. Pi has no
+                // unregisterCommand, so the old /<oldName> slot becomes a no-op
+                // (the exists predicate returns false and the handler tells the
+                // user to reload), consistent with how delete is handled.
+                if (opts.storage) {
+                  const renamed = opts.storage.load(newName);
+                  if (renamed) {
+                    registerSavedWorkflow(pi, opts.cwd ?? process.cwd(), renamed, undefined, () =>
+                      opts.storage!.list().some((w) => w.name === renamed.name),
+                    );
+                  }
+                }
                 ui.notify(`Renamed /${oldName} → /${newName}`, "info");
                 state.back();
               } else {

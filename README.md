@@ -137,6 +137,25 @@ The same model — on Pi, plus the production pieces a real run needs:
 
 In the navigator: `↑/↓` select · `enter`/`→` open · `esc`/`←` back · `p` pause · `x` stop · `r` restart · `s` save · `q` quit. Each agent shows the model it ran on; the detail view shows its prompt, result, error diagnostics, and compact message/tool history.
 
+### Navigator keyboard shortcuts
+
+| Key | Where | Action |
+| --- | --- | --- |
+| `↑` / `↓` or `j` / `k` | all list views | move selection |
+| `enter` / `→` | runs, phases, agents | drill in |
+| `esc` / `←` | any view | go back (esc at top closes) |
+| `q` | any view | close navigator |
+| `p` | runs view — run selected | pause the run |
+| `x` | runs view — run selected | stop the run (press `x` again to confirm) |
+| `r` | runs view — run selected | restart the run |
+| `s` | runs view — run selected | save run script as a `/<name>` command |
+| `/` | runs view | open the filter bar; type to filter runs and saved workflows by name |
+| `esc` (in filter) | runs view, filter active | clear filter and exit filter mode |
+| `enter` (in filter) | runs view, filter active | lock in the filter and return to normal navigation |
+| `x` | runs view — saved selected, or saved detail | delete the saved workflow (press `x` again to confirm) |
+| `n` | runs view — saved selected, or saved detail | rename the saved workflow; type new name, `enter` to confirm, `esc` to cancel |
+| `j` / `k` | detail / saved detail | scroll the detail body |
+
 ## Storage
 
 Workflow state is stored under `~/.pi/workflows` so projects do not accumulate extension-owned `.pi/workflows` directories. Global settings and model tiers live at `~/.pi/workflows/settings.json` and `~/.pi/workflows/model-tiers.json`; project-scoped run history, resume journals, locks, and saved workflow overrides live under `~/.pi/workflows/projects/<project>/`. Older project-local `.pi/workflows/runs` and `.pi/workflows/saved` data is still read as a fallback, but new writes go to the user-level workflow store.
