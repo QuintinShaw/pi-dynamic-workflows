@@ -281,6 +281,13 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
    * structured_output) before falling back to strict prose extraction. Default 2.
    */
   maxSchemaRetries?: number;
+  /**
+   * Tools that are always injected AFTER the tool-policy filter (`toolNames` /
+   * `disallowedToolNames`), so they are available even under a restrictive
+   * allowlist. Used by the workflow runtime to inject shared-store tools into
+   * every agent regardless of its agentType definition.
+   */
+  systemTools?: ToolDefinition[];
 }
 
 export type AgentRunResult<TSchemaDef extends TSchema | undefined> = TSchemaDef extends TSchema
@@ -345,6 +352,11 @@ export class WorkflowAgent {
       options.toolNames,
       options.disallowedToolNames,
     );
+
+    // System tools bypass the allowlist/denylist filter (e.g. shared-store tools).
+    if (options.systemTools?.length) {
+      customTools.push(...options.systemTools);
+    }
 
     if (options.schema) {
       customTools.push(createStructuredOutputTool({ schema: options.schema, capture }) as unknown as ToolDefinition);

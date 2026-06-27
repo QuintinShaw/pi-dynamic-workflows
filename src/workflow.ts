@@ -6,6 +6,7 @@ import type { TSchema } from "typebox";
 import type { AgentUsage } from "./agent.js";
 import { WorkflowAgent, type WorkflowAgentOptions } from "./agent.js";
 import type { AgentHistoryEntry } from "./agent-history.js";
+import { createSharedStoreTools, SharedStore } from "./shared-store.js";
 import {
   type AgentDefinition,
   type AgentRegistry,
@@ -39,6 +40,12 @@ export interface JournalEntry {
   /** sha256 of the call's identity (prompt + model + phase + agentType + schema). */
   hash: string;
   result: unknown;
+  /**
+   * Shared-store state immediately after this agent completed (for replay
+   * consistency). Absent on older journal entries — replaying them leaves the
+   * store unchanged. Populated when `SharedStore` is active for the run.
+   */
+  storeSnapshot?: Record<string, unknown>;
 }
 
 /**
@@ -86,6 +93,12 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   onAgentJournal?: (entry: JournalEntry) => void;
   /** Internal: shared runtime inherited by a nested workflow() call. */
   sharedRuntime?: SharedRuntime;
+  /**
+   * Shared store for this run. One instance is created per top-level run and
+   * propagated into nested workflow() calls. Pass an existing instance to share
+   * state across a parent and child run; omit to create a fresh isolated store.
+   */
+  sharedStore?: SharedStore;
   /** Resolve a saved-workflow name to its script, enabling `workflow('name', args)`. */
   loadSavedWorkflow?: (name: string) => string | undefined;
   /**
@@ -294,6 +307,11 @@ export async function runWorkflow<T = unknown>(
   };
   const limiter = shared.limiter;
 
+  // One store instance per run; nested workflow() calls inherit the parent's store
+  // so all agents across nesting levels share the same key-value space.
+  const store: SharedStore = options.sharedStore ?? new SharedStore();
+  const storeTools = createSharedStoreTools(store);
+
   const log = (message: string) => {
     const text = String(message);
     state.logs.push(text);
@@ -410,6 +428,9 @@ export async function runWorkflow<T = unknown>(
     if (hashMatches && !cachedEmptyOutput && callIndex < state.firstMiss) {
       options.onAgentStart?.({ label, phase: assignedPhase, prompt, model: displayModel });
       options.onAgentEnd?.({ label, phase: assignedPhase, result: cached.result, tokens: 0, model: displayModel });
+      // Restore the store to the state recorded when this agent originally ran
+      // so live agents later in the run see a consistent store.
+      if (cached.storeSnapshot) store.restore(cached.storeSnapshot);
       return cached.result;
     }
     // A genuine miss (no journal entry, or the hash changed) marks where the
@@ -466,6 +487,9 @@ export async function runWorkflow<T = unknown>(
                 tier: agentOptions.tier,
                 toolNames: agentDef?.tools,
                 disallowedToolNames: agentDef?.disallowedTools,
+                // Shared-store tools bypass the policy filter so they are always
+                // available regardless of the agent's tools allowlist.
+                systemTools: storeTools,
                 cwd: runCwd,
                 onModelResolved: (id: string) => {
                   displayModel = id;
@@ -494,7 +518,7 @@ export async function runWorkflow<T = unknown>(
             }
 
             const tokens = recordTokens(result);
-            options.onAgentJournal?.({ index: callIndex, hash: callHash, result });
+            options.onAgentJournal?.({ index: callIndex, hash: callHash, result, storeSnapshot: store.snapshot() });
             options.onAgentEnd?.({
               label,
               phase: assignedPhase,
@@ -619,6 +643,8 @@ export async function runWorkflow<T = unknown>(
         ...options,
         args: childArgs,
         sharedRuntime: shared,
+        // Propagate the parent's store so nested agents share the same key-value space.
+        sharedStore: store,
         // A nested run is its own script; never reuse the parent's resume journal.
         resumeJournal: undefined,
         resumeFromRunId: undefined,
@@ -858,27 +884,33 @@ export async function runWorkflow<T = unknown>(
   });
 
   const wrapped = `${DETERMINISM_PRELUDE}\n(async () => {\n${body}\n})()`;
-  const result = await new vm.Script(wrapped, { filename: `${meta.name || "workflow"}.js` }).runInContext(context);
+  try {
+    const result = await new vm.Script(wrapped, { filename: `${meta.name || "workflow"}.js` }).runInContext(context);
 
-  // Persist logs
-  const logFile = logger.persist();
-  if (logFile) {
-    log(`Logs persisted to ${logFile}`);
+    // Persist logs
+    const logFile = logger.persist();
+    if (logFile) {
+      log(`Logs persisted to ${logFile}`);
+    }
+
+    // Emit final token usage
+    options.onTokenUsage?.(shared.tokenUsage);
+
+    return {
+      meta,
+      result: result as T,
+      logs: state.logs,
+      phases: state.phases,
+      agentCount: shared.agentCount,
+      durationMs: Date.now() - started,
+      runId,
+      tokenUsage: shared.tokenUsage,
+    };
+  } finally {
+    // Dispose the store only when this run created it; nested runs inherit the
+    // parent's store and must not tear it down while the parent is still running.
+    if (!options.sharedStore) store.dispose();
   }
-
-  // Emit final token usage
-  options.onTokenUsage?.(shared.tokenUsage);
-
-  return {
-    meta,
-    result: result as T,
-    logs: state.logs,
-    phases: state.phases,
-    agentCount: shared.agentCount,
-    durationMs: Date.now() - started,
-    runId,
-    tokenUsage: shared.tokenUsage,
-  };
 }
 
 export function parseWorkflowScript(script: string): { meta: WorkflowMeta; body: string } {
