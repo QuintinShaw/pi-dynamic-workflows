@@ -65,7 +65,7 @@ export function createSharedStoreTools(store: SharedStore): ToolDefinition[] {
     name: "store_put",
     label: "Store Put",
     description:
-      "Write a value to the shared run store. Any other agent in this workflow run can read it with store_get. Overwrites any existing value for the key.",
+      "Write a value to the shared run store. Any other agent in this workflow run can read it with store_get. Overwrites any existing value for the key. Note: when two parallel agents write the same key, the last write wins — no merge is performed.",
     promptSnippet: "Write a value to the shared store",
     parameters: Type.Object({
       key: Type.String({ description: "The key to store the value under." }),
