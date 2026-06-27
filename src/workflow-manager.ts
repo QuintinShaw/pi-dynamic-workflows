@@ -60,6 +60,11 @@ export interface ExecOptions {
   agentRetries?: number;
   /** Resolve a checkpoint() question with a human reply (only for UI-bearing runs). */
   confirm?: (promptText: string, options: unknown) => Promise<unknown>;
+  /**
+   * Automatically resume this run after the provider usage limit resets.
+   * Defaults to true. Set to false to disable auto-resume for this execution.
+   */
+  autoResume?: boolean;
 }
 
 export interface WorkflowManagerOptions {
@@ -92,6 +97,14 @@ export class WorkflowManager extends EventEmitter {
   private sessionId?: string;
   private defaultAgentTimeoutMs: number | null;
   private defaultAgentRetries: number;
+
+  /** Pending auto-resume timers keyed by runId. */
+  private autoResumeTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Backoff attempt counts per runId for auto-resume. */
+  private autoResumeAttempts = new Map<string, number>();
+
+  private static readonly DEFAULT_AUTO_RESUME_DELAY_MS = 60 * 60 * 1000; // 60 min
+  private static readonly MAX_AUTO_RESUME_ATTEMPTS = 5;
 
   constructor(options: WorkflowManagerOptions = {}) {
     super();
@@ -131,9 +144,55 @@ export class WorkflowManager extends EventEmitter {
             this.persistence.releaseRunLease(lease);
           }
         }
+        // Re-arm auto-resume timer for usage-limit paused runs that survived a restart.
+        if (p.status === "paused" && p.pauseReason === "usage_limit" && !this.runs.has(p.runId)) {
+          this.scheduleAutoResume(p.runId, p.resetHint);
+        }
       }
     } catch {
       // Recovery is best-effort; never let it block manager construction.
+    }
+  }
+
+  /** Parse a provider reset hint string into milliseconds. Falls back to 60 min. */
+  private parseResetHintMs(hint: string | undefined): number {
+    if (!hint) return WorkflowManager.DEFAULT_AUTO_RESUME_DELAY_MS;
+    const hourMatch = hint.match(/(\d+(?:\.\d+)?)\s*h/i);
+    const minMatch = hint.match(/(\d+(?:\.\d+)?)\s*m(?:in)?/i);
+    if (hourMatch) return Math.round(parseFloat(hourMatch[1]!) * 60 * 60 * 1000);
+    if (minMatch) return Math.round(parseFloat(minMatch[1]!) * 60 * 1000);
+    return WorkflowManager.DEFAULT_AUTO_RESUME_DELAY_MS;
+  }
+
+  /** Schedule an automatic resume for a usage-limit paused run, with exponential backoff. */
+  private scheduleAutoResume(runId: string, resetHint?: string): void {
+    this.cancelAutoResume(runId);
+    const attempts = this.autoResumeAttempts.get(runId) ?? 0;
+    if (attempts >= WorkflowManager.MAX_AUTO_RESUME_ATTEMPTS) return;
+    const base = this.parseResetHintMs(resetHint);
+    const delay = base * Math.pow(2, attempts);
+    const timer = setTimeout(async () => {
+      this.autoResumeTimers.delete(runId);
+      this.autoResumeAttempts.set(runId, attempts + 1);
+      const persisted = this.persistence.load(runId);
+      if (persisted?.status === "paused" && persisted.pauseReason === "usage_limit") {
+        this.emit("autoResuming", { runId, attempt: attempts + 1 });
+        await this.resume(runId).catch(() => {});
+      } else {
+        // Run is no longer paused-for-usage-limit — clear attempt tracking.
+        this.autoResumeAttempts.delete(runId);
+      }
+    }, delay);
+    timer.unref?.();
+    this.autoResumeTimers.set(runId, timer);
+  }
+
+  /** Cancel any pending auto-resume timer for a run. */
+  private cancelAutoResume(runId: string): void {
+    const existing = this.autoResumeTimers.get(runId);
+    if (existing !== undefined) {
+      clearTimeout(existing);
+      this.autoResumeTimers.delete(runId);
     }
   }
 
@@ -274,6 +333,7 @@ export class WorkflowManager extends EventEmitter {
       concurrency,
       agentRetries,
       confirm,
+      autoResume = true,
     } = exec;
     const resolvedAgentTimeoutMs = agentTimeoutMs !== undefined ? agentTimeoutMs : this.defaultAgentTimeoutMs;
     const resolvedConcurrency = concurrency ?? this.concurrency;
@@ -406,6 +466,9 @@ export class WorkflowManager extends EventEmitter {
           error: workflowError,
           resetHint: workflowError.resetHint,
         });
+        if (autoResume) {
+          this.scheduleAutoResume(managed.runId, workflowError.resetHint);
+        }
       } else {
         this.emit("error", { runId: managed.runId, error: workflowError });
       }
@@ -547,6 +610,8 @@ export class WorkflowManager extends EventEmitter {
     const managed = this.runs.get(runId);
     if (!managed || (managed.status !== "running" && managed.status !== "paused")) return false;
 
+    this.cancelAutoResume(runId);
+    this.autoResumeAttempts.delete(runId);
     managed.controller.abort();
     managed.status = "aborted";
     this.emit("stopped", { runId });
@@ -593,6 +658,8 @@ export class WorkflowManager extends EventEmitter {
   deleteRun(runId: string): boolean {
     const managed = this.runs.get(runId);
     if (managed) this.releaseRunLease(managed);
+    this.cancelAutoResume(runId);
+    this.autoResumeAttempts.delete(runId);
     this.runs.delete(runId);
     return this.persistence.delete(runId);
   }
