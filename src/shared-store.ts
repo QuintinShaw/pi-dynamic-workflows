@@ -71,7 +71,7 @@ export function createSharedStoreTools(store: SharedStore): ToolDefinition[] {
       key: Type.String({ description: "The key to store the value under." }),
       value: Type.Any({ description: "The value to store (any JSON-serializable value)." }),
     }),
-    execute(_id: string, params: { key: string; value: unknown }) {
+    async execute(_id: string, params: { key: string; value: unknown }) {
       store.put(params.key, params.value);
       return {
         content: [{ type: "text", text: `Stored value under key "${params.key}".` }],
@@ -89,7 +89,7 @@ export function createSharedStoreTools(store: SharedStore): ToolDefinition[] {
     parameters: Type.Object({
       key: Type.String({ description: "The key to read." }),
     }),
-    execute(_id: string, params: { key: string }) {
+    async execute(_id: string, params: { key: string }) {
       const value = store.get(params.key);
       const found = value !== undefined;
       const text = found
