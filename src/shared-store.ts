@@ -135,8 +135,8 @@ export function createSharedStoreTools(store: SharedStore): ToolDefinition[] {
       key: Type.String({ description: "The key to read." }),
     }),
     async execute(_id: string, params: { key: string }) {
+      const found = store.has(params.key);
       const value = store.get(params.key);
-      const found = value !== undefined;
       const text = found
         ? `Value for key "${params.key}": ${JSON.stringify(value)}`
         : `Key "${params.key}" not found in store.`;
@@ -185,8 +185,8 @@ export function createAgentStoreTools(store: SharedStore, callIndex: number): To
       key: Type.String({ description: "The key to read." }),
     }),
     async execute(_id: string, params: { key: string }) {
+      const found = store.has(params.key);
       const value = store.get(params.key);
-      const found = value !== undefined;
       const text = found
         ? `Value for key "${params.key}": ${JSON.stringify(value)}`
         : `Key "${params.key}" not found in store.`;
