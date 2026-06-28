@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { SharedStore, createSharedStoreTools, createAgentStoreTools } from "../src/shared-store.js";
+import { SharedStore } from "../src/shared-store.js";
 import { runWorkflow } from "../src/workflow.js";
 
 // ─── SharedStore unit tests ───────────────────────────────────────────────────
@@ -18,7 +18,7 @@ test("SharedStore.snapshot returns deep copy", () => {
   const store = new SharedStore();
   store.put("obj", { nested: 1 });
   const snap = store.snapshot();
-  (snap["obj"] as { nested: number }).nested = 999;
+  (snap.obj as { nested: number }).nested = 999;
   assert.deepEqual(store.get("obj"), { nested: 1 }, "mutation of snapshot must not affect the store");
 });
 
@@ -82,7 +82,10 @@ test("each runWorkflow call gets an isolated SharedStore", async () => {
   const results: string[] = [];
 
   const agent = {
-    async run(prompt: string, opts: { systemTools?: { name: string; execute: Function }[] }) {
+    async run(
+      prompt: string,
+      opts: { systemTools?: { name: string; execute: (...args: unknown[]) => Promise<unknown> }[] },
+    ) {
       // Find store_get tool and call it
       const getResult = await opts.systemTools
         ?.find((t) => t.name === "store_get")
@@ -167,12 +170,12 @@ test("resume replays parallel-agent deltas additively so no writes are lost", as
   });
 
   // Verify first run saw both values.
-  assert.equal(writeCalls["alpha"], "hello", "first run: alpha must be readable");
-  assert.equal(writeCalls["beta"], "world", "first run: beta must be readable");
+  assert.equal(writeCalls.alpha, "hello", "first run: alpha must be readable");
+  assert.equal(writeCalls.beta, "world", "first run: beta must be readable");
 
   // Reset read results so we can tell if the resume re-reads correctly.
-  delete writeCalls["alpha"];
-  delete writeCalls["beta"];
+  delete writeCalls.alpha;
+  delete writeCalls.beta;
 
   // Replay the whole run from journal (simulates a resume where all prefix entries hit cache).
   const resumeJournal = new Map(journal.map((e) => [e.index, e]));
@@ -184,6 +187,6 @@ test("resume replays parallel-agent deltas additively so no writes are lost", as
   });
 
   // The get agents ran live against a store rebuilt from deltas.
-  assert.equal(writeCalls["alpha"], "hello", "resume: alpha delta must survive replay");
-  assert.equal(writeCalls["beta"], "world", "resume: beta delta must survive replay");
+  assert.equal(writeCalls.alpha, "hello", "resume: alpha delta must survive replay");
+  assert.equal(writeCalls.beta, "world", "resume: beta delta must survive replay");
 });
