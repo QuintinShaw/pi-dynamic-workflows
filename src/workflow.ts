@@ -519,7 +519,12 @@ export async function runWorkflow<T = unknown>(
             }
 
             const tokens = recordTokens(result);
-            options.onAgentJournal?.({ index: callIndex, hash: callHash, result, storeDelta: store.commitDelta(callIndex) });
+            options.onAgentJournal?.({
+              index: callIndex,
+              hash: callHash,
+              result,
+              storeDelta: store.commitDelta(callIndex),
+            });
             options.onAgentEnd?.({
               label,
               phase: assignedPhase,
