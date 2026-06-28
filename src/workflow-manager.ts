@@ -607,11 +607,16 @@ export class WorkflowManager extends EventEmitter {
    * Stop a running workflow.
    */
   stop(runId: string): boolean {
+    // Cancel any pending auto-resume timer unconditionally — recoverStaleRuns()
+    // may have armed a timer for a run that is in persistence but not in memory,
+    // so we must cancel before the managed guard to avoid the timer firing after
+    // a user-requested stop.
+    this.cancelAutoResume(runId);
+    this.autoResumeAttempts.delete(runId);
+
     const managed = this.runs.get(runId);
     if (!managed || (managed.status !== "running" && managed.status !== "paused")) return false;
 
-    this.cancelAutoResume(runId);
-    this.autoResumeAttempts.delete(runId);
     managed.controller.abort();
     managed.status = "aborted";
     this.emit("stopped", { runId });

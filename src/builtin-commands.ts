@@ -4,7 +4,7 @@
  * They run a generated workflow script and print the final report.
  */
 
-import { exec } from "node:child_process";
+import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createCodingTools, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { generateAdversarialReviewWorkflow, generateMultiPerspectiveWorkflow } from "./adversarial-review.js";
@@ -13,7 +13,7 @@ import { generateCodebaseAuditWorkflow, generateDeepResearchWorkflow } from "./d
 import { createWebTools } from "./web-tools.js";
 import { runWorkflow, type WorkflowRunResult } from "./workflow.js";
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 function alreadyRegistered(pi: ExtensionAPI, name: string): boolean {
   try {
@@ -131,16 +131,26 @@ export function registerBuiltinWorkflows(pi: ExtensionAPI, opts: { cwd: string }
         let diff = "";
 
         try {
+          let cmd: string;
+          let cmdArgs: string[];
           if (!input) {
             diffSource = "git diff HEAD";
+            cmd = "git";
+            cmdArgs = ["diff", "HEAD"];
           } else if (/^\d+$/.test(input)) {
             diffSource = `gh pr diff ${input}`;
+            cmd = "gh";
+            cmdArgs = ["pr", "diff", input];
           } else if (input.includes("..")) {
             diffSource = `git diff ${input}`;
+            cmd = "git";
+            cmdArgs = ["diff", input];
           } else {
             diffSource = `git diff HEAD -- ${input}`;
+            cmd = "git";
+            cmdArgs = ["diff", "HEAD", "--", input];
           }
-          const { stdout } = await execAsync(diffSource, { cwd });
+          const { stdout } = await execFileAsync(cmd, cmdArgs, { cwd });
           diff = stdout;
           if (!diff.trim()) {
             return ctx.ui.notify(`No diff output from: ${diffSource}`, "warning");
