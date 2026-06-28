@@ -6,9 +6,11 @@
  * injected into every agent's tool list so parallel agents can share
  * intermediate state without coordinating through the script itself.
  *
- * Journal integration: callers capture `store.snapshot()` alongside each agent
- * result in the journal. On resume, `store.restore(snapshot)` rebuilds the
- * store state for the replayed prefix so live agents see a consistent view.
+ * Journal integration: callers capture `store.commitDelta(callIndex)` alongside
+ * each agent result in the journal. On resume, `store.applyDelta(delta)` rebuilds
+ * the store state additively in callSeq order, so parallel-agent writes are
+ * replayed correctly without the last-complete-wins ordering bug that a
+ * whole-Map restore() would cause.
  */
 
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -16,10 +18,27 @@ import { Type } from "typebox";
 
 export class SharedStore {
   private readonly map = new Map<string, unknown>();
+  // Per-agent write deltas for delta-journaling; keyed by callIndex.
+  private readonly agentDeltas = new Map<number, Record<string, unknown>>();
 
   /** Store a value under `key`. Overwrites any existing value. */
   put(key: string, value: unknown): void {
     this.map.set(key, value);
+  }
+
+  /**
+   * Store a value and record the write in the per-agent delta for `callIndex`.
+   * Used by per-agent tools created via `createAgentStoreTools` so that each
+   * agent's writes can be journaled and replayed independently.
+   */
+  trackPut(key: string, value: unknown, callIndex: number): void {
+    this.map.set(key, value);
+    let delta = this.agentDeltas.get(callIndex);
+    if (!delta) {
+      delta = {};
+      this.agentDeltas.set(callIndex, delta);
+    }
+    delta[key] = value;
   }
 
   /** Retrieve the value for `key`, or `undefined` when absent. */
@@ -32,14 +51,35 @@ export class SharedStore {
     return this.map.has(key);
   }
 
-  /** Return a plain-object copy of all entries (for journaling). */
+  /** Return a deep-copied plain-object snapshot of all entries. */
   snapshot(): Record<string, unknown> {
-    return Object.fromEntries(this.map);
+    return structuredClone(Object.fromEntries(this.map));
   }
 
   /**
-   * Replace all entries with a snapshot (for resume replay).
-   * The snapshot must be a plain object produced by `snapshot()`.
+   * Extract and clear the write delta accumulated for `callIndex`.
+   * Called after an agent completes to get the set of keys it wrote.
+   */
+  commitDelta(callIndex: number): Record<string, unknown> {
+    const delta = this.agentDeltas.get(callIndex) ?? {};
+    this.agentDeltas.delete(callIndex);
+    return delta;
+  }
+
+  /**
+   * Apply a write delta additively — sets each key without clearing others.
+   * Used during resume replay so parallel-agent deltas applied in callSeq
+   * order accumulate correctly regardless of original completion order.
+   */
+  applyDelta(delta: Record<string, unknown>): void {
+    for (const [k, v] of Object.entries(delta)) {
+      this.map.set(k, v);
+    }
+  }
+
+  /**
+   * Replace all entries with a snapshot (for full resets).
+   * Prefer `applyDelta` for resume replay — see journal integration above.
    */
   restore(snap: Record<string, unknown>): void {
     this.map.clear();
@@ -51,6 +91,7 @@ export class SharedStore {
   /** Clear all entries (called when the run ends). */
   dispose(): void {
     this.map.clear();
+    this.agentDeltas.clear();
   }
 }
 
@@ -59,6 +100,10 @@ export class SharedStore {
  * `SharedStore` instance. Inject the returned array into every agent in the run
  * via `systemTools` so all agents, including those with a restrictive
  * `tools` allowlist, can read and write shared state.
+ *
+ * For workflow-internal use where delta-journaling is needed, use
+ * `createAgentStoreTools(store, callIndex)` instead — it attributes each put to
+ * the given agent so the write can be replayed correctly on resume.
  */
 export function createSharedStoreTools(store: SharedStore): ToolDefinition[] {
   const storePut = defineTool({
@@ -73,6 +118,56 @@ export function createSharedStoreTools(store: SharedStore): ToolDefinition[] {
     }),
     async execute(_id: string, params: { key: string; value: unknown }) {
       store.put(params.key, params.value);
+      return {
+        content: [{ type: "text", text: `Stored value under key "${params.key}".` }],
+        details: { key: params.key },
+      };
+    },
+  }) as unknown as ToolDefinition;
+
+  const storeGet = defineTool({
+    name: "store_get",
+    label: "Store Get",
+    description:
+      "Read a value from the shared run store previously written by store_put. Returns the stored value, or null when the key does not exist.",
+    promptSnippet: "Read a value from the shared store",
+    parameters: Type.Object({
+      key: Type.String({ description: "The key to read." }),
+    }),
+    async execute(_id: string, params: { key: string }) {
+      const value = store.get(params.key);
+      const found = value !== undefined;
+      const text = found
+        ? `Value for key "${params.key}": ${JSON.stringify(value)}`
+        : `Key "${params.key}" not found in store.`;
+      return {
+        content: [{ type: "text", text }],
+        details: { key: params.key, value: found ? value : null, found },
+      };
+    },
+  }) as unknown as ToolDefinition;
+
+  return [storePut, storeGet];
+}
+
+/**
+ * Create per-agent store tools that attribute writes to `callIndex`.
+ * Used internally by `runWorkflow` so each agent's puts are tracked in the
+ * store's delta journal and can be replayed additively on resume.
+ */
+export function createAgentStoreTools(store: SharedStore, callIndex: number): ToolDefinition[] {
+  const storePut = defineTool({
+    name: "store_put",
+    label: "Store Put",
+    description:
+      "Write a value to the shared run store. Any other agent in this workflow run can read it with store_get. Overwrites any existing value for the key. Note: when two parallel agents write the same key, the last write wins — no merge is performed.",
+    promptSnippet: "Write a value to the shared store",
+    parameters: Type.Object({
+      key: Type.String({ description: "The key to store the value under." }),
+      value: Type.Any({ description: "The value to store (any JSON-serializable value)." }),
+    }),
+    async execute(_id: string, params: { key: string; value: unknown }) {
+      store.trackPut(params.key, params.value, callIndex);
       return {
         content: [{ type: "text", text: `Stored value under key "${params.key}".` }],
         details: { key: params.key },

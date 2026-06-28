@@ -17,7 +17,7 @@ import { DEFAULT_AGENT_TIMEOUT_MS, MAX_AGENT_RETRIES, MAX_AGENTS_PER_RUN, MAX_CO
 import { WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
 import { createWorkflowLogger } from "./logger.js";
 import { parseModelRoutingFromMeta, resolveModelForPhase } from "./model-routing.js";
-import { createSharedStoreTools, SharedStore } from "./shared-store.js";
+import { createAgentStoreTools, SharedStore } from "./shared-store.js";
 import { createWorktree, removeWorktree, type Worktree } from "./worktree.js";
 
 export interface WorkflowMetaPhase {
@@ -41,11 +41,12 @@ export interface JournalEntry {
   hash: string;
   result: unknown;
   /**
-   * Shared-store state immediately after this agent completed (for replay
-   * consistency). Absent on older journal entries — replaying them leaves the
-   * store unchanged. Populated when `SharedStore` is active for the run.
+   * Per-agent write delta (keys set by this agent) for additive replay on resume.
+   * Replaces the former full-map snapshot to fix parallel-agent ordering: applying
+   * deltas in callSeq order accumulates all agents' writes correctly regardless of
+   * which agent finished first. Absent on older journal entries.
    */
-  storeSnapshot?: Record<string, unknown>;
+  storeDelta?: Record<string, unknown>;
 }
 
 /**
@@ -310,7 +311,6 @@ export async function runWorkflow<T = unknown>(
   // One store instance per run; nested workflow() calls inherit the parent's store
   // so all agents across nesting levels share the same key-value space.
   const store: SharedStore = options.sharedStore ?? new SharedStore();
-  const storeTools = createSharedStoreTools(store);
 
   const log = (message: string) => {
     const text = String(message);
@@ -428,9 +428,10 @@ export async function runWorkflow<T = unknown>(
     if (hashMatches && !cachedEmptyOutput && callIndex < state.firstMiss) {
       options.onAgentStart?.({ label, phase: assignedPhase, prompt, model: displayModel });
       options.onAgentEnd?.({ label, phase: assignedPhase, result: cached.result, tokens: 0, model: displayModel });
-      // Restore the store to the state recorded when this agent originally ran
-      // so live agents later in the run see a consistent store.
-      if (cached.storeSnapshot) store.restore(cached.storeSnapshot);
+      // Apply this agent's write delta so live agents later in the run see a
+      // consistent store. Additive apply preserves parallel-agent writes that
+      // came from higher-callIndex agents finishing before this one.
+      if (cached.storeDelta) store.applyDelta(cached.storeDelta);
       return cached.result;
     }
     // A genuine miss (no journal entry, or the hash changed) marks where the
@@ -487,9 +488,9 @@ export async function runWorkflow<T = unknown>(
                 tier: agentOptions.tier,
                 toolNames: agentDef?.tools,
                 disallowedToolNames: agentDef?.disallowedTools,
-                // Shared-store tools bypass the policy filter so they are always
-                // available regardless of the agent's tools allowlist.
-                systemTools: storeTools,
+                // Per-agent store tools track this agent's writes by callIndex so
+                // the delta can be journaled and replayed correctly on resume.
+                systemTools: createAgentStoreTools(store, callIndex),
                 cwd: runCwd,
                 onModelResolved: (id: string) => {
                   displayModel = id;
@@ -518,7 +519,7 @@ export async function runWorkflow<T = unknown>(
             }
 
             const tokens = recordTokens(result);
-            options.onAgentJournal?.({ index: callIndex, hash: callHash, result, storeSnapshot: store.snapshot() });
+            options.onAgentJournal?.({ index: callIndex, hash: callHash, result, storeDelta: store.commitDelta(callIndex) });
             options.onAgentEnd?.({
               label,
               phase: assignedPhase,
