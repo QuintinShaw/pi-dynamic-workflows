@@ -40,6 +40,8 @@ export interface PersistedRunState {
   pauseReason?: string;
   /** Provider reset hint for a usage-limit pause, e.g. "Resets in ~3h" (verbatim). */
   resetHint?: string;
+  /** Number of auto-resume attempts already made, persisted so the cap survives process restarts. */
+  autoResumeAttempts?: number;
   phases: string[];
   currentPhase?: string;
   agents: PersistedAgentState[];

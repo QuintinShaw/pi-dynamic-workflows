@@ -145,7 +145,9 @@ export class WorkflowManager extends EventEmitter {
           }
         }
         // Re-arm auto-resume timer for usage-limit paused runs that survived a restart.
+        // Restore persisted attempt count first so the cap is honoured across restarts.
         if (p.status === "paused" && p.pauseReason === "usage_limit" && !this.runs.has(p.runId)) {
+          if (p.autoResumeAttempts) this.autoResumeAttempts.set(p.runId, p.autoResumeAttempts);
           this.scheduleAutoResume(p.runId, p.resetHint);
         }
       }
@@ -173,10 +175,21 @@ export class WorkflowManager extends EventEmitter {
     const delay = base * Math.pow(2, attempts);
     const timer = setTimeout(async () => {
       this.autoResumeTimers.delete(runId);
-      this.autoResumeAttempts.set(runId, attempts + 1);
+      const nextAttempts = attempts + 1;
+      this.autoResumeAttempts.set(runId, nextAttempts);
       const persisted = this.persistence.load(runId);
       if (persisted?.status === "paused" && persisted.pauseReason === "usage_limit") {
-        this.emit("autoResuming", { runId, attempt: attempts + 1 });
+        // Persist the incremented attempt count before resuming so a crash mid-resume
+        // doesn't reset the cap on the next cold start.
+        const lease = this.persistence.acquireRunLease(runId);
+        if (lease) {
+          try {
+            this.persistence.save({ ...persisted, autoResumeAttempts: nextAttempts });
+          } finally {
+            this.persistence.releaseRunLease(lease);
+          }
+        }
+        this.emit("autoResuming", { runId, attempt: nextAttempts });
         await this.resume(runId).catch(() => {});
       } else {
         // Run is no longer paused-for-usage-limit — clear attempt tracking.
@@ -508,6 +521,10 @@ export class WorkflowManager extends EventEmitter {
         resetHint:
           managed.status === "paused" && managed.error?.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT
             ? managed.error.resetHint
+            : undefined,
+        autoResumeAttempts:
+          managed.status === "paused" && managed.error?.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT
+            ? (this.autoResumeAttempts.get(managed.runId) ?? 0)
             : undefined,
         phases: managed.snapshot.phases,
         currentPhase: managed.snapshot.currentPhase,
