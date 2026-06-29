@@ -100,9 +100,7 @@ test("each runWorkflow call gets an isolated SharedStore", async () => {
   // wiring the whole tool call pipeline, so instead verify isolation via dispose:
   // two separate runWorkflow calls should not share a store instance.
   const script = `
-    ---
-    name: isolation-test
-    ---
+    export const meta = { name: "isolation-test", description: "isolation test" };
     const r = await agent("check", {});
     return r;
   `;
@@ -150,9 +148,7 @@ test("resume replays parallel-agent deltas additively so no writes are lost", as
 
   // Script: two parallel puts, then one sequential get that should see both.
   const script = `
-    ---
-    name: fan-out-resume-test
-    ---
+    export const meta = { name: "fan-out-resume-test", description: "fan-out resume test" };
     await Promise.all([
       agent("put:alpha:hello"),
       agent("put:beta:world"),
@@ -177,8 +173,12 @@ test("resume replays parallel-agent deltas additively so no writes are lost", as
   delete writeCalls.alpha;
   delete writeCalls.beta;
 
-  // Replay the whole run from journal (simulates a resume where all prefix entries hit cache).
-  const resumeJournal = new Map(journal.map((e) => [e.index, e]));
+  // Replay only the put agents from the journal — their deltas rebuild the store.
+  // The get agents are intentionally absent so they run live against the rebuilt store,
+  // which is how we verify the delta replay correctness.
+  const resumeJournal = new Map(
+    journal.filter((e) => Object.keys(e.storeDelta ?? {}).length > 0).map((e) => [e.index, e]),
+  );
   await runWorkflow(script, {
     agent,
     cwd: process.cwd(),
