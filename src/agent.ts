@@ -425,6 +425,7 @@ export class WorkflowAgent {
       }
 
       await session.prompt(this.buildPrompt(prompt, options as AgentRunOptions<any>, Boolean(options.schema)));
+
       if (options.signal?.aborted) throw new Error("Subagent was aborted");
 
       // The SDK buries a provider usage/quota limit in the assistant message rather
