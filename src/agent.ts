@@ -203,6 +203,14 @@ export interface WorkflowAgentOptions {
    * to the session default when no config is saved yet.
    */
   mainModel?: string;
+  /**
+   * Shared model registry from the host Pi session. When provided, subagents
+   * resolve tier/model specs against the same registry the main session uses,
+   * including dynamically-registered providers such as ollama-cloud. Without
+   * this, the agent builds an isolated registry from disk and may miss models
+   * that are only available via extension registration.
+   */
+  modelRegistry?: ModelRegistry;
 }
 
 /**
@@ -210,12 +218,15 @@ export interface WorkflowAgentOptions {
  * `provider/modelId` specs. Used to tell the workflow author which models it may
  * route agents to. Best-effort: returns [] if the registry can't be built.
  */
-export function listAvailableModelSpecs(): string[] {
+export function listAvailableModelSpecs(registry?: ModelRegistry): string[] {
   try {
+    if (registry) {
+      return registry.getAvailable().map((m) => `${m.provider}/${m.id}`);
+    }
     const dir = getAgentDir();
     const auth = AuthStorage.create(join(dir, "auth.json"));
-    const registry = ModelRegistry.create(auth, join(dir, "models.json"));
-    return registry.getAvailable().map((m) => `${m.provider}/${m.id}`);
+    const r = ModelRegistry.create(auth, join(dir, "models.json"));
+    return r.getAvailable().map((m) => `${m.provider}/${m.id}`);
   } catch {
     return [];
   }
@@ -293,6 +304,8 @@ export class WorkflowAgent {
   private readonly sessionOptions: Partial<CreateAgentSessionOptions>;
   private readonly instructions?: string;
   private readonly mainModel?: string;
+  /** Shared registry from the host session, when provided. */
+  private readonly sharedRegistry?: ModelRegistry;
   /** Lazily built once; shares the SDK's agentDir/auth so resolved models are authed. */
   private registry?: ModelRegistry;
 
@@ -302,9 +315,13 @@ export class WorkflowAgent {
     this.sessionOptions = options.session ?? {};
     this.instructions = options.instructions;
     this.mainModel = options.mainModel;
+    this.sharedRegistry = options.modelRegistry;
   }
 
   private getRegistry(): ModelRegistry {
+    if (this.sharedRegistry) {
+      return this.sharedRegistry;
+    }
     if (!this.registry) {
       const dir = getAgentDir();
       // Same agentDir/auth files createAgentSession uses by default, so a model
@@ -379,6 +396,7 @@ export class WorkflowAgent {
       // not have valid auth, causing silent empty responses.
       settingsManager: SettingsManager.create(this.cwd, agentDir),
       customTools,
+      ...(this.sharedRegistry ? { modelRegistry: this.sharedRegistry } : {}),
       ...this.sessionOptions,
       // Per-call model wins over any sessionOptions.model.
       ...(resolvedModel ? { model: resolvedModel } : {}),

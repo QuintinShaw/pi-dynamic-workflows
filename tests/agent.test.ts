@@ -90,11 +90,38 @@ test("WorkflowAgent constructor accepts all option shapes without throwing", () 
     { cwd: "/tmp", tools: [], session: {}, instructions: "test" },
     { cwd: "/tmp", mainModel: "openai/gpt-4.1" },
     { cwd: "/tmp", tools: [], session: {}, instructions: "test", mainModel: "openai/gpt-4.1" },
+    {
+      cwd: "/tmp",
+      modelRegistry: {
+        getAvailable: () => [{ provider: "mock", id: "model" }],
+        find: () => undefined,
+        getAll: () => [],
+      } as any,
+    },
   ];
   for (const opts of optionSets) {
     const agent = opts ? new WorkflowAgent(opts) : new WorkflowAgent();
     assert.ok(agent instanceof WorkflowAgent, `agent should be constructed for options: ${JSON.stringify(opts)}`);
   }
+});
+
+test("WorkflowAgent reuses an injected ModelRegistry instead of building its own", () => {
+  const mockModel = { provider: "mock", id: "shared" } as any;
+  const registry = {
+    find: (provider: string, id: string) => (provider === "mock" && id === "shared" ? mockModel : undefined),
+    getAvailable: () => [mockModel],
+    getAll: () => [mockModel],
+  } as any;
+
+  const agent = new WorkflowAgent({ cwd: "/tmp", modelRegistry: registry });
+  const resolved = (agent as any).resolveModel("mock/shared");
+  assert.equal(resolved, mockModel, "should resolve via the injected registry");
+});
+
+test("WorkflowAgent falls back to building a disk registry when no registry is injected", () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp" });
+  // Should not throw; getRegistry() lazily builds a ModelRegistry.
+  assert.doesNotThrow(() => (agent as any).getRegistry());
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -274,6 +301,19 @@ test("agent() in workflow passes prompt and label to runner", async () => {
   );
   assert.equal(rec.calls.length, 1);
   assert.equal(rec.calls[0].prompt, "analyze this");
+});
+
+test("agent() in workflow forwards modelRegistry to the runner", async () => {
+  const rec = new CallRecordingAgent();
+  const fakeRegistry = { getAvailable: () => [], find: () => undefined, getAll: () => [] } as any;
+  await runWorkflow(
+    `export const meta = { name: 'test', description: 't' }
+     const r = await agent('task', { label: 't' })
+     return r`,
+    { agent: rec, persistLogs: false, modelRegistry: fakeRegistry },
+  );
+  assert.equal(rec.calls.length, 1);
+  assert.equal((rec.calls[0].options as { modelRegistry?: any }).modelRegistry, fakeRegistry);
 });
 
 test("agent() in workflow passes model spec to runner", async () => {

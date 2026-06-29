@@ -54,6 +54,9 @@ export default function extension(pi: ExtensionAPI) {
     // Tell the manager the session's main model so "explore" agents auto-tier
     // down to a lighter same-family sibling (e.g. Claude → Haiku).
     manager.setMainModel(ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
+    // Share the host session's model registry so tier/phase routing resolves
+    // extension-registered providers (e.g. ollama-cloud) consistently.
+    manager.setModelRegistry(ctx.modelRegistry);
     // Scope the /workflows history to this session: runs persist on disk across
     // sessions, but the navigator/task panel show only the current session's runs.
     // Switching back to a previous session re-shows that session's runs.

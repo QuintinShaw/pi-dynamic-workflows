@@ -469,6 +469,7 @@ export async function runWorkflow<T = unknown>(
                 instructions: buildAgentInstructions(assignedPhase, agentOptions, agentDef, resolvedIsolation),
                 model: modelSpec,
                 tier: agentOptions.tier,
+                modelRegistry: options.modelRegistry,
                 toolNames: agentDef?.tools,
                 disallowedToolNames: agentDef?.disallowedTools,
                 cwd: runCwd,
