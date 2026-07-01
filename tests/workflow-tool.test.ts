@@ -193,6 +193,26 @@ test("createWorkflowTool advertises models from the manager's shared registry wh
   assert.match(all, /router\/wired-model/);
 });
 
+test("createWorkflowTool promptGuidelines reflect a registry set AFTER tool creation (lazy accessor)", () => {
+  // Mirrors the real ordering: createWorkflowTool() runs at extension load,
+  // setModelRegistry() runs later in session_start. The SDK re-reads
+  // definition.promptGuidelines on every tool-registry refresh, so a fresh
+  // property read must see the late-set registry.
+  const manager = new WorkflowManager({ cwd: "/tmp" });
+  manager.setModelRegistry(fakeRegistry([]));
+  const tool = createWorkflowTool({ cwd: "/tmp", manager });
+  assert.doesNotMatch(tool.promptGuidelines.join(" "), /router\/late-model/);
+
+  manager.setModelRegistry(fakeRegistry([{ provider: "router", id: "late-model" }]));
+  assert.match(tool.promptGuidelines.join(" "), /router\/late-model/);
+
+  // Replacing the registry again is also reflected.
+  manager.setModelRegistry(fakeRegistry([{ provider: "router", id: "replacement-model" }]));
+  const latest = tool.promptGuidelines.join(" ");
+  assert.match(latest, /router\/replacement-model/);
+  assert.doesNotMatch(latest, /router\/late-model/);
+});
+
 test("modelRoutingGuideline output is non-empty and well-formed", () => {
   const text = modelRoutingGuideline();
   assert.ok(text.length > 50, "should be a substantial instruction");
