@@ -292,6 +292,14 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
    * structured_output) before falling back to strict prose extraction. Default 2.
    */
   maxSchemaRetries?: number;
+  /**
+   * Per-run model registry override. Takes precedence over the constructor's
+   * `modelRegistry` (WorkflowAgentOptions.modelRegistry) for both model
+   * resolution and the `createAgentSession` call this run makes. Falls back to
+   * the constructor's shared registry, then a lazily-built disk registry, when
+   * omitted.
+   */
+  modelRegistry?: ModelRegistry;
 }
 
 export type AgentRunResult<TSchemaDef extends TSchema | undefined> = TSchemaDef extends TSchema
@@ -318,7 +326,15 @@ export class WorkflowAgent {
     this.sharedRegistry = options.modelRegistry;
   }
 
-  private getRegistry(): ModelRegistry {
+  /**
+   * Resolve the registry for a run: an explicit per-run registry wins, then the
+   * constructor's shared registry, then a lazily-built disk registry (shared
+   * across calls once built).
+   */
+  private getRegistry(perRunRegistry?: ModelRegistry): ModelRegistry {
+    if (perRunRegistry) {
+      return perRunRegistry;
+    }
     if (this.sharedRegistry) {
       return this.sharedRegistry;
     }
@@ -337,8 +353,8 @@ export class WorkflowAgent {
    * or a bare `modelId` (prefers auth-configured models, then any known model).
    * Returns undefined when nothing matches.
    */
-  private resolveModel(spec: string): Model<any> | undefined {
-    const registry = this.getRegistry();
+  private resolveModel(spec: string, perRunRegistry?: ModelRegistry): Model<any> | undefined {
+    const registry = this.getRegistry(perRunRegistry);
     const slash = spec.indexOf("/");
     if (slash > 0) {
       return registry.find(spec.slice(0, slash), spec.slice(slash + 1));
@@ -376,7 +392,7 @@ export class WorkflowAgent {
     // spec falls back to the session default (with a warning) rather than failing.
     let resolvedModel: Model<any> | undefined;
     if (modelSpec) {
-      resolvedModel = this.resolveModel(modelSpec);
+      resolvedModel = this.resolveModel(modelSpec, options.modelRegistry);
       if (resolvedModel) {
         options.onModelResolved?.(`${resolvedModel.provider}/${resolvedModel.id}`);
       } else {
@@ -396,7 +412,11 @@ export class WorkflowAgent {
       // not have valid auth, causing silent empty responses.
       settingsManager: SettingsManager.create(this.cwd, agentDir),
       customTools,
-      ...(this.sharedRegistry ? { modelRegistry: this.sharedRegistry } : {}),
+      // Per-run modelRegistry wins over the constructor's shared registry, same
+      // precedence as resolveModel() above.
+      ...(options.modelRegistry || this.sharedRegistry
+        ? { modelRegistry: options.modelRegistry ?? this.sharedRegistry }
+        : {}),
       ...this.sessionOptions,
       // Per-call model wins over any sessionOptions.model.
       ...(resolvedModel ? { model: resolvedModel } : {}),

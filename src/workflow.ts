@@ -486,7 +486,7 @@ export async function runWorkflow<T = unknown>(
                 onHistory: (history: AgentHistoryEntry[]) => {
                   options.onAgentHistory?.({ label, phase: assignedPhase, history });
                 },
-              } as any),
+              }),
               timeout,
               label,
             );
