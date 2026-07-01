@@ -1,6 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { WorkflowManager } from "../src/workflow-manager.js";
 import { backgroundStartedText, createWorkflowTool, modelRoutingGuideline } from "../src/workflow-tool.js";
+
+/** Minimal fake ModelRegistry, matching the shape the PR's existing tests use. */
+function fakeRegistry(models: Array<{ provider: string; id: string }>) {
+  return {
+    getAvailable: () => models,
+    find: () => undefined,
+    getAll: () => models,
+  } as any;
+}
 
 // ─── backgroundStartedText ─────────────────────────────────────────────────────
 
@@ -152,6 +162,35 @@ test("createWorkflowTool invalid args throws descriptive error", () => {
 test("createWorkflowTool with custom cwd creates tool", () => {
   const tool = createWorkflowTool({ cwd: "/tmp" });
   assert.equal(tool.name, "workflow");
+});
+
+test("modelRoutingGuideline advertises models from an injected registry", () => {
+  const registry = fakeRegistry([{ provider: "router", id: "shared-model" }]);
+  const text = modelRoutingGuideline(registry);
+  assert.match(text, /route only to these/i);
+  assert.match(text, /router\/shared-model/);
+});
+
+test("modelRoutingGuideline accepts a getter and resolves it lazily at call time", () => {
+  // Empty registry (not undefined) so the getter path is exercised end-to-end
+  // rather than falling through to the disk-registry default.
+  let registry: any = fakeRegistry([]);
+  const text = modelRoutingGuideline(() => registry);
+  assert.doesNotMatch(text, /router\/late-model/);
+
+  // Registering after construction (simulating session_start running after the
+  // guideline string was first read) is reflected on the next call.
+  registry = fakeRegistry([{ provider: "router", id: "late-model" }]);
+  const later = modelRoutingGuideline(() => registry);
+  assert.match(later, /router\/late-model/);
+});
+
+test("createWorkflowTool advertises models from the manager's shared registry when set before creation", () => {
+  const manager = new WorkflowManager({ cwd: "/tmp" });
+  manager.setModelRegistry(fakeRegistry([{ provider: "router", id: "wired-model" }]));
+  const tool = createWorkflowTool({ cwd: "/tmp", manager });
+  const all = tool.promptGuidelines.join(" ");
+  assert.match(all, /router\/wired-model/);
 });
 
 test("modelRoutingGuideline output is non-empty and well-formed", () => {

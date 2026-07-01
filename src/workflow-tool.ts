@@ -1,4 +1,4 @@
-import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { defineTool, type ModelRegistry, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { listAvailableModelSpecs } from "./agent.js";
@@ -23,9 +23,16 @@ import { loadWorkflowSettings } from "./workflow-settings.js";
  *
  * This string is injected into the workflow tool's promptGuidelines and
  * therefore appears in the LLM's system prompt for every workflow execution.
+ *
+ * `registry` is a live host-session ModelRegistry (or a getter reaching one),
+ * e.g. from WorkflowManager.getModelRegistry(). The manager's registry is set
+ * on session_start — after the tool (and this string) is built — so a getter
+ * lets each call see the registry as it stands then, rather than a snapshot
+ * taken before it was populated.
  */
-export function modelRoutingGuideline(): string {
-  const available = listAvailableModelSpecs();
+export function modelRoutingGuideline(registry?: ModelRegistry | (() => ModelRegistry | undefined)): string {
+  const resolvedRegistry = typeof registry === "function" ? registry() : registry;
+  const available = listAvailableModelSpecs(resolvedRegistry);
   const list = available.length
     ? `The user's currently available models (route only to these) are: ${available.join(", ")}.`
     : "Use models the user has configured.";
@@ -174,7 +181,13 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       "For workflow, failed agent(), parallel(), or pipeline() branches return null and log the failure unless the workflow is aborted. Check for nulls before synthesizing conclusions.",
       "For workflow, include a final synthesis/assertion agent when combining multiple subagent results; return a compact JSON-serializable value with ok/verdict plus the important outputs.",
       "For workflow, if agent() needs machine-readable output, pass a plain JSON Schema via opts.schema; agent() will return the validated object. Use JSON Schema syntax, not TypeScript or TypeBox constructors.",
-      modelRoutingGuideline(),
+      // The guideline string is built once here, at tool creation — pi has no
+      // re-render hook for promptGuidelines. Passing manager.getModelRegistry
+      // (rather than the registry itself) means this still picks up whatever
+      // registry the manager holds at THIS moment; a registry set later via
+      // setModelRegistry (session_start runs after tool creation) is not
+      // reflected unless the tool is recreated. See modelRoutingGuideline's doc.
+      modelRoutingGuideline(() => manager.getModelRegistry()),
       agentTypeGuideline(),
       "For workflow, do not assume the parent assistant has repository code context inside subagents; include enough task context and relevant paths in each agent prompt.",
       "For workflow, runs are background by default: the tool returns immediately with a run ID, the turn ends so the user isn't blocked, and the result is delivered back into the conversation when the run finishes. Pass background: false only when you must use the result inline in this same turn (it will block).",
