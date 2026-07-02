@@ -71,12 +71,13 @@ describe("workflows-models-command", () => {
       assert.equal(result, null);
     });
 
-    it("returns null when user selects the same model (no change)", async () => {
+    it("returns null when user selects the same model and default thinking (no change)", async () => {
       const { editSingleTier } = await import("../src/workflows-models-command.js");
       // Mock ctx.ui.custom to return the same model that's already selected
       const ctx = {
         ui: {
           custom: mock.fn(async () => "gpt-4.1-mini"),
+          select: mock.fn(async () => "Default thinking (session setting)"),
           notify: mock.fn(),
         },
       };
@@ -86,12 +87,13 @@ describe("workflows-models-command", () => {
       assert.equal(result, null); // no change
     });
 
-    it("selects a different model and returns updated tiers", async () => {
+    it("selects a different model and returns updated tiers with default thinking", async () => {
       const { editSingleTier } = await import("../src/workflows-models-command.js");
       // Mock ctx.ui.custom to return a different model
       const ctx = {
         ui: {
           custom: mock.fn(async () => "gpt-5"),
+          select: mock.fn(async () => "Default thinking (session setting)"),
           notify: mock.fn(),
         },
       };
@@ -103,11 +105,48 @@ describe("workflows-models-command", () => {
       assert.equal(typeof result.small, "string", "should still be a string");
     });
 
+    it("lets users choose a thinking level for the selected model", async () => {
+      const { editSingleTier } = await import("../src/workflows-models-command.js");
+      let thinkingOptions: string[] = [];
+      const ctx = {
+        ui: {
+          custom: mock.fn(async () => "openai-codex/gpt-5.5"),
+          select: mock.fn(async (_title: string, options: string[]) => {
+            thinkingOptions = options;
+            return "xhigh";
+          }),
+          notify: mock.fn(),
+        },
+      };
+      const tiers: Record<string, string> = { big: "openai-codex/gpt-5.5" };
+
+      const result = await editSingleTier(ctx as never, tiers, "big");
+      assert.ok(result, "should return updated tiers");
+      assert.equal(result.big, "openai-codex/gpt-5.5:xhigh");
+      assert.ok(thinkingOptions.includes("xhigh"), "TUI should offer xhigh thinking");
+    });
+
+    it("preselects the base model when the current tier has a thinking suffix", async () => {
+      const { editSingleTier } = await import("../src/workflows-models-command.js");
+      const ctx = {
+        ui: {
+          custom: mock.fn(async () => "openai-codex/gpt-5.5"),
+          select: mock.fn(async () => "xhigh"),
+          notify: mock.fn(),
+        },
+      };
+      const tiers: Record<string, string> = { big: "openai-codex/gpt-5.5:xhigh" };
+
+      const result = await editSingleTier(ctx as never, tiers, "big");
+      assert.equal(result, null, "same model plus same thinking suffix should be unchanged");
+    });
+
     it("selects a model when no current model exists", async () => {
       const { editSingleTier } = await import("../src/workflows-models-command.js");
       const ctx = {
         ui: {
           custom: mock.fn(async () => "openai/gpt-4.1-mini"),
+          select: mock.fn(async () => "Default thinking (session setting)"),
           notify: mock.fn(),
         },
       };

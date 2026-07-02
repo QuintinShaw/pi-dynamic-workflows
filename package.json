@@ -76,6 +76,7 @@
     "@earendil-works/pi-ai": "latest",
     "@earendil-works/pi-coding-agent": "latest",
     "@earendil-works/pi-tui": "latest",
+    "fast-check": "^4.8.0",
     "tsx": "latest",
     "typebox": "latest",
     "typescript": "latest"
