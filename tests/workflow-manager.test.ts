@@ -386,6 +386,30 @@ test(
 );
 
 test(
+  "setModelRegistry stores the registry and forwards it to subagent runs",
+  withTempCwd(async (cwd) => {
+    const fakeRegistry = {
+      getAvailable: () => [{ provider: "mock", id: "m" }],
+      find: () => undefined,
+      getAll: () => [],
+    } as any;
+    const rec = new (class {
+      calls: Array<{ options: any }> = [];
+      async run(_prompt: string, options: any) {
+        this.calls.push({ options });
+        options.onUsage?.({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 });
+        return "ok";
+      }
+    })();
+    const manager = new WorkflowManager({ cwd, agent: rec });
+    manager.setModelRegistry(fakeRegistry);
+    await manager.runSync(oneAgentScript);
+    assert.equal(rec.calls.length, 1);
+    assert.equal(rec.calls[0].options.modelRegistry, fakeRegistry);
+  }),
+);
+
+test(
   "setMainModel sets the main model used for default agents",
   withTempCwd(async (cwd) => {
     const manager = new WorkflowManager({ cwd, agent: fakeAgent() });

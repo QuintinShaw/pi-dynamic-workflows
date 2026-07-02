@@ -23,6 +23,7 @@ import {
   type ExtensionUIContext,
 } from "@earendil-works/pi-coding-agent";
 import type { EditorTheme, TUI } from "@earendil-works/pi-tui";
+import { DEFAULT_KEYWORD_TRIGGER_WORD, normalizeKeywordTriggerWord } from "./config.js";
 import { type EffortState, effortDirective, isSubstantive } from "./effort-command.js";
 import {
   loadWorkflowSettings,
@@ -31,15 +32,24 @@ import {
   type WorkflowSettingsStore,
 } from "./workflow-settings.js";
 
-// A trigger is `workflow`/`workflows` (substring, case-insensitive) that is NOT
-// immediately preceded by `/` — so a slash command like `/workflows` or `/workflow`
-// is left alone (not colored, not armed).
-/** Matches a trigger anywhere in the text. */
-const TRIGGER = /(?<!\/)workflows?/i;
-/** Global variant for finding every occurrence to colorize. */
-const TRIGGER_G = /(?<!\/)workflows?/gi;
-/** True when the text immediately before the cursor ends with a trigger word. */
-const TRIGGER_AT_END = /(?<!\/)workflows?$/i;
+// A keyword trigger is a configured literal term. The default `workflow`
+// trigger keeps legacy substring behavior and plural support (`workflows`) while
+// custom trigger words match only that exact term. Slash commands like
+// `/workflows` or `/pi-workflow` are left alone (not colored, not armed).
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function triggerSource(triggerWord: string): string {
+  const escaped = escapeRegExp(triggerWord);
+  if (triggerWord.toLowerCase() === DEFAULT_KEYWORD_TRIGGER_WORD) return `(?<!\\/)${escaped}s?`;
+  return `(?<![/A-Za-z0-9_-])${escaped}(?![A-Za-z0-9_-])`;
+}
+
+function triggerRegex(triggerWord = DEFAULT_KEYWORD_TRIGGER_WORD, flags = "i", atEnd = false): RegExp {
+  const word = normalizeKeywordTriggerWord(triggerWord) ?? DEFAULT_KEYWORD_TRIGGER_WORD;
+  return new RegExp(`${triggerSource(word)}${atEnd ? "$" : ""}`, flags);
+}
 
 /** 256-color ring cycling through the spectrum — shifted by a tick to "flow". */
 export const RAINBOW = [
@@ -47,18 +57,19 @@ export const RAINBOW = [
   93, 129, 165, 201, 198, 197,
 ];
 
-export function hasTrigger(text: string): boolean {
-  return TRIGGER.test(text);
+export function hasTrigger(text: string, triggerWord = DEFAULT_KEYWORD_TRIGGER_WORD): boolean {
+  return triggerRegex(triggerWord).test(text);
 }
 
-export function endsWithTrigger(textBeforeCursor: string): boolean {
-  return TRIGGER_AT_END.test(textBeforeCursor);
+export function endsWithTrigger(textBeforeCursor: string, triggerWord = DEFAULT_KEYWORD_TRIGGER_WORD): boolean {
+  return triggerRegex(triggerWord, "i", true).test(textBeforeCursor);
 }
 
 /** Shared, mutable view of whether "workflows mode" is currently armed. */
 export interface WorkflowModeState {
   active: boolean;
   keywordTriggerEnabled: boolean;
+  keywordTriggerWord?: string;
   suppressedKeywordText?: string;
 }
 
@@ -113,17 +124,22 @@ export function tokenizeAnsi(line: string): AnsiToken[] {
  * flowing rainbow, leaving all ANSI escapes (cursor, markers) intact. Returns the
  * line unchanged when it contains no trigger.
  */
-export function colorizeWorkflow(line: string, tick: number, palette: number[] = RAINBOW): string {
+export function colorizeWorkflow(
+  line: string,
+  tick: number,
+  palette: number[] = RAINBOW,
+  triggerWord = DEFAULT_KEYWORD_TRIGGER_WORD,
+): string {
   const tokens = tokenizeAnsi(line);
   const visible = tokens
     .filter((t) => t.ch !== undefined)
     .map((t) => t.ch)
     .join("");
-  if (!TRIGGER.test(visible)) return line;
+  if (!hasTrigger(visible, triggerWord)) return line;
 
   const ranges: Array<[number, number]> = [];
-  TRIGGER_G.lastIndex = 0;
-  for (let m = TRIGGER_G.exec(visible); m; m = TRIGGER_G.exec(visible)) {
+  const globalTrigger = triggerRegex(triggerWord, "gi");
+  for (let m = globalTrigger.exec(visible); m; m = globalTrigger.exec(visible)) {
     ranges.push([m.index, m.index + m[0].length]);
   }
   const inRange = (idx: number) => ranges.some(([s, e]) => idx >= s && idx < e);
@@ -176,7 +192,11 @@ export class WorkflowEditor extends CustomEditor {
 
   /** Highlighted/armed: a trigger is present and the user hasn't toggled it off. */
   isActive(): boolean {
-    return this.modeState.keywordTriggerEnabled && !this.disabled && hasTrigger(this.getText());
+    return (
+      this.modeState.keywordTriggerEnabled &&
+      !this.disabled &&
+      hasTrigger(this.getText(), this.modeState.keywordTriggerWord)
+    );
   }
 
   override handleInput(data: string): void {
@@ -192,7 +212,7 @@ export class WorkflowEditor extends CustomEditor {
     super.handleInput(data);
     const after = this.getText();
     if (after !== before) {
-      const now = hasTrigger(after);
+      const now = hasTrigger(after, this.modeState.keywordTriggerWord);
       const normalizedAfter = after.trim();
       const suppressionCleared =
         this.modeState.suppressedKeywordText !== undefined &&
@@ -217,7 +237,11 @@ export class WorkflowEditor extends CustomEditor {
     if (!this.isActive() || lines.length === 0) return lines;
     // First and last lines are the editor's horizontal borders; only the text
     // lines in between are colorized.
-    return lines.map((ln, i) => (i === 0 || i === lines.length - 1 ? ln : colorizeWorkflow(ln, this.tick)));
+    return lines.map((ln, i) =>
+      i === 0 || i === lines.length - 1
+        ? ln
+        : colorizeWorkflow(ln, this.tick, RAINBOW, this.modeState.keywordTriggerWord),
+    );
   }
 
   /** Absolute text before the cursor, used to detect "right after the word". */
@@ -225,7 +249,7 @@ export class WorkflowEditor extends CustomEditor {
     const lines = this.getLines();
     const { line, col } = this.getCursor();
     const before = lines.slice(0, line).join("\n") + (line > 0 ? "\n" : "") + (lines[line] ?? "").slice(0, col);
-    return endsWithTrigger(before);
+    return endsWithTrigger(before, this.modeState.keywordTriggerWord);
   }
 
   private syncState(): void {
@@ -287,17 +311,19 @@ export function registerWorkflowTriggerCommand(
   settingsStore: WorkflowSettingsStore = DEFAULT_SETTINGS_STORE,
 ): void {
   pi.registerCommand?.("workflows-trigger", {
-    description: "Keyword workflow trigger: on | off | status",
+    description: "Keyword workflow trigger: on | off | set <word> | reset | status",
     async handler(args: string, _ctx: ExtensionCommandContext) {
-      const arg = args.trim().toLowerCase();
+      const raw = args.trim();
+      const [command = "status", ...rest] = raw.split(/\s+/);
+      const arg = command.toLowerCase();
       const say = (content: string) => pi.sendMessage({ customType: "workflows-trigger", content, display: true });
       if (arg === "on") {
         state.keywordTriggerEnabled = true;
         state.suppressedKeywordText = undefined;
-        const saved = persistKeywordTrigger(settingsStore, true);
+        const saved = persistWorkflowTriggerSettings(settingsStore, { keywordTriggerEnabled: true });
         await say(
           saved
-            ? "Workflows keyword trigger on — mentioning workflow/workflows in an interactive message will auto-arm workflows mode. Saved for new sessions."
+            ? `Workflows keyword trigger on — mentioning ${triggerDisplayName(state.keywordTriggerWord)} in an interactive message will auto-arm workflows mode. Saved for new sessions.`
             : "Workflows keyword trigger on for this session, but the preference could not be saved.",
         );
         return;
@@ -306,16 +332,49 @@ export function registerWorkflowTriggerCommand(
         state.keywordTriggerEnabled = false;
         state.active = false;
         state.suppressedKeywordText = undefined;
-        const saved = persistKeywordTrigger(settingsStore, false);
+        const saved = persistWorkflowTriggerSettings(settingsStore, { keywordTriggerEnabled: false });
         await say(
           saved
-            ? "Workflows keyword trigger off — messages can mention workflow/workflows without forcing the workflow tool. Saved for new sessions. Use /workflows-trigger on to restore."
+            ? `Workflows keyword trigger off — messages can mention ${triggerDisplayName(state.keywordTriggerWord)} without forcing the workflow tool. Saved for new sessions. Use /workflows-trigger on to restore.`
             : "Workflows keyword trigger off for this session, but the preference could not be saved. Use /workflows-trigger on to restore.",
         );
         return;
       }
+      if (arg === "set") {
+        const requested = rest.join(" ");
+        const keywordTriggerWord = normalizeKeywordTriggerWord(requested);
+        if (!keywordTriggerWord) {
+          await say(
+            'Invalid trigger word. Use a non-empty term with no spaces and no leading "/", e.g. /workflows-trigger set pi-workflow',
+          );
+          return;
+        }
+        state.keywordTriggerWord = keywordTriggerWord;
+        state.suppressedKeywordText = undefined;
+        const saved = persistWorkflowTriggerSettings(settingsStore, { keywordTriggerWord });
+        await say(
+          saved
+            ? `Workflows keyword trigger word set to "${keywordTriggerWord}". Saved for new sessions.`
+            : `Workflows keyword trigger word set to "${keywordTriggerWord}" for this session, but the preference could not be saved.`,
+        );
+        return;
+      }
+      if (arg === "reset") {
+        state.keywordTriggerWord = DEFAULT_KEYWORD_TRIGGER_WORD;
+        state.suppressedKeywordText = undefined;
+        const saved = persistWorkflowTriggerSettings(settingsStore, {
+          keywordTriggerWord: DEFAULT_KEYWORD_TRIGGER_WORD,
+        });
+        await say(
+          saved
+            ? 'Workflows keyword trigger word reset to "workflow" (also matches "workflows"). Saved for new sessions.'
+            : 'Workflows keyword trigger word reset to "workflow" for this session, but the preference could not be saved.',
+        );
+        return;
+      }
+      const keywordTriggerWord = resolvedTriggerWord(state.keywordTriggerWord);
       await say(
-        `Workflows keyword trigger is ${state.keywordTriggerEnabled ? "on" : "off"}. Changes are saved for new sessions. Usage: /workflows-trigger on | off | status`,
+        `Workflows keyword trigger is ${state.keywordTriggerEnabled ? "on" : "off"}; trigger word is "${keywordTriggerWord}". Changes are saved for new sessions. Usage: /workflows-trigger on | off | set <word> | reset | status`,
       );
     },
   });
@@ -386,9 +445,11 @@ export function installWorkflowEditor(
   options: InstallWorkflowEditorOptions = {},
 ): WorkflowModeState {
   const settingsStore = options.settingsStore ?? DEFAULT_SETTINGS_STORE;
+  const initialSettings = loadInitialWorkflowSettings(settingsStore);
   const state: WorkflowModeState = {
     active: false,
-    keywordTriggerEnabled: loadInitialKeywordTrigger(settingsStore),
+    keywordTriggerEnabled: initialSettings.keywordTriggerEnabled ?? true,
+    keywordTriggerWord: initialSettings.keywordTriggerWord ?? DEFAULT_KEYWORD_TRIGGER_WORD,
   };
 
   if (!ui.getEditorComponent?.()) {
@@ -418,7 +479,7 @@ export function installWorkflowEditor(
     const normalizedText = event.text.trim();
     const suppressed = state.suppressedKeywordText === normalizedText;
     if (suppressed) state.suppressedKeywordText = undefined;
-    const triggered = state.keywordTriggerEnabled && !suppressed && hasTrigger(event.text);
+    const triggered = state.keywordTriggerEnabled && !suppressed && hasTrigger(event.text, state.keywordTriggerWord);
     const byEffort = !triggered && !!effort && effort.level !== "off" && isSubstantive(event.text);
     if (!triggered && !byEffort) return { action: "continue" } as const;
     try {
@@ -457,21 +518,34 @@ const DEFAULT_SETTINGS_STORE: WorkflowSettingsStore = {
   save: saveWorkflowSettings,
 };
 
-function loadInitialKeywordTrigger(settingsStore: WorkflowSettingsStore): boolean {
+function loadInitialWorkflowSettings(settingsStore: WorkflowSettingsStore): WorkflowSettings {
   try {
-    return settingsStore.load().keywordTriggerEnabled ?? true;
+    const settings = settingsStore.load();
+    return {
+      keywordTriggerEnabled: settings.keywordTriggerEnabled,
+      keywordTriggerWord: normalizeKeywordTriggerWord(settings.keywordTriggerWord) ?? DEFAULT_KEYWORD_TRIGGER_WORD,
+    };
   } catch {
-    return true;
+    return { keywordTriggerEnabled: true, keywordTriggerWord: DEFAULT_KEYWORD_TRIGGER_WORD };
   }
 }
 
-function persistKeywordTrigger(settingsStore: WorkflowSettingsStore, enabled: boolean): boolean {
+function persistWorkflowTriggerSettings(settingsStore: WorkflowSettingsStore, settings: WorkflowSettings): boolean {
   try {
-    settingsStore.save({ keywordTriggerEnabled: enabled });
+    settingsStore.save(settings);
     return true;
   } catch {
     return false;
   }
+}
+
+function resolvedTriggerWord(keywordTriggerWord: string | undefined): string {
+  return normalizeKeywordTriggerWord(keywordTriggerWord) ?? DEFAULT_KEYWORD_TRIGGER_WORD;
+}
+
+function triggerDisplayName(keywordTriggerWord: string | undefined): string {
+  const word = resolvedTriggerWord(keywordTriggerWord);
+  return word.toLowerCase() === DEFAULT_KEYWORD_TRIGGER_WORD ? "workflow/workflows" : `"${word}"`;
 }
 
 function persistProgressSettings(settingsStore: WorkflowSettingsStore, settings: WorkflowSettings): boolean {

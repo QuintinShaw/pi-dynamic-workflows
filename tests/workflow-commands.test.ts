@@ -2,16 +2,32 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import test from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { createEffortState, effortDirective } from "../src/effort-command.js";
 import { registerWorkflowCommands } from "../src/workflow-commands.js";
+import { buildForcedWorkflowPrompt, WORKFLOW_TOOL_NAME } from "../src/workflow-editor.js";
 import type { WorkflowManager } from "../src/workflow-manager.js";
 
 type Handler = (args: string, ctx: any) => Promise<void>;
 
 /** Capture the registered command + outputs for assertions. */
-function harness(managerOverrides: Record<string, any> = {}) {
+function harness(
+  managerOverrides: Record<string, any> = {},
+  commandOptions: Record<string, any> = {},
+  initialTools: string[] = [WORKFLOW_TOOL_NAME],
+  sendMessageImpl?: (
+    m: { customType?: string; content?: string },
+    options?: { triggerTurn?: boolean; deliverAs?: string },
+  ) => Promise<void>,
+) {
   const printed: string[] = [];
+  const sent: Array<{
+    customType?: string;
+    content?: string;
+    options?: { triggerTurn?: boolean; deliverAs?: string };
+  }> = [];
   const notified: Array<{ message: string; type?: string }> = [];
   const calls: string[] = [];
+  const activeTools = [...initialTools];
   let handler: Handler | undefined;
 
   const pi: Partial<ExtensionAPI> = {
@@ -19,8 +35,15 @@ function harness(managerOverrides: Record<string, any> = {}) {
     registerCommand: (_name: string, opts: { handler: Handler }) => {
       handler = opts.handler;
     },
-    sendMessage: async (m: { content: string }) => {
-      printed.push(m.content);
+    sendMessage:
+      sendMessageImpl ??
+      (async (m, options) => {
+        sent.push({ ...m, options });
+        if (!options && typeof m.content === "string") printed.push(m.content);
+      }),
+    getActiveTools: () => [...activeTools],
+    setActiveTools: (toolNames: string[]) => {
+      activeTools.splice(0, activeTools.length, ...toolNames);
     },
   };
 
@@ -47,13 +70,13 @@ function harness(managerOverrides: Record<string, any> = {}) {
     ...managerOverrides,
   };
 
-  registerWorkflowCommands(pi as unknown as ExtensionAPI, manager as unknown as WorkflowManager);
+  registerWorkflowCommands(pi as unknown as ExtensionAPI, manager as unknown as WorkflowManager, commandOptions);
   const ctx = { ui: { notify: (message: string, type?: string) => notified.push({ message, type }) } };
   const run = (args: string) => {
     if (!handler) throw new Error("command not registered");
     return handler(args, ctx);
   };
-  return { run, printed, notified, calls };
+  return { run, printed, sent, notified, calls, activeTools };
 }
 
 test("/workflows list shows empty hint when no runs", async () => {
@@ -69,6 +92,53 @@ test("/workflows (no args) defaults to list", async () => {
   await h.run("");
   assert.match(h.printed[0], /Workflow runs:/);
   assert.match(h.printed[0], /run-1/);
+});
+
+test("/workflows run without prompt warns usage", async () => {
+  const h = harness();
+  await h.run("run");
+  assert.equal(h.sent.length, 0);
+  assert.equal(h.notified.length, 1);
+  assert.equal(h.notified[0].type, "warning");
+  assert.match(h.notified[0].message, /Usage: \/workflows run <prompt>/);
+});
+
+test("/workflows run <prompt> sends a forced workflow follow-up turn", async () => {
+  const h = harness();
+  await h.run("run audit auth boundaries");
+  assert.equal(h.sent.length, 1);
+  assert.equal(h.sent[0].customType, "workflow-run");
+  assert.equal(h.sent[0].content, buildForcedWorkflowPrompt("audit auth boundaries"));
+  assert.equal(h.sent[0].options?.triggerTurn, true);
+  assert.equal(h.sent[0].options?.deliverAs, "followUp");
+  assert.deepEqual(h.activeTools, [WORKFLOW_TOOL_NAME], "does not duplicate an already-active workflow tool");
+});
+
+test("/workflows run <prompt> notifies error when sendMessage rejects and does not bubble", async () => {
+  const failingSend = async () => {
+    throw new Error("send failed");
+  };
+  const h = harness({}, {}, [WORKFLOW_TOOL_NAME], failingSend);
+  await h.run("run audit auth");
+  assert.ok(
+    h.notified.some((n) => n.message === "Could not start the workflow turn."),
+    "should notify the error message",
+  );
+});
+
+test("/workflows run adds the workflow tool when absent and does not depend on the keyword trigger", async () => {
+  const h = harness({}, {}, ["bash", "read"]);
+  await h.run("run summarize the auth module");
+  assert.deepEqual(h.activeTools, ["bash", "read", WORKFLOW_TOOL_NAME]);
+  assert.equal(h.sent[0].content, buildForcedWorkflowPrompt("summarize the auth module"));
+});
+
+test("/workflows run carries standing effort directives", async () => {
+  const effort = createEffortState();
+  effort.level = "ultra";
+  const h = harness({}, { effort });
+  await h.run("run do X");
+  assert.equal(h.sent[0].content, buildForcedWorkflowPrompt("do X", effortDirective("ultra")));
 });
 
 test("/workflows stop <id> calls manager.stop", async () => {

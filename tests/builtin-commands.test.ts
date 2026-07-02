@@ -3,27 +3,32 @@ import test from "node:test";
 import { registerBuiltinWorkflows } from "../src/builtin-commands.js";
 import { makeCommandRegistryPi, makeNotifyCtx } from "./helpers/mock-pi.js";
 
-test("registerBuiltinWorkflows registers deep-research and adversarial-review commands", () => {
+test("registerBuiltinWorkflows registers all four built-in workflow commands", () => {
   const { pi, commands } = makeCommandRegistryPi();
   registerBuiltinWorkflows(pi, { cwd: "/tmp" });
-  assert.equal(commands.length, 2);
+  assert.equal(commands.length, 4);
   const names = commands.map((c) => c.name).sort();
-  assert.deepEqual(names, ["adversarial-review", "deep-research"]);
+  assert.deepEqual(names, ["adversarial-review", "codebase-audit", "deep-research", "multi-perspective"]);
 });
 
 test("registerBuiltinWorkflows is idempotent — skips already registered commands", () => {
-  const { pi, commands } = makeCommandRegistryPi(["deep-research", "adversarial-review"]);
+  const { pi, commands } = makeCommandRegistryPi([
+    "deep-research",
+    "adversarial-review",
+    "multi-perspective",
+    "codebase-audit",
+  ]);
   registerBuiltinWorkflows(pi, { cwd: "/tmp" });
   assert.equal(commands.length, 0, "should not re-register when already present");
 });
 
 test("registerBuiltinWorkflows registers only missing commands", () => {
-  const { pi, commands } = makeCommandRegistryPi(["deep-research"]);
+  const { pi, commands } = makeCommandRegistryPi(["deep-research", "adversarial-review"]);
   registerBuiltinWorkflows(pi, { cwd: "/tmp" });
   assert.deepEqual(
-    commands.map((c) => c.name),
-    ["adversarial-review"],
-    "should only register the missing command",
+    commands.map((c) => c.name).sort(),
+    ["codebase-audit", "multi-perspective"],
+    "should only register the commands that aren't already present",
   );
 });
 
@@ -49,6 +54,33 @@ test("registerBuiltinWorkflows adversarial-review handler validates empty args (
 
   const { ctx, notified } = makeNotifyCtx();
   await advHandler("", ctx);
+  assert.equal(notified.length, 1, "should notify with warning");
+  assert.equal(notified[0].type, "warning", "should be a warning");
+  assert.ok(notified[0].message.includes("Usage"), "should tell the user how to use it");
+});
+
+test("registerBuiltinWorkflows multi-perspective handler validates empty args (returns early)", async () => {
+  const { pi, commands } = makeCommandRegistryPi();
+  registerBuiltinWorkflows(pi, { cwd: "/tmp" });
+  const handler = commands.find((c) => c.name === "multi-perspective")?.handler;
+  assert.ok(handler, "multi-perspective handler should exist");
+
+  const { ctx, notified } = makeNotifyCtx();
+  await handler("", ctx);
+  assert.equal(notified.length, 1, "should notify with warning");
+  assert.equal(notified[0].type, "warning", "should be a warning");
+  assert.ok(notified[0].message.includes("Usage"), "should tell the user how to use it");
+});
+
+test("registerBuiltinWorkflows codebase-audit handler validates missing checks (returns early)", async () => {
+  const { pi, commands } = makeCommandRegistryPi();
+  registerBuiltinWorkflows(pi, { cwd: "/tmp" });
+  const handler = commands.find((c) => c.name === "codebase-audit")?.handler;
+  assert.ok(handler, "codebase-audit handler should exist");
+
+  const { ctx, notified } = makeNotifyCtx();
+  // scope but no checks → should warn and return early
+  await handler("src/", ctx);
   assert.equal(notified.length, 1, "should notify with warning");
   assert.equal(notified[0].type, "warning", "should be a warning");
   assert.ok(notified[0].message.includes("Usage"), "should tell the user how to use it");

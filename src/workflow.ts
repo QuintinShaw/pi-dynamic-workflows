@@ -424,8 +424,13 @@ export async function runWorkflow<T = unknown>(
       options.onAgentStart?.({ label, phase: assignedPhase, prompt, model: displayModel });
 
       // Optional per-agent worktree isolation (deterministic name -> stable resume keys).
+      // Precedence: explicit call-site isolation > agentDef isolation.
+      // Note: passing { isolation: undefined } falls through ?? to the def's value — there
+      // is no sentinel to suppress a def's isolation at the call site. Remove the agentType
+      // or override with a def that has no isolation field if opt-out is needed.
       let worktree: Worktree | undefined;
-      if (agentOptions.isolation === "worktree") {
+      const resolvedIsolation = agentOptions.isolation ?? agentDef?.isolation;
+      if (resolvedIsolation === "worktree") {
         worktree = await createWorktree(baseCwd, `${runId}-${callIndex}-${label}`);
         if (!worktree.isolated) log(`isolation ignored for "${label}" (${worktree.reason})`);
       }
@@ -461,9 +466,10 @@ export async function runWorkflow<T = unknown>(
                 label,
                 schema: agentOptions.schema,
                 signal: options.signal,
-                instructions: buildAgentInstructions(assignedPhase, agentOptions, agentDef),
+                instructions: buildAgentInstructions(assignedPhase, agentOptions, agentDef, resolvedIsolation),
                 model: modelSpec,
                 tier: agentOptions.tier,
+                modelRegistry: options.modelRegistry,
                 toolNames: agentDef?.tools,
                 disallowedToolNames: agentDef?.disallowedTools,
                 cwd: runCwd,
@@ -480,7 +486,7 @@ export async function runWorkflow<T = unknown>(
                 onHistory: (history: AgentHistoryEntry[]) => {
                   options.onAgentHistory?.({ label, phase: assignedPhase, history });
                 },
-              } as any),
+              }),
               timeout,
               label,
             );
@@ -644,8 +650,8 @@ export async function runWorkflow<T = unknown>(
     item: unknown,
     opts: { reviewers?: number; threshold?: number; lens?: string | string[] } = {},
   ) => {
-    const reviewers = Math.max(1, opts.reviewers ?? 3);
-    const threshold = opts.threshold ?? 0.66;
+    const reviewers = Math.max(1, opts.reviewers ?? 2);
+    const threshold = opts.threshold ?? 0.5;
     const lenses = opts.lens ? (Array.isArray(opts.lens) ? opts.lens : [opts.lens]) : [];
     const claim = typeof item === "string" ? item : JSON.stringify(item);
     const votes = (
@@ -1062,6 +1068,7 @@ function buildAgentInstructions(
   phase: string | undefined,
   options: AgentOptions,
   def: AgentDefinition | undefined,
+  resolvedIsolation?: "worktree",
 ): string | undefined {
   const lines: string[] = [];
   // A resolved agentType binds a real role prompt (the definition body). Only
@@ -1069,7 +1076,9 @@ function buildAgentInstructions(
   if (def?.prompt) lines.push(def.prompt);
   else if (options.agentType) lines.push(`Act as workflow subagent type: ${options.agentType}`);
   if (phase) lines.push(`Workflow phase: ${phase}`);
-  if (options.isolation) lines.push(`Requested isolation: ${options.isolation}`);
+  // Use resolvedIsolation so the annotation fires whether isolation came from
+  // the call site or from the agentDef's isolation field.
+  if (resolvedIsolation) lines.push(`Requested isolation: ${resolvedIsolation}`);
   // Note: options.model is applied for real via the session, not injected as prose.
   return lines.length ? lines.join("\n\n") : undefined;
 }

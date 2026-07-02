@@ -5,8 +5,10 @@
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { recomputeWorkflowSnapshot, renderWorkflowText, type WorkflowSnapshot } from "./display.js";
+import { type EffortState, effortDirective } from "./effort-command.js";
 import type { PersistedRunState } from "./run-persistence.js";
 import { registerSavedWorkflow } from "./saved-commands.js";
+import { buildForcedWorkflowPrompt, WORKFLOW_TOOL_NAME } from "./workflow-editor.js";
 import type { WorkflowManager } from "./workflow-manager.js";
 import type { WorkflowStorage } from "./workflow-saved.js";
 import { openWorkflowNavigator } from "./workflow-ui.js";
@@ -21,7 +23,9 @@ const STATUS_ICON: Record<string, string> = {
 };
 
 const USAGE =
-  "Usage: /workflows [list] | status <id> | watch <id> | stop <id> | pause <id> | resume <id> | rm <id> | save <name> [runId]";
+  "Usage: /workflows [list] | run <prompt> | status <id> | watch <id> | stop <id> | pause <id> | resume <id> | rm <id> | save <name> [runId]";
+
+const RUN_USAGE = "Usage: /workflows run <prompt> — force a dynamic workflow from the prompt";
 
 function summarizeRun(run: PersistedRunState): string {
   const icon = STATUS_ICON[run.status] ?? "?";
@@ -103,6 +107,8 @@ export interface WorkflowCommandOptions {
   storage?: WorkflowStorage;
   /** Working directory for saved workflows registered via `save`. */
   cwd?: string;
+  /** Standing effort mode; when high/ultra, `/workflows run` carries its directive too. */
+  effort?: EffortState;
 }
 
 /** Register the `/workflows` command against the shared manager. Idempotent. */
@@ -120,7 +126,7 @@ export function registerWorkflowCommands(
 
   pi.registerCommand("workflows", {
     description:
-      "Manage workflow runs — no args (opens navigator) | status/stop/pause/resume <id> | rm <id> | save <name> [runId]",
+      "Manage workflow runs — no args (opens navigator) | run <prompt> | status/stop/pause/resume <id> | rm <id> | save <name> [runId]",
     async handler(args: string, ctx: ExtensionCommandContext) {
       const parts = args.trim().split(/\s+/).filter(Boolean);
       const sub = (parts[0] ?? "list").toLowerCase();
@@ -128,6 +134,39 @@ export function registerWorkflowCommands(
       const print = (text: string) => pi.sendMessage({ customType: "workflows", content: text, display: true });
 
       switch (sub) {
+        case "run": {
+          const prompt = args
+            .trim()
+            .slice(parts[0]?.length ?? 0)
+            .trim();
+          if (!prompt) {
+            ctx.ui.notify(RUN_USAGE, "warning");
+            return;
+          }
+
+          // Best-effort: ensure the workflow tool is active (session_start usually has).
+          // Add-only so this does not interfere with the keyword hook's save/restore state.
+          try {
+            const active = pi.getActiveTools?.() ?? [];
+            if (!active.includes(WORKFLOW_TOOL_NAME)) pi.setActiveTools?.([...active, WORKFLOW_TOOL_NAME]);
+          } catch {
+            // ignore — the forced directive is the real forcing primitive
+          }
+
+          const effort = opts.effort;
+          const extra = effort && effort.level !== "off" ? effortDirective(effort.level) : undefined;
+          const forced = buildForcedWorkflowPrompt(prompt, extra);
+          ctx.ui.notify(`Forcing workflow: ${prompt.slice(0, 60)}${prompt.length > 60 ? "…" : ""}`, "info");
+          try {
+            await pi.sendMessage(
+              { customType: "workflow-run", content: forced, display: true },
+              { triggerTurn: true, deliverAs: "followUp" },
+            );
+          } catch {
+            ctx.ui.notify("Could not start the workflow turn.", "error");
+          }
+          return;
+        }
         case "ui":
         case "list": {
           // Interactive navigator when a UI is available; plain text otherwise

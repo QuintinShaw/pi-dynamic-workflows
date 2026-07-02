@@ -60,23 +60,26 @@ async function load() {
   return import("../src/workflow-editor.js");
 }
 
-function testSettingsOptions(keywordTriggerEnabled = true) {
+function testSettingsOptions(keywordTriggerEnabled = true, keywordTriggerWord?: string) {
   return {
     settingsStore: {
-      load: () => ({ keywordTriggerEnabled }),
+      load: () => ({ keywordTriggerEnabled, ...(keywordTriggerWord ? { keywordTriggerWord } : {}) }),
       save: () => {},
     },
   };
 }
 
-function memorySettingsOptions(keywordTriggerEnabled = true) {
-  let settings = { keywordTriggerEnabled };
-  const saved: Array<{ keywordTriggerEnabled?: boolean }> = [];
+function memorySettingsOptions(keywordTriggerEnabled = true, keywordTriggerWord?: string) {
+  let settings: { keywordTriggerEnabled?: boolean; keywordTriggerWord?: string } = {
+    keywordTriggerEnabled,
+    ...(keywordTriggerWord ? { keywordTriggerWord } : {}),
+  };
+  const saved: Array<{ keywordTriggerEnabled?: boolean; keywordTriggerWord?: string }> = [];
   return {
     options: {
       settingsStore: {
         load: () => ({ ...settings }),
-        save: (next: { keywordTriggerEnabled?: boolean }) => {
+        save: (next: { keywordTriggerEnabled?: boolean; keywordTriggerWord?: string }) => {
           settings = { ...settings, ...next };
           saved.push(next);
         },
@@ -146,6 +149,20 @@ describe("hasTrigger", () => {
     assert.equal(hasTrigger("zrób workflow test"), true);
     assert.equal(hasTrigger("uruchom workflows"), true);
   });
+
+  it("uses a configured trigger word exactly", async () => {
+    const { hasTrigger } = await load();
+    assert.equal(hasTrigger("run pi-workflow now", "pi-workflow"), true);
+    assert.equal(hasTrigger("run workflow now", "pi-workflow"), false);
+    assert.equal(hasTrigger("run pi-workflows now", "pi-workflow"), false);
+    assert.equal(hasTrigger("/pi-workflow status", "pi-workflow"), false);
+  });
+
+  it("escapes regex characters in configured trigger words", async () => {
+    const { hasTrigger } = await load();
+    assert.equal(hasTrigger("run pi.workflow", "pi.workflow"), true);
+    assert.equal(hasTrigger("run pixworkflow", "pi.workflow"), false);
+  });
 });
 
 describe("endsWithTrigger", () => {
@@ -177,6 +194,14 @@ describe("endsWithTrigger", () => {
   it("returns true with trailing non-ASCII prefix", async () => {
     const { endsWithTrigger } = await load();
     assert.equal(endsWithTrigger("zrób workflow"), true);
+  });
+
+  it("uses a configured trigger word exactly", async () => {
+    const { endsWithTrigger } = await load();
+    assert.equal(endsWithTrigger("run pi-workflow", "pi-workflow"), true);
+    assert.equal(endsWithTrigger("run workflow", "pi-workflow"), false);
+    assert.equal(endsWithTrigger("run pi-workflows", "pi-workflow"), false);
+    assert.equal(endsWithTrigger("/pi-workflow", "pi-workflow"), false);
   });
 });
 
@@ -273,6 +298,13 @@ describe("colorizeWorkflow", () => {
     // Different tick → different color codes (may differ per char)
     assert.notEqual(t0, t1, "different tick should produce different output");
   });
+
+  it("colorizes a configured trigger word without colorizing the default word", async () => {
+    const { colorizeWorkflow } = await load();
+    assert.equal(colorizeWorkflow("run workflow", 0, [196], "pi-workflow"), "run workflow");
+    const result = colorizeWorkflow("run pi-workflow", 0, [196], "pi-workflow");
+    assert.ok(result.includes("\x1b[38;5;196m"), "custom trigger should be colorized");
+  });
 });
 
 describe("buildForcedWorkflowPrompt", () => {
@@ -341,17 +373,33 @@ describe("WorkflowEditor", () => {
   });
 
   function createEditor(
-    stateOverrides?: Partial<{ active: boolean; keywordTriggerEnabled: boolean; suppressedKeywordText?: string }>,
+    stateOverrides?: Partial<{
+      active: boolean;
+      keywordTriggerEnabled: boolean;
+      keywordTriggerWord: string;
+      suppressedKeywordText?: string;
+    }>,
   ): {
     editor: InstanceType<Awaited<ReturnType<typeof load>>["WorkflowEditor"]>;
-    state: { active: boolean; keywordTriggerEnabled: boolean; suppressedKeywordText?: string };
+    state: {
+      active: boolean;
+      keywordTriggerEnabled: boolean;
+      keywordTriggerWord: string;
+      suppressedKeywordText?: string;
+    };
   } {
     const tui = createMockTui();
     const theme = makeTheme();
     const kb = new KB();
-    const state: { active: boolean; keywordTriggerEnabled: boolean; suppressedKeywordText?: string } = {
+    const state: {
+      active: boolean;
+      keywordTriggerEnabled: boolean;
+      keywordTriggerWord: string;
+      suppressedKeywordText?: string;
+    } = {
       active: false,
       keywordTriggerEnabled: true,
+      keywordTriggerWord: "workflow",
       ...stateOverrides,
     };
     const editor = new mod.WorkflowEditor(tui, theme, kb, state);
@@ -388,6 +436,15 @@ describe("WorkflowEditor", () => {
 
     state.keywordTriggerEnabled = true;
     assert.equal(editor.isActive(), true, "re-enabling the keyword trigger should re-arm matching text");
+  });
+
+  it("isActive() follows the configured trigger word", () => {
+    const { editor } = createEditor({ keywordTriggerWord: "pi-workflow" });
+    editor.setText("run a workflow test");
+    assert.equal(editor.isActive(), false, "default word should not arm when a custom trigger is configured");
+
+    editor.setText("run a pi-workflow test");
+    assert.equal(editor.isActive(), true, "custom trigger word should arm workflows mode");
   });
 
   it("isActive() returns false after backspace disarms trigger", () => {
@@ -577,6 +634,7 @@ describe("installWorkflowEditor", () => {
 
     const state = mod.installWorkflowEditor(pi, ui, undefined, store.options);
     assert.equal(state.keywordTriggerEnabled, true, "keyword trigger should default on");
+    assert.equal(state.keywordTriggerWord, "workflow", "keyword trigger word should default to workflow");
 
     const command = commands.get("workflows-trigger");
     assert.ok(command, "should register /workflows-trigger");
@@ -593,6 +651,73 @@ describe("installWorkflowEditor", () => {
     assert.deepEqual(store.settings, { keywordTriggerEnabled: true });
     assert.match(sent.at(-1)?.content ?? "", /keyword trigger on/i);
     assert.match(sent.at(-1)?.content ?? "", /saved for new sessions/i);
+  });
+
+  it("/workflows-trigger sets and reports the keyword trigger word", async () => {
+    const mod = await load();
+    const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
+    const sent: Array<{ content?: string }> = [];
+    const store = memorySettingsOptions();
+    const pi = {
+      on: () => {},
+      registerCommand: (name: string, command: { handler: (args: string, ctx: unknown) => Promise<void> }) => {
+        commands.set(name, command);
+      },
+      sendMessage: (message: { content?: string }) => {
+        sent.push(message);
+      },
+      getActiveTools: () => [],
+      setActiveTools: () => {},
+    } as unknown as ExtensionAPI;
+
+    const ui = {
+      setEditorComponent: () => {},
+    } as unknown as ExtensionUIContext;
+
+    const state = mod.installWorkflowEditor(pi, ui, undefined, store.options);
+    const command = commands.get("workflows-trigger");
+    assert.ok(command, "should register /workflows-trigger");
+
+    await command.handler("set pi-workflow", {});
+    assert.equal(state.keywordTriggerWord, "pi-workflow");
+    assert.deepEqual(store.settings, { keywordTriggerEnabled: true, keywordTriggerWord: "pi-workflow" });
+    assert.match(sent.at(-1)?.content ?? "", /pi-workflow/);
+
+    await command.handler("status", {});
+    assert.match(sent.at(-1)?.content ?? "", /pi-workflow/);
+
+    await command.handler("reset", {});
+    assert.equal(state.keywordTriggerWord, "workflow");
+    assert.deepEqual(store.settings, { keywordTriggerEnabled: true, keywordTriggerWord: "workflow" });
+  });
+
+  it("supports legacy WorkflowModeState objects without keywordTriggerWord", async () => {
+    const mod = await load();
+    const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
+    const sent: Array<{ content?: string }> = [];
+    const state = { active: false, keywordTriggerEnabled: true };
+    const pi = {
+      registerCommand: (name: string, command: { handler: (args: string, ctx: unknown) => Promise<void> }) => {
+        commands.set(name, command);
+      },
+      sendMessage: (message: { content?: string }) => {
+        sent.push(message);
+      },
+    } as unknown as ExtensionAPI;
+
+    mod.registerWorkflowTriggerCommand(pi, state, {
+      load: () => ({}),
+      save: () => {},
+    });
+
+    const command = commands.get("workflows-trigger");
+    assert.ok(command, "should register /workflows-trigger");
+
+    await command.handler("status", {});
+    assert.match(sent.at(-1)?.content ?? "", /trigger word is "workflow"/);
+
+    await command.handler("on", {});
+    assert.match(sent.at(-1)?.content ?? "", /workflow\/workflows/);
   });
 
   it("loads the persisted keyword trigger preference on install", async () => {
@@ -627,6 +752,41 @@ describe("installWorkflowEditor", () => {
 
     assert.deepEqual(result, { action: "continue" });
     assert.equal(setActiveToolsCalls, 0);
+  });
+
+  it("loads the persisted keyword trigger word on install", async () => {
+    const mod = await load();
+    const captured: Array<{ event: string; handler: (...args: unknown[]) => unknown }> = [];
+    let setActiveToolsCalls = 0;
+    const pi = {
+      on: (event: string, handler: (...args: unknown[]) => unknown) => {
+        captured.push({ event, handler });
+      },
+      registerCommand: () => {},
+      sendMessage: () => {},
+      getActiveTools: () => ["bash", "read"],
+      setActiveTools: () => {
+        setActiveToolsCalls++;
+      },
+    } as unknown as ExtensionAPI;
+
+    const ui = {
+      setEditorComponent: () => {},
+    } as unknown as ExtensionUIContext;
+
+    const state = mod.installWorkflowEditor(pi, ui, undefined, testSettingsOptions(true, "pi-workflow"));
+    assert.equal(state.keywordTriggerWord, "pi-workflow");
+
+    const inputHandler = captured.find((h) => h.event === "input")?.handler;
+    assert.ok(inputHandler, "input handler should be registered");
+    assert.deepEqual(inputHandler({ source: "interactive", text: "Please discuss workflows normally." }), {
+      action: "continue",
+    });
+    assert.equal(setActiveToolsCalls, 0);
+
+    const result = inputHandler({ source: "interactive", text: "Please run pi-workflow now." });
+    assert.equal((result as { action?: string }).action, "transform");
+    assert.equal(setActiveToolsCalls, 1);
   });
 
   it("keeps session trigger state when saving the preference fails", async () => {

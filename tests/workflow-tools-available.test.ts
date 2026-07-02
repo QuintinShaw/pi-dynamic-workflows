@@ -64,10 +64,10 @@ function createMockPi(initialTools: string[] = [...DEFAULT_PI_TOOLS]): MockPi {
   };
 }
 
-function testSettingsOptions(keywordTriggerEnabled = true) {
+function testSettingsOptions(keywordTriggerEnabled = true, keywordTriggerWord?: string) {
   return {
     settingsStore: {
-      load: () => ({ keywordTriggerEnabled }),
+      load: () => ({ keywordTriggerEnabled, ...(keywordTriggerWord ? { keywordTriggerWord } : {}) }),
       save: () => {},
     },
   };
@@ -178,6 +178,30 @@ describe("installWorkflowEditor - tool availability", () => {
     // Verify original tools were restored exactly
     const restoredTools = mockPi.setActiveTools.mock.calls[1].arguments[0];
     assert.deepEqual(restoredTools, originalTools, "original tools should be restored exactly");
+  });
+
+  it("should fire for a configured trigger word but not the default word", async () => {
+    const { installWorkflowEditor } = await import("../src/workflow-editor.js");
+
+    const mockPi = createMockPi();
+    const ui = {
+      setEditorComponent: mock.fn(),
+    };
+
+    installWorkflowEditor(
+      mockPi as unknown as ExtensionAPI,
+      ui as unknown as ExtensionUIContext,
+      undefined,
+      testSettingsOptions(true, "pi-workflow"),
+    );
+
+    const inputHandlers = mockPi.handlers.input;
+    assert.deepEqual(inputHandlers[0]({ source: "interactive", text: "run workflow" }), { action: "continue" });
+    assert.equal(mockPi.setActiveTools.mock.callCount(), 0);
+
+    const result = inputHandlers[0]({ source: "interactive", text: "run pi-workflow" });
+    assert.equal(result.action, "transform");
+    assert.equal(mockPi.setActiveTools.mock.callCount(), 1);
   });
 
   it('should not fire for "/workflows" (slash command, not trigger)', async () => {

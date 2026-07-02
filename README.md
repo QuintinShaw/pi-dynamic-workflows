@@ -32,11 +32,11 @@ Ask in plain language:
 Run a workflow to audit every route under src/routes/ for missing auth checks.
 ```
 
-Pi writes the script and runs it in the background — your turn ends immediately and a live panel tracks progress while you keep working. Or just type the word **workflows** in any message to force one. If you only want to discuss workflows without triggering one, run `/workflows-trigger off`; the preference is saved for new sessions in `~/.pi/workflows/settings.json`. Check the current state with `/workflows-trigger status`, and turn it back on with `/workflows-trigger on`.
+Pi writes the script and runs it in the background — your turn ends immediately and a live panel tracks progress while you keep working. Or just type **workflow** or **workflows** in any message to force one. To force one explicitly — even with the keyword trigger off — run `/workflows run <prompt>`. If that causes false triggers, set a custom trigger such as `pi-workflow` with `/workflows-trigger set pi-workflow` or by adding `{ "keywordTriggerWord": "pi-workflow" }` to `~/.pi/workflows/settings.json`. With that setting, only `pi-workflow` auto-arms workflows mode. If you only want to discuss workflows without triggering one, run `/workflows-trigger off`; preferences are saved for new sessions. Check the current state with `/workflows-trigger status`, and turn it back on with `/workflows-trigger on`.
 
 ![Workflows mode in the input box](https://raw.githubusercontent.com/QuintinShaw/pi-dynamic-workflows/main/docs/media/workflows-mode.jpg)
 
-If another Pi extension has already installed a custom editor component, pi-dynamic-workflows leaves it in place and keeps the submit-time workflow trigger active. In that compatibility mode, the animated keyword highlight and Backspace one-shot disarm affordance are skipped because the existing editor remains responsible for rendering and input handling; use `/workflows-trigger off` when you need to discuss workflow/workflows without auto-triggering, including in future sessions. Editor composition is load-order dependent: whichever extension installs a visual editor last owns the editor surface, while pi-dynamic-workflows still keeps its submit-time hook registered.
+If another Pi extension has already installed a custom editor component, pi-dynamic-workflows leaves it in place and keeps the submit-time workflow trigger active. In that compatibility mode, the animated keyword highlight and Backspace one-shot disarm affordance are skipped because the existing editor remains responsible for rendering and input handling; use `/workflows-trigger off` or `/workflows-trigger set <word>` when you need to discuss workflow/workflows without auto-triggering, including in future sessions. Editor composition is load-order dependent: whichever extension installs a visual editor last owns the editor surface, while pi-dynamic-workflows still keeps its submit-time hook registered.
 
 ## What a workflow looks like
 
@@ -102,7 +102,13 @@ The same model — on Pi, plus the production pieces a real run needs:
 /workflows save <name>      save the latest run's script as a reusable /<name> command
 /workflows pause|resume|stop|rm <id>
 /workflows-trigger off|on|status
-                            persistently disable, restore, or inspect keyword-triggered workflows mode
+                            persistently disable, restore, or inspect keyword triggering
+/workflows-trigger set <word>|reset
+                            customize or reset the keyword trigger word (default "workflow",
+                            also matches "workflows"; custom words match exactly, case-insensitive)
+/workflows run <prompt>     force a dynamic workflow from <prompt> on demand — the explicit
+                            twin of the keyword trigger. Works even when the keyword trigger
+                            is off (/workflows-trigger off); the run shows in the panel + /workflows.
 /workflows-progress compact|detailed|status
                             switch the live panel between the compact one-liner and the detailed
                             per-phase/per-agent view (with tokens, cost, and a live tok/s rate)
@@ -113,13 +119,37 @@ The same model — on Pi, plus the production pieces a real run needs:
 
 /deep-research <question>   web-researched, source-cross-checked report
 /adversarial-review <task>  findings vetted by skeptical reviewers
+/multi-perspective "<topic>" [angle …]
+                            analyze a topic from several independent angles, then synthesize
+/codebase-audit <scope> "<check>" …
+                            run parallel checks over a scope, then cross-validate and report
 ```
+
+`/multi-perspective` and `/codebase-audit` take quoted arguments so a topic or check can be multiple words:
+
+```
+/multi-perspective "should we use Redis or Postgres for session storage"
+/multi-perspective "JWT vs session cookies" security scalability developer-experience
+/codebase-audit src/ "missing error handling" "unused exports" "inconsistent naming"
+```
+
+`/multi-perspective` needs a topic; with fewer than two angles it defaults to `technical, product, security, user experience, maintainability`. `/codebase-audit` needs a scope and at least one check.
 
 In the navigator: `↑/↓` select · `enter`/`→` open · `esc`/`←` back · `p` pause · `x` stop · `r` restart · `s` save · `q` quit. Each agent shows the model it ran on; the detail view shows its prompt, result, error diagnostics, and compact message/tool history.
 
 ## Storage
 
 Workflow state is stored under `~/.pi/workflows` so projects do not accumulate extension-owned `.pi/workflows` directories. Global settings and model tiers live at `~/.pi/workflows/settings.json` and `~/.pi/workflows/model-tiers.json`; project-scoped run history, resume journals, locks, and saved workflow overrides live under `~/.pi/workflows/projects/<project>/`. Older project-local `.pi/workflows/runs` and `.pi/workflows/saved` data is still read as a fallback, but new writes go to the user-level workflow store.
+
+To avoid accidental keyword triggers, configure a custom trigger word in `~/.pi/workflows/settings.json`:
+
+```json
+{
+  "keywordTriggerWord": "pi-workflow"
+}
+```
+
+The default `"workflow"` preserves the legacy behavior and also matches `"workflows"`. Custom trigger words are literal, case-insensitive terms with no spaces and no leading slash; for example, `"pi-workflow"` does not match `"workflow"`, `"workflows"`, or `"pi-workflows"`.
 
 ## Reference
 

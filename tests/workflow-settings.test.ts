@@ -33,12 +33,29 @@ describe("workflow settings", () => {
     });
   });
 
-  it("saves and loads keyword trigger preference", () => {
+  it("saves and loads keyword trigger preferences", () => {
     withSettingsPath((settingsPath) => {
-      saveWorkflowSettings({ keywordTriggerEnabled: false }, settingsPath);
+      saveWorkflowSettings({ keywordTriggerEnabled: false, keywordTriggerWord: "pi-workflow" }, settingsPath);
 
       assert.ok(existsSync(settingsPath), "settings file should be created");
-      assert.deepEqual(loadWorkflowSettings(settingsPath), { keywordTriggerEnabled: false });
+      assert.deepEqual(loadWorkflowSettings(settingsPath), {
+        keywordTriggerEnabled: false,
+        keywordTriggerWord: "pi-workflow",
+      });
+    });
+  });
+
+  it("normalizes keyword trigger word settings", () => {
+    withSettingsPath((settingsPath) => {
+      mkdirSync(dirname(settingsPath), { recursive: true });
+
+      writeFileSync(settingsPath, JSON.stringify({ keywordTriggerWord: "  pi-workflow  " }), "utf-8");
+      assert.deepEqual(loadWorkflowSettings(settingsPath), { keywordTriggerWord: "pi-workflow" });
+
+      for (const keywordTriggerWord of ["", "   ", "/workflow", "pi workflow", 42, false]) {
+        writeFileSync(settingsPath, JSON.stringify({ keywordTriggerWord }), "utf-8");
+        assert.deepEqual(loadWorkflowSettings(settingsPath), {});
+      }
     });
   });
 
