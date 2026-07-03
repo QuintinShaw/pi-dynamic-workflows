@@ -203,6 +203,14 @@ export interface WorkflowAgentOptions {
    * to the session default when no config is saved yet.
    */
   mainModel?: string;
+  /**
+   * Shared model registry from the host Pi session. When provided, subagents
+   * resolve tier/model specs against the same registry the main session uses,
+   * including dynamically-registered providers such as ollama-cloud. Without
+   * this, the agent builds an isolated registry from disk and may miss models
+   * that are only available via extension registration.
+   */
+  modelRegistry?: ModelRegistry;
 }
 
 /**
@@ -210,12 +218,15 @@ export interface WorkflowAgentOptions {
  * `provider/modelId` specs. Used to tell the workflow author which models it may
  * route agents to. Best-effort: returns [] if the registry can't be built.
  */
-export function listAvailableModelSpecs(): string[] {
+export function listAvailableModelSpecs(registry?: ModelRegistry): string[] {
   try {
+    if (registry) {
+      return registry.getAvailable().map((m) => `${m.provider}/${m.id}`);
+    }
     const dir = getAgentDir();
     const auth = AuthStorage.create(join(dir, "auth.json"));
-    const registry = ModelRegistry.create(auth, join(dir, "models.json"));
-    return registry.getAvailable().map((m) => `${m.provider}/${m.id}`);
+    const r = ModelRegistry.create(auth, join(dir, "models.json"));
+    return r.getAvailable().map((m) => `${m.provider}/${m.id}`);
   } catch {
     return [];
   }
@@ -281,6 +292,14 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
    * structured_output) before falling back to strict prose extraction. Default 2.
    */
   maxSchemaRetries?: number;
+  /**
+   * Per-run model registry override. Takes precedence over the constructor's
+   * `modelRegistry` (WorkflowAgentOptions.modelRegistry) for both model
+   * resolution and the `createAgentSession` call this run makes. Falls back to
+   * the constructor's shared registry, then a lazily-built disk registry, when
+   * omitted.
+   */
+  modelRegistry?: ModelRegistry;
 }
 
 export type AgentRunResult<TSchemaDef extends TSchema | undefined> = TSchemaDef extends TSchema
@@ -293,6 +312,8 @@ export class WorkflowAgent {
   private readonly sessionOptions: Partial<CreateAgentSessionOptions>;
   private readonly instructions?: string;
   private readonly mainModel?: string;
+  /** Shared registry from the host session, when provided. */
+  private readonly sharedRegistry?: ModelRegistry;
   /** Lazily built once; shares the SDK's agentDir/auth so resolved models are authed. */
   private registry?: ModelRegistry;
 
@@ -302,9 +323,21 @@ export class WorkflowAgent {
     this.sessionOptions = options.session ?? {};
     this.instructions = options.instructions;
     this.mainModel = options.mainModel;
+    this.sharedRegistry = options.modelRegistry;
   }
 
-  private getRegistry(): ModelRegistry {
+  /**
+   * Resolve the registry for a run: an explicit per-run registry wins, then the
+   * constructor's shared registry, then a lazily-built disk registry (shared
+   * across calls once built).
+   */
+  private getRegistry(perRunRegistry?: ModelRegistry): ModelRegistry {
+    if (perRunRegistry) {
+      return perRunRegistry;
+    }
+    if (this.sharedRegistry) {
+      return this.sharedRegistry;
+    }
     if (!this.registry) {
       const dir = getAgentDir();
       // Same agentDir/auth files createAgentSession uses by default, so a model
@@ -320,8 +353,8 @@ export class WorkflowAgent {
    * or a bare `modelId` (prefers auth-configured models, then any known model).
    * Returns undefined when nothing matches.
    */
-  private resolveModel(spec: string): Model<any> | undefined {
-    const registry = this.getRegistry();
+  private resolveModel(spec: string, perRunRegistry?: ModelRegistry): Model<any> | undefined {
+    const registry = this.getRegistry(perRunRegistry);
     const slash = spec.indexOf("/");
     if (slash > 0) {
       return registry.find(spec.slice(0, slash), spec.slice(slash + 1));
@@ -359,7 +392,7 @@ export class WorkflowAgent {
     // spec falls back to the session default (with a warning) rather than failing.
     let resolvedModel: Model<any> | undefined;
     if (modelSpec) {
-      resolvedModel = this.resolveModel(modelSpec);
+      resolvedModel = this.resolveModel(modelSpec, options.modelRegistry);
       if (resolvedModel) {
         options.onModelResolved?.(`${resolvedModel.provider}/${resolvedModel.id}`);
       } else {
@@ -379,6 +412,11 @@ export class WorkflowAgent {
       // not have valid auth, causing silent empty responses.
       settingsManager: SettingsManager.create(this.cwd, agentDir),
       customTools,
+      // Per-run modelRegistry wins over the constructor's shared registry, same
+      // precedence as resolveModel() above.
+      ...(options.modelRegistry || this.sharedRegistry
+        ? { modelRegistry: options.modelRegistry ?? this.sharedRegistry }
+        : {}),
       ...this.sessionOptions,
       // Per-call model wins over any sessionOptions.model.
       ...(resolvedModel ? { model: resolvedModel } : {}),
@@ -407,6 +445,7 @@ export class WorkflowAgent {
       }
 
       await session.prompt(this.buildPrompt(prompt, options as AgentRunOptions<any>, Boolean(options.schema)));
+
       if (options.signal?.aborted) throw new Error("Subagent was aborted");
 
       // The SDK buries a provider usage/quota limit in the assistant message rather

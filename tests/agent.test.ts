@@ -90,11 +90,90 @@ test("WorkflowAgent constructor accepts all option shapes without throwing", () 
     { cwd: "/tmp", tools: [], session: {}, instructions: "test" },
     { cwd: "/tmp", mainModel: "openai/gpt-4.1" },
     { cwd: "/tmp", tools: [], session: {}, instructions: "test", mainModel: "openai/gpt-4.1" },
+    {
+      cwd: "/tmp",
+      modelRegistry: {
+        getAvailable: () => [{ provider: "mock", id: "model" }],
+        find: () => undefined,
+        getAll: () => [],
+      } as any,
+    },
   ];
   for (const opts of optionSets) {
     const agent = opts ? new WorkflowAgent(opts) : new WorkflowAgent();
     assert.ok(agent instanceof WorkflowAgent, `agent should be constructed for options: ${JSON.stringify(opts)}`);
   }
+});
+
+test("WorkflowAgent reuses an injected ModelRegistry instead of building its own", () => {
+  const mockModel = { provider: "mock", id: "shared" } as any;
+  const registry = {
+    find: (provider: string, id: string) => (provider === "mock" && id === "shared" ? mockModel : undefined),
+    getAvailable: () => [mockModel],
+    getAll: () => [mockModel],
+  } as any;
+
+  const agent = new WorkflowAgent({ cwd: "/tmp", modelRegistry: registry });
+  const resolved = (agent as any).resolveModel("mock/shared");
+  assert.equal(resolved, mockModel, "should resolve via the injected registry");
+});
+
+test("WorkflowAgent falls back to building a disk registry when no registry is injected", () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp" });
+  // Should not throw; getRegistry() lazily builds a ModelRegistry.
+  assert.doesNotThrow(() => (agent as any).getRegistry());
+});
+
+test("WorkflowAgent.resolveModel resolves via a per-run registry when the constructor got none", () => {
+  // Regression test for the per-run `modelRegistry` AgentRunOptions field: a
+  // model present only in a registry passed to run() (not the constructor)
+  // must still resolve.
+  const perRunModel = { provider: "router", id: "per-run-only" } as any;
+  const perRunRegistry = {
+    find: (provider: string, id: string) => (provider === "router" && id === "per-run-only" ? perRunModel : undefined),
+    getAvailable: () => [perRunModel],
+    getAll: () => [perRunModel],
+  } as any;
+
+  const agent = new WorkflowAgent({ cwd: "/tmp" });
+  const resolved = (agent as any).resolveModel("router/per-run-only", perRunRegistry);
+  assert.equal(resolved, perRunModel, "should resolve via the per-run registry, not a disk registry");
+});
+
+test("WorkflowAgent.resolveModel: per-run registry takes precedence over the constructor's shared registry", () => {
+  const constructorModel = { provider: "ctor", id: "shared" } as any;
+  const constructorRegistry = {
+    find: (provider: string, id: string) => (provider === "ctor" && id === "shared" ? constructorModel : undefined),
+    getAvailable: () => [constructorModel],
+    getAll: () => [constructorModel],
+  } as any;
+
+  const perRunModel = { provider: "run", id: "override" } as any;
+  const perRunRegistry = {
+    find: (provider: string, id: string) => (provider === "run" && id === "override" ? perRunModel : undefined),
+    getAvailable: () => [perRunModel],
+    getAll: () => [perRunModel],
+  } as any;
+
+  const agent = new WorkflowAgent({ cwd: "/tmp", modelRegistry: constructorRegistry });
+  // The per-run registry, not the constructor's, is consulted when both are set.
+  const resolved = (agent as any).resolveModel("run/override", perRunRegistry);
+  assert.equal(resolved, perRunModel, "per-run registry should win over the constructor's shared registry");
+  // And the constructor registry is still used when no per-run registry is given.
+  const fallback = (agent as any).resolveModel("ctor/shared");
+  assert.equal(fallback, constructorModel, "constructor registry should still apply without a per-run override");
+});
+
+test("WorkflowAgent.getRegistry: per-run registry wins, then constructor's shared registry, then disk", () => {
+  const constructorRegistry = { getAvailable: () => [], find: () => undefined, getAll: () => [] } as any;
+  const perRunRegistry = { getAvailable: () => [], find: () => undefined, getAll: () => [] } as any;
+
+  const agent = new WorkflowAgent({ cwd: "/tmp", modelRegistry: constructorRegistry });
+  assert.equal((agent as any).getRegistry(perRunRegistry), perRunRegistry);
+  assert.equal((agent as any).getRegistry(), constructorRegistry);
+
+  const bareAgent = new WorkflowAgent({ cwd: "/tmp" });
+  assert.doesNotThrow(() => (bareAgent as any).getRegistry());
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -274,6 +353,19 @@ test("agent() in workflow passes prompt and label to runner", async () => {
   );
   assert.equal(rec.calls.length, 1);
   assert.equal(rec.calls[0].prompt, "analyze this");
+});
+
+test("agent() in workflow forwards modelRegistry to the runner", async () => {
+  const rec = new CallRecordingAgent();
+  const fakeRegistry = { getAvailable: () => [], find: () => undefined, getAll: () => [] } as any;
+  await runWorkflow(
+    `export const meta = { name: 'test', description: 't' }
+     const r = await agent('task', { label: 't' })
+     return r`,
+    { agent: rec, persistLogs: false, modelRegistry: fakeRegistry },
+  );
+  assert.equal(rec.calls.length, 1);
+  assert.equal((rec.calls[0].options as { modelRegistry?: any }).modelRegistry, fakeRegistry);
 });
 
 test("agent() in workflow passes model spec to runner", async () => {

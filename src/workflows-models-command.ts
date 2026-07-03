@@ -4,8 +4,9 @@
  * Uses Pi's built-in `ctx.ui.select()`, `ctx.ui.confirm()`, and `ctx.ui.notify()`
  * to let users view and manage model tier configuration for workflows.
  *
- * Model selection draws from the same `listAvailableModelSpecs()` that powers
- * Pi's `/model` command, so users see exactly the same models.
+ * Model selection draws from the host session's shared model registry so users
+ * see every provider Pi can reach, including extension-registered providers such
+ * as `ollama-cloud`.
  *
  * Each tier holds exactly one model spec string.
  * When editing a tier, a single-select picker is used (like Pi's `/model`).
@@ -119,7 +120,7 @@ export async function editSingleTier(
   tiers: Record<string, string>,
   tierName: string,
 ): Promise<Record<string, string> | null> {
-  const available = listAvailableModelSpecs();
+  const available = listAvailableModelSpecs(ctx.modelRegistry);
   const current = tiers[tierName];
 
   // Build SelectItems: all available models as scrollable list

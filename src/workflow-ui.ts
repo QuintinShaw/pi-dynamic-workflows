@@ -15,7 +15,7 @@
 
 import type { ExtensionAPI, ExtensionUIContext, Theme } from "@earendil-works/pi-coding-agent";
 import type { Component, Focusable, TUI } from "@earendil-works/pi-tui";
-import { parseKey, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { parseKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import type { WorkflowAgentSnapshot, WorkflowSnapshot } from "./display.js";
 import type { PersistedRunState } from "./run-persistence.js";
 import { registerSavedWorkflow } from "./saved-commands.js";
@@ -331,6 +331,399 @@ function fmtTokens(t: number): string {
   return t > 0 ? `${pad(t)} tok` : "";
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// Two-pane (Phases | agents) renderer — Claude-Code parity.
+//
+// Draws a single combined frame that shares one top rule and one full-height
+// vertical divider between a left "Phases" box and a right "<phase> · N agent"
+// box. Pure: depends only on state + model + theme + width. All measuring is
+// ANSI-aware (visibleWidth) and all padding/truncation goes through
+// truncateToWidth so colored cells still align.
+// ───────────────────────────────────────────────────────────────────────────
+
+// Light box-drawing glyphs (no heavy/double variants).
+const BX = { h: "─", v: "│", tl: "┌", tr: "┐", bl: "└", br: "┘", tj: "┬", bj: "┴" } as const;
+const CARET = "›";
+const DOT = "●";
+const ELLIPSIS = "…";
+
+// Tunables (exposed for clarity / future tuning) — see spec §0/§10.
+const LW_MIN = 14;
+const RW_MIN = 24;
+const GAP_NM = 2; // min spaces between agent name and model columns
+
+/** Compact token count: 842, 35k, 35.7k, 1.3M (trailing .0 trimmed). */
+function compactTokens(t: number): string {
+  if (!t || t <= 0) return "0";
+  if (t < 1000) return String(Math.round(t));
+  if (t < 1_000_000) {
+    const k = t / 1000;
+    const s = k >= 100 ? Math.round(k).toString() : trimZero(k.toFixed(1));
+    return `${s}k`;
+  }
+  const m = t / 1_000_000;
+  return `${trimZero(m.toFixed(1))}M`;
+}
+function trimZero(s: string): string {
+  return s.endsWith(".0") ? s.slice(0, -2) : s;
+}
+
+function pluralize(word: string, n: number): string {
+  return n === 1 ? word : `${word}s`;
+}
+
+/** Aggregate phase status precedence: ERR > RUN > all-done(OK) > PEND. */
+function phaseStatusColor(p: { done: number; total: number }, agents: AgentRow[]): string {
+  if (agents.some((a) => a.status === "error" || a.status === "failed")) return "error";
+  if (agents.some((a) => a.status === "running")) return "warning";
+  if (p.total > 0 && p.done === p.total) return "success";
+  return "dim";
+}
+
+const AGENT_DOT_COLOR: Record<string, string> = {
+  running: "warning",
+  queued: "dim",
+  pending: "dim",
+  paused: "dim",
+  done: "success",
+  completed: "success",
+  error: "error",
+  failed: "error",
+  skipped: "dim",
+  aborted: "dim",
+};
+
+/** Compute the left ("Phases") box outer width, clamped per spec §3.1. */
+function computeLeftWidth(phases: PhaseRow[], width: number): number {
+  const titleNeed = visibleWidth("Phases") + 2 /*spaces*/ + 1 /*┌*/ + 1 /*┬*/ + 3 /*min dashes*/;
+  let contentMax = 0;
+  phases.forEach((p, i) => {
+    const idx = String(i + 1);
+    const hasAgents = p.total > 0;
+    const need =
+      2 /*marker*/ +
+      visibleWidth(idx) +
+      1 /*sp*/ +
+      visibleWidth(p.title) +
+      (hasAgents ? 1 + visibleWidth(`${p.done}/${p.total}`) : 0);
+    if (need > contentMax) contentMax = need;
+  });
+  const innerNeed = Math.max(contentMax, titleNeed - 2);
+  const lwNatural = innerNeed + 2; // + left │ + shared │
+  const lwMax = Math.min(40, Math.floor(width * 0.45));
+  return Math.max(LW_MIN, Math.min(lwNatural, Math.max(LW_MIN, lwMax)));
+}
+
+/** Build a left-pane phase row (content field, exact width = innerW). */
+function leftPhaseRow(
+  p: PhaseRow,
+  i: number,
+  selected: boolean,
+  agents: AgentRow[],
+  innerW: number,
+  theme: ThemeLike,
+): string {
+  const idx = String(i + 1);
+  const hasAgents = p.total > 0;
+  const progress = hasAgents ? `${p.done}/${p.total}` : "";
+  const marker = selected ? `${CARET} ` : "  ";
+  // Fixed parts width: marker + idx + space + (space+progress if shown)
+  const fixed = 2 + visibleWidth(idx) + 1 + (progress ? 1 + visibleWidth(progress) : 0);
+  const nameRoom = Math.max(0, innerW - fixed);
+  const name = truncateToWidth(p.title, nameRoom, ELLIPSIS, false);
+
+  const styleMain = (s: string) => (selected ? theme.fg("accent", theme.bold(s)) : hasAgents ? s : theme.fg("dim", s));
+  const progStyle = (s: string) =>
+    selected ? theme.fg("accent", theme.bold(s)) : theme.fg(phaseStatusColor(p, agents), s);
+
+  const caret = selected ? theme.fg("accent", theme.bold(marker)) : marker;
+  let row = caret + styleMain(`${idx} ${name}`);
+  if (progress) row += ` ${progStyle(progress)}`;
+  return truncateToWidth(row, innerW, "", true); // pad to exact innerW
+}
+
+/** Build a right-pane agent row (content field, exact width = innerW). */
+function rightAgentRow(
+  a: AgentRow,
+  selected: boolean,
+  modelColStart: number,
+  innerW: number,
+  theme: ThemeLike,
+): string {
+  const dotColor = AGENT_DOT_COLOR[a.status] ?? "dim";
+  const stats = `${compactTokens(a.tokens ?? 0)} tok`;
+  const model = shortModel(a.model) ?? "";
+
+  // Stable 2-cell marker so columns never shift on selection: "› " | "  ".
+  // Layout: <marker:2><dot><sp><name> … <model> … <stats(right-aligned)>.
+  const markerW = 2;
+  const statsW = visibleWidth(stats);
+  const nameStart = markerW + 2; // marker + dot + space
+  let modelStart = Math.max(nameStart + visibleWidth(a.label) + GAP_NM, markerW + modelColStart);
+  const statsStart = innerW - statsW;
+
+  // Available room for the model block (between modelStart and stats, min 1 gap).
+  let modelRoom = statsStart - 1 - modelStart;
+  let nameOut = a.label;
+  let modelOut = model;
+  if (modelRoom < 0) {
+    // No room for model: drop it (spec §4.4 step 1/2), possibly truncate name.
+    modelOut = "";
+    modelStart = nameStart;
+    modelRoom = 0;
+    const nameRoom = Math.max(0, statsStart - 1 - nameStart);
+    nameOut = truncateToWidth(a.label, nameRoom, ELLIPSIS, false);
+  } else {
+    modelOut = truncateToWidth(model, modelRoom, ELLIPSIS, false);
+    const nameRoom = Math.max(0, modelStart - GAP_NM - nameStart);
+    nameOut = truncateToWidth(a.label, nameRoom, ELLIPSIS, false);
+  }
+
+  const marker = selected ? theme.fg("accent", theme.bold(`${CARET} `)) : "  ";
+  const dot = theme.fg(dotColor, DOT);
+  const nameStyled = selected ? theme.fg("accent", theme.bold(nameOut)) : theme.fg("accent", nameOut);
+  const modelStyled = modelOut ? theme.fg("dim", modelOut) : "";
+  const statsStyled = theme.fg("dim", stats);
+
+  // Assemble with explicit cell padding (visibleWidth-driven gaps).
+  let out = marker + dot + " " + nameStyled;
+  const afterName = nameStart + visibleWidth(nameOut);
+  if (modelOut) {
+    out += " ".repeat(Math.max(0, modelStart - afterName)) + modelStyled;
+    const afterModel = modelStart + visibleWidth(modelOut);
+    out += " ".repeat(Math.max(0, statsStart - afterModel)) + statsStyled;
+  } else {
+    out += " ".repeat(Math.max(0, statsStart - afterName)) + statsStyled;
+  }
+  return truncateToWidth(out, innerW, "", true);
+}
+
+/** Compose a titled top rule for one box side (between two join chars). */
+function topTitleSegment(title: string, innerW: number, leading: boolean, theme: ThemeLike): string {
+  // leading=true → right box (one ─ before the title); leading=false → left box.
+  const label = ` ${title} `;
+  const lead = leading ? BX.h : "";
+  let labelOut = label;
+  const fixed = visibleWidth(lead) + 1; // + at least one trailing dash
+  if (visibleWidth(label) > innerW - fixed) {
+    labelOut = truncateToWidth(label, Math.max(0, innerW - fixed), ELLIPSIS, false);
+  }
+  const used = visibleWidth(lead) + visibleWidth(labelOut);
+  const dashes = BX.h.repeat(Math.max(0, innerW - used));
+  return theme.fg("muted", lead) + theme.fg("dim", labelOut) + theme.fg("muted", dashes);
+}
+
+interface TwoPaneArgs {
+  width: number;
+  bodyRows: number;
+  left: string[]; // pre-rendered left content rows (exact LW-2 cells each)
+  right: string[]; // pre-rendered right content rows (exact RW-2 cells each)
+  leftTitle: string;
+  rightTitle: string;
+  leftW: number; // LW
+  theme: ThemeLike;
+}
+
+/** Emit the full combined frame (top rule, body rows, bottom rule). */
+function renderTwoPaneFrame(a: TwoPaneArgs): string[] {
+  const { width, bodyRows, left, right, leftTitle, rightTitle, leftW, theme } = a;
+  // RW fills the remainder; the divider column is shared (overlaps 1 cell) so
+  // net rendered width = LW + RW - 1 = width. Hence RW = width - LW + 1.
+  const rightW = width - leftW + 1;
+  const leftInner = leftW - 2;
+  const rightInner = rightW - 2;
+  const bc = (s: string) => theme.fg("muted", s);
+  const out: string[] = [];
+
+  // Top rule: ┌ <left title> ┬ <right title> ┐
+  out.push(
+    bc(BX.tl) +
+      topTitleSegment(leftTitle, leftInner, false, theme) +
+      bc(BX.tj) +
+      topTitleSegment(rightTitle, rightInner, true, theme) +
+      bc(BX.tr),
+  );
+
+  // Body rows.
+  const blankL = " ".repeat(leftInner);
+  const blankR = " ".repeat(rightInner);
+  for (let r = 0; r < bodyRows; r++) {
+    const l = left[r] ?? blankL;
+    const rr = right[r] ?? blankR;
+    out.push(bc(BX.v) + l + bc(BX.v) + rr + bc(BX.v));
+  }
+
+  // Bottom rule: └ ─ ┴ ─ ┘
+  out.push(bc(BX.bl) + bc(BX.h.repeat(leftInner)) + bc(BX.bj) + bc(BX.h.repeat(rightInner)) + bc(BX.br));
+  return out;
+}
+
+/**
+ * Render the combined Phases | agents two-pane view. Shared by the "phases"
+ * branch (cursor in left/Phases pane) and the "agents" branch (cursor in
+ * right/agents pane after drilling in). Returns the full frame as lines.
+ */
+function renderPhasesAgents(
+  state: NavigatorState,
+  model: NavigatorModel,
+  runId: string,
+  width: number,
+  theme: ThemeLike,
+  bodyCap: number,
+): string[] {
+  const phases = model.phases(runId);
+  // Which phase is selected drives the right pane. In "phases" view it's the
+  // cursor; in "agents" view it's the drilled-in phase (state.phase).
+  const inAgents = state.kind === "agents";
+  let selPhaseIdx = inAgents ? phases.findIndex((p) => p.title === state.phase) : state.cursor;
+  if (selPhaseIdx < 0) selPhaseIdx = 0;
+  const selPhase = phases[selPhaseIdx];
+  const agents = selPhase ? model.agents(runId, selPhase.title) : [];
+
+  // Narrow-terminal degrade: single pane (spec §7.1).
+  if (width < LW_MIN + RW_MIN - 1) {
+    return renderSinglePane(state, phases, selPhaseIdx, agents, width, theme, bodyCap, inAgents);
+  }
+
+  const leftW = computeLeftWidth(phases, width);
+  const rightW = width - leftW + 1; // shared divider overlaps 1 cell
+  const leftInner = leftW - 2;
+  const rightInner = rightW - 2;
+
+  // Vertical scroll so the active item stays visible (spec §7.2).
+  const leftRows = scrollWindow(phases.length, inAgents ? selPhaseIdx : state.cursor, bodyCap);
+  const rightRows = scrollWindow(agents.length, inAgents ? state.cursor : 0, bodyCap);
+  const bodyRows = Math.max(1, Math.min(bodyCap, Math.max(leftRows.count, rightRows.count)));
+
+  // Left column (Phases).
+  const left: string[] = [];
+  for (let k = 0; k < bodyRows; k++) {
+    const idx = leftRows.start + k;
+    if (idx >= phases.length) {
+      left.push(" ".repeat(leftInner));
+      continue;
+    }
+    const p = phases[idx];
+    const selected = !inAgents && idx === state.cursor;
+    const ag = model.agents(runId, p.title);
+    let row = leftPhaseRow(p, idx, selected, ag, leftInner, theme);
+    if (k === bodyRows - 1 && leftRows.more) {
+      row = truncateToWidth(theme.fg("dim", `  ${ELLIPSIS}`), leftInner, "", true);
+    }
+    left.push(row);
+  }
+
+  // Right column (agents of selected phase).
+  const modelColStart = computeModelColStart(agents, rightInner);
+  const right: string[] = [];
+  if (agents.length === 0) {
+    const msg = truncateToWidth(theme.fg("dim", "no agents"), rightInner, "", true);
+    for (let k = 0; k < bodyRows; k++) right.push(k === 0 ? msg : " ".repeat(rightInner));
+  } else {
+    for (let k = 0; k < bodyRows; k++) {
+      const idx = rightRows.start + k;
+      if (idx >= agents.length) {
+        right.push(" ".repeat(rightInner));
+        continue;
+      }
+      const selected = inAgents && idx === state.cursor;
+      let row = rightAgentRow(agents[idx], selected, modelColStart, rightInner, theme);
+      if (k === bodyRows - 1 && rightRows.more) {
+        row = truncateToWidth(theme.fg("dim", `  ${ELLIPSIS}`), rightInner, "", true);
+      }
+      right.push(row);
+    }
+  }
+
+  const n = agents.length;
+  const rightTitle = `${selPhase ? selPhase.title : "(none)"} · ${n} ${pluralize("agent", n)}`;
+  return renderTwoPaneFrame({
+    width,
+    bodyRows,
+    left,
+    right,
+    leftTitle: "Phases",
+    rightTitle,
+    leftW,
+    theme,
+  });
+}
+
+/** Model column start aligned across agent rows (spec §4.3), clamped to field. */
+function computeModelColStart(agents: AgentRow[], innerW: number): number {
+  let maxName = 0;
+  for (const a of agents) maxName = Math.max(maxName, visibleWidth(a.label));
+  const start = 2 /*dot+sp*/ + maxName + GAP_NM;
+  // Keep model column from colliding with the right edge; cap at ~55% of field.
+  return Math.min(start, Math.max(2, Math.floor(innerW * 0.55)));
+}
+
+interface ScrollWin {
+  start: number;
+  count: number;
+  more: boolean;
+}
+/** Compute a scroll window of up to `cap` rows keeping `active` visible. */
+function scrollWindow(total: number, active: number, cap: number): ScrollWin {
+  if (total <= cap) return { start: 0, count: total, more: false };
+  let start = Math.max(0, Math.min(active - Math.floor(cap / 2), total - cap));
+  if (active < start) start = active;
+  if (active >= start + cap) start = active - cap + 1;
+  return { start, count: cap, more: start + cap < total };
+}
+
+/** Narrow-terminal single pane (spec §7.1): show the active pane full width. */
+function renderSinglePane(
+  state: NavigatorState,
+  phases: PhaseRow[],
+  selPhaseIdx: number,
+  agents: AgentRow[],
+  width: number,
+  theme: ThemeLike,
+  bodyCap: number,
+  inAgents: boolean,
+): string[] {
+  const innerW = Math.max(1, width - 2);
+  const bc = (s: string) => theme.fg("muted", s);
+  const out: string[] = [];
+  if (inAgents) {
+    const selPhase = phases[selPhaseIdx];
+    const n = agents.length;
+    const title = `${selPhase ? selPhase.title : "(none)"} · ${n} ${pluralize("agent", n)}`;
+    out.push(bc(BX.tl) + topTitleSegment(title, innerW, false, theme) + bc(BX.tr));
+    const win = scrollWindow(agents.length, state.cursor, bodyCap);
+    const modelColStart = computeModelColStart(agents, innerW);
+    const rows = Math.max(1, win.count);
+    for (let k = 0; k < rows; k++) {
+      const idx = win.start + k;
+      if (idx >= agents.length) {
+        out.push(bc(BX.v) + " ".repeat(innerW) + bc(BX.v));
+        continue;
+      }
+      let row = rightAgentRow(agents[idx], idx === state.cursor, modelColStart, innerW, theme);
+      if (k === rows - 1 && win.more) row = truncateToWidth(theme.fg("dim", `  ${ELLIPSIS}`), innerW, "", true);
+      out.push(bc(BX.v) + row + bc(BX.v));
+    }
+  } else {
+    out.push(bc(BX.tl) + topTitleSegment("Phases", innerW, false, theme) + bc(BX.tr));
+    const win = scrollWindow(phases.length, state.cursor, bodyCap);
+    const rows = Math.max(1, win.count);
+    for (let k = 0; k < rows; k++) {
+      const idx = win.start + k;
+      if (idx >= phases.length) {
+        out.push(bc(BX.v) + " ".repeat(innerW) + bc(BX.v));
+        continue;
+      }
+      const p = phases[idx];
+      let row = leftPhaseRow(p, idx, idx === state.cursor, [], innerW, theme);
+      if (k === rows - 1 && win.more) row = truncateToWidth(theme.fg("dim", `  ${ELLIPSIS}`), innerW, "", true);
+      out.push(bc(BX.v) + row + bc(BX.v));
+    }
+  }
+  out.push(bc(BX.bl) + bc(BX.h.repeat(innerW)) + bc(BX.br));
+  return out;
+}
+
 /** Build the lines for the current view. Pure: depends only on state + model + theme. */
 export function renderNavigator(
   state: NavigatorState,
@@ -388,21 +781,18 @@ export function renderNavigator(
   } else if (state.kind === "phases" && state.runId) {
     const phases = model.phases(state.runId);
     state.clamp(phases.length);
-    lines.push(theme.bold(model.runName(state.runId)) + dim(`  (${model.runStatus(state.runId)})`));
-    phases.forEach((p, i) => {
-      const meta = [`${p.done}/${p.total} agents`, fmtTokens(p.tokens)].filter(Boolean).join(" · ");
-      lines.push(sel(i, `${p.title}  ${dim(meta)}`));
-    });
+    // Two-line header (name + description/status) then the combined frame.
+    lines.push(...twoPaneHeader(model, state.runId, phases, width, theme));
+    // Body cap: total height minus 2 header + 2 frame rules + blank + footer.
+    const bodyCap = Math.max(1, viewportRows - 2 /*header*/ - 2 /*rules*/ - 2 /*blank+footer*/);
+    lines.push(...renderPhasesAgents(state, model, state.runId, width, theme, bodyCap));
   } else if (state.kind === "agents" && state.runId && state.phase) {
     const agents = model.agents(state.runId, state.phase);
     state.clamp(agents.length);
-    lines.push(theme.bold(`${model.runName(state.runId)} › ${state.phase}`));
-    agents.forEach((a, i) => {
-      const icon = STATUS_ICON[a.status] ?? "?";
-      const mdl = shortModel(a.model);
-      const meta = [mdl, a.tokens ? fmtTokens(a.tokens) : undefined].filter(Boolean).join(" · ");
-      lines.push(sel(i, `${icon} ${a.label}${meta ? dim(`  ${meta}`) : ""}`));
-    });
+    const phases = model.phases(state.runId);
+    lines.push(...twoPaneHeader(model, state.runId, phases, width, theme));
+    const bodyCap = Math.max(1, viewportRows - 2 - 2 - 2);
+    lines.push(...renderPhasesAgents(state, model, state.runId, width, theme, bodyCap));
   } else if (state.kind === "detail" && state.runId && state.agentId != null) {
     const a = model.agentDetail(state.runId, state.agentId);
     lines.push(theme.bold(a ? a.label : "agent"));
@@ -443,6 +833,52 @@ export function renderNavigator(
   lines.push("");
   lines.push(footerHint(state, model, theme));
   return lines;
+}
+
+/**
+ * Two-line header above the Phases | agents frame (spec §1):
+ *   line 0: <name>                          (ACCENT_BOLD)
+ *   line 1: <status>            <done>/<total> agent[s] · <tokens>   (DIM)
+ * Right segment is built first and never truncated; the left segment is
+ * truncated to the remaining width with an ellipsis.
+ */
+function twoPaneHeader(
+  model: NavigatorModel,
+  runId: string,
+  phases: PhaseRow[],
+  width: number,
+  theme: ThemeLike,
+): string[] {
+  const name = model.runName(runId);
+  const status = model.runStatus(runId);
+  let done = 0;
+  let total = 0;
+  let tokens = 0;
+  for (const p of phases) {
+    done += p.done;
+    total += p.total;
+    tokens += p.tokens;
+  }
+  // Line 0 — name (accent + bold), truncated to width if needed.
+  const nameText = truncateToWidth(name, width, ELLIPSIS, false);
+  const line0 = theme.fg("accent", theme.bold(nameText));
+
+  // Line 1 — left status, right summary.
+  const rightRaw = `${done}/${total} ${pluralize("agent", total)}${tokens > 0 ? ` · ${compactTokens(tokens)} tok` : ""}`;
+  const rightW = visibleWidth(rightRaw);
+  const gap = 2;
+  let line1: string;
+  if (rightW >= width) {
+    // No room for left content: right-align (truncate from the right as last resort).
+    line1 = theme.fg("dim", truncateToWidth(rightRaw, width, ELLIPSIS, false));
+  } else {
+    const availL = width - rightW - gap;
+    const leftText = availL > 0 ? truncateToWidth(status, availL, ELLIPSIS, false) : "";
+    const leftW = visibleWidth(leftText);
+    const fill = " ".repeat(Math.max(gap, width - leftW - rightW));
+    line1 = theme.fg("dim", leftText) + fill + theme.fg("dim", rightRaw);
+  }
+  return [line0, line1];
 }
 
 function historyLabel(entry: NonNullable<WorkflowAgentSnapshot["history"]>[number]): string {
