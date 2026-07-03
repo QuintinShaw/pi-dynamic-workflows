@@ -40,22 +40,104 @@ export function getModelTierConfigPath(): string {
 }
 
 // ---------------------------------------------------------------------------
+// Capability hints
+// ---------------------------------------------------------------------------
+
+/**
+ * Substrings that identify small/cheap models (case-insensitive).
+ * Used by `rankByCapability` to rank models lowest so a mini/flash/haiku model
+ * never lands in a higher tier than a model without this hint.
+ */
+export const SMALL_MODEL_HINTS = ["mini", "flash", "haiku", "nano", "small"] as const;
+
+/**
+ * Substrings that identify large/capable models (case-insensitive).
+ * Used by `rankByCapability` to rank models highest so they are preferred for
+ * the big tier over models without this hint.
+ */
+export const BIG_MODEL_HINTS = ["opus", "pro", "ultra", "large", "plus"] as const;
+
+/**
+ * Capability score for a single model spec: +1 if it matches a big-model hint,
+ * -1 if it matches a small-model hint, 0 otherwise. If a model happens to
+ * match both hint sets (e.g. a name containing both "mini" and "pro"), the
+ * small hint wins — we never want a "mini"-labelled model to outrank a
+ * neutral or clearly-large one.
+ */
+function capabilityScore(model: string): number {
+  const lower = model.toLowerCase();
+  if (SMALL_MODEL_HINTS.some((hint) => lower.includes(hint))) return -1;
+  if (BIG_MODEL_HINTS.some((hint) => lower.includes(hint))) return 1;
+  return 0;
+}
+
+/**
+ * Rank `available` models from least to most capable using `capabilityScore`.
+ * The sort is stable (ties preserve registry order), so within a score bucket
+ * models keep their original relative order.
+ */
+function rankByCapability(available: string[]): string[] {
+  return available
+    .map((model, index) => ({ model, index, score: capabilityScore(model) }))
+    .sort((a, b) => a.score - b.score || a.index - b.index)
+    .map((entry) => entry.model);
+}
+
+// ---------------------------------------------------------------------------
 // Defaults
 // ---------------------------------------------------------------------------
 
 /**
- * Build a default tier config where every tier points at a single model —
- * the user's currently active Pi model when known, else the first available
- * model. New users get consistent behaviour (every tier == the model they're
- * already chatting with) and can refine tiers later via `/workflows-models`.
+ * Build a default tier config. When the available model registry is known,
+ * spread it across tiers so small/medium/big routing is meaningful out of the
+ * box. When the registry is empty or unavailable, fall back to the current Pi
+ * model so fresh installs still get usable tier values.
+ *
+ * Models are first ranked least → most capable via `rankByCapability` (which
+ * consults `SMALL_MODEL_HINTS` / `BIG_MODEL_HINTS`, falling back to registry
+ * order for models that match neither). Tiers are then assigned from this
+ * single ranked pool with exclusion — each model is used for at most one
+ * tier — so distinct tiers never collapse onto the same model and a
+ * mini/flash/haiku model can never outrank a bigger one (no inversion):
+ *
+ *   - big    = the most capable model (last in the ranking)
+ *   - small  = the least capable model (first in the ranking)
+ *   - medium = the middle-ranked model
+ *
+ * When fewer than 3 distinct models are available, this degrades gracefully
+ * by reusing the *strongest* available model for the higher tier(s) — it
+ * never reuses a weaker model for a higher tier than a stronger one:
+ *
+ *   - 2 models: small = weaker, medium = big = stronger
+ *   - 1 model / 0 models: small = medium = big = that model (or the current
+ *     model / "" fallback)
+ *
+ * `_availableModels` is injectable for testing and for callers that already
+ * fetched the registry. When omitted, this reads from the live registry
+ * regardless of whether `currentModelSpec` was also provided, so the
+ * default-argument path always goes through the same corrected logic instead
+ * of silently reproducing the original single-tier collapse.
  */
-export function buildDefaultTierConfig(currentModelSpec?: string): ModelTierConfig {
-  const model = currentModelSpec ?? listAvailableModelSpecs()[0] ?? "";
+export function buildDefaultTierConfig(currentModelSpec?: string, _availableModels?: string[]): ModelTierConfig {
+  const available = _availableModels ?? listAvailableModelSpecs();
+  const ranked = rankByCapability(available);
+
+  if (ranked.length >= 3) {
+    const small = ranked[0];
+    const big = ranked[ranked.length - 1];
+    const medium = ranked[Math.floor(ranked.length / 2)];
+    return { tiers: { small, medium, big } };
+  }
+  if (ranked.length === 2) {
+    const [weaker, stronger] = ranked;
+    return { tiers: { small: weaker, medium: stronger, big: stronger } };
+  }
+  const fallback = ranked[0] ?? currentModelSpec ?? "";
   return {
     tiers: {
-      small: model,
-      medium: model,
-      big: model,
+      small: fallback,
+      medium: fallback,
+      big: fallback,
     },
   };
 }
