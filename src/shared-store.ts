@@ -6,11 +6,21 @@
  * injected into every agent's tool list so parallel agents can share
  * intermediate state without coordinating through the script itself.
  *
- * Journal integration: callers capture `store.commitDelta(callIndex)` alongside
+ * Journal integration: callers capture `store.commitDelta(deltaKey)` alongside
  * each agent result in the journal. On resume, `store.applyDelta(delta)` rebuilds
  * the store state additively in callSeq order, so parallel-agent writes are
  * replayed correctly without the last-complete-wins ordering bug that a
  * whole-Map restore() would cause.
+ *
+ * `deltaKey` must be unique across every run that shares this store instance,
+ * not just within one run's callSeq. A nested `workflow()` call restarts its own
+ * callSeq at 0 while inheriting the parent's store (so parent and nested-run
+ * agents can share state), so a bare callIndex would collide between a parent
+ * agent and a concurrently-running nested-run agent that both got index 0 —
+ * whichever commits its delta last would clobber the other's entry in
+ * `agentDeltas`. Callers compose `deltaKey` as `${runId}:${callIndex}`, and
+ * since every run (including each nested run) gets its own distinct `runId`,
+ * the composite key is unique across the whole store's lifetime.
  */
 
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -18,8 +28,10 @@ import { Type } from "typebox";
 
 export class SharedStore {
   private readonly map = new Map<string, unknown>();
-  // Per-agent write deltas for delta-journaling; keyed by callIndex.
-  private readonly agentDeltas = new Map<number, Record<string, unknown>>();
+  // Per-agent write deltas for delta-journaling; keyed by a run-unique
+  // `${runId}:${callIndex}` string (see class doc) so nested workflow() runs
+  // sharing this store can't collide on a bare callIndex.
+  private readonly agentDeltas = new Map<string, Record<string, unknown>>();
 
   /** Store a value under `key`. Overwrites any existing value. */
   put(key: string, value: unknown): void {
@@ -27,16 +39,17 @@ export class SharedStore {
   }
 
   /**
-   * Store a value and record the write in the per-agent delta for `callIndex`.
-   * Used by per-agent tools created via `createAgentStoreTools` so that each
-   * agent's writes can be journaled and replayed independently.
+   * Store a value and record the write in the per-agent delta for `deltaKey`
+   * (a run-unique `${runId}:${callIndex}` string — see class doc). Used by
+   * per-agent tools created via `createAgentStoreTools` so that each agent's
+   * writes can be journaled and replayed independently.
    */
-  trackPut(key: string, value: unknown, callIndex: number): void {
+  trackPut(key: string, value: unknown, deltaKey: string): void {
     this.map.set(key, value);
-    let delta = this.agentDeltas.get(callIndex);
+    let delta = this.agentDeltas.get(deltaKey);
     if (!delta) {
       delta = {};
-      this.agentDeltas.set(callIndex, delta);
+      this.agentDeltas.set(deltaKey, delta);
     }
     delta[key] = value;
   }
@@ -57,12 +70,12 @@ export class SharedStore {
   }
 
   /**
-   * Extract and clear the write delta accumulated for `callIndex`.
+   * Extract and clear the write delta accumulated for `deltaKey`.
    * Called after an agent completes to get the set of keys it wrote.
    */
-  commitDelta(callIndex: number): Record<string, unknown> {
-    const delta = this.agentDeltas.get(callIndex) ?? {};
-    this.agentDeltas.delete(callIndex);
+  commitDelta(deltaKey: string): Record<string, unknown> {
+    const delta = this.agentDeltas.get(deltaKey) ?? {};
+    this.agentDeltas.delete(deltaKey);
     return delta;
   }
 
@@ -102,8 +115,9 @@ export class SharedStore {
  * `tools` allowlist, can read and write shared state.
  *
  * For workflow-internal use where delta-journaling is needed, use
- * `createAgentStoreTools(store, callIndex)` instead — it attributes each put to
- * the given agent so the write can be replayed correctly on resume.
+ * `createAgentStoreTools(store, deltaKey)` instead — it attributes each put to
+ * the given agent (via a run-unique deltaKey) so the write can be replayed
+ * correctly on resume.
  */
 export function createSharedStoreTools(store: SharedStore): ToolDefinition[] {
   const storePut = defineTool({
@@ -151,11 +165,14 @@ export function createSharedStoreTools(store: SharedStore): ToolDefinition[] {
 }
 
 /**
- * Create per-agent store tools that attribute writes to `callIndex`.
+ * Create per-agent store tools that attribute writes to `deltaKey`, a
+ * run-unique `${runId}:${callIndex}` string (see the `SharedStore` class doc
+ * for why the bare callIndex alone is not enough once a nested `workflow()`
+ * call shares this store).
  * Used internally by `runWorkflow` so each agent's puts are tracked in the
  * store's delta journal and can be replayed additively on resume.
  */
-export function createAgentStoreTools(store: SharedStore, callIndex: number): ToolDefinition[] {
+export function createAgentStoreTools(store: SharedStore, deltaKey: string): ToolDefinition[] {
   const storePut = defineTool({
     name: "store_put",
     label: "Store Put",
@@ -167,7 +184,7 @@ export function createAgentStoreTools(store: SharedStore, callIndex: number): To
       value: Type.Any({ description: "The value to store (any JSON-serializable value)." }),
     }),
     async execute(_id: string, params: { key: string; value: unknown }) {
-      store.trackPut(params.key, params.value, callIndex);
+      store.trackPut(params.key, params.value, deltaKey);
       return {
         content: [{ type: "text", text: `Stored value under key "${params.key}".` }],
         details: { key: params.key },

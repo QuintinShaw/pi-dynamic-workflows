@@ -3,6 +3,7 @@
  */
 
 import { EventEmitter } from "node:events";
+import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import type { WorkflowAgent } from "./agent.js";
 import { preview, type WorkflowSnapshot } from "./display.js";
 import { WorkflowError, WorkflowErrorCode } from "./errors.js";
@@ -71,6 +72,12 @@ export interface WorkflowManagerOptions {
   agent?: Pick<WorkflowAgent, "run">;
   /** The session's main model (provider/id), for auto-tiering explore agents. */
   mainModel?: string;
+  /**
+   * The host Pi session's model registry. When provided, workflow subagents
+   * resolve models against the same registry as the main session, including
+   * extension-registered providers such as ollama-cloud.
+   */
+  modelRegistry?: ModelRegistry;
   /** The pi session id to tag runs with (see setSessionId). */
   sessionId?: string;
   /** Default per-agent timeout when a run does not pass agentTimeoutMs. null means no hard timeout. */
@@ -88,6 +95,8 @@ export class WorkflowManager extends EventEmitter {
   private agent?: Pick<WorkflowAgent, "run">;
   /** The session's main model (provider/id), for auto-tiering explore agents. */
   private mainModel?: string;
+  /** The host Pi session's model registry, shared with subagents. */
+  private modelRegistry?: ModelRegistry;
   /** The current pi session id; runs are stamped with it and listRuns() filters by it. */
   private sessionId?: string;
   private defaultAgentTimeoutMs: number | null;
@@ -100,6 +109,7 @@ export class WorkflowManager extends EventEmitter {
     this.loadSavedWorkflow = options.loadSavedWorkflow;
     this.agent = options.agent;
     this.mainModel = options.mainModel;
+    this.modelRegistry = options.modelRegistry;
     this.sessionId = options.sessionId;
     this.defaultAgentTimeoutMs = options.defaultAgentTimeoutMs ?? null;
     this.defaultAgentRetries = options.defaultAgentRetries ?? 0;
@@ -140,6 +150,21 @@ export class WorkflowManager extends EventEmitter {
   /** Set the session's main model (provider/id). Used to auto-tier explore agents. */
   setMainModel(spec: string | undefined): void {
     this.mainModel = spec;
+  }
+
+  /** Set the host session's model registry so subagents resolve models consistently. */
+  setModelRegistry(registry: ModelRegistry): void {
+    this.modelRegistry = registry;
+  }
+
+  /**
+   * The host session's model registry, when set. Read lazily (e.g. by the
+   * workflow tool's model routing guideline) since `setModelRegistry` is called
+   * from `session_start`, which runs after the tool is created — a snapshot
+   * taken at tool-creation time would miss it.
+   */
+  getModelRegistry(): ModelRegistry | undefined {
+    return this.modelRegistry;
   }
 
   /**
@@ -290,6 +315,7 @@ export class WorkflowManager extends EventEmitter {
         args,
         agent: this.agent,
         mainModel: this.mainModel,
+        modelRegistry: this.modelRegistry,
         signal: managed.controller.signal,
         concurrency: resolvedConcurrency,
         agentRetries: resolvedAgentRetries,

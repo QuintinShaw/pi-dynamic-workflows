@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { AgentDefinition, AgentRegistry } from "../src/agent-registry.js";
 import { SharedStore } from "../src/shared-store.js";
 import { runWorkflow } from "../src/workflow.js";
 
@@ -24,19 +25,19 @@ test("SharedStore.snapshot returns deep copy", () => {
 
 test("SharedStore.trackPut + commitDelta tracks per-agent writes", () => {
   const store = new SharedStore();
-  store.trackPut("a", 1, 2);
-  store.trackPut("b", 2, 3);
-  store.trackPut("a", 10, 2); // overwrite for agent 2
+  store.trackPut("a", 1, "run-1:2");
+  store.trackPut("b", 2, "run-1:3");
+  store.trackPut("a", 10, "run-1:2"); // overwrite for agent 2
 
-  const delta2 = store.commitDelta(2);
-  const delta3 = store.commitDelta(3);
+  const delta2 = store.commitDelta("run-1:2");
+  const delta3 = store.commitDelta("run-1:3");
 
   assert.deepEqual(delta2, { a: 10 });
   assert.deepEqual(delta3, { b: 2 });
 
   // After commit the deltas are cleared
-  assert.deepEqual(store.commitDelta(2), {});
-  assert.deepEqual(store.commitDelta(3), {});
+  assert.deepEqual(store.commitDelta("run-1:2"), {});
+  assert.deepEqual(store.commitDelta("run-1:3"), {});
 });
 
 test("SharedStore.applyDelta adds keys without clearing", () => {
@@ -69,47 +70,196 @@ test("SharedStore.applyDelta: replaying parallel-agent deltas in callSeq order i
 test("SharedStore.dispose clears map and agent deltas", () => {
   const store = new SharedStore();
   store.put("k", "v");
-  store.trackPut("k2", "v2", 1);
+  store.trackPut("k2", "v2", "run-1:1");
   store.dispose();
   assert.equal(store.get("k"), undefined);
-  assert.deepEqual(store.commitDelta(1), {});
+  assert.deepEqual(store.commitDelta("run-1:1"), {});
+});
+
+// ─── Delta-key collision regression (defect: nested workflow() shares a store
+// but restarts callSeq at 0) ───────────────────────────────────────────────────
+
+test("agentDeltas keyed by bare callIndex collide across two runs sharing a store", () => {
+  // This documents the bug shape at the SharedStore level: if callers key
+  // trackPut/commitDelta by a bare index (not a run-unique deltaKey), two
+  // different logical runs sharing one store instance and both using callIndex
+  // 0 stomp on each other's delta.
+  const store = new SharedStore();
+
+  // Simulate the OLD buggy call convention: both "runs" pass the bare index.
+  const BUGGY_PARENT_KEY = "0";
+  const BUGGY_NESTED_KEY = "0"; // collides with the parent's key under the old scheme
+
+  store.trackPut("parentKey", "parentValue", BUGGY_PARENT_KEY);
+  store.trackPut("nestedKey", "nestedValue", BUGGY_NESTED_KEY);
+
+  // Only one delta survives under the collided key — the nested run's write
+  // clobbered the parent's delta entry entirely.
+  const collided = store.commitDelta(BUGGY_PARENT_KEY);
+  assert.deepEqual(
+    collided,
+    { parentKey: "parentValue", nestedKey: "nestedValue" },
+    "both puts landed in the SAME delta bucket because the keys collided",
+  );
+
+  // With run-unique keys (the fix), the same scenario keeps deltas separate.
+  const store2 = new SharedStore();
+  store2.trackPut("parentKey", "parentValue", "run-abc:0");
+  store2.trackPut("nestedKey", "nestedValue", "run-abc-nested1:0");
+  assert.deepEqual(store2.commitDelta("run-abc:0"), { parentKey: "parentValue" });
+  assert.deepEqual(store2.commitDelta("run-abc-nested1:0"), { nestedKey: "nestedValue" });
 });
 
 // ─── Cross-run isolation ──────────────────────────────────────────────────────
 
-test("each runWorkflow call gets an isolated SharedStore", async () => {
-  // Run 1 writes to the store; run 2 must start clean.
-  const results: string[] = [];
+test("each runWorkflow call gets an isolated SharedStore: run 2 does not see run 1's writes", async () => {
+  const readsByRun: Record<string, boolean> = {};
 
   const agent = {
     async run(
       prompt: string,
       opts: { systemTools?: { name: string; execute: (...args: unknown[]) => Promise<unknown> }[] },
     ) {
-      // Find store_get tool and call it
-      const getResult = await opts.systemTools
-        ?.find((t) => t.name === "store_get")
-        ?.execute?.("", { key: "shared_key" });
-      const found = getResult?.details?.found ?? false;
-      results.push(`run:${prompt}:found=${found}`);
-      return `result-${prompt}`;
+      if (prompt === "put") {
+        await opts.systemTools?.find((t) => t.name === "store_put")?.execute("", { key: "shared_key", value: "run1" });
+        return "wrote";
+      }
+      // prompt === "get"
+      const res = (await opts.systemTools?.find((t) => t.name === "store_get")?.execute("", { key: "shared_key" })) as {
+        details?: { found?: boolean };
+      };
+      readsByRun[prompt] = res?.details?.found ?? false;
+      return "read";
     },
   };
 
-  // Run 1 — we can't easily drive store_put from a fake agent without
-  // wiring the whole tool call pipeline, so instead verify isolation via dispose:
-  // two separate runWorkflow calls should not share a store instance.
-  const script = `
-    export const meta = { name: "isolation-test", description: "isolation test" };
-    const r = await agent("check", {});
-    return r;
+  const putScript = `
+    export const meta = { name: "isolation-put", description: "writes to the store" };
+    return await agent("put", {});
+  `;
+  const getScript = `
+    export const meta = { name: "isolation-get", description: "reads from the store" };
+    return await agent("get", {});
   `;
 
-  // Running the same script twice should not throw and each run has its own store.
-  await runWorkflow(script, { agent, cwd: process.cwd() });
-  await runWorkflow(script, { agent, cwd: process.cwd() });
-  // No cross-contamination assertion needed beyond both runs completing without error.
-  assert.equal(results.length, 2);
+  // Run 1 writes "shared_key" into its own store.
+  await runWorkflow(putScript, { agent, cwd: process.cwd() });
+  // Run 2 is a brand new runWorkflow call (fresh SharedStore) and must NOT see it.
+  await runWorkflow(getScript, { agent, cwd: process.cwd() });
+
+  assert.equal(readsByRun.get, false, "a second, independent runWorkflow call must not see run 1's store writes");
+});
+
+test("store_put/store_get are injected as systemTools even under a restrictive agentType tools allowlist", async () => {
+  let observedToolNames: string[] | undefined;
+  let observedSystemToolNames: string[] | undefined;
+
+  const agent = {
+    async run(_prompt: string, opts: { toolNames?: string[]; systemTools?: { name: string }[] }) {
+      observedToolNames = opts.toolNames;
+      observedSystemToolNames = opts.systemTools?.map((t) => t.name);
+      return "ok";
+    },
+  };
+
+  // A restrictive agentType allowlist that does NOT mention store_put/store_get.
+  const restrictiveDef: AgentDefinition = {
+    name: "read-only-auditor",
+    tools: ["read_file"], // deliberately narrow — should never include store tools
+    prompt: "You audit code read-only.",
+    source: "project",
+  };
+  const agentRegistry: AgentRegistry = new Map([["read-only-auditor", restrictiveDef]]);
+
+  const script = `
+    export const meta = { name: "allowlist-bypass-test", description: "allowlist bypass test" };
+    return await agent("audit", { agentType: "read-only-auditor" });
+  `;
+
+  await runWorkflow(script, { agent, cwd: process.cwd(), agentRegistry });
+
+  // The allowlist passed through to the coding-tool filter is indeed restrictive...
+  assert.deepEqual(observedToolNames, ["read_file"], "agentType.tools allowlist must reach the agent runner");
+  // ...but store_put/store_get are still present via systemTools, which bypass
+  // the allowlist filter entirely (this is the headline feature of SharedStore).
+  assert.ok(observedSystemToolNames?.includes("store_put"), "store_put must be injected despite the allowlist");
+  assert.ok(observedSystemToolNames?.includes("store_get"), "store_get must be injected despite the allowlist");
+});
+
+// ─── Nested workflow() delta-collision regression (defect #1) ────────────────
+
+test("nested workflow() concurrent with its parent does not collide on shared-store deltas", async () => {
+  // Regression test for the delta-key-collision bug: a nested workflow() call
+  // restarts its own callSeq at 0 while sharing the parent's SharedStore. If
+  // agentDeltas were keyed by bare callIndex, a parent agent and a
+  // concurrently-running nested-run agent could both land on callIndex 0 and
+  // steal/overwrite each other's journaled delta. Both writes must survive.
+  const journal: import("../src/workflow.js").JournalEntry[] = [];
+
+  const agent = {
+    async run(
+      prompt: string,
+      opts: {
+        systemTools?: Array<{ name: string; execute: (id: string, p: unknown) => Promise<unknown> }>;
+      },
+    ) {
+      if (prompt.startsWith("put:")) {
+        const [, key, val] = prompt.split(":");
+        await opts.systemTools?.find((t) => t.name === "store_put")?.execute("", { key, value: val });
+        return `wrote ${key}`;
+      }
+      if (prompt.startsWith("get:")) {
+        const [, key] = prompt.split(":");
+        const res = (await opts.systemTools?.find((t) => t.name === "store_get")?.execute("", { key })) as {
+          details?: { value?: unknown; found?: boolean };
+        };
+        return { key, found: res?.details?.found, value: res?.details?.value };
+      }
+      return "ok";
+    },
+  };
+
+  // Outer script: kicks off a nested workflow() concurrently with its own
+  // parent-level agent() call, both writing to the shared store at the same
+  // (per-run) callIndex 0. Then reads both keys back.
+  const outerScript = `
+    export const meta = { name: "nested-collision-outer", description: "outer" };
+    const [, parentResult] = await Promise.all([
+      workflow(\`
+        export const meta = { name: "nested-collision-inner", description: "inner" };
+        return await agent("put:nestedKey:fromNested", {});
+      \`, {}),
+      agent("put:parentKey:fromParent", {}),
+    ]);
+    const gotParent = await agent("get:parentKey");
+    const gotNested = await agent("get:nestedKey");
+    return { parentResult, gotParent, gotNested };
+  `;
+
+  const result = await runWorkflow<{
+    gotParent: { key: string; found: boolean; value: unknown };
+    gotNested: { key: string; found: boolean; value: unknown };
+  }>(outerScript, {
+    agent,
+    cwd: process.cwd(),
+    onAgentJournal: (e) => journal.push(e),
+  });
+
+  // Both the parent-run write and the nested-run write must be independently
+  // visible — neither delta was stolen/overwritten by the other despite both
+  // originating from callIndex 0 in their respective runs.
+  assert.equal(result.result.gotParent.found, true, "parent's write must survive");
+  assert.equal(result.result.gotParent.value, "fromParent");
+  assert.equal(result.result.gotNested.found, true, "nested run's write must survive");
+  assert.equal(result.result.gotNested.value, "fromNested");
+
+  // At the journal level: there must be two distinct non-empty storeDelta
+  // entries (one per run) rather than one clobbering the other down to a
+  // single surviving key.
+  const nonEmptyDeltas = journal.filter((e) => Object.keys(e.storeDelta ?? {}).length > 0);
+  const allDeltaKeys = nonEmptyDeltas.flatMap((e) => Object.keys(e.storeDelta ?? {}));
+  assert.ok(allDeltaKeys.includes("parentKey"), "journal must contain a delta for parentKey");
+  assert.ok(allDeltaKeys.includes("nestedKey"), "journal must contain a delta for nestedKey");
 });
 
 // ─── Resume under fan-out (integration) ──────────────────────────────────────

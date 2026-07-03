@@ -432,8 +432,8 @@ test("renderNavigator shows agents view", () => {
   state.drill(model);
   const lines = renderNavigator(state, model, 80);
   const text = lines.join("\n");
-  assert.match(text, /audit › Scan/);
-  assert.match(text, /❯ ✓ scan a/);
+  assert.match(text, /Scan · 2 agents/);
+  assert.match(text, /› ● scan a/);
   assert.match(text, /scan b/);
   assert.match(text, /enter open/);
 });

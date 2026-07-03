@@ -27,7 +27,7 @@ export function createEffortState(): EffortState {
 const HIGH_DIRECTIVE =
   "Effort: HIGH. Be thorough — use a few parallel reviewers/perspectives and an adversarial verify pass (see verify()/judgePanel()); set a moderate tokenBudget and maxAgents on the workflow tool call.";
 const ULTRA_DIRECTIVE =
-  "Effort: ULTRA. Be exhaustive — fan out widely (more reviewers/judges, deeper loopUntilDry rounds, a completenessCheck at the end), set a generous tokenBudget and a high maxAgents on the workflow tool call, and prefer the big tier for synthesis.";
+  "Effort: ULTRA. Be exhaustive — fan out widely (more reviewers/judges, deeper loopUntilDry rounds, a completenessCheck at the end), and prefer the big tier for synthesis. This can spend a lot of tokens quickly, so set explicit caps you're comfortable paying for (a generous but bounded tokenBudget and a high maxAgents) on the workflow tool call rather than leaving them unbounded.";
 
 /** The extra directive appended to the forced-workflow prompt for an effort level. */
 export function effortDirective(level: EffortLevel): string | undefined {
@@ -69,7 +69,7 @@ export function registerEffortCommand(pi: ExtensionAPI, state: EffortState): voi
   // `/ultracode` turns it on, `/ultracode off` turns it off. Alias for /effort ultra.
   pi.registerCommand("ultracode", {
     description:
-      "Ultracode: standing maximal-effort mode — auto-arms an exhaustive workflow for substantive messages. /ultracode off to stop.",
+      "Ultracode: standing maximal-effort mode (this session only, never persisted) — auto-arms an exhaustive workflow for substantive messages. /ultracode off to stop.",
     async handler(args: string, _ctx: ExtensionCommandContext) {
       const arg = args.trim().toLowerCase();
       const say = (content: string) => pi.sendMessage({ customType: "effort", content, display: true });
