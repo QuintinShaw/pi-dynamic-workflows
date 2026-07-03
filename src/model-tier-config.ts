@@ -45,24 +45,42 @@ export function getModelTierConfigPath(): string {
 
 /**
  * Substrings that identify small/cheap models (case-insensitive).
- * Used by `buildDefaultTierConfig` to pick the best small-tier model from the
- * available registry regardless of the order providers are listed.
+ * Used by `rankByCapability` to rank models lowest so a mini/flash/haiku model
+ * never lands in a higher tier than a model without this hint.
  */
 export const SMALL_MODEL_HINTS = ["mini", "flash", "haiku", "nano", "small"] as const;
 
 /**
  * Substrings that identify large/capable models (case-insensitive).
- * Used by `buildDefaultTierConfig` to pick the best big-tier model from the
- * available registry regardless of the order providers are listed.
+ * Used by `rankByCapability` to rank models highest so they are preferred for
+ * the big tier over models without this hint.
  */
 export const BIG_MODEL_HINTS = ["opus", "pro", "ultra", "large", "plus"] as const;
 
 /**
- * Return the first model in `available` whose name (lower-cased) contains any
- * of the given hint substrings, or `undefined` if none match.
+ * Capability score for a single model spec: +1 if it matches a big-model hint,
+ * -1 if it matches a small-model hint, 0 otherwise. If a model happens to
+ * match both hint sets (e.g. a name containing both "mini" and "pro"), the
+ * small hint wins — we never want a "mini"-labelled model to outrank a
+ * neutral or clearly-large one.
  */
-function findByHints(available: string[], hints: readonly string[]): string | undefined {
-  return available.find((model) => hints.some((hint) => model.toLowerCase().includes(hint)));
+function capabilityScore(model: string): number {
+  const lower = model.toLowerCase();
+  if (SMALL_MODEL_HINTS.some((hint) => lower.includes(hint))) return -1;
+  if (BIG_MODEL_HINTS.some((hint) => lower.includes(hint))) return 1;
+  return 0;
+}
+
+/**
+ * Rank `available` models from least to most capable using `capabilityScore`.
+ * The sort is stable (ties preserve registry order), so within a score bucket
+ * models keep their original relative order.
+ */
+function rankByCapability(available: string[]): string[] {
+  return available
+    .map((model, index) => ({ model, index, score: capabilityScore(model) }))
+    .sort((a, b) => a.score - b.score || a.index - b.index)
+    .map((entry) => entry.model);
 }
 
 // ---------------------------------------------------------------------------
@@ -75,38 +93,46 @@ function findByHints(available: string[], hints: readonly string[]): string | un
  * box. When the registry is empty or unavailable, fall back to the current Pi
  * model so fresh installs still get usable tier values.
  *
- * For the small tier, `SMALL_MODEL_HINTS` substring matching is tried first so
- * that a mini/flash/haiku model is always assigned to small even when the
- * registry returns models grouped by provider rather than ordered by capability.
- * Likewise, `BIG_MODEL_HINTS` is tried for the big tier. Both fall back to
- * positional selection (`available[0]` / `available[last]`) when no hint
- * matches. The medium tier is always the positional middle element.
+ * Models are first ranked least → most capable via `rankByCapability` (which
+ * consults `SMALL_MODEL_HINTS` / `BIG_MODEL_HINTS`, falling back to registry
+ * order for models that match neither). Tiers are then assigned from this
+ * single ranked pool with exclusion — each model is used for at most one
+ * tier — so distinct tiers never collapse onto the same model and a
+ * mini/flash/haiku model can never outrank a bigger one (no inversion):
+ *
+ *   - big    = the most capable model (last in the ranking)
+ *   - small  = the least capable model (first in the ranking)
+ *   - medium = the middle-ranked model
+ *
+ * When fewer than 3 distinct models are available, this degrades gracefully
+ * by reusing the *strongest* available model for the higher tier(s) — it
+ * never reuses a weaker model for a higher tier than a stronger one:
+ *
+ *   - 2 models: small = weaker, medium = big = stronger
+ *   - 1 model / 0 models: small = medium = big = that model (or the current
+ *     model / "" fallback)
  *
  * `_availableModels` is injectable for testing and for callers that already
- * fetched the registry. When omitted and no current model is provided, this
- * reads from the live registry.
+ * fetched the registry. When omitted, this reads from the live registry
+ * regardless of whether `currentModelSpec` was also provided, so the
+ * default-argument path always goes through the same corrected logic instead
+ * of silently reproducing the original single-tier collapse.
  */
 export function buildDefaultTierConfig(currentModelSpec?: string, _availableModels?: string[]): ModelTierConfig {
-  const available = _availableModels ?? (currentModelSpec === undefined ? listAvailableModelSpecs() : []);
-  if (available.length >= 3) {
-    return {
-      tiers: {
-        small: findByHints(available, SMALL_MODEL_HINTS) ?? available[0],
-        medium: available[Math.floor(available.length / 2)],
-        big: findByHints(available, BIG_MODEL_HINTS) ?? available[available.length - 1],
-      },
-    };
+  const available = _availableModels ?? listAvailableModelSpecs();
+  const ranked = rankByCapability(available);
+
+  if (ranked.length >= 3) {
+    const small = ranked[0];
+    const big = ranked[ranked.length - 1];
+    const medium = ranked[Math.floor(ranked.length / 2)];
+    return { tiers: { small, medium, big } };
   }
-  if (available.length === 2) {
-    return {
-      tiers: {
-        small: available[0],
-        medium: available[1],
-        big: available[1],
-      },
-    };
+  if (ranked.length === 2) {
+    const [weaker, stronger] = ranked;
+    return { tiers: { small: weaker, medium: stronger, big: stronger } };
   }
-  const fallback = available[0] ?? currentModelSpec ?? "";
+  const fallback = ranked[0] ?? currentModelSpec ?? "";
   return {
     tiers: {
       small: fallback,
