@@ -17,9 +17,8 @@
  */
 
 import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { basename, join } from "node:path";
-import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { AGENTS_DIR } from "./config.js";
 
 export interface AgentDefinition {
@@ -44,9 +43,19 @@ export interface AgentDefinition {
 export type AgentRegistry = Map<string, AgentDefinition>;
 
 function toStringArray(value: unknown): string[] | undefined {
-  if (!Array.isArray(value)) return undefined;
-  const arr = value.filter((v): v is string => typeof v === "string" && v.trim().length > 0).map((v) => v.trim());
-  return arr.length ? arr : undefined;
+  if (value == null) return undefined;
+  // YAML list form: ["read", "grep"]
+  if (Array.isArray(value)) {
+    const arr = value.filter((v): v is string => typeof v === "string" && v.trim().length > 0).map((v) => v.trim());
+    return arr.length ? arr : undefined;
+  }
+  // Comma-separated string form: "read, grep, find" — the form pi-coding-agent's
+  // parseFrontmatter returns and the form the official subagent example uses.
+  if (typeof value === "string" && value.trim().length > 0) {
+    const arr = value.split(",").map((s) => s.trim()).filter(Boolean);
+    return arr.length ? arr : undefined;
+  }
+  return undefined;
 }
 
 /**
@@ -113,7 +122,11 @@ function readDefsFromDir(dir: string, source: "project" | "user"): AgentDefiniti
  */
 export function loadAgentRegistry(cwd: string, opts?: { projectDir?: string; userDir?: string }): AgentRegistry {
   const projectDir = opts?.projectDir ?? join(cwd, AGENTS_DIR);
-  const userDir = opts?.userDir ?? join(homedir(), AGENTS_DIR);
+  // User-level definitions live under the agent dir (e.g. ~/.pi/agent/agents/),
+  // matching the convention used by pi-coding-agent's built-in agent discovery
+  // and the official subagent extension example. Reading getAgentDir() also
+  // honors the PI_CODING_AGENT_DIR env override.
+  const userDir = opts?.userDir ?? join(getAgentDir(), "agents");
   const registry: AgentRegistry = new Map();
   for (const def of readDefsFromDir(projectDir, "project")) {
     if (def.name && !registry.has(def.name)) registry.set(def.name, def);
