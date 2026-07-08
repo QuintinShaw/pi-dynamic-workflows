@@ -1,16 +1,57 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import type { AgentRunOptions, AgentUsage } from "../src/agent.js";
 import { listAvailableModelSpecs, resolveAgentModelSpec, WorkflowAgent } from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import type { ModelTierConfig } from "../src/model-tier-config.js";
 import { runWorkflow } from "../src/workflow.js";
+import { withFakeHome } from "./helpers/fake-home.js";
 
 // Private methods used for testing - cast to this type to access them without `any`
 type WorkflowAgentPrivates = {
   buildPrompt(prompt: string, options: AgentRunOptions<any>, structured: boolean): string;
   lastAssistantText(messages: unknown[]): string;
+  createSessionManager(): { isPersisted(): boolean; getCwd(): string };
 };
+
+// ═══════════════════════════════════════════════════════════════════════
+// persistAgentSessions — in-memory by default, file-backed keyed by project cwd
+// ═══════════════════════════════════════════════════════════════════════
+
+test("WorkflowAgent uses an in-memory session manager by default", () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp" });
+  const manager = (agent as unknown as WorkflowAgentPrivates).createSessionManager();
+  assert.equal(manager.isPersisted(), false, "default must stay in-memory (back-compat)");
+});
+
+test("WorkflowAgent with persistAgentSessions=false explicitly stays in-memory", () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp", persistAgentSessions: false });
+  const manager = (agent as unknown as WorkflowAgentPrivates).createSessionManager();
+  assert.equal(manager.isPersisted(), false);
+});
+
+test("WorkflowAgent with persistAgentSessions=true creates a file-backed manager keyed by the project cwd", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-persist-agent-"));
+  const projectCwd = join(dir, "project");
+  const fakeHome = join(dir, "home");
+  try {
+    withFakeHome(fakeHome, () => {
+      const agent = new WorkflowAgent({ cwd: projectCwd, persistAgentSessions: true });
+      const manager = (agent as unknown as WorkflowAgentPrivates).createSessionManager();
+      assert.equal(manager.isPersisted(), true, "flag must yield a file-backed session manager");
+      // Sessions must be keyed by the runner's project cwd — never a per-call
+      // worktree cwd — so transcripts group under the project's session dir.
+      // createSessionManager() takes no per-call cwd by design; assert the
+      // manager saw the project cwd.
+      assert.equal(manager.getCwd(), projectCwd);
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test("listAvailableModelSpecs returns an array (empty when no auth configured)", () => {
   const result = listAvailableModelSpecs();

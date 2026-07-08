@@ -23,6 +23,13 @@ export interface WorkflowSettings {
   progressPanelMode?: "compact" | "detailed";
   /** Max agents shown per phase in detailed progress mode (default 8). */
   progressPanelMaxAgents?: number;
+  /**
+   * Persist each workflow subagent transcript as a real pi session file under
+   * the standard sessions directory (~/.pi/agent/sessions/<encoded-cwd>/),
+   * keyed by the project cwd. Default false: subagent sessions stay in-memory
+   * and only the compacted history embedded in the run JSON survives.
+   */
+  persistAgentSessions?: boolean;
 }
 
 export interface WorkflowSettingsStore {
@@ -133,6 +140,9 @@ function normalizeSettings(value: unknown): WorkflowSettings {
     raw.progressPanelMaxAgents >= 1
   ) {
     settings.progressPanelMaxAgents = Math.min(1000, Math.floor(raw.progressPanelMaxAgents));
+  }
+  if (typeof raw.persistAgentSessions === "boolean") {
+    settings.persistAgentSessions = raw.persistAgentSessions;
   }
   return settings;
 }

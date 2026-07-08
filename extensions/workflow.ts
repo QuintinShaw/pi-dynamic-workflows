@@ -28,6 +28,7 @@ export default function extension(pi: ExtensionAPI) {
     defaultAgentTimeoutMs: settings.defaultAgentTimeoutMs ?? null,
     concurrency: settings.defaultConcurrency,
     defaultAgentRetries: settings.defaultAgentRetries,
+    persistAgentSessions: settings.persistAgentSessions,
   });
 
   const workflowTool = createWorkflowTool({ cwd, manager, storage });

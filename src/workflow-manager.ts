@@ -84,6 +84,11 @@ export interface WorkflowManagerOptions {
   defaultAgentTimeoutMs?: number | null;
   /** Default retry attempts after recoverable agent failures. */
   defaultAgentRetries?: number;
+  /**
+   * Persist each subagent transcript as a real pi session file under the
+   * standard sessions directory. Default false (in-memory, discarded).
+   */
+  persistAgentSessions?: boolean;
 }
 
 export class WorkflowManager extends EventEmitter {
@@ -101,6 +106,7 @@ export class WorkflowManager extends EventEmitter {
   private sessionId?: string;
   private defaultAgentTimeoutMs: number | null;
   private defaultAgentRetries: number;
+  private persistAgentSessions: boolean;
 
   constructor(options: WorkflowManagerOptions = {}) {
     super();
@@ -113,6 +119,7 @@ export class WorkflowManager extends EventEmitter {
     this.sessionId = options.sessionId;
     this.defaultAgentTimeoutMs = options.defaultAgentTimeoutMs ?? null;
     this.defaultAgentRetries = options.defaultAgentRetries ?? 0;
+    this.persistAgentSessions = options.persistAgentSessions ?? false;
     this.persistence = createRunPersistence(this.cwd);
     this.recoverStaleRuns();
   }
@@ -316,6 +323,7 @@ export class WorkflowManager extends EventEmitter {
         agent: this.agent,
         mainModel: this.mainModel,
         modelRegistry: this.modelRegistry,
+        persistAgentSessions: this.persistAgentSessions,
         signal: managed.controller.signal,
         concurrency: resolvedConcurrency,
         agentRetries: resolvedAgentRetries,

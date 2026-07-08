@@ -197,6 +197,55 @@ describe("workflow settings", () => {
     });
   });
 
+  it("saves and loads persistAgentSessions", () => {
+    withSettingsPath((settingsPath) => {
+      assert.deepEqual(loadWorkflowSettings(settingsPath), {}, "absent by default");
+
+      saveWorkflowSettings({ persistAgentSessions: true }, settingsPath);
+      assert.deepEqual(loadWorkflowSettings(settingsPath), { persistAgentSessions: true });
+
+      saveWorkflowSettings({ persistAgentSessions: false }, settingsPath);
+      assert.deepEqual(loadWorkflowSettings(settingsPath), { persistAgentSessions: false });
+    });
+  });
+
+  it("ignores non-boolean persistAgentSessions values", () => {
+    withSettingsPath((settingsPath) => {
+      mkdirSync(dirname(settingsPath), { recursive: true });
+
+      writeFileSync(settingsPath, JSON.stringify({ persistAgentSessions: "true" }), "utf-8");
+      assert.deepEqual(loadWorkflowSettings(settingsPath), {});
+
+      writeFileSync(settingsPath, JSON.stringify({ persistAgentSessions: 1 }), "utf-8");
+      assert.deepEqual(loadWorkflowSettings(settingsPath), {});
+
+      writeFileSync(settingsPath, JSON.stringify({ persistAgentSessions: null }), "utf-8");
+      assert.deepEqual(loadWorkflowSettings(settingsPath), {});
+    });
+  });
+
+  it("project persistAgentSessions overrides the global setting", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-persist-settings-"));
+    const cwd = join(dir, "project");
+    const fakeHome = join(dir, "home");
+    try {
+      withFakeHome(fakeHome, () => {
+        const globalPath = getWorkflowSettingsPath();
+        const projectPath = getWorkflowProjectSettingsPath(cwd);
+
+        saveWorkflowSettings({ persistAgentSessions: false }, globalPath);
+        saveWorkflowSettings({ persistAgentSessions: true }, { cwd, settingsPath: globalPath, scope: "project" });
+
+        assert.deepEqual(loadWorkflowSettings(globalPath), { persistAgentSessions: false });
+        assert.deepEqual(loadWorkflowSettings({ cwd, settingsPath: globalPath, projectSettingsPath: projectPath }), {
+          persistAgentSessions: true,
+        });
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("ignores corrupt or invalid settings", () => {
     withSettingsPath((settingsPath) => {
       mkdirSync(dirname(settingsPath), { recursive: true });

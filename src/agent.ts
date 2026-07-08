@@ -211,6 +211,13 @@ export interface WorkflowAgentOptions {
    * that are only available via extension registration.
    */
   modelRegistry?: ModelRegistry;
+  /**
+   * Persist each subagent transcript as a real pi session file under the
+   * standard sessions directory (keyed by the runner's project cwd), instead
+   * of the default in-memory session that is discarded when the run ends.
+   * Default: false (current behavior).
+   */
+  persistAgentSessions?: boolean;
 }
 
 /**
@@ -244,6 +251,13 @@ export interface AgentUsage {
 
 export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefined> {
   label?: string;
+  /**
+   * Display name recorded on the persisted session (session_info entry) when
+   * `persistAgentSessions` is enabled, so transcripts are identifiable in
+   * session pickers (e.g. `workflow:<runId> <label>`). Ignored for in-memory
+   * sessions or when an explicit session.sessionManager override is injected.
+   */
+  sessionName?: string;
   schema?: TSchemaDef;
   tools?: ToolDefinition[];
   instructions?: string;
@@ -317,6 +331,7 @@ export class WorkflowAgent {
   private readonly cwd: string;
   private readonly baseTools: ToolDefinition[];
   private readonly sessionOptions: Partial<CreateAgentSessionOptions>;
+  private readonly persistAgentSessions: boolean;
   private readonly instructions?: string;
   private readonly mainModel?: string;
   /** Shared registry from the host session, when provided. */
@@ -328,6 +343,7 @@ export class WorkflowAgent {
     this.cwd = options.cwd ?? process.cwd();
     this.baseTools = options.tools ?? createCodingTools(this.cwd);
     this.sessionOptions = options.session ?? {};
+    this.persistAgentSessions = options.persistAgentSessions ?? false;
     this.instructions = options.instructions;
     this.mainModel = options.mainModel;
     this.sharedRegistry = options.modelRegistry;
@@ -360,6 +376,15 @@ export class WorkflowAgent {
    * or a bare `modelId` (prefers auth-configured models, then any known model).
    * Returns undefined when nothing matches.
    */
+  /**
+   * Session manager for one subagent run. File-backed (persisted under the
+   * standard sessions dir, keyed by the runner's project cwd — never a
+   * per-call worktree cwd) when persistAgentSessions is on; in-memory otherwise.
+   */
+  private createSessionManager(): SessionManager {
+    return this.persistAgentSessions ? SessionManager.create(this.cwd) : SessionManager.inMemory();
+  }
+
   private resolveModel(spec: string, perRunRegistry?: ModelRegistry): Model<any> | undefined {
     const registry = this.getRegistry(perRunRegistry);
     const slash = spec.indexOf("/");
@@ -414,10 +439,15 @@ export class WorkflowAgent {
     }
 
     const agentDir = getAgentDir();
+    // Key persisted sessions by the runner's project cwd (this.cwd), NOT the
+    // per-call runCwd: agents working in short-lived git worktrees should still
+    // group under the project's session dir instead of scattering across
+    // temporary worktree paths.
+    const sessionManager = this.createSessionManager();
     const { session } = await createAgentSession({
       cwd: runCwd,
       agentDir,
-      sessionManager: SessionManager.inMemory(),
+      sessionManager,
       // Use real SettingsManager to inherit user's default provider/model settings.
       // SettingsManager.inMemory() doesn't load ~/.pi/settings.json, so subagents
       // would fall back to the first available model (e.g. openai-codex) which may
@@ -433,6 +463,16 @@ export class WorkflowAgent {
       // Per-call model wins over any sessionOptions.model.
       ...(resolvedModel ? { model: resolvedModel } : {}),
     });
+
+    // Name the persisted session so it's identifiable in session pickers.
+    // Skip when an injected session.sessionManager override won (tests/embedders).
+    if (this.persistAgentSessions && !this.sessionOptions.sessionManager && options.sessionName) {
+      try {
+        sessionManager.appendSessionInfo(options.sessionName);
+      } catch {
+        // Naming is best-effort; never fail the run over it.
+      }
+    }
 
     let removeAbortListener: (() => void) | undefined;
     let removeHistoryListener: (() => void) | undefined;

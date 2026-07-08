@@ -495,6 +495,8 @@ export async function runWorkflow<T = unknown>(
             const result = await withTimeout(
               agentRunner.run(prompt, {
                 label,
+                // Identifiable name for persisted sessions (persistAgentSessions).
+                sessionName: `workflow:${runId} ${label}`,
                 schema: agentOptions.schema,
                 signal: options.signal,
                 instructions: buildAgentInstructions(assignedPhase, agentOptions, agentDef, resolvedIsolation),
