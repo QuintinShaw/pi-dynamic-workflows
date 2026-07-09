@@ -73,6 +73,14 @@ interface AgentRow {
   status: string;
   phase?: string;
   tokens?: number;
+  tokenUsage?: {
+    input: number;
+    output: number;
+    total: number;
+    cost: number;
+    cacheRead: number;
+    cacheWrite: number;
+  };
   model?: string;
 }
 
@@ -161,7 +169,15 @@ export class NavigatorModel {
     if (!snap) return [];
     return snap.agents
       .filter((a) => (a.phase ?? "(no phase)") === phase)
-      .map((a) => ({ id: a.id, label: a.label, status: a.status, phase: a.phase, tokens: a.tokens, model: a.model }));
+      .map((a) => ({
+        id: a.id,
+        label: a.label,
+        status: a.status,
+        phase: a.phase,
+        tokens: a.tokens,
+        tokenUsage: a.tokenUsage,
+        model: a.model,
+      }));
   }
 
   agentDetail(runId: string, agentId: number): WorkflowAgentSnapshot | undefined {
@@ -451,7 +467,11 @@ function rightAgentRow(
   theme: ThemeLike,
 ): string {
   const dotColor = AGENT_DOT_COLOR[a.status] ?? "dim";
-  const stats = `${compactTokens(a.tokens ?? 0)} tok`;
+  const stats = a.tokenUsage
+    ? `${compactTokens(a.tokenUsage.input + a.tokenUsage.output)} fresh${
+        a.tokenUsage.cacheRead > 0 ? ` · ${compactTokens(a.tokenUsage.cacheRead)} cache` : ""
+      }`
+    : `${compactTokens(a.tokens ?? 0)} tok`;
   const model = shortModel(a.model) ?? "";
 
   // Stable 2-cell marker so columns never shift on selection: "› " | "  ".

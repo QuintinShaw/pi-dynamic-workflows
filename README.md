@@ -72,7 +72,7 @@ return await agent('Synthesize and double-check these findings:\n' + findings.jo
 - **Journaled resume** — an interrupted run replays finished agents from a journal (no re-run, no tokens) and runs only what's left or what you changed.
 - **Git worktree isolation** — `isolation: "worktree"` gives an agent its own branch, so parallel agents can edit the same files without clobbering each other.
 - **Real token & cost accounting** — read from each subagent's session, not estimated. Runs have no default token cap; `tokenBudget`, phase budgets, and `budget` let you add explicit gates when you want them.
-- **Background by default** — the turn ends right away, a live "Workflows running" panel tracks runs, and each result is delivered back so the conversation auto-continues when it finishes. The panel is compact by default; `/workflows-progress detailed` expands it inline to per-phase/per-agent rows with tokens, cost, and a live tok/s rate (so a stalled agent shows as 0 tok/s) — no need to open `/workflows`.
+- **Background by default** — the turn ends right away, a live "Workflows running" panel tracks runs, and each result is delivered back so the conversation auto-continues when it finishes. The panel is compact by default; `/workflows-progress detailed` expands it inline to per-phase/per-agent rows with a fresh/cache token split, cost, and a live tok/s rate (so a stalled agent shows as 0 tok/s) — no need to open `/workflows`.
 - **Interactive `/workflows` TUI** — drill runs → phases → agents → detail; inspect per-agent failures and compact subagent history; pause, stop, restart, and save runs from the keyboard.
 - **Quality patterns built in** — `verify()`, `judgePanel()`, `loopUntilDry()`, and `completenessCheck()` for adversarial review, best-of-N, and exhaustive discovery.
 - **Ultracode** — `/ultracode` is a standing opt-in that auto-arms an exhaustive multi-agent workflow for every substantive message, the way Claude Code's ultracode does. `/effort high` is the lighter tier.
@@ -111,7 +111,7 @@ The same model — on Pi, plus the production pieces a real run needs:
                             is off (/workflows-trigger off); the run shows in the panel + /workflows.
 /workflows-progress compact|detailed|status
                             switch the live panel between the compact one-liner and the detailed
-                            per-phase/per-agent view (with tokens, cost, and a live tok/s rate)
+                            per-phase/per-agent view (with a fresh/cache token split, cost, and a live tok/s rate)
 /workflows-progress-max <N> cap agents shown per phase in detailed mode (1-1000, default 8)
 /workflows-models           map the small / medium / big tiers to real models, optionally with thinking levels
 /ultracode [off]            ultracode: auto-arm an exhaustive workflow for every substantive message

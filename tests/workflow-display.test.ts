@@ -30,7 +30,13 @@ function agent(
   label: string,
   status: "queued" | "running" | "done" | "error" | "skipped",
   phase?: string,
-  opts?: { resultPreview?: string; tokens?: number; model?: string; prompt?: string },
+  opts?: {
+    resultPreview?: string;
+    tokens?: number;
+    tokenUsage?: { input: number; output: number; total: number; cost: number; cacheRead: number; cacheWrite: number };
+    model?: string;
+    prompt?: string;
+  },
 ) {
   return {
     id,
@@ -40,6 +46,7 @@ function agent(
     prompt: opts?.prompt ?? `execute ${label}`,
     ...(opts?.resultPreview ? { resultPreview: opts.resultPreview } : {}),
     ...(opts?.tokens ? { tokens: opts.tokens } : {}),
+    ...(opts?.tokenUsage ? { tokenUsage: opts.tokenUsage } : {}),
     ...(opts?.model ? { model: opts.model } : {}),
   };
 }
@@ -170,6 +177,21 @@ describe("renderWorkflowText", () => {
     // toLocaleString() output depends on locale (UK/US uses commas, PL uses NBSP)
     // Check with a regex matching any thousands separator between 12 and 345
     assert.ok(/12[ ,.\u00a0]345/.test(text), "should show formatted token count");
+  });
+
+  it("shows a fresh/cache split for an agent with tokenUsage", async () => {
+    const { createWorkflowSnapshot, renderWorkflowLines } = await loadDisplay();
+    const snap = createWorkflowSnapshot(fakeMeta());
+    snap.agents = [
+      agent(1, "cached-agent", "done", "Research", {
+        tokens: 3_100_000,
+        tokenUsage: { input: 80_000, output: 20_000, total: 3_100_000, cacheRead: 3_000_000, cacheWrite: 0, cost: 0.4 },
+      }),
+    ] as never[];
+    const text = renderWorkflowLines(snap).join("\n");
+    // fresh = input+output = 100,000; cache = cacheRead = 3,000,000 (locale-flexible separators)
+    assert.ok(/100[ ,.\u00a0]000 fresh/.test(text), "shows fresh = input+output");
+    assert.ok(/3[ ,.\u00a0]000[ ,.\u00a0]000 cache/.test(text), "shows cache = cacheRead");
   });
 
   it("truncates long agent labels", async () => {
@@ -626,8 +648,8 @@ describe("deliverText", () => {
   it("includes token count when available", async () => {
     const { deliverText } = await loadTaskPanel();
     const text = deliverText(fakeManagedRun());
-    assert.ok(text.includes("150"), "should show token count");
-    assert.ok(text.includes("tokens"), "should mention tokens");
+    assert.ok(text.includes("150"), "should show fresh token count");
+    assert.ok(text.includes("fresh"), "should label fresh tokens");
   });
 
   it("includes agent count", async () => {
