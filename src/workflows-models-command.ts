@@ -8,8 +8,9 @@
  * see every provider Pi can reach, including extension-registered providers such
  * as `ollama-cloud`.
  *
- * Each tier holds exactly one model spec string.
- * When editing a tier, a single-select picker is used (like Pi's `/model`).
+ * Each tier holds exactly one model spec string. The string may include Pi
+ * CLI-style thinking suffixes, e.g. `openai-codex/gpt-5.5:xhigh`.
+ * When editing a tier, users pick a model, then an optional thinking level.
  */
 
 import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
@@ -23,6 +24,12 @@ import {
   type TUI,
 } from "@earendil-works/pi-tui";
 import { listAvailableModelSpecs } from "./agent.js";
+import {
+  formatModelSpecWithThinking,
+  type ModelThinkingLevel,
+  splitModelSpecThinking,
+  THINKING_LEVELS,
+} from "./model-spec.js";
 import {
   buildDefaultTierConfig,
   loadModelTierConfig,
@@ -104,14 +111,21 @@ export function registerWorkflowModelsCommand(pi: ExtensionAPI): void {
   });
 }
 
+const DEFAULT_THINKING_CHOICE = "Default thinking (session setting)";
+const THINKING_CHOICES = [DEFAULT_THINKING_CHOICE, ...THINKING_LEVELS] as const;
+
+function fromThinkingChoice(choice: string | undefined): ModelThinkingLevel | undefined {
+  return THINKING_LEVELS.find((level) => level === choice);
+}
+
 /**
- * Interactive editor for a single tier — scrollable model picker.
+ * Interactive editor for a single tier — scrollable model picker plus optional
+ * thinking-level picker.
  *
- * Uses `ctx.ui.custom()` with Pi TUI's `SelectList` for proper
- * scrollable list with limited visible rows (like `/advisor`).
- *
- * The currently selected model is shown in the dialog title.
- * User scrolls with ↑↓, selects with Enter, cancels with Escape.
+ * Uses `ctx.ui.custom()` with Pi TUI's `SelectList` for proper scrollable list
+ * with limited visible rows (like `/advisor`). The currently selected base
+ * model is shown in the dialog title. After choosing the model, users can set
+ * a Pi CLI-style thinking suffix or keep the session default.
  *
  * Returns the updated tiers object, or null if nothing changed.
  */
@@ -121,12 +135,14 @@ export async function editSingleTier(
   tierName: string,
 ): Promise<Record<string, string> | null> {
   const available = listAvailableModelSpecs(ctx.modelRegistry);
+  const knownSpecs = available.length > 0 ? available : undefined;
   const current = tiers[tierName];
+  const currentParts = splitModelSpecThinking(current, knownSpecs);
 
   // Build SelectItems: all available models as scrollable list
   const items: SelectItem[] = available.map((m) => ({ value: m, label: m }));
 
-  const result = await ctx.ui.custom<string | null>((tui: TUI, theme: Theme, _keybindings, done) => {
+  const selectedModel = await ctx.ui.custom<string | null>((tui: TUI, theme: Theme, _keybindings, done) => {
     const container = new Container();
 
     // Title showing current model
@@ -147,9 +163,9 @@ export async function editSingleTier(
 
     const selectList = new SelectList(items, 12, selectTheme);
 
-    // Preselect the current model
-    if (current) {
-      const idx = items.findIndex((i) => i.value === current);
+    // Preselect the current base model even when the stored tier has :thinking.
+    if (currentParts.modelSpec) {
+      const idx = items.findIndex((i) => i.value === currentParts.modelSpec);
       if (idx >= 0) selectList.setSelectedIndex(idx);
     }
 
@@ -159,7 +175,9 @@ export async function editSingleTier(
 
     container.addChild(selectList);
     container.addChild(new Spacer(1));
-    container.addChild(new Text(theme.fg("dim", "↑↓ navigate  enter select  esc cancel"), 1, 0));
+    container.addChild(
+      new Text(theme.fg("dim", "↑↓ navigate  enter select  esc cancel  · thinking is chosen next"), 1, 0),
+    );
 
     return {
       render: (w: number) => container.render(w),
@@ -171,7 +189,18 @@ export async function editSingleTier(
     };
   });
 
-  if (!result || result === current) return null;
+  if (!selectedModel) return null;
+
+  const currentThinkingLabel = currentParts.thinkingLevel ?? DEFAULT_THINKING_CHOICE;
+  const thinkingChoice = await ctx.ui.select(
+    `Thinking for "${tierName}" tier (current: ${currentThinkingLabel})`,
+    THINKING_CHOICES.map((choice) => String(choice)),
+  );
+  if (!thinkingChoice) return null;
+
+  const thinkingLevel = fromThinkingChoice(thinkingChoice);
+  const result = formatModelSpecWithThinking(selectedModel, thinkingLevel);
+  if (result === current) return null;
 
   ctx.ui.notify(`"${tierName}" tier → ${result}`, "info");
   return { ...tiers, [tierName]: result };

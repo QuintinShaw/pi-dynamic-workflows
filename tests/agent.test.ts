@@ -3,6 +3,7 @@ import test from "node:test";
 import type { AgentRunOptions, AgentUsage } from "../src/agent.js";
 import { listAvailableModelSpecs, resolveAgentModelSpec, WorkflowAgent } from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
+import { resolveModelSpecWithThinking } from "../src/model-spec.js";
 import type { ModelTierConfig } from "../src/model-tier-config.js";
 import { runWorkflow } from "../src/workflow.js";
 
@@ -114,8 +115,8 @@ test("WorkflowAgent reuses an injected ModelRegistry instead of building its own
   } as any;
 
   const agent = new WorkflowAgent({ cwd: "/tmp", modelRegistry: registry });
-  const resolved = (agent as any).resolveModel("mock/shared");
-  assert.equal(resolved, mockModel, "should resolve via the injected registry");
+  const resolved = resolveModelSpecWithThinking("mock/shared", (agent as any).getRegistry());
+  assert.equal(resolved.model, mockModel, "should resolve via the injected registry");
 });
 
 test("WorkflowAgent falls back to building a disk registry when no registry is injected", () => {
@@ -136,8 +137,8 @@ test("WorkflowAgent.resolveModel resolves via a per-run registry when the constr
   } as any;
 
   const agent = new WorkflowAgent({ cwd: "/tmp" });
-  const resolved = (agent as any).resolveModel("router/per-run-only", perRunRegistry);
-  assert.equal(resolved, perRunModel, "should resolve via the per-run registry, not a disk registry");
+  const resolved = resolveModelSpecWithThinking("router/per-run-only", (agent as any).getRegistry(perRunRegistry));
+  assert.equal(resolved.model, perRunModel, "should resolve via the per-run registry, not a disk registry");
 });
 
 test("WorkflowAgent.resolveModel: per-run registry takes precedence over the constructor's shared registry", () => {
@@ -157,11 +158,11 @@ test("WorkflowAgent.resolveModel: per-run registry takes precedence over the con
 
   const agent = new WorkflowAgent({ cwd: "/tmp", modelRegistry: constructorRegistry });
   // The per-run registry, not the constructor's, is consulted when both are set.
-  const resolved = (agent as any).resolveModel("run/override", perRunRegistry);
-  assert.equal(resolved, perRunModel, "per-run registry should win over the constructor's shared registry");
+  const resolved = resolveModelSpecWithThinking("run/override", (agent as any).getRegistry(perRunRegistry));
+  assert.equal(resolved.model, perRunModel, "per-run registry should win over the constructor's shared registry");
   // And the constructor registry is still used when no per-run registry is given.
-  const fallback = (agent as any).resolveModel("ctor/shared");
-  assert.equal(fallback, constructorModel, "constructor registry should still apply without a per-run override");
+  const fallback = resolveModelSpecWithThinking("ctor/shared", (agent as any).getRegistry());
+  assert.equal(fallback.model, constructorModel, "constructor registry should still apply without a per-run override");
 });
 
 test("WorkflowAgent.getRegistry: per-run registry wins, then constructor's shared registry, then disk", () => {
@@ -378,6 +379,20 @@ test("agent() in workflow passes model spec to runner", async () => {
   );
   assert.equal(rec.calls.length, 1);
   assert.equal((rec.calls[0].options as { model?: string }).model, "fast-llm/model");
+});
+
+test("agent() in workflow forwards modelRegistry for CLI-style model parsing", async () => {
+  const rec = new CallRecordingAgent();
+  const modelRegistry = { getAll: () => [] };
+  await runWorkflow(
+    `export const meta = { name: 'test', description: 't' }
+     const r = await agent('task', { label: 't', model: 'fast-llm/model:xhigh' })
+     return r`,
+    { agent: rec, modelRegistry: modelRegistry as never, persistLogs: false },
+  );
+  assert.equal(rec.calls.length, 1);
+  assert.equal((rec.calls[0].options as { modelRegistry?: unknown }).modelRegistry, modelRegistry);
+  assert.equal((rec.calls[0].options as { model?: string }).model, "fast-llm/model:xhigh");
 });
 
 test("agent() in workflow fires onAgentStart and onAgentEnd callbacks", async () => {
