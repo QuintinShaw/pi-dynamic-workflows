@@ -17,6 +17,8 @@ import type { ExtensionAPI, ExtensionUIContext, Theme } from "@earendil-works/pi
 import type { Component, Focusable, TUI } from "@earendil-works/pi-tui";
 import { parseKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import type { WorkflowAgentSnapshot, WorkflowSnapshot } from "./display.js";
+import { formatModelWithThinking } from "./model-display.js";
+import type { ThinkingLevel } from "./model-tier-config.js";
 import type { PersistedRunState } from "./run-persistence.js";
 import { registerSavedWorkflow } from "./saved-commands.js";
 import type { WorkflowManager } from "./workflow-manager.js";
@@ -59,6 +61,7 @@ interface RunRow {
   done: number;
   total: number;
   tokens: number;
+  tokensEstimated?: boolean;
   cost: number;
 }
 interface PhaseRow {
@@ -66,6 +69,7 @@ interface PhaseRow {
   done: number;
   total: number;
   tokens: number;
+  tokensEstimated?: boolean;
 }
 interface AgentRow {
   id: number;
@@ -73,15 +77,12 @@ interface AgentRow {
   status: string;
   phase?: string;
   tokens?: number;
+  tokensEstimated?: boolean;
   model?: string;
+  thinkingLevel?: ThinkingLevel;
 }
 
-/** Short, human-friendly model label: drop the provider prefix for display. */
-export function shortModel(model: string | undefined): string | undefined {
-  if (!model) return undefined;
-  const slash = model.indexOf("/");
-  return slash > 0 ? model.slice(slash + 1) : model;
-}
+export { formatModelWithThinking, shortModel } from "./model-display.js";
 
 /** Reads run/phase/agent data from the manager, preferring live snapshots. */
 export class NavigatorModel {
@@ -109,6 +110,7 @@ export class NavigatorModel {
         done: agents.filter((a) => a.status === "done").length,
         total: agents.length,
         tokens: (live?.snapshot.tokenUsage ?? p.tokenUsage)?.total ?? 0,
+        tokensEstimated: agents.some((a) => a.tokensEstimated),
         cost: (live?.snapshot.tokenUsage ?? p.tokenUsage)?.cost ?? 0,
       };
     });
@@ -152,6 +154,7 @@ export class NavigatorModel {
         done: agents.filter((a) => a.status === "done").length,
         total: agents.length,
         tokens: agents.reduce((n, a) => n + (a.tokens ?? 0), 0),
+        tokensEstimated: agents.some((a) => a.tokensEstimated),
       };
     });
   }
@@ -161,7 +164,16 @@ export class NavigatorModel {
     if (!snap) return [];
     return snap.agents
       .filter((a) => (a.phase ?? "(no phase)") === phase)
-      .map((a) => ({ id: a.id, label: a.label, status: a.status, phase: a.phase, tokens: a.tokens, model: a.model }));
+      .map((a) => ({
+        id: a.id,
+        label: a.label,
+        status: a.status,
+        phase: a.phase,
+        tokens: a.tokens,
+        tokensEstimated: a.tokensEstimated,
+        model: a.model,
+        thinkingLevel: a.thinkingLevel,
+      }));
   }
 
   agentDetail(runId: string, agentId: number): WorkflowAgentSnapshot | undefined {
@@ -196,7 +208,10 @@ function persistedToSnapshot(p: PersistedRunState): WorkflowSnapshot {
       errorCode: a.errorCode,
       recoverable: a.recoverable,
       history: a.history,
+      tokens: a.tokens,
+      tokensEstimated: a.tokensEstimated,
       model: a.model,
+      thinkingLevel: a.thinkingLevel,
     })),
     agentCount: p.agents.length,
     runningCount: p.agents.filter((a) => a.status === "running").length,
@@ -327,8 +342,12 @@ function pad(n: number): string {
   return n.toLocaleString();
 }
 
-function fmtTokens(t: number): string {
-  return t > 0 ? `${pad(t)} tok` : "";
+function fmtTokens(t: number, estimated = false): string {
+  return t > 0 ? `${estimated ? "~" : ""}${pad(t)} tok` : "";
+}
+
+function compactTokenText(t: number, estimated = false): string {
+  return `${estimated ? "~" : ""}${compactTokens(t)} tok`;
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -451,8 +470,8 @@ function rightAgentRow(
   theme: ThemeLike,
 ): string {
   const dotColor = AGENT_DOT_COLOR[a.status] ?? "dim";
-  const stats = `${compactTokens(a.tokens ?? 0)} tok`;
-  const model = shortModel(a.model) ?? "";
+  const stats = compactTokenText(a.tokens ?? 0, a.tokensEstimated);
+  const model = formatModelWithThinking(a.model, a.thinkingLevel) ?? "";
 
   // Stable 2-cell marker so columns never shift on selection: "› " | "  ".
   // Layout: <marker:2><dot><sp><name> … <model> … <stats(right-aligned)>.
@@ -486,7 +505,7 @@ function rightAgentRow(
   const statsStyled = theme.fg("dim", stats);
 
   // Assemble with explicit cell padding (visibleWidth-driven gaps).
-  let out = marker + dot + " " + nameStyled;
+  let out = `${marker}${dot} ${nameStyled}`;
   const afterName = nameStart + visibleWidth(nameOut);
   if (modelOut) {
     out += " ".repeat(Math.max(0, modelStart - afterName)) + modelStyled;
@@ -763,7 +782,11 @@ export function renderNavigator(
     // Render runs
     runs.forEach((r, i) => {
       const icon = STATUS_ICON[r.status] ?? "?";
-      const meta = [`${r.done}/${r.total}`, fmtTokens(r.tokens), r.cost > 0 ? `$${r.cost.toFixed(4)}` : ""]
+      const meta = [
+        `${r.done}/${r.total}`,
+        fmtTokens(r.tokens, r.tokensEstimated),
+        r.cost > 0 ? `$${r.cost.toFixed(4)}` : "",
+      ]
         .filter(Boolean)
         .join(" · ");
       lines.push(sel(i, `${icon} ${r.name}  ${dim(`${r.runId} · ${r.status} · ${meta}`)}`));
@@ -799,7 +822,9 @@ export function renderNavigator(
     if (a) {
       const body: string[] = [];
       body.push(dim("Status: ") + (a.status ?? ""));
-      if (a.model) body.push(dim("Model: ") + (shortModel(a.model) ?? ""));
+      if (a.tokens !== undefined) body.push(dim("Tokens: ") + compactTokenText(a.tokens, a.tokensEstimated));
+      const modelInfo = formatModelWithThinking(a.model, a.thinkingLevel);
+      if (modelInfo) body.push(dim("Model: ") + modelInfo);
       if (a.error) body.push(dim("Error: ") + a.error);
       if (a.errorCode) body.push(`${dim("Error code: ")}${a.errorCode}${a.recoverable ? " (recoverable)" : ""}`);
       body.push("", dim("Prompt:"));
@@ -854,17 +879,19 @@ function twoPaneHeader(
   let done = 0;
   let total = 0;
   let tokens = 0;
+  let tokensEstimated = false;
   for (const p of phases) {
     done += p.done;
     total += p.total;
     tokens += p.tokens;
+    tokensEstimated ||= Boolean(p.tokensEstimated);
   }
   // Line 0 — name (accent + bold), truncated to width if needed.
   const nameText = truncateToWidth(name, width, ELLIPSIS, false);
   const line0 = theme.fg("accent", theme.bold(nameText));
 
   // Line 1 — left status, right summary.
-  const rightRaw = `${done}/${total} ${pluralize("agent", total)}${tokens > 0 ? ` · ${compactTokens(tokens)} tok` : ""}`;
+  const rightRaw = `${done}/${total} ${pluralize("agent", total)}${tokens > 0 ? ` · ${compactTokenText(tokens, tokensEstimated)}` : ""}`;
   const rightW = visibleWidth(rightRaw);
   const gap = 2;
   let line1: string;
@@ -999,7 +1026,18 @@ export function openWorkflowNavigator(
   return ui.custom<void>(
     (tui: TUI, theme: Theme, _keybindings, done: (r: undefined) => void) => {
       const rerender = () => tui.requestRender();
-      const events = ["agentStart", "agentEnd", "phase", "log", "complete", "error", "stopped", "paused", "resumed"];
+      const events = [
+        "agentStart",
+        "agentProgress",
+        "agentEnd",
+        "phase",
+        "log",
+        "complete",
+        "error",
+        "stopped",
+        "paused",
+        "resumed",
+      ];
       const onEvent = () => rerender();
       for (const ev of events) manager.on(ev, onEvent);
       const cleanup = () => {

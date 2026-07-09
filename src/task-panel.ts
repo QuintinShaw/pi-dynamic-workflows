@@ -9,16 +9,17 @@
 import type { ExtensionAPI, ExtensionUIContext, Theme } from "@earendil-works/pi-coding-agent";
 import { type Component, type TUI, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { shorten, statusIcon, type WorkflowAgentSnapshot, type WorkflowSnapshot } from "./display.js";
+import { formatModelWithThinking } from "./model-display.js";
 import type { ManagedRun, WorkflowManager } from "./workflow-manager.js";
 import type { WorkflowStorage } from "./workflow-saved.js";
 import type { WorkflowSettings } from "./workflow-settings.js";
-import { shortModel } from "./workflow-ui.js";
 
 // `tokenUsage` is included so the detailed panel's live token/s counter refreshes
 // as tokens accrue (not only on agent start/end). It is harmless in compact mode —
 // it redraws identical content.
 const RUN_EVENTS = [
   "agentStart",
+  "agentProgress",
   "agentEnd",
   "phase",
   "log",
@@ -262,11 +263,12 @@ function renderRunBody(
     const complete = done + errors + skipped === phaseAgents.length;
     const marker = running > 0 || (!complete && snap.currentPhase === title) ? "▶" : complete ? "✓" : " ";
     const phaseTokens = phaseAgents.reduce((n, a) => n + (a.tokens ?? 0), 0);
+    const phaseTokensEstimated = phaseAgents.some((a) => a.tokensEstimated);
     const phaseMeta = [
       `${done}/${phaseAgents.length} agents`,
       running ? `${running} running` : "",
       errors ? `${errors} errors` : "",
-      phaseTokens > 0 ? `${fmtTokensShort(phaseTokens)} tok` : "",
+      phaseTokens > 0 ? `${phaseTokensEstimated ? "~" : ""}${fmtTokensShort(phaseTokens)} tok` : "",
     ]
       .filter(Boolean)
       .join(" · ");
@@ -274,8 +276,8 @@ function renderRunBody(
 
     const visible = phaseAgents.slice(-maxAgents);
     for (const a of visible) {
-      const tok = a.tokens ? dim(` ${fmtTokensShort(a.tokens)} tok`) : "";
-      const mdl = shortModel(a.model);
+      const tok = a.tokens !== undefined ? dim(` ${a.tokensEstimated ? "~" : ""}${fmtTokensShort(a.tokens)} tok`) : "";
+      const mdl = formatModelWithThinking(a.model, a.thinkingLevel);
       const model = mdl ? dim(` · ${mdl}`) : "";
       lines.push(`    [${a.id}] ${statusIcon(a.status)} ${shorten(a.label, 40)}${tok}${model}`);
     }
@@ -311,13 +313,11 @@ export function renderPanelDetailed(
     const done = agents.filter((a) => a.status === "done").length;
     const icon = r.status === "paused" ? "⏸" : "◆";
     const usage = snap?.tokenUsage ?? r.tokenUsage;
-    // The run-level tokenUsage aggregate is only finalized when the run ends, so
-    // it reads 0 for the whole live run. Per-agent `tokens` update on each agent
-    // completion, so sum those for a live total (and keep the header consistent
-    // with the per-phase subtotals). Note: tokens land at agent-completion
-    // granularity, so the rate reflects completion throughput — it decays to 0
-    // during a single long-running agent or a stall (which is the intended signal).
+    // Sum per-agent tokens for the live total so running agents can show
+    // streaming/heartbeat estimates before provider usage finalizes. The final
+    // exact provider usage replaces the estimate on agent completion.
     const total = agents.reduce((n, a) => n + (a.tokens ?? 0), 0);
+    const totalEstimated = agents.some((a) => a.tokensEstimated);
     // Sample the running total and derive the rolling token/s. Paused runs don't
     // accrue tokens, so their rate is suppressed (a stalled rate would mislead).
     sampleTokens(r.runId, total, now);
@@ -325,7 +325,7 @@ export function renderPanelDetailed(
     const meta = [
       `${done}/${agents.length} agents`,
       snap?.currentPhase || "",
-      total > 0 ? `${fmtTokensShort(total)} tok` : "",
+      total > 0 ? `${totalEstimated ? "~" : ""}${fmtTokensShort(total)} tok` : "",
       // 2 decimals for ≥1¢, 4 for sub-cent so a real cost never shows as "$0.00".
       // (cost is only known once the run finalizes its usage.)
       usage?.cost ? `$${usage.cost.toFixed(usage.cost >= 0.01 ? 2 : 4)}` : "",

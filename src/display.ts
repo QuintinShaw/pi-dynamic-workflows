@@ -1,6 +1,8 @@
 import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import type { AgentHistoryEntry } from "./agent-history.js";
 import type { WorkflowErrorCode } from "./errors.js";
+import { formatModelWithThinking } from "./model-display.js";
+import type { ThinkingLevel } from "./model-tier-config.js";
 import type { WorkflowMeta } from "./workflow.js";
 
 export type WorkflowAgentStatus = "queued" | "running" | "done" | "error" | "skipped";
@@ -16,10 +18,14 @@ export interface WorkflowAgentSnapshot {
   errorCode?: WorkflowErrorCode;
   recoverable?: boolean;
   history?: AgentHistoryEntry[];
-  /** Tokens used by this agent. */
+  /** Tokens used by this agent. Running agents may hold a live estimate until provider usage finalizes. */
   tokens?: number;
+  /** True when `tokens` is a live estimate rather than finalized provider usage. */
+  tokensEstimated?: boolean;
   /** The model this agent ran on (provider/id), when known. */
   model?: string;
+  /** Pi thinking/reasoning level requested or used by this agent, when known. */
+  thinkingLevel?: ThinkingLevel;
 }
 
 export interface WorkflowSnapshot {
@@ -183,7 +189,8 @@ export function renderWorkflowLines(
   // Build header with token info (and cost when the provider reports it)
   const usage = snapshot.tokenUsage;
   const costInfo = usage?.cost ? ` · $${usage.cost.toFixed(4)}` : "";
-  const tokenInfo = usage ? ` · ${usage.total.toLocaleString()} tokens${costInfo}` : "";
+  const tokenEstimatePrefix = snapshot.agents.some((agent) => agent.tokensEstimated) ? "~" : "";
+  const tokenInfo = usage ? ` · ${tokenEstimatePrefix}${usage.total.toLocaleString()} tokens${costInfo}` : "";
   const lines = [
     `${theme.bold(`◆ Workflow: ${snapshot.name}`)} (${snapshot.doneCount}/${snapshot.agentCount} done${state}${tokenInfo})`,
   ];
@@ -214,8 +221,12 @@ export function renderWorkflowLines(
     for (const agent of visibleAgents) {
       const order = `[${agent.id}]`;
       const result = showResultPreviews && agent.resultPreview ? ` — ${agent.resultPreview}` : "";
-      const agentTokens = agent.tokens ? theme.fg("dim", ` [${agent.tokens.toLocaleString()} tok]`) : "";
-      lines.push(`    ${order} ${statusIcon(agent.status)} ${shorten(agent.label, 48)}${agentTokens}${result}`);
+      const agentTokens = formatAgentTokens(agent, theme);
+      const modelInfo = formatModelWithThinking(agent.model, agent.thinkingLevel);
+      const agentModel = modelInfo ? theme.fg("dim", ` [${modelInfo}]`) : "";
+      lines.push(
+        `    ${order} ${statusIcon(agent.status)} ${shorten(agent.label, 48)}${agentTokens}${agentModel}${result}`,
+      );
     }
     if (agents.length > visibleAgents.length)
       lines.push(theme.fg("dim", `    … ${agents.length - visibleAgents.length} earlier agents`));
@@ -226,8 +237,12 @@ export function renderWorkflowLines(
     lines.push(theme.fg("accent", "  Unphased"));
     for (const agent of unphased.slice(-maxAgents)) {
       const result = showResultPreviews && agent.resultPreview ? ` — ${agent.resultPreview}` : "";
-      const agentTokens = agent.tokens ? theme.fg("dim", ` [${agent.tokens.toLocaleString()} tok]`) : "";
-      lines.push(`    [${agent.id}] ${statusIcon(agent.status)} ${shorten(agent.label, 48)}${agentTokens}${result}`);
+      const agentTokens = formatAgentTokens(agent, theme);
+      const modelInfo = formatModelWithThinking(agent.model, agent.thinkingLevel);
+      const agentModel = modelInfo ? theme.fg("dim", ` [${modelInfo}]`) : "";
+      lines.push(
+        `    [${agent.id}] ${statusIcon(agent.status)} ${shorten(agent.label, 48)}${agentTokens}${agentModel}${result}`,
+      );
     }
   }
 
@@ -244,6 +259,12 @@ function statusLine(snapshot: WorkflowSnapshot, completed: boolean): string {
   if (snapshot.runningCount > 0)
     return `workflow ${snapshot.name}: ${snapshot.runningCount} running, ${snapshot.doneCount}/${snapshot.agentCount} done`;
   return `workflow ${snapshot.name}: ${snapshot.doneCount}/${snapshot.agentCount} done`;
+}
+
+function formatAgentTokens(agent: WorkflowAgentSnapshot, theme: ThemeLike): string {
+  if (agent.tokens === undefined) return "";
+  const prefix = agent.tokensEstimated ? "~" : "";
+  return theme.fg("dim", ` [${prefix}${agent.tokens.toLocaleString()} tok]`);
 }
 
 export function statusIcon(status: WorkflowAgentStatus): string {

@@ -223,6 +223,60 @@ return { a, b }`;
 );
 
 test(
+  "each agent's thinking level is recorded for /workflows",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent(), mainModel: "anthropic/claude-opus-4-8" });
+    const script = `export const meta = { name: 'thinking_demo', description: 'per-agent thinking' }
+const a = await agent('reason', { label: 'judge', thinkingLevel: 'xhigh' })
+return { a }`;
+    await manager.runSync(script);
+
+    const run = manager.listRuns().find((r) => r.workflowName === "thinking_demo");
+    assert.equal(run?.agents[0]?.thinkingLevel, "xhigh");
+  }),
+);
+
+test(
+  "live agent token progress updates the running snapshot",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(_prompt: string, options: any) {
+          options.onUsageUpdate?.({
+            input: 9,
+            output: 6,
+            cacheRead: 0,
+            cacheWrite: 0,
+            total: 15,
+            cost: 0,
+            estimated: true,
+          });
+          options.onUsage?.({ input: 20, output: 10, cacheRead: 0, cacheWrite: 0, total: 30, cost: 0.001 });
+          return "ok";
+        },
+      },
+    });
+    const progressTotals: Array<{ tokens?: number; estimated?: boolean; runTotal?: number }> = [];
+    manager.on("agentProgress", ({ runId }) => {
+      const snap = manager.getRun(runId)?.snapshot;
+      progressTotals.push({
+        tokens: snap?.agents[0]?.tokens,
+        estimated: snap?.agents[0]?.tokensEstimated,
+        runTotal: snap?.tokenUsage?.total,
+      });
+    });
+
+    await manager.runSync(oneAgentScript);
+
+    assert.deepEqual(progressTotals, [{ tokens: 15, estimated: true, runTotal: 15 }]);
+    const run = manager.listRuns().find((r) => r.workflowName === "tracked_demo");
+    assert.equal(run?.agents[0]?.tokens, 30);
+    assert.equal(run?.agents[0]?.tokensEstimated, false);
+  }),
+);
+
+test(
   "runSync persists recoverable agent error details for /workflows",
   withTempCwd(async (cwd) => {
     const manager = new WorkflowManager({

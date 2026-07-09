@@ -109,7 +109,10 @@ test("createWorktree falls back when target branch already exists", async () => 
     const wt = await createWorktreeLive(repo, name);
     assert.equal(wt.isolated, false);
     assert.equal(wt.cwd, repo);
-    assert.ok(/already exists/i.test(wt.reason ?? ""), `Expected 'already exists' error, got: ${wt.reason}`);
+    assert.ok(
+      /pi\/wf\/conflict-branch|conflict-branch/i.test(wt.reason ?? ""),
+      `Expected branch conflict error, got: ${wt.reason}`,
+    );
   } finally {
     rmSync(repo, { recursive: true, force: true });
   }

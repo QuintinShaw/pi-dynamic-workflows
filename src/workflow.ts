@@ -3,7 +3,7 @@ import vm from "node:vm";
 import type { Node } from "acorn";
 import { parse } from "acorn";
 import type { TSchema } from "typebox";
-import type { AgentUsage } from "./agent.js";
+import type { AgentUsage, AgentUsageUpdate } from "./agent.js";
 import { WorkflowAgent, type WorkflowAgentOptions } from "./agent.js";
 import type { AgentHistoryEntry } from "./agent-history.js";
 import {
@@ -17,7 +17,14 @@ import { DEFAULT_AGENT_TIMEOUT_MS, MAX_AGENT_RETRIES, MAX_AGENTS_PER_RUN, MAX_CO
 import { WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
 import { createWorkflowLogger } from "./logger.js";
 import { parseModelRoutingFromMeta, resolveModelForPhase } from "./model-routing.js";
+import {
+  loadModelTierConfig,
+  resolveTierModel,
+  resolveTierThinkingLevel,
+  type ThinkingLevel,
+} from "./model-tier-config.js";
 import { createAgentStoreTools, SharedStore } from "./shared-store.js";
+import { estimateTokens } from "./token-estimate.js";
 import { createWorktree, removeWorktree, type Worktree } from "./worktree.js";
 
 export interface WorkflowMetaPhase {
@@ -110,7 +117,13 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   confirm?: (promptText: string, options: CheckpointOptions) => Promise<unknown>;
   onLog?: (message: string) => void;
   onPhase?: (title: string) => void;
-  onAgentStart?: (event: { label: string; phase?: string; prompt: string; model?: string }) => void;
+  onAgentStart?: (event: {
+    label: string;
+    phase?: string;
+    prompt: string;
+    model?: string;
+    thinkingLevel?: ThinkingLevel;
+  }) => void;
   onAgentEnd?: (event: {
     label: string;
     phase?: string;
@@ -118,9 +131,19 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
     tokens?: number;
     worktree?: string;
     model?: string;
+    thinkingLevel?: ThinkingLevel;
     error?: string;
     errorCode?: WorkflowErrorCode;
     recoverable?: boolean;
+  }) => void;
+  /** Live display-only token progress for a running agent. Final accounting still comes from onAgentEnd/onTokenUsage. */
+  onAgentProgress?: (event: {
+    label: string;
+    phase?: string;
+    tokens: number;
+    estimated?: boolean;
+    model?: string;
+    thinkingLevel?: ThinkingLevel;
   }) => void;
   onAgentHistory?: (event: { label: string; phase?: string; history: AgentHistoryEntry[] }) => void;
   onTokenUsage?: (usage: {
@@ -165,10 +188,13 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
   /**
    * Coarse model tier ("small" | "medium" | "big"), resolved from the user's
    * model-tiers config (see /workflows-models). An explicit `model` takes
-   * precedence; a tier takes precedence over the phase model. When the tier has
-   * no configured entry it falls back to the session's main model.
+   * precedence for the model; a tier takes precedence over the phase model.
+   * The tier's configured thinking level is also used unless `thinkingLevel` is set.
+   * When the tier has no configured entry it falls back to the session's main model.
    */
   tier?: string;
+  /** Explicit Pi thinking/reasoning level for this agent. Overrides the tier's configured level. */
+  thinkingLevel?: ThinkingLevel;
   isolation?: "worktree";
   /**
    * Name of a registered subagent definition (`.pi/agents/<name>.md`, project >
@@ -399,15 +425,26 @@ export async function runWorkflow<T = unknown>(
     const explicitModel = agentOptions.model ?? agentDef?.model;
     const modelSpec =
       explicitModel ?? (agentOptions.tier ? undefined : resolveModelForPhase(assignedPhase, routingConfig));
-    // For display in /workflows: the model this agent runs on — its explicit/phase
-    // spec, else the session's main model. The real resolved id overrides this via
-    // onModelResolved once the subagent session is created.
-    let displayModel = modelSpec ?? options.mainModel;
+    // For display in /workflows: the model/thinking this agent runs on — its
+    // explicit/phase spec, else the selected tier model, else the session's main
+    // model. The real resolved id and effective thinking level override this via
+    // callbacks once the subagent session is created.
+    const tierHashIdentity = resolveTierHashIdentity(agentOptions, modelSpec);
+    let displayModel = modelSpec ?? tierHashIdentity?.model ?? options.mainModel;
+    let displayThinkingLevel = agentOptions.thinkingLevel;
+    if (!displayThinkingLevel) displayThinkingLevel = tierHashIdentity?.thinkingLevel ?? undefined;
 
     // Deterministic resume key: assigned at lexical call time, before the limiter,
     // so parallel()/pipeline() fan-out is reproducible for a fixed script.
     const callIndex = state.callSeq++;
-    const callHash = hashAgentCall(prompt, modelSpec, assignedPhase, agentOptions, agentDefinitionKey(agentDef));
+    const callHash = hashAgentCall(
+      prompt,
+      modelSpec,
+      assignedPhase,
+      agentOptions,
+      agentDefinitionKey(agentDef),
+      tierHashIdentity,
+    );
     // Store delta key: callIndex alone is NOT run-unique. A nested workflow()
     // call (see workflowFn below) shares this run's SharedStore instance but
     // restarts its own callSeq at 0, so a parent agent and a concurrently
@@ -435,8 +472,21 @@ export async function runWorkflow<T = unknown>(
     const hashMatches = cached != null && cached.hash === callHash;
     const cachedEmptyOutput = hashMatches && isEmptyTextAgentResult(cached.result, agentOptions.schema);
     if (hashMatches && !cachedEmptyOutput && callIndex < state.firstMiss) {
-      options.onAgentStart?.({ label, phase: assignedPhase, prompt, model: displayModel });
-      options.onAgentEnd?.({ label, phase: assignedPhase, result: cached.result, tokens: 0, model: displayModel });
+      options.onAgentStart?.({
+        label,
+        phase: assignedPhase,
+        prompt,
+        model: displayModel,
+        thinkingLevel: displayThinkingLevel,
+      });
+      options.onAgentEnd?.({
+        label,
+        phase: assignedPhase,
+        result: cached.result,
+        tokens: 0,
+        model: displayModel,
+        thinkingLevel: displayThinkingLevel,
+      });
       // Apply this agent's write delta so live agents later in the run see a
       // consistent store. Additive apply preserves parallel-agent writes that
       // came from higher-callIndex agents finishing before this one.
@@ -452,7 +502,13 @@ export async function runWorkflow<T = unknown>(
       const retryAttempts = normalizeAgentRetries(agentOptions.retries ?? options.agentRetries ?? 0);
       const maxAttempts = retryAttempts + 1;
 
-      options.onAgentStart?.({ label, phase: assignedPhase, prompt, model: displayModel });
+      options.onAgentStart?.({
+        label,
+        phase: assignedPhase,
+        prompt,
+        model: displayModel,
+        thinkingLevel: displayThinkingLevel,
+      });
 
       // Optional per-agent worktree isolation (deterministic name -> stable resume keys).
       // Precedence: explicit call-site isolation > agentDef isolation.
@@ -471,6 +527,18 @@ export async function runWorkflow<T = unknown>(
       // estimate when the provider reports no usage (total === 0). Usage is reset
       // per retry attempt so a failed attempt does not double-count the next one.
       let usage: AgentUsage | undefined;
+      let agentTotalTokens = 0;
+      const emitAgentProgress = (attemptUsage: AgentUsageUpdate) => {
+        const liveTokens = Math.max(0, agentTotalTokens + Math.max(0, attemptUsage.total || 0));
+        options.onAgentProgress?.({
+          label,
+          phase: assignedPhase,
+          tokens: liveTokens,
+          estimated: attemptUsage.estimated ?? true,
+          model: displayModel,
+          thinkingLevel: displayThinkingLevel,
+        });
+      };
       const recordTokens = (result: unknown): number => {
         const tokens = usage && usage.total > 0 ? usage.total : estimateTokens(result) + estimateTokens(prompt);
         if (usage) {
@@ -482,6 +550,7 @@ export async function runWorkflow<T = unknown>(
         }
         shared.tokenUsage.total += tokens;
         shared.spent += tokens;
+        agentTotalTokens += tokens;
         return tokens;
       };
 
@@ -500,6 +569,7 @@ export async function runWorkflow<T = unknown>(
                 instructions: buildAgentInstructions(assignedPhase, agentOptions, agentDef, resolvedIsolation),
                 model: modelSpec,
                 tier: agentOptions.tier,
+                thinkingLevel: agentOptions.thinkingLevel,
                 modelRegistry: options.modelRegistry,
                 toolNames: agentDef?.tools,
                 disallowedToolNames: agentDef?.disallowedTools,
@@ -512,12 +582,18 @@ export async function runWorkflow<T = unknown>(
                 onModelResolved: (id: string) => {
                   displayModel = id;
                 },
+                onThinkingLevelResolved: (thinkingLevel: ThinkingLevel) => {
+                  displayThinkingLevel = thinkingLevel;
+                },
                 onModelFallback: (spec: string) => {
                   // Make the silent degrade visible in /workflows, not just console.
                   log(`${label}: model "${spec}" unavailable — using the session default`);
                 },
                 onUsage: (u: AgentUsage) => {
                   usage = u;
+                },
+                onUsageUpdate: (u: AgentUsageUpdate) => {
+                  emitAgentProgress(u);
                 },
                 onHistory: (history: AgentHistoryEntry[]) => {
                   options.onAgentHistory?.({ label, phase: assignedPhase, history });
@@ -535,7 +611,7 @@ export async function runWorkflow<T = unknown>(
               });
             }
 
-            const tokens = recordTokens(result);
+            recordTokens(result);
             options.onAgentJournal?.({
               index: callIndex,
               hash: callHash,
@@ -546,9 +622,10 @@ export async function runWorkflow<T = unknown>(
               label,
               phase: assignedPhase,
               result,
-              tokens,
+              tokens: agentTotalTokens,
               worktree: runCwd,
               model: displayModel,
+              thinkingLevel: displayThinkingLevel,
             });
             return result;
           } catch (error) {
@@ -556,7 +633,7 @@ export async function runWorkflow<T = unknown>(
 
             const workflowError = wrapError(error, { agentLabel: label });
             logger.error(`agent ${label} attempt ${attempt}/${maxAttempts} failed: ${workflowError.message}`);
-            const tokens = recordTokens(null);
+            recordTokens(null);
 
             if (workflowError.recoverable && attempt < maxAttempts) {
               log(
@@ -569,9 +646,10 @@ export async function runWorkflow<T = unknown>(
               label,
               phase: assignedPhase,
               result: null,
-              tokens,
+              tokens: agentTotalTokens,
               worktree: runCwd,
               model: displayModel,
+              thinkingLevel: displayThinkingLevel,
               error: workflowError.message,
               errorCode: workflowError.code,
               recoverable: workflowError.recoverable,
@@ -1092,17 +1170,59 @@ function hashCheckpoint(promptText: string, options: CheckpointOptions): string 
   return createHash("sha256").update(identity).digest("hex");
 }
 
+interface TierHashIdentity {
+  tier: string;
+  model?: string | null;
+  thinkingLevel?: ThinkingLevel | null;
+}
+
+function resolveTierHashIdentity(options: AgentOptions, modelSpec: string | undefined): TierHashIdentity | null {
+  let config: ReturnType<typeof loadModelTierConfig>;
+  try {
+    config = loadModelTierConfig();
+  } catch {
+    config = null;
+  }
+  if (!config) return null;
+
+  if (options.tier) {
+    return {
+      tier: options.tier,
+      // When an explicit/agentType model is already supplied, the tier's model is
+      // not applied; still include tier thinking when it can affect the session.
+      model: modelSpec ? null : (resolveTierModel(options.tier, config) ?? null),
+      thinkingLevel: options.thinkingLevel ? null : (resolveTierThinkingLevel(options.tier, config) ?? null),
+    };
+  }
+
+  // Untagged agents only consult the medium tier when no explicit/phase model
+  // is supplied. Include it so changing the configured default tier invalidates
+  // resume cache entries that would otherwise replay with stale routing.
+  if (!modelSpec) {
+    return {
+      tier: "medium",
+      model: resolveTierModel("medium", config) ?? null,
+      thinkingLevel: options.thinkingLevel ? null : (resolveTierThinkingLevel("medium", config) ?? null),
+    };
+  }
+
+  return null;
+}
+
 function hashAgentCall(
   prompt: string,
   model: string | undefined,
   phase: string | undefined,
   options: AgentOptions,
   agentDefKey: string | null,
+  tierConfig: TierHashIdentity | null,
 ): string {
   const identity = JSON.stringify({
     prompt,
     model: model ?? null,
     tier: options.tier ?? null,
+    tierConfig,
+    thinkingLevel: options.thinkingLevel ?? null,
     phase: phase ?? null,
     agentType: options.agentType ?? null,
     // Resolved definition (tools/model/prompt) so editing an agent .md invalidates
@@ -1134,10 +1254,6 @@ function buildAgentInstructions(
 
 function isEmptyTextAgentResult(result: unknown, schema: TSchema | undefined): boolean {
   return schema === undefined && typeof result === "string" && result.trim().length === 0;
-}
-
-function estimateTokens(value: unknown): number {
-  return Math.ceil(JSON.stringify(value ?? "").length / 4);
 }
 
 function normalizeConcurrency(value: unknown): number {

@@ -1,10 +1,12 @@
 /**
- * Model tier configuration for workflow subagent model routing.
+ * Model tier configuration for workflow subagent routing.
  *
- * A tier is a named slot (small/medium/big) holding exactly ONE model spec
- * string (e.g. "openai/gpt-4.1-mini"). When an agent() call specifies
- * opts.tier, that single model is resolved and used as the subagent's model
- * (unless an explicit opts.model is given, which always wins — see agent.ts).
+ * A tier is a named slot (small/medium/big) holding one model spec plus an
+ * optional Pi thinking/reasoning effort level. When an agent() call specifies
+ * opts.tier, that tier's model and thinkingLevel are applied to the subagent
+ * (unless an explicit opts.model is given, which still wins for the model — see
+ * agent.ts). Legacy configs that stored a tier as a plain string are accepted
+ * and normalized to { model: string } on load/save.
  *
  * This augments the phase-pattern routing in model-routing.ts: phase routing
  * maps workflow phases → models via the script's meta; tiers give scripts a
@@ -22,12 +24,24 @@ import { MODEL_TIERS_FILE } from "./config.js";
 // Types
 // ---------------------------------------------------------------------------
 
+export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
+export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
+
+/** One tier's concrete runtime selection. */
+export interface ModelTierEntry {
+  model: string;
+  thinkingLevel?: ThinkingLevel;
+}
+
+/** Backward-compatible in-memory value: legacy callers may still pass strings. */
+export type ModelTierValue = string | ModelTierEntry;
+
 /**
  * Model tier configuration. Maps tier names (e.g. "small", "medium", "big")
- * to a single model spec string (e.g. "gpt-4.1-mini" or "openai/gpt-4.1-mini").
+ * to one model spec and, optionally, one Pi thinking/reasoning effort level.
  */
 export interface ModelTierConfig {
-  tiers: Record<string, string>;
+  tiers: Record<string, ModelTierValue>;
 }
 
 // ---------------------------------------------------------------------------
@@ -37,6 +51,45 @@ export interface ModelTierConfig {
 /** Path to the model tiers JSON config file (~/.pi/workflows/model-tiers.json). */
 export function getModelTierConfigPath(): string {
   return join(homedir(), MODEL_TIERS_FILE);
+}
+
+// ---------------------------------------------------------------------------
+// Thinking-level validation / normalization
+// ---------------------------------------------------------------------------
+
+export function isThinkingLevel(value: unknown): value is ThinkingLevel {
+  return typeof value === "string" && (THINKING_LEVELS as readonly string[]).includes(value);
+}
+
+/** Normalize a legacy string or object tier entry. Returns null for invalid shapes. */
+export function normalizeTierEntry(value: unknown): ModelTierEntry | null {
+  if (typeof value === "string") return { model: value };
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+
+  const entry = value as { model?: unknown; thinkingLevel?: unknown };
+  if (typeof entry.model !== "string") return null;
+
+  const normalized: ModelTierEntry = { model: entry.model };
+  if (entry.thinkingLevel != null) {
+    if (!isThinkingLevel(entry.thinkingLevel)) return null;
+    normalized.thinkingLevel = entry.thinkingLevel;
+  }
+  return normalized;
+}
+
+/** Normalize a full tier config to the object-entry shape used when saving. */
+export function normalizeModelTierConfig(config: unknown): ModelTierConfig | null {
+  if (!config || typeof config !== "object" || Array.isArray(config)) return null;
+  const tiers = (config as { tiers?: unknown }).tiers;
+  if (!tiers || typeof tiers !== "object" || Array.isArray(tiers)) return null;
+
+  const normalized: Record<string, ModelTierEntry> = {};
+  for (const [name, raw] of Object.entries(tiers)) {
+    const entry = normalizeTierEntry(raw);
+    if (!entry) return null;
+    normalized[name] = entry;
+  }
+  return { tiers: normalized };
 }
 
 // ---------------------------------------------------------------------------
@@ -87,11 +140,16 @@ function rankByCapability(available: string[]): string[] {
 // Defaults
 // ---------------------------------------------------------------------------
 
+function tier(model: string): ModelTierEntry {
+  return { model };
+}
+
 /**
  * Build a default tier config. When the available model registry is known,
  * spread it across tiers so small/medium/big routing is meaningful out of the
- * box. When the registry is empty or unavailable, fall back to the current Pi
- * model so fresh installs still get usable tier values.
+ * box. Default entries intentionally omit thinkingLevel so existing sessions
+ * keep their current/default Pi thinking behavior until the user chooses a
+ * per-tier value with `/workflows-models`.
  *
  * Models are first ranked least → most capable via `rankByCapability` (which
  * consults `SMALL_MODEL_HINTS` / `BIG_MODEL_HINTS`, falling back to registry
@@ -126,18 +184,18 @@ export function buildDefaultTierConfig(currentModelSpec?: string, _availableMode
     const small = ranked[0];
     const big = ranked[ranked.length - 1];
     const medium = ranked[Math.floor(ranked.length / 2)];
-    return { tiers: { small, medium, big } };
+    return { tiers: { small: tier(small), medium: tier(medium), big: tier(big) } };
   }
   if (ranked.length === 2) {
     const [weaker, stronger] = ranked;
-    return { tiers: { small: weaker, medium: stronger, big: stronger } };
+    return { tiers: { small: tier(weaker), medium: tier(stronger), big: tier(stronger) } };
   }
   const fallback = ranked[0] ?? currentModelSpec ?? "";
   return {
     tiers: {
-      small: fallback,
-      medium: fallback,
-      big: fallback,
+      small: tier(fallback),
+      medium: tier(fallback),
+      big: tier(fallback),
     },
   };
 }
@@ -148,7 +206,8 @@ export function buildDefaultTierConfig(currentModelSpec?: string, _availableMode
 
 /**
  * Load the model tier config from disk. Returns null if the file does not
- * exist or is unparseable (callers fall back to a default).
+ * exist or is unparseable (callers fall back to a default). Legacy string-valued
+ * tier configs are accepted and normalized to object entries.
  */
 export function loadModelTierConfig(configPath?: string): ModelTierConfig | null {
   const path = configPath ?? getModelTierConfigPath();
@@ -156,12 +215,7 @@ export function loadModelTierConfig(configPath?: string): ModelTierConfig | null
   try {
     const raw = readFileSync(path, "utf-8");
     const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object") return null;
-    if (!parsed.tiers || typeof parsed.tiers !== "object") return null;
-    for (const val of Object.values(parsed.tiers)) {
-      if (typeof val !== "string") return null;
-    }
-    return parsed as ModelTierConfig;
+    return normalizeModelTierConfig(parsed);
   } catch {
     return null;
   }
@@ -171,24 +225,38 @@ export function loadModelTierConfig(configPath?: string): ModelTierConfig | null
  * Save a model tier config to disk. Creates parent directories if needed.
  */
 export function saveModelTierConfig(config: ModelTierConfig, configPath?: string): void {
+  const normalized = normalizeModelTierConfig(config);
+  if (!normalized) throw new Error("Invalid model tier config");
+
   const path = configPath ?? getModelTierConfigPath();
   const dir = dirname(path);
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true });
   }
-  writeFileSync(path, JSON.stringify(config, null, 2), "utf-8");
+  writeFileSync(path, JSON.stringify(normalized, null, 2), "utf-8");
 }
 
 // ---------------------------------------------------------------------------
 // Resolve / helpers
 // ---------------------------------------------------------------------------
 
+/** Resolve a tier name to its normalized entry, or undefined if missing/invalid. */
+export function resolveTierEntry(tierName: string, config: ModelTierConfig): ModelTierEntry | undefined {
+  const entry = normalizeTierEntry(config.tiers[tierName]);
+  return entry ?? undefined;
+}
+
 /**
  * Resolve a tier name to its configured model spec, or undefined if the tier
  * is not configured.
  */
-export function resolveTierModel(tier: string, config: ModelTierConfig): string | undefined {
-  return config.tiers[tier];
+export function resolveTierModel(tierName: string, config: ModelTierConfig): string | undefined {
+  return resolveTierEntry(tierName, config)?.model;
+}
+
+/** Resolve a tier name to its configured thinking level, if any. */
+export function resolveTierThinkingLevel(tierName: string, config: ModelTierConfig): ThinkingLevel | undefined {
+  return resolveTierEntry(tierName, config)?.thinkingLevel;
 }
 
 /** Return all tier names sorted: small < medium < big, then alphabetically. */

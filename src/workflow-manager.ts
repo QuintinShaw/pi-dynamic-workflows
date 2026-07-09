@@ -304,6 +304,11 @@ export class WorkflowManager extends EventEmitter {
     const resolvedConcurrency = concurrency ?? this.concurrency;
     const resolvedAgentRetries = agentRetries ?? this.defaultAgentRetries;
     const progress = () => onProgress?.(managed.snapshot);
+    const refreshLiveTokenUsage = () => {
+      const total = managed.snapshot.agents.reduce((sum, agent) => sum + (agent.tokens ?? 0), 0);
+      if (total <= 0 && !managed.snapshot.tokenUsage) return;
+      managed.snapshot.tokenUsage = { ...(managed.snapshot.tokenUsage ?? { input: 0, output: 0 }), total };
+    };
     // Let a host abort (e.g. Esc during a blocking tool call) cancel this run.
     if (externalSignal) {
       if (externalSignal.aborted) managed.controller.abort();
@@ -353,6 +358,7 @@ export class WorkflowManager extends EventEmitter {
             prompt: event.prompt,
             status: "running",
             model: event.model,
+            thinkingLevel: event.thinkingLevel,
           });
           this.emit("agentStart", { runId: managed.runId, ...event });
           progress();
@@ -368,9 +374,26 @@ export class WorkflowManager extends EventEmitter {
             agent.errorCode = event.errorCode;
             agent.recoverable = event.recoverable;
             agent.tokens = event.tokens;
+            agent.tokensEstimated = false;
             if (event.model) agent.model = event.model;
+            if (event.thinkingLevel) agent.thinkingLevel = event.thinkingLevel;
           }
+          refreshLiveTokenUsage();
           this.emit("agentEnd", { runId: managed.runId, ...event });
+          progress();
+        },
+        onAgentProgress: (event) => {
+          const agent = [...managed.snapshot.agents]
+            .reverse()
+            .find((a) => a.label === event.label && a.status === "running");
+          if (agent) {
+            agent.tokens = event.tokens;
+            agent.tokensEstimated = event.estimated ?? true;
+            if (event.model) agent.model = event.model;
+            if (event.thinkingLevel) agent.thinkingLevel = event.thinkingLevel;
+          }
+          refreshLiveTokenUsage();
+          this.emit("agentProgress", { runId: managed.runId, ...event });
           progress();
         },
         onAgentHistory: (event) => {

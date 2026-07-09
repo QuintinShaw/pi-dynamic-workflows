@@ -16,8 +16,15 @@ import { Check, Convert } from "typebox/value";
 import { type AgentHistoryEntry, compactAgentHistory } from "./agent-history.js";
 import { applyToolPolicy } from "./agent-registry.js";
 import { classifyProviderLimit, WorkflowError, WorkflowErrorCode } from "./errors.js";
-import { loadModelTierConfig, type ModelTierConfig, resolveTierModel } from "./model-tier-config.js";
+import {
+  loadModelTierConfig,
+  type ModelTierConfig,
+  resolveTierModel,
+  resolveTierThinkingLevel,
+  type ThinkingLevel,
+} from "./model-tier-config.js";
 import { createStructuredOutputTool, type StructuredOutputCapture } from "./structured-output.js";
+import { estimateCharCountTokens, estimateTextTokens } from "./token-estimate.js";
 
 /**
  * Find a JSON object/array in free-form text: a fenced ```json block if present,
@@ -155,8 +162,8 @@ export async function resolveStructuredOutput<T>(
 }
 
 /**
- * Resolve which concrete model spec a subagent should use. Precedence, most
- * specific first:
+ * Resolve which concrete model spec and thinking level a subagent should use.
+ * Model precedence, most specific first:
  *   1. options.model — an explicit per-agent model (also carries agentType /
  *      phase model, which the workflow layer folds into options.model).
  *   2. options.tier  — resolved via the model-tiers config, falling back to the
@@ -166,26 +173,53 @@ export async function resolveStructuredOutput<T>(
  *      actually affects the whole workflow (not just agents the script tagged).
  *      Fresh-install medium == the session model, so this is a no-op until the
  *      user customizes tiers via /workflows-models.
- * Returns undefined when nothing applies, so the session default is used.
+ * Thinking precedence is options.thinkingLevel, then the selected tier's
+ * thinkingLevel, then the session default (undefined here).
  *
  * `loadConfig` is injectable for testing; it defaults to reading from disk.
  */
-export function resolveAgentModelSpec(
-  options: { model?: string; tier?: string },
+export interface AgentModelSelection {
+  model?: string;
+  thinkingLevel?: ThinkingLevel;
+}
+
+/** Resolve the model plus optional thinking level for an agent run. */
+export function resolveAgentModelSelection(
+  options: { model?: string; tier?: string; thinkingLevel?: ThinkingLevel },
   mainModel: string | undefined,
   loadConfig: () => ModelTierConfig | null = loadModelTierConfig,
-): string | undefined {
-  if (options.model) return options.model;
-  const config = loadConfig();
-  if (options.tier) {
-    return (config ? resolveTierModel(options.tier, config) : undefined) ?? mainModel;
+): AgentModelSelection {
+  const needsTierConfig = Boolean(options.tier) || !options.model;
+  const config = needsTierConfig ? loadConfig() : null;
+
+  if (options.model) {
+    const tierThinking = options.tier && config ? resolveTierThinkingLevel(options.tier, config) : undefined;
+    return { model: options.model, thinkingLevel: options.thinkingLevel ?? tierThinking };
   }
+
+  if (options.tier) {
+    return {
+      model: (config ? resolveTierModel(options.tier, config) : undefined) ?? mainModel,
+      thinkingLevel: options.thinkingLevel ?? (config ? resolveTierThinkingLevel(options.tier, config) : undefined),
+    };
+  }
+
   // Untagged agent: default to the configured medium tier when one exists.
   if (config) {
     const medium = resolveTierModel("medium", config);
-    if (medium) return medium;
+    if (medium) {
+      return { model: medium, thinkingLevel: options.thinkingLevel ?? resolveTierThinkingLevel("medium", config) };
+    }
   }
-  return undefined;
+  return { thinkingLevel: options.thinkingLevel };
+}
+
+export function resolveAgentModelSpec(
+  options: { model?: string; tier?: string; thinkingLevel?: ThinkingLevel },
+  mainModel: string | undefined,
+  loadConfig: () => ModelTierConfig | null = loadModelTierConfig,
+): string | undefined {
+  return resolveAgentModelSelection(options, mainModel, loadConfig).model;
 }
 
 export interface WorkflowAgentOptions {
@@ -242,6 +276,56 @@ export interface AgentUsage {
   cost: number;
 }
 
+export interface AgentUsageUpdate extends AgentUsage {
+  /** True when this is a live estimate; omitted/false means provider-reported usage. */
+  estimated?: boolean;
+}
+
+const ZERO_USAGE: AgentUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 };
+const LIVE_USAGE_THROTTLE_MS = 250;
+const LIVE_REASONING_TOKENS_PER_SECOND = 3;
+
+function usageFromStats(stats: unknown): AgentUsage | undefined {
+  const s = stats as
+    | {
+        tokens?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; total?: number };
+        cost?: number;
+      }
+    | undefined;
+  const t = s?.tokens;
+  if (!t) return undefined;
+  const input = finiteNumber(t.input);
+  const output = finiteNumber(t.output);
+  const cacheRead = finiteNumber(t.cacheRead);
+  const cacheWrite = finiteNumber(t.cacheWrite);
+  const total = finiteNumber(t.total) || input + output + cacheRead + cacheWrite;
+  return { input, output, cacheRead, cacheWrite, total, cost: finiteNumber(s?.cost) };
+}
+
+function usageFromAssistantUsage(usage: unknown): AgentUsage | undefined {
+  const u = usage as
+    | {
+        input?: number;
+        output?: number;
+        cacheRead?: number;
+        cacheWrite?: number;
+        totalTokens?: number;
+        cost?: { total?: number };
+      }
+    | undefined;
+  if (!u) return undefined;
+  const input = finiteNumber(u.input);
+  const output = finiteNumber(u.output);
+  const cacheRead = finiteNumber(u.cacheRead);
+  const cacheWrite = finiteNumber(u.cacheWrite);
+  const total = finiteNumber(u.totalTokens) || input + output + cacheRead + cacheWrite;
+  return { input, output, cacheRead, cacheWrite, total, cost: finiteNumber(u.cost?.total) };
+}
+
+function finiteNumber(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0;
+}
+
 export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefined> {
   label?: string;
   schema?: TSchemaDef;
@@ -255,6 +339,12 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
    */
   onUsage?: (usage: AgentUsage) => void;
   /**
+   * Live usage progress for display while the subagent is still running. Exact
+   * provider usage is generally unavailable until the turn ends, so updates may
+   * be estimated and should not be used for billing/budget accounting.
+   */
+  onUsageUpdate?: (usage: AgentUsageUpdate) => void;
+  /**
    * Model spec for this subagent: either `provider/modelId` (unambiguous) or a
    * bare `modelId`. When it can't be resolved, the session default is used and
    * a warning is logged. When omitted, the session default applies.
@@ -264,13 +354,18 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
    * Model tier name (e.g. "small", "medium", "big"). When set (and no explicit
    * `model` is given), the model is resolved from the user's model-tiers.json
    * config before `run()` starts, falling back to the session's main model when
-   * the tier has no configured entry. An explicit `model` always takes priority,
-   * so workflow scripts can use `{ tier: "small" }` for coarse routing without
-   * caring which concrete model backs that tier.
+   * the tier has no configured entry. The tier's thinkingLevel is also applied
+   * unless `thinkingLevel` is set. An explicit `model` always takes priority for
+   * the model, so workflow scripts can use `{ tier: "small" }` for coarse routing
+   * without caring which concrete model backs that tier.
    */
   tier?: string;
+  /** Explicit Pi thinking/reasoning level for this agent. Overrides the tier's configured level. */
+  thinkingLevel?: ThinkingLevel;
   /** Called with the resolved model id once known (for display/telemetry). */
   onModelResolved?: (modelId: string) => void;
+  /** Called with the requested/effective thinking level once known (for display/telemetry). */
+  onThinkingLevelResolved?: (thinkingLevel: ThinkingLevel) => void;
   /** Called when `model`/`tier`/phase resolved to a spec that wasn't found (fell back to session default). */
   onModelFallback?: (requestedSpec: string) => void;
   /** Called with a compact snapshot of this subagent's message/tool history. */
@@ -391,14 +486,18 @@ export class WorkflowAgent {
       customTools.push(...options.systemTools);
     }
 
+    const structured = Boolean(options.schema);
     if (options.schema) {
       customTools.push(createStructuredOutputTool({ schema: options.schema, capture }) as unknown as ToolDefinition);
     }
+    const fullPrompt = this.buildPrompt(prompt, options as AgentRunOptions<any>, structured);
 
     // Resolve the model spec (explicit model > tier > session default). This
     // composes with phase-based routing in workflow.ts, which only supplies
     // options.model when a phase pattern matches — so an explicit model wins.
-    const modelSpec = resolveAgentModelSpec(options, this.mainModel);
+    const modelSelection = resolveAgentModelSelection(options, this.mainModel);
+    const modelSpec = modelSelection.model;
+    const requestedThinkingLevel = modelSelection.thinkingLevel;
 
     // Resolve a requested model spec to a Model object. A given-but-unresolved
     // spec falls back to the session default (with a warning) rather than failing.
@@ -430,13 +529,27 @@ export class WorkflowAgent {
         ? { modelRegistry: options.modelRegistry ?? this.sharedRegistry }
         : {}),
       ...this.sessionOptions,
+      // Per-call tier/agent thinking wins over any sessionOptions.thinkingLevel.
+      ...(requestedThinkingLevel ? { thinkingLevel: requestedThinkingLevel } : {}),
       // Per-call model wins over any sessionOptions.model.
       ...(resolvedModel ? { model: resolvedModel } : {}),
     });
 
+    const effectiveThinkingLevel =
+      ((session as unknown as { thinkingLevel?: ThinkingLevel }).thinkingLevel as ThinkingLevel | undefined) ??
+      requestedThinkingLevel;
+    if (effectiveThinkingLevel) options.onThinkingLevelResolved?.(effectiveThinkingLevel);
+
     let removeAbortListener: (() => void) | undefined;
     let removeHistoryListener: (() => void) | undefined;
+    let removeUsageListener: (() => void) | undefined;
+    let liveUsageTimer: ReturnType<typeof setInterval> | undefined;
     let lastHistoryEmit = 0;
+    let lastUsageEmit = 0;
+    let lastUsageTotal = 0;
+    let liveOutputChars = 0;
+    let generationStartedAt: number | undefined;
+    let lastActualUsage: AgentUsage | undefined;
     const emitHistory = () => options.onHistory?.(compactAgentHistory(session.messages));
     const maybeEmitHistory = () => {
       if (!options.onHistory) return;
@@ -444,6 +557,69 @@ export class WorkflowAgent {
       if (now - lastHistoryEmit < 250) return;
       lastHistoryEmit = now;
       emitHistory();
+    };
+    const emitUsageUpdate = (usage: AgentUsageUpdate, force = false) => {
+      if (!options.onUsageUpdate) return;
+      if (usage.total <= 0) return;
+      const now = Date.now();
+      if (!force && usage.total === lastUsageTotal && now - lastUsageEmit < LIVE_USAGE_THROTTLE_MS) return;
+      if (!force && usage.estimated && usage.total < lastUsageTotal) return;
+      lastUsageTotal = usage.total;
+      lastUsageEmit = now;
+      options.onUsageUpdate(usage);
+    };
+    const readActualUsage = (): AgentUsage | undefined => {
+      try {
+        return usageFromStats(session.getSessionStats());
+      } catch {
+        return undefined;
+      }
+    };
+    const emitActualUsage = (usage: AgentUsage | undefined, force = false) => {
+      if (!usage || usage.total <= 0) return false;
+      lastActualUsage = usage;
+      emitUsageUpdate({ ...usage, estimated: false }, force);
+      return true;
+    };
+    const inputEstimate = estimateTextTokens(fullPrompt);
+    const emitEstimatedUsage = (force = false) => {
+      const elapsedSeconds = generationStartedAt ? Math.max(0, (Date.now() - generationStartedAt) / 1000) : 0;
+      const streamedOutput = estimateCharCountTokens(liveOutputChars);
+      const heartbeatOutput = Math.ceil(elapsedSeconds * LIVE_REASONING_TOKENS_PER_SECOND);
+      const output = Math.max(streamedOutput, heartbeatOutput);
+      emitUsageUpdate(
+        { ...ZERO_USAGE, input: inputEstimate, output, total: inputEstimate + output, estimated: true },
+        force,
+      );
+    };
+    const handleUsageEvent = (event: unknown) => {
+      const e = event as {
+        type?: string;
+        assistantMessageEvent?: { type?: string; delta?: string; partial?: { usage?: unknown } };
+        message?: { usage?: unknown };
+      };
+      if (e.type === "turn_start" || e.type === "message_start") {
+        generationStartedAt = Date.now();
+        emitEstimatedUsage(true);
+        return;
+      }
+      if (e.type === "message_update") {
+        generationStartedAt ??= Date.now();
+        const actual = usageFromAssistantUsage(e.assistantMessageEvent?.partial?.usage);
+        if (actual?.total) {
+          emitActualUsage(actual);
+          return;
+        }
+        const updateType = e.assistantMessageEvent?.type;
+        if (updateType === "text_delta" || updateType === "thinking_delta" || updateType === "toolcall_delta") {
+          liveOutputChars += e.assistantMessageEvent?.delta?.length ?? 0;
+          emitEstimatedUsage();
+        }
+        return;
+      }
+      if (e.type === "turn_end") {
+        emitActualUsage(usageFromAssistantUsage(e.message?.usage) ?? readActualUsage(), true);
+      }
     };
     try {
       if (options.signal?.aborted) throw new Error("Subagent was aborted");
@@ -455,8 +631,16 @@ export class WorkflowAgent {
       if (options.onHistory) {
         removeHistoryListener = session.subscribe(() => maybeEmitHistory());
       }
+      if (options.onUsageUpdate) {
+        emitEstimatedUsage(true);
+        removeUsageListener = session.subscribe((event) => handleUsageEvent(event));
+        liveUsageTimer = setInterval(() => {
+          if (emitActualUsage(readActualUsage())) return;
+          if (session.isStreaming || generationStartedAt) emitEstimatedUsage();
+        }, 1000);
+      }
 
-      await session.prompt(this.buildPrompt(prompt, options as AgentRunOptions<any>, Boolean(options.schema)));
+      await session.prompt(fullPrompt);
 
       if (options.signal?.aborted) throw new Error("Subagent was aborted");
 
@@ -483,6 +667,8 @@ export class WorkflowAgent {
     } finally {
       removeAbortListener?.();
       removeHistoryListener?.();
+      removeUsageListener?.();
+      if (liveUsageTimer) clearInterval(liveUsageTimer);
       try {
         emitHistory();
       } catch {
@@ -491,15 +677,11 @@ export class WorkflowAgent {
       // Read real usage before disposing — dispose tears down the session state.
       if (options.onUsage) {
         try {
-          const { tokens, cost } = session.getSessionStats();
-          options.onUsage({
-            input: tokens.input,
-            output: tokens.output,
-            cacheRead: tokens.cacheRead,
-            cacheWrite: tokens.cacheWrite,
-            total: tokens.total,
-            cost,
-          });
+          const usage = readActualUsage() ?? lastActualUsage;
+          if (usage) {
+            options.onUsageUpdate?.({ ...usage, estimated: false });
+            options.onUsage(usage);
+          }
         } catch {
           // Usage is best-effort; never let stats failure mask the real result/error.
         }

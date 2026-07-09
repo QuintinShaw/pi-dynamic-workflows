@@ -19,7 +19,8 @@ import { loadWorkflowSettings } from "./workflow-settings.js";
 /**
  * Model routing guideline for workflow authors.
  * Tells the LLM about opts.tier (small/medium/big) for runtime-enforced
- * model selection, and opts.model for an exact provider/id override.
+ * model + thinking-level selection, opts.thinkingLevel for an exact reasoning
+ * effort override, and opts.model for an exact provider/id override.
  *
  * This string is injected into the workflow tool's promptGuidelines and
  * therefore appears in the LLM's system prompt for every workflow execution.
@@ -36,13 +37,13 @@ export function modelRoutingGuideline(registry?: ModelRegistry | (() => ModelReg
     ? `The user's currently available models (route only to these) are: ${available.join(", ")}.`
     : "Use models the user has configured.";
   return [
-    "For workflow, the user configures per-tier models (/workflows-models), so TAG EVERY agent with opts.tier by role so those models are actually used.",
-    "opts.tier accepts 'small', 'medium', or 'big' and is enforced at runtime.",
+    "For workflow, the user configures per-tier models and thinking levels (/workflows-models), so TAG EVERY agent with opts.tier by role so those settings are actually used.",
+    "opts.tier accepts 'small', 'medium', or 'big' and is enforced at runtime for both model and configured thinking level.",
     "Small tier: lightweight exploration/search/inventory agents.",
     "Medium tier: balanced analysis agents.",
     "Big tier: synthesis/judgment/decision agents spanning the full context.",
     "An agent with no opts.tier and no opts.model falls back to the user's medium tier; do not rely on that — tag agents explicitly so small/big are used where they fit.",
-    "If the user named a specific model, use opts.model with that exact provider/id; opts.model always takes precedence over opts.tier.",
+    "If the user named a specific model, use opts.model with that exact provider/id; opts.model takes precedence over opts.tier for the model. Use opts.thinkingLevel ('off'|'minimal'|'low'|'medium'|'high'|'xhigh') only when the user asks for a specific reasoning effort; otherwise let the tier setting apply.",
     list,
   ].join(" ");
 }

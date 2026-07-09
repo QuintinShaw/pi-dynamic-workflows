@@ -71,6 +71,7 @@ test("createWorkflowTool promptGuidelines mention model routing", () => {
   const all = tool.promptGuidelines.join(" ");
   assert.ok(all.includes("opts.tier"), "should mention opts.tier");
   assert.ok(all.includes("opts.model"), "should mention opts.model");
+  assert.ok(all.includes("opts.thinkingLevel"), "should mention opts.thinkingLevel");
   assert.ok(all.includes("small") || all.includes("medium") || all.includes("big"), "should mention tier names");
 });
 
@@ -126,6 +127,7 @@ test("modelRoutingGuideline explains tier vs model priority", () => {
   const text = modelRoutingGuideline();
   assert.ok(text.includes("opts.tier"), "should mention opts.tier");
   assert.ok(text.includes("opts.model"), "should mention opts.model");
+  assert.ok(text.includes("thinking"), "should mention thinking levels");
   assert.ok(
     /opts\.(tier|model).+opts\.(model|tier)/.test(text),
     "should explain ordering / relationship between tier and model",

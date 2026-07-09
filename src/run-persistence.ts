@@ -6,6 +6,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSyn
 import { join } from "node:path";
 import type { AgentHistoryEntry } from "./agent-history.js";
 import type { WorkflowErrorCode } from "./errors.js";
+import type { ThinkingLevel } from "./model-tier-config.js";
 import { workflowProjectPaths } from "./workflow-paths.js";
 
 export type RunStatus = "pending" | "running" | "paused" | "completed" | "failed" | "aborted";
@@ -25,6 +26,12 @@ export interface PersistedAgentState {
   endedAt?: string;
   /** The model this agent ran on (provider/id), when known. */
   model?: string;
+  /** Pi thinking/reasoning level requested or used by this agent, when known. */
+  thinkingLevel?: ThinkingLevel;
+  /** Tokens used by this agent; may be estimated while a run is still active. */
+  tokens?: number;
+  /** True when `tokens` is a live estimate rather than finalized provider usage. */
+  tokensEstimated?: boolean;
 }
 
 export interface PersistedRunState {

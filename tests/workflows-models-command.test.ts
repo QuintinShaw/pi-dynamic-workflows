@@ -3,10 +3,7 @@
  *
  * Since pi.registerCommand and ctx.ui functions are only available at runtime
  * inside Pi, these tests focus on the pure logic: command creation,
- * the editSingleTier single-select helper, and integration with model-tier-config.
- *
- * editSingleTier now uses ctx.ui.custom() with SelectList.
- * In tests, we mock ctx.ui.custom to directly return the expected value.
+ * the editSingleTier helper, and integration with model-tier-config.
  */
 
 import assert from "node:assert/strict";
@@ -15,6 +12,25 @@ import { describe, it, mock } from "node:test";
 async function loadCommand() {
   const mod = await import("../src/workflows-models-command.js");
   return mod;
+}
+
+function editCtx(selectResults: Array<string | null>, customResult: string | null = null) {
+  let selectIndex = 0;
+  return {
+    ui: {
+      select: mock.fn(async () => selectResults[selectIndex++] ?? null),
+      custom: mock.fn(async () => customResult),
+      notify: mock.fn(),
+    },
+    modelRegistry: {
+      getAvailable: () => [
+        { provider: "openai", id: "gpt-4.1-mini" },
+        { provider: "openai", id: "gpt-5" },
+      ],
+      getAll: () => [],
+      find: () => undefined,
+    },
+  };
 }
 
 describe("workflows-models-command", () => {
@@ -47,6 +63,7 @@ describe("workflows-models-command", () => {
       registerWorkflowModelsCommand(mockPi as never);
       assert.ok(capturedDescription.length > 0, "description should not be empty");
       assert.ok(capturedDescription.toLowerCase().includes("tier"), "description should mention tiers");
+      assert.ok(capturedDescription.toLowerCase().includes("thinking"), "description should mention thinking");
     });
   });
 
@@ -56,66 +73,63 @@ describe("workflows-models-command", () => {
       assert.equal(typeof mod.editSingleTier, "function");
     });
 
-    it("returns null when user presses Escape (done with null)", async () => {
+    it("returns null when user cancels", async () => {
       const { editSingleTier } = await import("../src/workflows-models-command.js");
-      // Mock ctx.ui.custom to return null (simulating user cancelling)
-      const ctx = {
-        ui: {
-          custom: mock.fn(async () => null),
-          notify: mock.fn(),
-        },
-      };
-      const tiers: Record<string, string> = { small: "gpt-4.1-mini" };
+      const ctx = editCtx(["Cancel"]);
+      const tiers = { small: { model: "gpt-4.1-mini" } };
 
       const result = await editSingleTier(ctx as never, tiers, "small");
       assert.equal(result, null);
     });
 
-    it("returns null when user selects the same model (no change)", async () => {
+    it("returns null when user selects Done without changes", async () => {
       const { editSingleTier } = await import("../src/workflows-models-command.js");
-      // Mock ctx.ui.custom to return the same model that's already selected
-      const ctx = {
-        ui: {
-          custom: mock.fn(async () => "gpt-4.1-mini"),
-          notify: mock.fn(),
-        },
-      };
-      const tiers: Record<string, string> = { small: "gpt-4.1-mini" };
+      const ctx = editCtx(["Done"]);
+      const tiers = { small: { model: "gpt-4.1-mini" } };
 
       const result = await editSingleTier(ctx as never, tiers, "small");
-      assert.equal(result, null); // no change
+      assert.equal(result, null);
     });
 
     it("selects a different model and returns updated tiers", async () => {
       const { editSingleTier } = await import("../src/workflows-models-command.js");
-      // Mock ctx.ui.custom to return a different model
-      const ctx = {
-        ui: {
-          custom: mock.fn(async () => "gpt-5"),
-          notify: mock.fn(),
-        },
-      };
-      const tiers: Record<string, string> = { small: "gpt-4.1-mini" };
+      const ctx = editCtx(["Model → gpt-4.1-mini", "Save tier"], "openai/gpt-5");
+      const tiers = { small: { model: "gpt-4.1-mini" } };
 
       const result = await editSingleTier(ctx as never, tiers, "small");
       assert.ok(result, "should return updated tiers");
-      assert.equal(result.small, "gpt-5", "should have changed model");
-      assert.equal(typeof result.small, "string", "should still be a string");
+      assert.deepEqual(result.small, { model: "openai/gpt-5" });
+      assert.equal(ctx.ui.notify.mock.callCount(), 1);
     });
 
-    it("selects a model when no current model exists", async () => {
+    it("selects a thinking level without changing the model", async () => {
       const { editSingleTier } = await import("../src/workflows-models-command.js");
-      const ctx = {
-        ui: {
-          custom: mock.fn(async () => "openai/gpt-4.1-mini"),
-          notify: mock.fn(),
-        },
-      };
-      const tiers: Record<string, string> = {};
+      const ctx = editCtx(["Thinking → inherit", "high", "Save tier"]);
+      const tiers = { small: { model: "gpt-4.1-mini" } };
 
       const result = await editSingleTier(ctx as never, tiers, "small");
       assert.ok(result, "should return updated tiers");
-      assert.equal(result.small, "openai/gpt-4.1-mini");
+      assert.deepEqual(result.small, { model: "gpt-4.1-mini", thinkingLevel: "high" });
+    });
+
+    it("can clear an existing thinking level back to inherit", async () => {
+      const { editSingleTier } = await import("../src/workflows-models-command.js");
+      const ctx = editCtx(["Thinking → high", "Inherit session/default", "Save tier"]);
+      const tiers = { small: { model: "gpt-4.1-mini", thinkingLevel: "high" as const } };
+
+      const result = await editSingleTier(ctx as never, tiers, "small");
+      assert.ok(result, "should return updated tiers");
+      assert.deepEqual(result.small, { model: "gpt-4.1-mini" });
+    });
+
+    it("normalizes a legacy string tier when editing", async () => {
+      const { editSingleTier } = await import("../src/workflows-models-command.js");
+      const ctx = editCtx(["Thinking → inherit", "xhigh", "Save tier"]);
+      const tiers = { small: "gpt-4.1-mini" };
+
+      const result = await editSingleTier(ctx as never, tiers, "small");
+      assert.ok(result, "should return updated tiers");
+      assert.deepEqual(result.small, { model: "gpt-4.1-mini", thinkingLevel: "xhigh" });
     });
   });
 });

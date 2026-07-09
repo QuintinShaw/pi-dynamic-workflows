@@ -8,8 +8,8 @@
  * see every provider Pi can reach, including extension-registered providers such
  * as `ollama-cloud`.
  *
- * Each tier holds exactly one model spec string.
- * When editing a tier, a single-select picker is used (like Pi's `/model`).
+ * Each tier holds exactly one model spec plus an optional Pi thinking level.
+ * When editing a tier, users can change the model and/or thinking effort.
  */
 
 import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
@@ -26,8 +26,14 @@ import { listAvailableModelSpecs } from "./agent.js";
 import {
   buildDefaultTierConfig,
   loadModelTierConfig,
+  type ModelTierConfig,
+  type ModelTierEntry,
+  type ModelTierValue,
+  normalizeTierEntry,
   saveModelTierConfig,
   sortedTierNames,
+  THINKING_LEVELS,
+  type ThinkingLevel,
 } from "./model-tier-config.js";
 
 /**
@@ -35,15 +41,18 @@ import {
  */
 export function registerWorkflowModelsCommand(pi: ExtensionAPI): void {
   pi.registerCommand("workflows-models", {
-    description: "View and edit model tiers used by workflows (small/medium/big)",
+    description: "View and edit workflow model tiers and thinking levels (small/medium/big)",
     handler: async (_args, ctx) => {
       await ctx.waitForIdle();
 
       // Load the saved config, or build an in-memory default spread across the
       // available models. If the model registry is empty, fall back to the
-      // current Pi model so the tiers are still usable.
+      // current Pi model so the tiers are still usable. Defaults intentionally
+      // leave thinkingLevel unset (inherit session/default) until the user picks
+      // a tier-specific level.
       const currentModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
-      let config = loadModelTierConfig() ?? buildDefaultTierConfig(currentModel, listAvailableModelSpecs());
+      const availableModels = () => listAvailableModelSpecs(ctx.modelRegistry);
+      let config = loadModelTierConfig() ?? buildDefaultTierConfig(currentModel, availableModels());
       let dirty = false;
 
       const ensureFresh = (cfg: typeof config) => {
@@ -58,8 +67,8 @@ export function registerWorkflowModelsCommand(pi: ExtensionAPI): void {
 
         menuOptions.push("─".repeat(30));
         for (const name of tiers) {
-          const model = config.tiers[name];
-          menuOptions.push(`${name} tier → ${model}`);
+          const entry = getTierEntry(config.tiers[name]);
+          menuOptions.push(`${name} tier → ${formatTierEntry(entry)}`);
         }
         menuOptions.push("─".repeat(30));
 
@@ -84,10 +93,10 @@ export function registerWorkflowModelsCommand(pi: ExtensionAPI): void {
         if (choice === "Reset to defaults") {
           const confirmed = await ctx.ui.confirm(
             "Reset model tiers",
-            "This will reset tiers from your available model list. Continue?",
+            "This will reset tiers from your available model list and clear tier-specific thinking levels. Continue?",
           );
           if (confirmed) {
-            ensureFresh(buildDefaultTierConfig(currentModel, listAvailableModelSpecs()));
+            ensureFresh(buildDefaultTierConfig(currentModel, availableModels()));
             ctx.ui.notify("Tiers reset to defaults. Use 'Save and exit' to persist.", "info");
           }
         }
@@ -104,27 +113,85 @@ export function registerWorkflowModelsCommand(pi: ExtensionAPI): void {
   });
 }
 
+function getTierEntry(value: ModelTierValue | undefined): ModelTierEntry {
+  return normalizeTierEntry(value) ?? { model: "" };
+}
+
+function formatThinking(thinkingLevel: ThinkingLevel | undefined): string {
+  return thinkingLevel ?? "inherit";
+}
+
+function withThinking(entry: ModelTierEntry, thinkingLevel: ThinkingLevel | undefined): ModelTierEntry {
+  return thinkingLevel ? { model: entry.model, thinkingLevel } : { model: entry.model };
+}
+
+function formatTierEntry(entry: ModelTierEntry): string {
+  const model = entry.model || "(none)";
+  return `${model} · thinking: ${formatThinking(entry.thinkingLevel)}`;
+}
+
 /**
- * Interactive editor for a single tier — scrollable model picker.
+ * Interactive editor for a single tier — model picker + thinking-level picker.
  *
- * Uses `ctx.ui.custom()` with Pi TUI's `SelectList` for proper
- * scrollable list with limited visible rows (like `/advisor`).
- *
- * The currently selected model is shown in the dialog title.
- * User scrolls with ↑↓, selects with Enter, cancels with Escape.
- *
- * Returns the updated tiers object, or null if nothing changed.
+ * Returns the updated tiers object, or null if nothing changed / user cancelled.
  */
 export async function editSingleTier(
   ctx: ExtensionCommandContext,
-  tiers: Record<string, string>,
+  tiers: ModelTierConfig["tiers"],
   tierName: string,
-): Promise<Record<string, string> | null> {
-  const available = listAvailableModelSpecs(ctx.modelRegistry);
-  const current = tiers[tierName];
+): Promise<ModelTierConfig["tiers"] | null> {
+  let entry = getTierEntry(tiers[tierName]);
+  let dirty = false;
 
-  // Build SelectItems: all available models as scrollable list
-  const items: SelectItem[] = available.map((m) => ({ value: m, label: m }));
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    const choice = await ctx.ui.select(`Edit "${tierName}" tier`, [
+      `Model → ${entry.model || "(none)"}`,
+      `Thinking → ${formatThinking(entry.thinkingLevel)}`,
+      dirty ? "Save tier" : "Done",
+      "Cancel",
+    ]);
+
+    if (!choice || choice === "Cancel") return null;
+
+    if (choice.startsWith("Model →")) {
+      const nextModel = await pickModelForTier(ctx, tierName, entry.model);
+      if (nextModel != null && nextModel !== entry.model) {
+        entry = { ...entry, model: nextModel };
+        dirty = true;
+      }
+      continue;
+    }
+
+    if (choice.startsWith("Thinking →")) {
+      const nextThinking = await pickThinkingLevel(ctx, tierName, entry.thinkingLevel);
+      if (nextThinking !== null && nextThinking !== entry.thinkingLevel) {
+        entry = withThinking(entry, nextThinking);
+        dirty = true;
+      }
+      continue;
+    }
+
+    if (choice === "Save tier" || choice === "Done") {
+      if (!dirty) return null;
+      ctx.ui.notify(`"${tierName}" tier → ${formatTierEntry(entry)}`, "info");
+      return { ...tiers, [tierName]: entry };
+    }
+  }
+}
+
+/** Scrollable model picker for a tier. Returns null on cancel. */
+async function pickModelForTier(
+  ctx: ExtensionCommandContext,
+  tierName: string,
+  current: string | undefined,
+): Promise<string | null> {
+  const available = listAvailableModelSpecs(ctx.modelRegistry);
+  const choices = current && !available.includes(current) ? [current, ...available] : available;
+
+  // Build SelectItems: all available models as scrollable list.
+  const items: SelectItem[] = choices.map((m) => ({ value: m, label: m }));
+  if (items.length === 0) items.push({ value: "", label: "(no available models)" });
 
   const result = await ctx.ui.custom<string | null>((tui: TUI, theme: Theme, _keybindings, done) => {
     const container = new Container();
@@ -171,8 +238,19 @@ export async function editSingleTier(
     };
   });
 
-  if (!result || result === current) return null;
+  return result;
+}
 
-  ctx.ui.notify(`"${tierName}" tier → ${result}`, "info");
-  return { ...tiers, [tierName]: result };
+/** Thinking-level picker. Undefined means inherit the session/default level; null means cancel. */
+async function pickThinkingLevel(
+  ctx: ExtensionCommandContext,
+  tierName: string,
+  current: ThinkingLevel | undefined,
+): Promise<ThinkingLevel | undefined | null> {
+  const inherit = "Inherit session/default";
+  const options = [inherit, ...THINKING_LEVELS];
+  const choice = await ctx.ui.select(`Thinking level for "${tierName}" (current: ${formatThinking(current)})`, options);
+  if (!choice) return null;
+  if (choice === inherit) return undefined;
+  return (THINKING_LEVELS as readonly string[]).includes(choice) ? (choice as ThinkingLevel) : null;
 }

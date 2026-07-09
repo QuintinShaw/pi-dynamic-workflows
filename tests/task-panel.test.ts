@@ -495,6 +495,7 @@ describe("renderPanelDetailed", () => {
           phase: "Scan",
           tokens: blueTokens,
           model: "anthropic/claude-haiku-4-5",
+          thinkingLevel: "low",
         },
         { id: 2, label: "audit_auth", status: "running", phase: "Scan", tokens: 1800 },
         { id: 3, label: "scan_middleware", status: "queued", phase: "Scan" },
@@ -533,8 +534,8 @@ describe("renderPanelDetailed", () => {
     );
     // Agent rows: status icons + label + tokens + model
     assert.ok(
-      lines.some((l) => l.includes("[1] ✓ discover_routes") && /2\.1K tok/.test(l) && /claude-haiku-4-5/.test(l)),
-      "done agent row with model",
+      lines.some((l) => l.includes("[1] ✓ discover_routes") && /2\.1K tok/.test(l) && /claude-haiku-4-5 · low/.test(l)),
+      "done agent row with model and thinking",
     );
     assert.ok(
       lines.some((l) => l.includes("[2] ● audit_auth") && /1\.8K tok/.test(l)),

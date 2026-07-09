@@ -30,7 +30,7 @@ function agent(
   label: string,
   status: "queued" | "running" | "done" | "error" | "skipped",
   phase?: string,
-  opts?: { resultPreview?: string; tokens?: number; model?: string; prompt?: string },
+  opts?: { resultPreview?: string; tokens?: number; model?: string; thinkingLevel?: string; prompt?: string },
 ) {
   return {
     id,
@@ -41,6 +41,7 @@ function agent(
     ...(opts?.resultPreview ? { resultPreview: opts.resultPreview } : {}),
     ...(opts?.tokens ? { tokens: opts.tokens } : {}),
     ...(opts?.model ? { model: opts.model } : {}),
+    ...(opts?.thinkingLevel ? { thinkingLevel: opts.thinkingLevel } : {}),
   };
 }
 
@@ -170,6 +171,16 @@ describe("renderWorkflowText", () => {
     // toLocaleString() output depends on locale (UK/US uses commas, PL uses NBSP)
     // Check with a regex matching any thousands separator between 12 and 345
     assert.ok(/12[ ,.\u00a0]345/.test(text), "should show formatted token count");
+  });
+
+  it("shows agent model with thinking level when available", async () => {
+    const { createWorkflowSnapshot, renderWorkflowLines } = await loadDisplay();
+    const snap = createWorkflowSnapshot(fakeMeta());
+    snap.agents = [
+      agent(1, "reasoner", "done", "Research", { model: "openai/gpt-5.5", thinkingLevel: "xhigh" }),
+    ] as never[];
+    const text = renderWorkflowLines(snap).join("\n");
+    assert.ok(text.includes("gpt-5.5 · xhigh"), "should show model with thinking level");
   });
 
   it("truncates long agent labels", async () => {

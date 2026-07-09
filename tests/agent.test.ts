@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { AgentRunOptions, AgentUsage } from "../src/agent.js";
-import { listAvailableModelSpecs, resolveAgentModelSpec, WorkflowAgent } from "../src/agent.js";
+import {
+  listAvailableModelSpecs,
+  resolveAgentModelSelection,
+  resolveAgentModelSpec,
+  WorkflowAgent,
+} from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import type { ModelTierConfig } from "../src/model-tier-config.js";
 import { runWorkflow } from "../src/workflow.js";
@@ -34,7 +39,11 @@ test("listAvailableModelSpecs entries have provider/model format when non-empty"
 // ═══════════════════════════════════════════════════════════════════════════
 
 const tierConfig: ModelTierConfig = {
-  tiers: { small: "vendor/small", medium: "vendor/medium", big: "vendor/big" },
+  tiers: {
+    small: { model: "vendor/small", thinkingLevel: "low" },
+    medium: { model: "vendor/medium", thinkingLevel: "high" },
+    big: { model: "vendor/big", thinkingLevel: "xhigh" },
+  },
 };
 const loadCfg = () => tierConfig;
 const noCfg = () => null;
@@ -80,6 +89,44 @@ test("resolveAgentModelSpec: untagged agent with a config lacking a medium tier 
 
 test("resolveAgentModelSpec: tier with no main model and no config yields undefined", () => {
   assert.equal(resolveAgentModelSpec({ tier: "small" }, undefined, noCfg), undefined);
+});
+
+test("resolveAgentModelSelection: tier resolves model plus thinking level", () => {
+  assert.deepEqual(resolveAgentModelSelection({ tier: "big" }, "main/model", loadCfg), {
+    model: "vendor/big",
+    thinkingLevel: "xhigh",
+  });
+});
+
+test("resolveAgentModelSelection: explicit model wins but tier thinking still applies", () => {
+  assert.deepEqual(resolveAgentModelSelection({ model: "explicit/model", tier: "small" }, "main/model", loadCfg), {
+    model: "explicit/model",
+    thinkingLevel: "low",
+  });
+});
+
+test("resolveAgentModelSelection: explicit thinking overrides tier thinking", () => {
+  assert.deepEqual(
+    resolveAgentModelSelection({ model: "explicit/model", tier: "small", thinkingLevel: "off" }, "main/model", loadCfg),
+    {
+      model: "explicit/model",
+      thinkingLevel: "off",
+    },
+  );
+});
+
+test("resolveAgentModelSelection: untagged agent defaults to medium model and thinking", () => {
+  assert.deepEqual(resolveAgentModelSelection({}, "main/model", loadCfg), {
+    model: "vendor/medium",
+    thinkingLevel: "high",
+  });
+});
+
+test("resolveAgentModelSelection: explicit thinking does not opt out of default medium model", () => {
+  assert.deepEqual(resolveAgentModelSelection({ thinkingLevel: "low" }, "main/model", loadCfg), {
+    model: "vendor/medium",
+    thinkingLevel: "low",
+  });
 });
 
 test("WorkflowAgent constructor accepts all option shapes without throwing", () => {
@@ -380,6 +427,18 @@ test("agent() in workflow passes model spec to runner", async () => {
   assert.equal((rec.calls[0].options as { model?: string }).model, "fast-llm/model");
 });
 
+test("agent() in workflow passes explicit thinkingLevel to runner", async () => {
+  const rec = new CallRecordingAgent();
+  await runWorkflow(
+    `export const meta = { name: 'test', description: 't' }
+     const r = await agent('task', { label: 't', thinkingLevel: 'high' })
+     return r`,
+    { agent: rec, persistLogs: false },
+  );
+  assert.equal(rec.calls.length, 1);
+  assert.equal((rec.calls[0].options as { thinkingLevel?: string }).thinkingLevel, "high");
+});
+
 test("agent() in workflow fires onAgentStart and onAgentEnd callbacks", async () => {
   const rec = new CallRecordingAgent();
   const events: string[] = [];
@@ -536,6 +595,43 @@ test("agent() in workflow reports non-recoverable errors before throwing", async
   assert.equal(end?.recoverable, false);
 });
 
+test("agent() reports live usage progress while running", async () => {
+  const runner = {
+    async run(_prompt: string, options: any) {
+      options.onUsageUpdate?.({
+        input: 8,
+        output: 4,
+        cacheRead: 0,
+        cacheWrite: 0,
+        total: 12,
+        cost: 0,
+        estimated: true,
+      });
+      options.onUsage?.({ input: 20, output: 10, cacheRead: 0, cacheWrite: 0, total: 30, cost: 0.001 });
+      return "ok";
+    },
+  };
+  const progress: Array<{ label: string; tokens: number; estimated?: boolean }> = [];
+  let endedTokens = 0;
+
+  await runWorkflow(
+    `export const meta = { name: 'test', description: 't' }
+     await agent('task', { label: 't' })
+     return 1`,
+    {
+      agent: runner,
+      persistLogs: false,
+      onAgentProgress: (e) => progress.push({ label: e.label, tokens: e.tokens, estimated: e.estimated }),
+      onAgentEnd: (e) => {
+        endedTokens = e.tokens ?? 0;
+      },
+    },
+  );
+
+  assert.deepEqual(progress, [{ label: "t", tokens: 12, estimated: true }]);
+  assert.equal(endedTokens, 30, "final agent tokens use provider usage, not the live estimate");
+});
+
 test("agent() in workflow fires onTokenUsage after run", async () => {
   const rec = new CallRecordingAgent();
   const usageEvents: Array<{ input: number; output: number; total: number }> = [];
@@ -568,6 +664,27 @@ test("agent() passes onModelResolved callback for display model updates", async 
     },
   );
   assert.ok(rec.calls.length > 0, "rec.calls should not be empty");
+});
+
+test("agent() passes onThinkingLevelResolved callback for display thinking updates", async () => {
+  const rec = {
+    async run(_prompt: string, options: { onThinkingLevelResolved?: (level: "xhigh") => void }) {
+      options.onThinkingLevelResolved?.("xhigh");
+      return "ok";
+    },
+  };
+  await runWorkflow(
+    `export const meta = { name: 'test', description: 't' }
+     await agent('task', { label: 't', thinkingLevel: 'high' })
+     return 1`,
+    {
+      agent: rec,
+      persistLogs: false,
+      onAgentEnd: (e) => {
+        assert.equal(e.thinkingLevel, "xhigh");
+      },
+    },
+  );
 });
 
 test("agent() accumulates usage across multiple agents", async () => {

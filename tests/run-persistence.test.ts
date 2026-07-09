@@ -457,7 +457,7 @@ test(
       phases: ["Scan", "Analyze", "Report"],
       currentPhase: "Analyze",
       agents: [
-        { id: 1, label: "agent-a", prompt: "scan", status: "done", result: { found: true } },
+        { id: 1, label: "agent-a", prompt: "scan", status: "done", result: { found: true }, thinkingLevel: "high" },
         { id: 2, label: "agent-b", prompt: "analyze", status: "running" },
       ],
       logs: ["started", "phase: Scan", "phase: Analyze"],
@@ -480,6 +480,7 @@ test(
     assert.deepEqual(loaded.phases, ["Scan", "Analyze", "Report"]);
     assert.equal(loaded.agents.length, 2);
     assert.deepEqual(loaded.agents[0].result, { found: true });
+    assert.equal(loaded.agents[0].thinkingLevel, "high");
     assert.equal(loaded.agents[1].status, "running");
     assert.deepEqual(loaded.logs, ["started", "phase: Scan", "phase: Analyze"]);
     assert.deepEqual(loaded.tokenUsage, { input: 500, output: 200, total: 700 });

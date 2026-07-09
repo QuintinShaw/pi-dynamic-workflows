@@ -1,6 +1,6 @@
 export type { AdversarialReviewConfig } from "./adversarial-review.js";
 export { generateAdversarialReviewWorkflow, generateMultiPerspectiveWorkflow } from "./adversarial-review.js";
-export type { AgentRunOptions, AgentRunResult, WorkflowAgentOptions } from "./agent.js";
+export type { AgentRunOptions, AgentRunResult, AgentUsage, AgentUsageUpdate, WorkflowAgentOptions } from "./agent.js";
 export { listAvailableModelSpecs, WorkflowAgent } from "./agent.js";
 export type { AgentHistoryEntry, AgentHistoryKind, AgentHistoryRole } from "./agent-history.js";
 export { compactAgentHistory } from "./agent-history.js";
@@ -44,16 +44,23 @@ export {
 } from "./errors.js";
 export type { WorkflowLogger, WorkflowLoggerOptions } from "./logger.js";
 export { createWorkflowLogger } from "./logger.js";
+export { formatModelWithThinking, shortModel } from "./model-display.js";
 export type { ModelRoute, ModelRoutingConfig } from "./model-routing.js";
 export { parseModelRoutingFromMeta, resolveModelForPhase } from "./model-routing.js";
-export type { ModelTierConfig } from "./model-tier-config.js";
+export type { ModelTierConfig, ModelTierEntry, ModelTierValue, ThinkingLevel } from "./model-tier-config.js";
 export {
   buildDefaultTierConfig,
   getModelTierConfigPath,
+  isThinkingLevel,
   loadModelTierConfig,
+  normalizeModelTierConfig,
+  normalizeTierEntry,
+  resolveTierEntry,
   resolveTierModel,
+  resolveTierThinkingLevel,
   saveModelTierConfig,
   sortedTierNames,
+  THINKING_LEVELS,
 } from "./model-tier-config.js";
 export type { PersistedRunState, RunPersistence, RunStatus } from "./run-persistence.js";
 export { createRunPersistence, generateRunId } from "./run-persistence.js";

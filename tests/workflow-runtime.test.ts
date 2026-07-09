@@ -383,6 +383,27 @@ test("resume re-runs only the changed call (hash mismatch)", async () => {
   assert.equal(second.state.calls, 1, "only the edited call re-runs");
 });
 
+test("resume re-runs when an agent thinkingLevel changes", async () => {
+  const script = (thinking: string) => `export const meta = { name: 'thinking_resume', description: 'resume' }
+const a = await agent('work', { label: 'a', thinkingLevel: '${thinking}' })
+return { a }`;
+  const first = countingAgent();
+  const journal: JournalEntry[] = [];
+  await runWorkflow(script("high"), {
+    agent: first.runner,
+    persistLogs: false,
+    onAgentJournal: (e) => journal.push(e),
+  });
+
+  const second = countingAgent();
+  await runWorkflow(script("xhigh"), {
+    agent: second.runner,
+    persistLogs: false,
+    resumeJournal: new Map(journal.map((e) => [e.index, e])),
+  });
+  assert.equal(second.state.calls, 1, "thinking changes must invalidate the cached agent result");
+});
+
 const threeCallScript = `export const meta = { name: 'prefix', description: 'prefix resume' }
 const a = await agent('A', { label: 'a' })
 const b = await agent('B', { label: 'b' })

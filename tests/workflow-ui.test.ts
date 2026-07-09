@@ -24,6 +24,7 @@ function fakeManager(): Pick<WorkflowManager, "listRuns" | "getRun"> {
         resultPreview: "found 2",
         tokens: 100,
         model: "fast-llm/model",
+        thinkingLevel: "high",
       },
       {
         id: 2,
@@ -34,6 +35,7 @@ function fakeManager(): Pick<WorkflowManager, "listRuns" | "getRun"> {
         resultPreview: "found 1",
         tokens: 50,
         model: "fast-llm/model",
+        thinkingLevel: "low",
       },
       { id: 3, label: "write report", phase: "Report", prompt: "write it", status: "running", tokens: 0 },
     ],
@@ -452,7 +454,7 @@ test("renderNavigator shows agent detail view", () => {
   assert.match(text, /found 2/);
   assert.match(text, /Status:/);
   assert.match(text, /Model:/);
-  assert.match(text, /model/); // shortModel strips provider prefix
+  assert.match(text, /model · high/); // shortModel strips provider prefix and shows thinking
   assert.match(text, /j\/k scroll/); // detail view footer
 });
 
@@ -473,14 +475,14 @@ test("renderNavigator shows agent error diagnostics in detail view", () => {
   assert.match(text, /tool read: README content/);
 });
 
-test("renderNavigator shows model info in agent rows", () => {
+test("renderNavigator shows model and thinking info in agent rows", () => {
   const model = new NavigatorModel(fakeManager());
   const state = new NavigatorState();
   state.drill(model);
   state.drill(model);
   const lines = renderNavigator(state, model, 80);
   const text = lines.join("\n");
-  assert.match(text, /model/);
+  assert.match(text, /model · high/);
 });
 
 test("renderNavigator shows correct footer hint per view", () => {
