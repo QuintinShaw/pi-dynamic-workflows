@@ -90,9 +90,33 @@ describe("installResultDelivery", () => {
     assert.ok(calls[0].content.includes("All tests passed"), "should contain All tests passed");
     assert.ok(calls[0].content.includes("test-workflow"), "should contain test-workflow");
     assert.ok(calls[0].content.includes("3 agents"), "should contain 3 agents");
-    // locale may format the group separator as ',' / '.' / ' ' / none
-    assert.ok(/50[\s,.]?000/.test(calls[0].content), "should contain 50000 tokens formatted");
+    // deliverText shows the fresh/cache split; the cache segment is omitted with no cache reads.
+    assert.ok(calls[0].content.includes("50.0K fresh"), "should show fresh tokens (input+output)");
+    assert.ok(!calls[0].content.includes("cache"), "omits the cache segment when cacheRead is 0");
     assert.ok(calls[0].content.includes("1.5s"), "should contain 1.5s");
+  });
+
+  it("shows the fresh/cache split and cost in the delivery line", () => {
+    const pi = createMockPi();
+    // A caching model: little fresh input+output, most of the tokens are cheap cache reads.
+    const manager = createMockManager(
+      makeRun({
+        result: {
+          agentCount: 2,
+          durationMs: 1000,
+          tokenUsage: { input: 80000, output: 20000, total: 6100000, cacheRead: 6000000, cacheWrite: 0, cost: 6.7 },
+          result: { verdict: "done" },
+        },
+      }),
+    );
+
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    manager.emit("complete", { runId: "test-run-1" });
+
+    const content = (pi as unknown as { _calls: { content: string }[] })._calls[0].content;
+    assert.ok(content.includes("100.0K fresh"), `fresh should be input+output; got: ${content}`);
+    assert.ok(content.includes("6.0M cache"), `cache should be cacheRead; got: ${content}`);
+    assert.ok(content.includes("$6.70"), `cost should be shown; got: ${content}`);
   });
 
   // ── deliverText: fallback chain ──
@@ -510,6 +534,46 @@ describe("renderPanelDetailed", () => {
       getRun: (id: string) => (id === "r1" ? { snapshot, status } : undefined),
     };
   }
+
+  it("renders a per-agent fresh/cache split when tokenUsage is present", async () => {
+    const { renderPanelDetailed } = await import("../src/task-panel.js");
+    const snapshot = {
+      name: "wf",
+      phases: ["Scan"],
+      currentPhase: "Scan",
+      logs: [],
+      agents: [
+        {
+          id: 1,
+          label: "cached_agent",
+          status: "done",
+          phase: "Scan",
+          tokens: 3100000,
+          // Opus-style: little fresh input+output, most of it cheap cache reads.
+          tokenUsage: { input: 80000, output: 20000, total: 3100000, cacheRead: 3000000, cacheWrite: 0, cost: 0.4 },
+          model: "github-copilot/claude-opus-4.8",
+        },
+      ],
+      tokenUsage: { total: 0, input: 0, output: 0, cost: 0 },
+    };
+    const manager = {
+      listRuns: () => [
+        {
+          runId: "r2",
+          workflowName: "wf",
+          status: "running",
+          agents: snapshot.agents,
+          tokenUsage: snapshot.tokenUsage,
+        },
+      ],
+      getRun: (id: string) => (id === "r2" ? { snapshot, status: "running" } : undefined),
+    };
+    const lines = renderPanelDetailed(manager as never, theme as never, undefined, 8, 1000);
+    assert.ok(
+      lines.some((l) => l.includes("[1] ✓ cached_agent") && /100\.0K fresh/.test(l) && /3\.0M cache/.test(l)),
+      `expected a per-agent fresh/cache row, got:\n${lines.join("\n")}`,
+    );
+  });
 
   it("renders aggregate tokens, cost, phases, and per-agent rows", async () => {
     const { renderPanelDetailed, clearTokenSamples } = await import("../src/task-panel.js");

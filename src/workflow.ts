@@ -116,6 +116,7 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
     phase?: string;
     result: unknown;
     tokens?: number;
+    tokenUsage?: AgentUsage;
     worktree?: string;
     model?: string;
     error?: string;
@@ -547,6 +548,7 @@ export async function runWorkflow<T = unknown>(
               phase: assignedPhase,
               result,
               tokens,
+              tokenUsage: usage,
               worktree: runCwd,
               model: displayModel,
             });
@@ -570,6 +572,7 @@ export async function runWorkflow<T = unknown>(
               phase: assignedPhase,
               result: null,
               tokens,
+              tokenUsage: usage,
               worktree: runCwd,
               model: displayModel,
               error: workflowError.message,

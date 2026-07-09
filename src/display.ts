@@ -18,6 +18,15 @@ export interface WorkflowAgentSnapshot {
   history?: AgentHistoryEntry[];
   /** Tokens used by this agent. */
   tokens?: number;
+  /** Per-agent token usage breakdown (fresh input+output vs cached), when known. */
+  tokenUsage?: {
+    input: number;
+    output: number;
+    total: number;
+    cost: number;
+    cacheRead: number;
+    cacheWrite: number;
+  };
   /** The model this agent ran on (provider/id), when known. */
   model?: string;
 }
@@ -214,7 +223,16 @@ export function renderWorkflowLines(
     for (const agent of visibleAgents) {
       const order = `[${agent.id}]`;
       const result = showResultPreviews && agent.resultPreview ? ` — ${agent.resultPreview}` : "";
-      const agentTokens = agent.tokens ? theme.fg("dim", ` [${agent.tokens.toLocaleString()} tok]`) : "";
+      const agentTokens = agent.tokenUsage
+        ? theme.fg(
+            "dim",
+            ` [${(agent.tokenUsage.input + agent.tokenUsage.output).toLocaleString()} fresh${
+              agent.tokenUsage.cacheRead > 0 ? ` · ${agent.tokenUsage.cacheRead.toLocaleString()} cache` : ""
+            }]`,
+          )
+        : agent.tokens
+          ? theme.fg("dim", ` [${agent.tokens.toLocaleString()} tok]`)
+          : "";
       lines.push(`    ${order} ${statusIcon(agent.status)} ${shorten(agent.label, 48)}${agentTokens}${result}`);
     }
     if (agents.length > visibleAgents.length)
@@ -226,7 +244,16 @@ export function renderWorkflowLines(
     lines.push(theme.fg("accent", "  Unphased"));
     for (const agent of unphased.slice(-maxAgents)) {
       const result = showResultPreviews && agent.resultPreview ? ` — ${agent.resultPreview}` : "";
-      const agentTokens = agent.tokens ? theme.fg("dim", ` [${agent.tokens.toLocaleString()} tok]`) : "";
+      const agentTokens = agent.tokenUsage
+        ? theme.fg(
+            "dim",
+            ` [${(agent.tokenUsage.input + agent.tokenUsage.output).toLocaleString()} fresh${
+              agent.tokenUsage.cacheRead > 0 ? ` · ${agent.tokenUsage.cacheRead.toLocaleString()} cache` : ""
+            }]`,
+          )
+        : agent.tokens
+          ? theme.fg("dim", ` [${agent.tokens.toLocaleString()} tok]`)
+          : "";
       lines.push(`    [${agent.id}] ${statusIcon(agent.status)} ${shorten(agent.label, 48)}${agentTokens}${result}`);
     }
   }

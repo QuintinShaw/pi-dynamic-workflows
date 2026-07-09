@@ -71,7 +71,9 @@ function fitLine(line: string, width?: number): string {
 
 export function deliverText(run: ManagedRun): string {
   const summary = summarizeResult(run.result?.result);
-  const tokens = run.result?.tokenUsage ? ` · ${run.result.tokenUsage.total.toLocaleString()} tokens` : "";
+  const tu = run.result?.tokenUsage;
+  const cost = tu?.cost ? ` · $${tu.cost.toFixed(tu.cost >= 0.01 ? 2 : 4)}` : "";
+  const tokens = tu ? ` · ${fmtFreshCache(tu.input, tu.output, tu.cacheRead ?? 0)}${cost}` : "";
   const agents = run.result?.agentCount ?? run.snapshot.agentCount;
   const duration = run.result?.durationMs ? ` · ${(run.result.durationMs / 1000).toFixed(1)}s` : "";
   return [
@@ -228,6 +230,19 @@ function fmtTokensShort(n: number): string {
   return `${(n / 1_000_000).toFixed(1)}M`;
 }
 
+/**
+ * Format a fresh (input+output) vs cache (cacheRead) token split. The cache segment
+ * is omitted when there were no cache reads (e.g. a provider without prompt caching),
+ * so it reads "6.3M fresh" rather than a dangling "6.3M fresh ·  cache". cacheWrite (the
+ * one-time cache-creation premium) is intentionally excluded from both counts; its dollar
+ * impact already shows in the delivery line's $cost.
+ */
+function fmtFreshCache(input: number, output: number, cacheRead: number): string {
+  const fresh = fmtTokensShort(input + output) || "0";
+  const cache = fmtTokensShort(cacheRead);
+  return cache ? `${fresh} fresh · ${cache} cache` : `${fresh} fresh`;
+}
+
 /** Normalize the configured per-phase agent cap to a sane integer (default 8). */
 export function clampMaxAgents(value: number | undefined): number {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 1) return 8;
@@ -274,7 +289,11 @@ function renderRunBody(
 
     const visible = phaseAgents.slice(-maxAgents);
     for (const a of visible) {
-      const tok = a.tokens ? dim(` ${fmtTokensShort(a.tokens)} tok`) : "";
+      const tok = a.tokenUsage
+        ? dim(` ${fmtFreshCache(a.tokenUsage.input, a.tokenUsage.output, a.tokenUsage.cacheRead)}`)
+        : a.tokens
+          ? dim(` ${fmtTokensShort(a.tokens)} tok`)
+          : "";
       const mdl = shortModel(a.model);
       const model = mdl ? dim(` · ${mdl}`) : "";
       lines.push(`    [${a.id}] ${statusIcon(a.status)} ${shorten(a.label, 40)}${tok}${model}`);
