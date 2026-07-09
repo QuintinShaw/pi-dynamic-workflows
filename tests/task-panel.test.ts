@@ -5,7 +5,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 
 type TaskPanelModule = {
-  installResultDelivery: (pi: ExtensionAPI, manager: unknown) => void;
+  installResultDelivery: (pi: ExtensionAPI, manager: unknown, opts?: unknown) => void;
   installTaskPanel: (pi: ExtensionAPI | null, manager: unknown, ui: unknown) => void;
 };
 
@@ -19,13 +19,15 @@ before(async () => {
 // ─── Pure-function tests (tested indirectly via installResultDelivery) ─────────
 
 describe("installResultDelivery", () => {
-  function createMockManager(run?: unknown) {
+  function createMockManager(run?: unknown, runsDir?: string) {
     const manager = new EventEmitter() as ReturnType<typeof EventEmitter> & {
       getRun: (...args: unknown[]) => unknown;
+      getPersistence?: () => { getRunsDir: () => string };
       __deliveryInstalled?: boolean;
       listRuns?: () => unknown[];
     };
     manager.getRun = () => run;
+    if (runsDir) manager.getPersistence = () => ({ getRunsDir: () => runsDir });
     return manager;
   }
 
@@ -143,7 +145,7 @@ describe("installResultDelivery", () => {
 
     const calls = (pi as unknown as { _calls: { content: string }[] })._calls;
     assert.ok(calls[0].content.includes("foo"), "should contain foo");
-    assert.ok(calls[0].content.includes("…(truncated)"), "should contain …(truncated)");
+    assert.ok(/…\(truncated [\d.]+ (B|KB|MB)\)/.test(calls[0].content), "should note the dropped size on truncation");
   });
 
   it("falls back gracefully when result is nullish", () => {
@@ -158,6 +160,53 @@ describe("installResultDelivery", () => {
     const calls = (pi as unknown as { _calls: { content: string }[] })._calls;
     assert.equal(calls.length, 1);
     assert.ok(calls[0].content.includes("null"), "should contain null for undefined result");
+  });
+
+  // ── Full-result pointer + configurable threshold ──
+
+  it("appends a Full result pointer to <runsDir>/<runId>.json when persistence exists", () => {
+    const pi = createMockPi();
+    const manager = createMockManager(makeRun(), "/runs");
+
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    manager.emit("complete", { runId: "test-run-1" });
+
+    const content = (pi as unknown as { _calls: { content: string }[] })._calls[0].content;
+    assert.ok(content.includes("Full result:"), "should include the pointer label");
+    assert.ok(content.includes("/runs/test-run-1.json"), "should point at <runsDir>/<runId>.json");
+    // The verdict summary itself is unchanged apart from the appended pointer.
+    assert.ok(content.includes("All tests passed"), "verdict text preserved");
+  });
+
+  it("omits the pointer when the manager exposes no persistence layer", () => {
+    const pi = createMockPi();
+    const manager = createMockManager(makeRun()); // no runsDir
+
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    manager.emit("complete", { runId: "test-run-1" });
+
+    const calls = (pi as unknown as { _calls: { content: string }[] })._calls;
+    assert.equal(calls.length, 1, "the result is still delivered");
+    assert.ok(calls[0].content.includes("All tests passed"), "verdict body still intact");
+    assert.ok(!calls[0].content.includes("Full result:"), "no pointer without a persisted path");
+  });
+
+  it("honors deliveredResultMaxChars from loadSettings for the JSON-dump branch", () => {
+    const pi = createMockPi();
+    // ~216-char JSON dump: under the default 400, so it would NOT truncate by default
+    // — a truncation marker can therefore only come from the 50-char setting.
+    const run = makeRun({ result: { result: { note: "z".repeat(200) } } });
+    const manager = createMockManager(run, "/runs");
+
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager, {
+      loadSettings: () => ({ deliveredResultMaxChars: 50 }),
+    });
+    manager.emit("complete", { runId: "test-run-1" });
+
+    const content = (pi as unknown as { _calls: { content: string }[] })._calls[0].content;
+    assert.ok(/…\(truncated [\d.]+ (B|KB|MB)\)/.test(content), "the 50-char setting truncates a sub-400 dump");
+    assert.ok(!content.includes("z".repeat(200)), "the body is cut at the configured threshold");
+    assert.ok(content.includes("/runs/test-run-1.json"), "pointer still appended");
   });
 
   // ── installResultDelivery: guard / stale ctx ──
@@ -644,5 +693,61 @@ describe("installTaskPanel mode selection", () => {
       lines.some((l) => /\[1\] ● a/.test(l)),
       "per-agent row in detailed mode",
     );
+  });
+});
+
+// ─── deliverText: pointer + truncation threshold ─────────────────────────────────
+
+describe("deliverText", () => {
+  function makeResult(result: unknown) {
+    return { snapshot: { name: "wf", agentCount: 1 }, result: { agentCount: 1, result } };
+  }
+
+  it("appends the Full result pointer to a verdict result without altering it", async () => {
+    const { deliverText } = await import("../src/task-panel.js");
+    // A verdict longer than the default cap must still pass through in full: the
+    // verdict branch is never subject to the JSON-dump truncation.
+    const verdict = "V".repeat(600);
+    const text = deliverText(makeResult({ verdict }) as never, { resultPath: "/r/x.json" });
+    assert.ok(text.includes(verdict), "long verdict passed through in full");
+    assert.ok(text.includes("↳ Full result: /r/x.json"), "pointer appended");
+    assert.ok(!/truncated/.test(text), "verdict branch bypasses truncation");
+  });
+
+  it("does not append a pointer when no resultPath is given", async () => {
+    const { deliverText } = await import("../src/task-panel.js");
+    const text = deliverText(makeResult("plain string") as never);
+    assert.ok(text.includes("plain string"), "string result passed through");
+    assert.ok(!text.includes("Full result:"), "no pointer without a resultPath");
+  });
+
+  it("leaves a small JSON dump untouched (no truncation marker)", async () => {
+    const { deliverText } = await import("../src/task-panel.js");
+    const text = deliverText(makeResult({ ok: true, changed: 2 }) as never, { resultPath: "/r/x.json" });
+    assert.ok(text.includes('"ok": true'), "full JSON shown");
+    assert.ok(!/truncated/.test(text), "no truncation under the threshold");
+    assert.ok(text.includes("↳ Full result: /r/x.json"), "pointer still appended");
+  });
+
+  it("truncates the JSON dump at maxChars and reports the dropped size", async () => {
+    const { deliverText } = await import("../src/task-panel.js");
+    const text = deliverText(makeResult({ note: "x".repeat(500) }) as never, {
+      resultPath: "/r/x.json",
+      maxChars: 100,
+    });
+    assert.ok(/…\(truncated [\d.]+ (B|KB|MB)\)/.test(text), "size hint present");
+    assert.ok(text.includes("↳ Full result: /r/x.json"), "pointer still appended");
+    // Body is capped near maxChars, so the 500-char tail is not delivered in full.
+    assert.ok(!text.includes("x".repeat(500)), "the full tail is not inlined");
+  });
+
+  it("defaults the JSON-dump threshold to 400 chars", async () => {
+    const { deliverText } = await import("../src/task-panel.js");
+    // JSON length is note length + 16, so 380 → 396 (under 400) and 390 → 406 (over),
+    // bracketing the default threshold tightly around 400.
+    const under = deliverText(makeResult({ note: "y".repeat(380) }) as never);
+    assert.ok(!/truncated/.test(under), "a 396-char dump is under the default 400");
+    const over = deliverText(makeResult({ note: "y".repeat(390) }) as never);
+    assert.ok(/…\(truncated/.test(over), "a 406-char dump exceeds the default 400");
   });
 });
