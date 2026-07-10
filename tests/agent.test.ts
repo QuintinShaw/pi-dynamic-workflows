@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import type { AgentRunOptions, AgentUsage } from "../src/agent.js";
-import { listAvailableModelSpecs, resolveAgentModelSpec, WorkflowAgent } from "../src/agent.js";
+import { listAvailableModelSpecs, resolveAgentModelSpec, usageFromStats, WorkflowAgent } from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { resolveModelSpecWithThinking } from "../src/model-spec.js";
 import type { ModelTierConfig } from "../src/model-tier-config.js";
@@ -784,4 +784,32 @@ test("agent() monitors agent count and calls onAgentStart/End for each", async (
   assert.equal(counts.length, 2);
   assert.ok(counts[0] > 0, "first agent tokens");
   assert.ok(counts[1] > 0, "second agent tokens");
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// usageFromStats — the guard between session stats and the onUsage callback.
+// ═══════════════════════════════════════════════════════════════════════════
+
+test("usageFromStats maps real stats to an AgentUsage", () => {
+  const usage = usageFromStats({
+    tokens: { input: 100, output: 50, cacheRead: 900, cacheWrite: 30, total: 1080 },
+    cost: 0.42,
+  });
+  assert.deepEqual(usage, { input: 100, output: 50, cacheRead: 900, cacheWrite: 30, total: 1080, cost: 0.42 });
+});
+
+test("usageFromStats returns undefined for all-zero stats (provider reported nothing)", () => {
+  const usage = usageFromStats({
+    tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    cost: 0,
+  });
+  assert.equal(usage, undefined);
+});
+
+test("usageFromStats keeps cost-only stats (billed but tokens unreported)", () => {
+  const usage = usageFromStats({
+    tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    cost: 0.01,
+  });
+  assert.equal(usage?.cost, 0.01);
 });

@@ -253,6 +253,28 @@ export interface AgentUsage {
   cost: number;
 }
 
+/**
+ * Map session stats to an AgentUsage, or undefined when the provider reported
+ * no usage at all (all-zero stats). Returning undefined — instead of a zero
+ * breakdown — lets displays fall back to their scalar token count, so setups
+ * on non-reporting providers render the same as before the split existed.
+ */
+export function usageFromStats(stats: {
+  tokens: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
+  cost: number;
+}): AgentUsage | undefined {
+  const { tokens, cost } = stats;
+  if (tokens.total <= 0 && cost <= 0) return undefined;
+  return {
+    input: tokens.input,
+    output: tokens.output,
+    cacheRead: tokens.cacheRead,
+    cacheWrite: tokens.cacheWrite,
+    total: tokens.total,
+    cost,
+  };
+}
+
 export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefined> {
   label?: string;
   /**
@@ -269,7 +291,8 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
   /**
    * Called once with this subagent's real usage, read from the session right
    * before disposal. Fires on both the success and error paths so partial
-   * usage is never lost. `total === 0` means the provider reported no usage.
+   * usage is never lost — but NOT when the provider reported no usage at all
+   * (all-zero stats), so consumers keep their scalar fallback.
    */
   onUsage?: (usage: AgentUsage) => void;
   /**
@@ -556,15 +579,8 @@ export class WorkflowAgent {
       // Read real usage before disposing — dispose tears down the session state.
       if (options.onUsage) {
         try {
-          const { tokens, cost } = session.getSessionStats();
-          options.onUsage({
-            input: tokens.input,
-            output: tokens.output,
-            cacheRead: tokens.cacheRead,
-            cacheWrite: tokens.cacheWrite,
-            total: tokens.total,
-            cost,
-          });
+          const usage = usageFromStats(session.getSessionStats());
+          if (usage) options.onUsage(usage);
         } catch {
           // Usage is best-effort; never let stats failure mask the real result/error.
         }
