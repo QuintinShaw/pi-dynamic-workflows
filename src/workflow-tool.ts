@@ -7,6 +7,7 @@ import {
   createToolUpdateWorkflowDisplay,
   createWorkflowSnapshot,
   fmtCost,
+  fmtFull,
   fmtTokenSegment,
   recomputeWorkflowSnapshot,
   renderWorkflowText,
@@ -290,7 +291,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       display.complete(snapshot);
 
       // Format token usage (include cost when the provider reports it)
-      const tokenSegment = fmtTokenSegment(tokenFigures(result.tokenUsage), (n) => n.toLocaleString());
+      const tokenSegment = fmtTokenSegment(tokenFigures(result.tokenUsage), fmtFull);
       const tokenInfo = tokenSegment
         ? `\n\nToken usage: ${tokenSegment}${result.tokenUsage?.cost ? ` (${fmtCost(result.tokenUsage.cost)})` : ""}`
         : "";

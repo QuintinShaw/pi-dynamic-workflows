@@ -134,7 +134,8 @@ export function fmtCost(cost: number): string {
   return `$${cost.toFixed(cost >= 0.01 ? 2 : 4)}`;
 }
 
-const fmtFull = (n: number): string => n.toLocaleString();
+/** Full (non-compact) number style for print/text surfaces: locale-grouped digits. */
+export const fmtFull = (n: number): string => n.toLocaleString();
 
 export function createWorkflowSnapshot(meta: WorkflowMeta): WorkflowSnapshot {
   return {

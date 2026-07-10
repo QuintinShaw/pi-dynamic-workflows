@@ -5,6 +5,7 @@
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import {
+  fmtFull,
   fmtTokenSegment,
   recomputeWorkflowSnapshot,
   renderWorkflowText,
@@ -37,7 +38,7 @@ function summarizeRun(run: PersistedRunState): string {
   const icon = STATUS_ICON[run.status] ?? "?";
   const done = run.agents.filter((a) => a.status === "done").length;
   const total = run.agents.length;
-  const segment = fmtTokenSegment(tokenFigures(run.tokenUsage), (n) => n.toLocaleString());
+  const segment = fmtTokenSegment(tokenFigures(run.tokenUsage), fmtFull);
   const tokens = segment ? ` · ${segment}` : "";
   return `${icon} ${run.runId}  ${run.workflowName} [${run.status}] ${done}/${total} agents${tokens}`;
 }
@@ -104,7 +105,7 @@ function renderPersistedStatus(run: PersistedRunState): string {
       agent.status === "done" ? "✓" : agent.status === "error" ? "✗" : agent.status === "running" ? "◆" : "·";
     lines.push(`  ${icon} ${agent.label}`);
   }
-  const tokenSegment = fmtTokenSegment(tokenFigures(run.tokenUsage), (n) => n.toLocaleString());
+  const tokenSegment = fmtTokenSegment(tokenFigures(run.tokenUsage), fmtFull);
   if (tokenSegment) lines.push(`  tokens: ${tokenSegment}`);
   if (run.durationMs) lines.push(`  duration: ${(run.durationMs / 1000).toFixed(1)}s`);
   return lines.join("\n");

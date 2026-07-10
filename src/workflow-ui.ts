@@ -18,7 +18,7 @@ import type { Component, Focusable, TUI } from "@earendil-works/pi-tui";
 import { parseKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import type { AgentUsage } from "./agent.js";
 import type { WorkflowAgentSnapshot, WorkflowSnapshot } from "./display.js";
-import { aggregateAgentUsage, fmtCost, fmtTokenCount, fmtTokenSegment, tokenFigures } from "./display.js";
+import { aggregateAgentUsage, fmtCost, fmtTokenSegment, tokenFigures } from "./display.js";
 import type { PersistedRunState } from "./run-persistence.js";
 import { registerSavedWorkflow } from "./saved-commands.js";
 import type { WorkflowManager } from "./workflow-manager.js";
