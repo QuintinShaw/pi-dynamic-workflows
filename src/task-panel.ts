@@ -11,9 +11,11 @@ import type { ExtensionAPI, ExtensionUIContext, Theme } from "@earendil-works/pi
 import { type Component, type TUI, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import {
   aggregateAgentUsage,
+  fmtCost,
   fmtTokenCount,
   shorten,
   statusIcon,
+  tokenFigures,
   type WorkflowAgentSnapshot,
   type WorkflowSnapshot,
 } from "./display.js";
@@ -98,8 +100,9 @@ function fitLine(line: string, width?: number): string {
 export function deliverText(run: ManagedRun, opts: { resultPath?: string; maxChars?: number } = {}): string {
   const summary = summarizeResult(run.result?.result, opts.maxChars);
   const tu = run.result?.tokenUsage;
-  const cost = tu?.cost ? ` · $${tu.cost.toFixed(tu.cost >= 0.01 ? 2 : 4)}` : "";
-  const tokens = tu ? ` · ${fmtTokenCount(tu.input + tu.output, tu.cacheRead ?? 0, fmtTokensShort)}${cost}` : "";
+  const cost = tu?.cost ? ` · ${fmtCost(tu.cost)}` : "";
+  const fig = tokenFigures(tu);
+  const tokens = tu ? ` · ${fmtTokenCount(fig.fresh, fig.cacheRead, fmtTokensShort)}${cost}` : "";
   const agents = run.result?.agentCount ?? run.snapshot.agentCount;
   const duration = run.result?.durationMs ? ` · ${(run.result.durationMs / 1000).toFixed(1)}s` : "";
   const lines = [
@@ -334,11 +337,9 @@ function renderRunBody(
 
     const visible = phaseAgents.slice(-maxAgents);
     for (const a of visible) {
-      const tok = a.tokenUsage
-        ? dim(` ${fmtTokenCount(a.tokenUsage.input + a.tokenUsage.output, a.tokenUsage.cacheRead, fmtTokensShort)}`)
-        : a.tokens
-          ? dim(` ${fmtTokensShort(a.tokens)} tok`)
-          : "";
+      const fig = tokenFigures(a.tokenUsage, a.tokens);
+      const tok =
+        fig.fresh + fig.cacheRead > 0 ? dim(` ${fmtTokenCount(fig.fresh, fig.cacheRead, fmtTokensShort)}`) : "";
       const mdl = shortModel(a.model);
       const model = mdl ? dim(` · ${mdl}`) : "";
       lines.push(`    [${a.id}] ${statusIcon(a.status)} ${shorten(a.label, 40)}${tok}${model}`);
@@ -390,10 +391,9 @@ export function renderPanelDetailed(
     const meta = [
       `${done}/${agents.length} agents`,
       snap?.currentPhase || "",
-      total > 0 ? fmtTokenCount(runUsage.fresh, runUsage.cacheRead, fmtTokensShort) : "",
-      // 2 decimals for ≥1¢, 4 for sub-cent so a real cost never shows as "$0.00".
+      runUsage.fresh + runUsage.cacheRead > 0 ? fmtTokenCount(runUsage.fresh, runUsage.cacheRead, fmtTokensShort) : "",
       // (cost is only known once the run finalizes its usage.)
-      usage?.cost ? `$${usage.cost.toFixed(usage.cost >= 0.01 ? 2 : 4)}` : "",
+      usage?.cost ? fmtCost(usage.cost) : "",
       rate > 0 ? `${Math.round(rate)} tok/s` : "",
     ]
       .filter(Boolean)

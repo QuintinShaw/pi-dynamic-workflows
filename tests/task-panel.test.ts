@@ -121,6 +121,29 @@ describe("installResultDelivery", () => {
     assert.ok(content.includes("$6.70"), `cost should be shown; got: ${content}`);
   });
 
+  it("falls back to the estimated total when the provider reported no usage (#57 regression)", () => {
+    const pi = createMockPi();
+    // Estimate-only run: onUsage never fired, so the breakdown is all-zero while
+    // run-level `total` carries the scalar estimate.
+    const manager = createMockManager(
+      makeRun({
+        result: {
+          agentCount: 2,
+          durationMs: 1000,
+          tokenUsage: { input: 0, output: 0, total: 800, cacheRead: 0, cacheWrite: 0, cost: 0 },
+          result: { verdict: "done" },
+        },
+      }),
+    );
+
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    manager.emit("complete", { runId: "test-run-1" });
+
+    const content = (pi as unknown as { _calls: { content: string }[] })._calls[0].content;
+    assert.ok(content.includes("800 tok"), `the estimate should survive as the token count; got: ${content}`);
+    assert.ok(!/\b0 tok/.test(content), `must not render a zero breakdown; got: ${content}`);
+  });
+
   // ── deliverText: fallback chain ──
 
   it("falls back to report when verdict is absent", () => {
@@ -622,6 +645,52 @@ describe("renderPanelDetailed", () => {
       lines.some((l) => l.includes("[1] ✓ cached_agent") && /100\.0K tok/.test(l) && /3\.0M cached/.test(l)),
       `expected a per-agent tok/cached row, got:\n${lines.join("\n")}`,
     );
+  });
+
+  it("keeps the scalar estimate for cost-only agents instead of a zero breakdown (#57 regression)", async () => {
+    const { renderPanelDetailed, clearTokenSamples } = await import("../src/task-panel.js");
+    clearTokenSamples("r3");
+    const snapshot = {
+      name: "wf3",
+      phases: ["P"],
+      currentPhase: "P",
+      logs: [],
+      agents: [
+        {
+          id: 1,
+          label: "cost_only",
+          status: "done",
+          phase: "P",
+          tokens: 384,
+          // Provider billed cost but reported zero token counts.
+          tokenUsage: { input: 0, output: 0, total: 0, cacheRead: 0, cacheWrite: 0, cost: 0.02 },
+        },
+      ],
+      tokenUsage: { total: 0, input: 0, output: 0, cost: 0.02 },
+    };
+    const manager = {
+      listRuns: () => [
+        {
+          runId: "r3",
+          workflowName: "wf3",
+          status: "running",
+          agents: snapshot.agents,
+          tokenUsage: snapshot.tokenUsage,
+        },
+      ],
+      getRun: (id: string) => (id === "r3" ? { snapshot, status: "running" } : undefined),
+    };
+    const lines = renderPanelDetailed(manager as never, theme as never, undefined, 8, 1000);
+    assert.ok(
+      lines.some((l) => l.includes("[1] ✓ cost_only") && /384 tok/.test(l)),
+      `cost-only agent should show its scalar estimate, got:\n${lines.join("\n")}`,
+    );
+    // The run header guard must agree with the value it gates (no "0 tok" beside a real cost).
+    assert.ok(
+      lines.some((l) => /wf3/.test(l) && /384 tok/.test(l) && /\$0\.02/.test(l)),
+      `run header should show the estimate and the cost, got:\n${lines.join("\n")}`,
+    );
+    assert.ok(!lines.some((l) => /\b0 tok/.test(l)), `no zero breakdown anywhere:\n${lines.join("\n")}`);
   });
 
   it("renders aggregate tokens, cost, phases, and per-agent rows", async () => {

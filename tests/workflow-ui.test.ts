@@ -182,7 +182,6 @@ test("NavigatorModel reads runs, phases, agents, and detail", () => {
   assert.equal(runs.length, 1);
   assert.equal(runs[0].done, 2);
   assert.equal(runs[0].total, 3);
-  assert.equal(runs[0].tokens, 1050);
   assert.equal(runs[0].fresh, 150);
   assert.equal(runs[0].cacheRead, 900);
 
@@ -192,7 +191,7 @@ test("NavigatorModel reads runs, phases, agents, and detail", () => {
     ["Scan", "Report"],
   );
   assert.equal(phases[0].total, 2);
-  assert.equal(phases[0].tokens, 150);
+  assert.equal(phases[0].fresh, 150);
 
   const agents = model.agents("run-1", "Scan");
   assert.deepEqual(
@@ -226,11 +225,11 @@ test("NavigatorModel reads from persisted runs when no live snapshot", () => {
   assert.equal(runs[0].name, "old-run");
   assert.equal(runs[0].done, 1);
   assert.equal(runs[0].total, 1);
-  assert.equal(runs[0].tokens, 500);
-  assert.equal(runs[0].fresh, 0);
+  // Legacy total-only usage surfaces as fresh (tokenFigures fallback).
+  assert.equal(runs[0].fresh, 500);
   assert.equal(runs[0].cacheRead, 0);
 
-  // The runs list falls back to the plain total for legacy usage.
+  // The runs list surfaces legacy total-only usage as a plain count.
   const lines = renderNavigator(new NavigatorState(), model, 80);
   assert.match(lines.join("\n"), /1\/1 · 500 tok/);
 
@@ -671,4 +670,68 @@ test("renderNavigator footer hint changes based on item under cursor", () => {
   const savedText = renderNavigator(state, model, 80).join("\n");
   assert.notEqual(savedText.indexOf("x delete"), -1, "saved item should show x delete");
   assert.equal(savedText.indexOf("x stop"), -1, "saved item should NOT show x stop");
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #57 regressions — the split must survive persistence, and mixed or
+// estimate-only runs must never under-report vs the pre-split scalar.
+// ═══════════════════════════════════════════════════════════════════════════
+
+test("persisted runs keep the per-agent split across sessions (#57 regression)", () => {
+  const model = new NavigatorModel({
+    listRuns: () => [
+      {
+        runId: "r-split",
+        workflowName: "old-split",
+        status: "completed",
+        phases: ["Build"],
+        agents: [
+          {
+            id: 1,
+            label: "builder",
+            phase: "Build",
+            status: "done",
+            prompt: "build it",
+            result: "ok",
+            tokens: 1080,
+            tokenUsage: { input: 60, output: 20, total: 1080, cost: 0.01, cacheRead: 900, cacheWrite: 100 },
+          },
+        ],
+        logs: [],
+        tokenUsage: { input: 60, output: 20, total: 1080, cost: 0.01, cacheRead: 900, cacheWrite: 100 },
+      } as unknown as PersistedRunState,
+    ],
+    getRun: () => undefined,
+  });
+
+  // persistedToSnapshot must carry tokens/tokenUsage through to every view.
+  const agents = model.agents("r-split", "Build");
+  assert.equal(agents[0].tokenUsage?.cacheRead, 900);
+  const phases = model.phases("r-split");
+  assert.equal(phases[0].fresh, 80);
+  assert.equal(phases[0].cacheRead, 900);
+  const runs = model.runs();
+  assert.equal(runs[0].fresh, 80);
+  assert.equal(runs[0].cacheRead, 900);
+});
+
+test("runs list never under-reports mixed runs (reported + estimate-only agents) (#57 regression)", () => {
+  const model = new NavigatorModel({
+    listRuns: () => [
+      {
+        runId: "r-mixed",
+        workflowName: "mixed",
+        status: "completed",
+        phases: [],
+        agents: [],
+        logs: [],
+        // One agent reported input+output=100; the rest only estimated into total.
+        tokenUsage: { input: 70, output: 30, total: 900, cost: 0, cacheRead: 0, cacheWrite: 0 },
+      } as unknown as PersistedRunState,
+    ],
+    getRun: () => undefined,
+  });
+  assert.equal(model.runs()[0].fresh, 900);
+  const lines = renderNavigator(new NavigatorState(), model, 80);
+  assert.match(lines.join("\n"), /900 tok/);
 });

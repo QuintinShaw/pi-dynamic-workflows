@@ -4,6 +4,7 @@
 
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import type { AgentUsage } from "./agent.js";
 import type { AgentHistoryEntry } from "./agent-history.js";
 import type { WorkflowErrorCode } from "./errors.js";
 import { workflowProjectPaths } from "./workflow-paths.js";
@@ -23,6 +24,10 @@ export interface PersistedAgentState {
   history?: AgentHistoryEntry[];
   startedAt?: string;
   endedAt?: string;
+  /** Tokens used by this agent (a scalar estimate when the provider reports no usage). */
+  tokens?: number;
+  /** Per-agent token usage breakdown, when the provider reported one. */
+  tokenUsage?: AgentUsage;
   /** The model this agent ran on (provider/id), when known. */
   model?: string;
 }

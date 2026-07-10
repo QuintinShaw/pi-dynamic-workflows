@@ -1,4 +1,5 @@
 import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import type { AgentUsage } from "./agent.js";
 import type { AgentHistoryEntry } from "./agent-history.js";
 import type { WorkflowErrorCode } from "./errors.js";
 import type { WorkflowMeta } from "./workflow.js";
@@ -16,17 +17,10 @@ export interface WorkflowAgentSnapshot {
   errorCode?: WorkflowErrorCode;
   recoverable?: boolean;
   history?: AgentHistoryEntry[];
-  /** Tokens used by this agent. */
+  /** Tokens used by this agent (a scalar estimate when the provider reports no usage). */
   tokens?: number;
   /** Per-agent token usage breakdown (fresh input+output vs cached), when known. */
-  tokenUsage?: {
-    input: number;
-    output: number;
-    total: number;
-    cost: number;
-    cacheRead: number;
-    cacheWrite: number;
-  };
+  tokenUsage?: AgentUsage;
   /** The model this agent ran on (provider/id), when known. */
   model?: string;
 }
@@ -70,10 +64,28 @@ export interface WorkflowDisplayOptions {
 }
 
 /**
- * Sum a set of agents into fresh (input+output) vs cacheRead totals. Agents whose
- * provider reported no usage breakdown contribute their scalar `tokens` as fresh, so
- * a mixed run (some agents with a breakdown, some without) still aggregates sensibly.
+ * Displayable fresh/cached figures from a usage breakdown and/or a scalar
+ * estimate. The token pipeline has two sources that don't always agree: the
+ * provider-reported breakdown (input/output/cacheRead/cacheWrite) and a scalar
+ * estimate (`total` at run level, `tokens` per agent) that keeps accruing even
+ * when the provider reports nothing. Rule: `fresh` is the reported input+output,
+ * but never less than what the estimate can account for after removing cache
+ * reads/writes. That keeps estimate-only providers, cost-only providers
+ * (billed but zero token counts), and mixed runs at the count the display
+ * showed before the split existed, instead of a false "0 tok".
  */
+export function tokenFigures(
+  usage: Partial<AgentUsage> | undefined,
+  scalarTokens?: number,
+): { fresh: number; cacheRead: number } {
+  const cacheRead = usage?.cacheRead ?? 0;
+  const cacheWrite = usage?.cacheWrite ?? 0;
+  const reported = (usage?.input ?? 0) + (usage?.output ?? 0);
+  const estimate = Math.max(scalarTokens ?? 0, usage?.total ?? 0);
+  return { fresh: Math.max(reported, estimate - cacheRead - cacheWrite), cacheRead };
+}
+
+/** Sum a set of agents into fresh vs cacheRead totals, via {@link tokenFigures}. */
 export function aggregateAgentUsage(agents: ReadonlyArray<Pick<WorkflowAgentSnapshot, "tokens" | "tokenUsage">>): {
   fresh: number;
   cacheRead: number;
@@ -81,12 +93,9 @@ export function aggregateAgentUsage(agents: ReadonlyArray<Pick<WorkflowAgentSnap
   let fresh = 0;
   let cacheRead = 0;
   for (const a of agents) {
-    if (a.tokenUsage) {
-      fresh += a.tokenUsage.input + a.tokenUsage.output;
-      cacheRead += a.tokenUsage.cacheRead;
-    } else {
-      fresh += a.tokens ?? 0;
-    }
+    const f = tokenFigures(a.tokenUsage, a.tokens);
+    fresh += f.fresh;
+    cacheRead += f.cacheRead;
   }
   return { fresh, cacheRead };
 }
@@ -104,6 +113,13 @@ export function fmtTokenCount(fresh: number, cacheRead: number, fmt: (n: number)
   const f = fmt(fresh) || "0";
   return cacheRead > 0 ? `${f} tok · ${fmt(cacheRead)} cached` : `${f} tok`;
 }
+
+/** "$1.23" from one cent up, four decimals below it — a real sub-cent cost never shows as "$0.00". */
+export function fmtCost(cost: number): string {
+  return `$${cost.toFixed(cost >= 0.01 ? 2 : 4)}`;
+}
+
+const fmtFull = (n: number): string => n.toLocaleString();
 
 export function createWorkflowSnapshot(meta: WorkflowMeta): WorkflowSnapshot {
   return {
@@ -212,6 +228,13 @@ export interface ThemeLike {
 /** Identity passthrough for contexts where no theme is available (tool text output). */
 const NO_THEME: ThemeLike = { fg: (_c, t) => t, bold: (t) => t };
 
+/** The bracketed per-agent token cell (" [89 tok · 3,000 cached]"), or "" when nothing is known yet. */
+function agentTokenCell(agent: WorkflowAgentSnapshot, theme: ThemeLike): string {
+  const { fresh, cacheRead } = tokenFigures(agent.tokenUsage, agent.tokens);
+  if (fresh + cacheRead <= 0) return "";
+  return theme.fg("dim", ` [${fmtTokenCount(fresh, cacheRead, fmtFull)}]`);
+}
+
 export function renderWorkflowLines(
   snapshot: WorkflowSnapshot,
   options: WorkflowDisplayOptions = {},
@@ -227,10 +250,9 @@ export function renderWorkflowLines(
         : "";
   // Build header with token info (and cost when the provider reports it)
   const usage = snapshot.tokenUsage;
-  const costInfo = usage?.cost ? ` · $${usage.cost.toFixed(4)}` : "";
-  const tokenInfo = usage
-    ? ` · ${fmtTokenCount(usage.input + usage.output, usage.cacheRead ?? 0, (n) => n.toLocaleString())}${costInfo}`
-    : "";
+  const costInfo = usage?.cost ? ` · ${fmtCost(usage.cost)}` : "";
+  const figures = tokenFigures(usage);
+  const tokenInfo = usage ? ` · ${fmtTokenCount(figures.fresh, figures.cacheRead, fmtFull)}${costInfo}` : "";
   const lines = [
     `${theme.bold(`◆ Workflow: ${snapshot.name}`)} (${snapshot.doneCount}/${snapshot.agentCount} done${state}${tokenInfo})`,
   ];
@@ -261,17 +283,9 @@ export function renderWorkflowLines(
     for (const agent of visibleAgents) {
       const order = `[${agent.id}]`;
       const result = showResultPreviews && agent.resultPreview ? ` — ${agent.resultPreview}` : "";
-      const agentTokens = agent.tokenUsage
-        ? theme.fg(
-            "dim",
-            ` [${fmtTokenCount(agent.tokenUsage.input + agent.tokenUsage.output, agent.tokenUsage.cacheRead, (n) =>
-              n.toLocaleString(),
-            )}]`,
-          )
-        : agent.tokens
-          ? theme.fg("dim", ` [${agent.tokens.toLocaleString()} tok]`)
-          : "";
-      lines.push(`    ${order} ${statusIcon(agent.status)} ${shorten(agent.label, 48)}${agentTokens}${result}`);
+      lines.push(
+        `    ${order} ${statusIcon(agent.status)} ${shorten(agent.label, 48)}${agentTokenCell(agent, theme)}${result}`,
+      );
     }
     if (agents.length > visibleAgents.length)
       lines.push(theme.fg("dim", `    … ${agents.length - visibleAgents.length} earlier agents`));
@@ -282,17 +296,9 @@ export function renderWorkflowLines(
     lines.push(theme.fg("accent", "  Unphased"));
     for (const agent of unphased.slice(-maxAgents)) {
       const result = showResultPreviews && agent.resultPreview ? ` — ${agent.resultPreview}` : "";
-      const agentTokens = agent.tokenUsage
-        ? theme.fg(
-            "dim",
-            ` [${fmtTokenCount(agent.tokenUsage.input + agent.tokenUsage.output, agent.tokenUsage.cacheRead, (n) =>
-              n.toLocaleString(),
-            )}]`,
-          )
-        : agent.tokens
-          ? theme.fg("dim", ` [${agent.tokens.toLocaleString()} tok]`)
-          : "";
-      lines.push(`    [${agent.id}] ${statusIcon(agent.status)} ${shorten(agent.label, 48)}${agentTokens}${result}`);
+      lines.push(
+        `    [${agent.id}] ${statusIcon(agent.status)} ${shorten(agent.label, 48)}${agentTokenCell(agent, theme)}${result}`,
+      );
     }
   }
 

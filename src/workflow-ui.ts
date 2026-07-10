@@ -16,8 +16,9 @@
 import type { ExtensionAPI, ExtensionUIContext, Theme } from "@earendil-works/pi-coding-agent";
 import type { Component, Focusable, TUI } from "@earendil-works/pi-tui";
 import { parseKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import type { AgentUsage } from "./agent.js";
 import type { WorkflowAgentSnapshot, WorkflowSnapshot } from "./display.js";
-import { aggregateAgentUsage, fmtTokenCount } from "./display.js";
+import { aggregateAgentUsage, fmtCost, fmtTokenCount, tokenFigures } from "./display.js";
 import type { PersistedRunState } from "./run-persistence.js";
 import { registerSavedWorkflow } from "./saved-commands.js";
 import type { WorkflowManager } from "./workflow-manager.js";
@@ -59,8 +60,7 @@ interface RunRow {
   status: string;
   done: number;
   total: number;
-  tokens: number;
-  /** Fresh (input+output) tokens for the whole run. */
+  /** Fresh tokens for the whole run (see tokenFigures for the fallback rule). */
   fresh: number;
   /** Cache-read tokens for the whole run. */
   cacheRead: number;
@@ -70,8 +70,7 @@ interface PhaseRow {
   title: string;
   done: number;
   total: number;
-  tokens: number;
-  /** Fresh (input+output) tokens summed across the phase's agents. */
+  /** Fresh tokens summed across the phase's agents. */
   fresh: number;
   /** Cache-read tokens summed across the phase's agents. */
   cacheRead: number;
@@ -82,14 +81,7 @@ interface AgentRow {
   status: string;
   phase?: string;
   tokens?: number;
-  tokenUsage?: {
-    input: number;
-    output: number;
-    total: number;
-    cost: number;
-    cacheRead: number;
-    cacheWrite: number;
-  };
+  tokenUsage?: AgentUsage;
   model?: string;
 }
 
@@ -120,15 +112,15 @@ export class NavigatorModel {
       const live = this.manager.getRun(p.runId);
       const agents = (live?.snapshot.agents ?? p.agents) as WorkflowAgentSnapshot[];
       const usage = live?.snapshot.tokenUsage ?? p.tokenUsage;
+      const figures = tokenFigures(usage);
       return {
         runId: p.runId,
         name: live?.snapshot.name ?? p.workflowName,
         status: live?.status ?? p.status,
         done: agents.filter((a) => a.status === "done").length,
         total: agents.length,
-        tokens: usage?.total ?? 0,
-        fresh: (usage?.input ?? 0) + (usage?.output ?? 0),
-        cacheRead: usage?.cacheRead ?? 0,
+        fresh: figures.fresh,
+        cacheRead: figures.cacheRead,
         cost: usage?.cost ?? 0,
       };
     });
@@ -172,7 +164,6 @@ export class NavigatorModel {
         title,
         done: agents.filter((a) => a.status === "done").length,
         total: agents.length,
-        tokens: agents.reduce((n, a) => n + (a.tokens ?? 0), 0),
         fresh: usage.fresh,
         cacheRead: usage.cacheRead,
       };
@@ -227,6 +218,8 @@ function persistedToSnapshot(p: PersistedRunState): WorkflowSnapshot {
       errorCode: a.errorCode,
       recoverable: a.recoverable,
       history: a.history,
+      tokens: a.tokens,
+      tokenUsage: a.tokenUsage,
       model: a.model,
     })),
     agentCount: p.agents.length,
@@ -358,10 +351,6 @@ function pad(n: number): string {
   return n.toLocaleString();
 }
 
-function fmtTokens(t: number): string {
-  return t > 0 ? `${pad(t)} tok` : "";
-}
-
 // ───────────────────────────────────────────────────────────────────────────
 // Two-pane (Phases | agents) renderer — Claude-Code parity.
 //
@@ -482,9 +471,8 @@ function rightAgentRow(
   theme: ThemeLike,
 ): string {
   const dotColor = AGENT_DOT_COLOR[a.status] ?? "dim";
-  const stats = a.tokenUsage
-    ? fmtTokenCount(a.tokenUsage.input + a.tokenUsage.output, a.tokenUsage.cacheRead, compactTokens)
-    : `${compactTokens(a.tokens ?? 0)} tok`;
+  const fig = tokenFigures(a.tokenUsage, a.tokens);
+  const stats = fmtTokenCount(fig.fresh, fig.cacheRead, compactTokens);
   const model = shortModel(a.model) ?? "";
 
   // Stable 2-cell marker so columns never shift on selection: "› " | "  ".
@@ -796,10 +784,8 @@ export function renderNavigator(
     // Render runs
     runs.forEach((r, i) => {
       const icon = STATUS_ICON[r.status] ?? "?";
-      // Prefer the fresh/cached split; fall back to the total for legacy
-      // persisted runs whose usage predates the breakdown.
-      const tok = r.fresh + r.cacheRead > 0 ? fmtTokenCount(r.fresh, r.cacheRead, pad) : fmtTokens(r.tokens);
-      const meta = [`${r.done}/${r.total}`, tok, r.cost > 0 ? `$${r.cost.toFixed(4)}` : ""].filter(Boolean).join(" · ");
+      const tok = r.fresh + r.cacheRead > 0 ? fmtTokenCount(r.fresh, r.cacheRead, pad) : "";
+      const meta = [`${r.done}/${r.total}`, tok, r.cost > 0 ? fmtCost(r.cost) : ""].filter(Boolean).join(" · ");
       lines.push(sel(i, `${icon} ${r.name}  ${dim(`${r.runId} · ${r.status} · ${meta}`)}`));
     });
     // Render saved workflows after a separator
@@ -887,13 +873,11 @@ function twoPaneHeader(
   const status = model.runStatus(runId);
   let done = 0;
   let total = 0;
-  let tokens = 0;
   let fresh = 0;
   let cacheRead = 0;
   for (const p of phases) {
     done += p.done;
     total += p.total;
-    tokens += p.tokens;
     fresh += p.fresh;
     cacheRead += p.cacheRead;
   }
@@ -902,7 +886,7 @@ function twoPaneHeader(
   const line0 = theme.fg("accent", theme.bold(nameText));
 
   // Line 1 — left status, right summary.
-  const rightRaw = `${done}/${total} ${pluralize("agent", total)}${tokens > 0 ? ` · ${fmtTokenCount(fresh, cacheRead, compactTokens)}` : ""}`;
+  const rightRaw = `${done}/${total} ${pluralize("agent", total)}${fresh + cacheRead > 0 ? ` · ${fmtTokenCount(fresh, cacheRead, compactTokens)}` : ""}`;
   const rightW = visibleWidth(rightRaw);
   const gap = 2;
   let line1: string;

@@ -140,7 +140,8 @@ describe("renderWorkflowText", () => {
     const snap = createWorkflowSnapshot(fakeMeta());
     snap.tokenUsage = { input: 1000, output: 500, total: 1500, cost: 0.042 };
     const text = renderWorkflowLines(snap).join("\n");
-    assert.ok(text.includes("$0.0420"), "should show cost");
+    // fmtCost: 2 decimals from one cent up, 4 below it (shared across all surfaces).
+    assert.ok(text.includes("$0.04"), "should show cost");
   });
 
   it("shows token info without cost when cost is absent", async () => {
@@ -192,6 +193,56 @@ describe("renderWorkflowText", () => {
     // fresh (input+output = 100,000) reads as "tok"; cacheRead (3,000,000) as "cached" (locale-flexible separators)
     assert.ok(/100[ ,.\u00a0]000 tok/.test(text), "shows fresh (input+output) as tok");
     assert.ok(/3[ ,.\u00a0]000[ ,.\u00a0]000 cached/.test(text), "shows cacheRead as cached");
+  });
+
+  it("tokenFigures uses the breakdown when it carries signal and the estimate otherwise", async () => {
+    const { tokenFigures } = await loadDisplay();
+    // Reporting provider: total = input+output+cacheRead+cacheWrite, both paths agree.
+    assert.deepEqual(tokenFigures({ input: 80, output: 20, total: 1100, cacheRead: 900, cacheWrite: 100 }), {
+      fresh: 100,
+      cacheRead: 900,
+    });
+    // Estimate-only (provider reported nothing): the scalar total survives as fresh.
+    assert.deepEqual(tokenFigures({ input: 0, output: 0, total: 800, cacheRead: 0, cacheWrite: 0 }), {
+      fresh: 800,
+      cacheRead: 0,
+    });
+    // Cost-only agent: all-zero breakdown, scalar estimate alongside.
+    assert.deepEqual(tokenFigures({ input: 0, output: 0, total: 0, cacheRead: 0, cacheWrite: 0, cost: 0.02 }, 384), {
+      fresh: 384,
+      cacheRead: 0,
+    });
+    // Mixed run: some agents reported (input+output=100), the rest only estimated into total.
+    assert.deepEqual(tokenFigures({ input: 70, output: 30, total: 900, cacheRead: 0, cacheWrite: 0 }), {
+      fresh: 900,
+      cacheRead: 0,
+    });
+    // No usage object at all.
+    assert.deepEqual(tokenFigures(undefined, 500), { fresh: 500, cacheRead: 0 });
+    assert.deepEqual(tokenFigures(undefined), { fresh: 0, cacheRead: 0 });
+  });
+
+  it("header falls back to the estimated total when the provider reported no usage (#57 regression)", async () => {
+    const { createWorkflowSnapshot, renderWorkflowLines } = await loadDisplay();
+    const snap = createWorkflowSnapshot(fakeMeta());
+    // onUsage never fired: breakdown is all-zero, total carries the estimate.
+    snap.tokenUsage = { input: 0, output: 0, total: 800 };
+    const text = renderWorkflowLines(snap).join("\n");
+    assert.ok(text.includes("800 tok"), `estimate should survive in the header; got: ${text}`);
+    assert.ok(!/\b0 tok/.test(text), `must not render a zero breakdown; got: ${text}`);
+  });
+
+  it("keeps the scalar estimate for a cost-only agent row (#57 regression)", async () => {
+    const { createWorkflowSnapshot, renderWorkflowLines } = await loadDisplay();
+    const snap = createWorkflowSnapshot(fakeMeta());
+    snap.agents = [
+      agent(1, "cost-only-agent", "done", "Research", {
+        tokens: 384,
+        tokenUsage: { input: 0, output: 0, total: 0, cacheRead: 0, cacheWrite: 0, cost: 0.02 },
+      }),
+    ] as never[];
+    const text = renderWorkflowLines(snap).join("\n");
+    assert.ok(/\[384 tok\]/.test(text), `cost-only agent should show its scalar estimate; got: ${text}`);
   });
 
   it("truncates long agent labels", async () => {
