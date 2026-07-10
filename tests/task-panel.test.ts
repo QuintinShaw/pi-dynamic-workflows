@@ -144,6 +144,28 @@ describe("installResultDelivery", () => {
     assert.ok(!/\b0 tok/.test(content), `must not render a zero breakdown; got: ${content}`);
   });
 
+  it("suppresses the token segment when the run-level aggregate is all-zero (#57 regression)", () => {
+    const pi = createMockPi();
+    // e.g. a fully journal-replayed resume: every agent came from cache, nothing accrued.
+    const manager = createMockManager(
+      makeRun({
+        result: {
+          agentCount: 3,
+          durationMs: 1500,
+          tokenUsage: { input: 0, output: 0, total: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+          result: { verdict: "done" },
+        },
+      }),
+    );
+
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    manager.emit("complete", { runId: "test-run-1" });
+
+    const content = (pi as unknown as { _calls: { content: string }[] })._calls[0].content;
+    assert.ok(!/\b0 tok/.test(content), `an all-zero aggregate must not render "0 tok"; got: ${content}`);
+    assert.ok(content.includes("3 agents"), "the rest of the line is intact");
+  });
+
   // ── deliverText: fallback chain ──
 
   it("falls back to report when verdict is absent", () => {

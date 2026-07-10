@@ -198,9 +198,15 @@ describe("renderWorkflowText", () => {
   it("tokenFigures uses the breakdown when it carries signal and the estimate otherwise", async () => {
     const { tokenFigures } = await loadDisplay();
     // Reporting provider: total = input+output+cacheRead+cacheWrite, both paths agree.
+    // cacheWrite counts as fresh — it is first-time ingestion billed at full/premium price.
     assert.deepEqual(tokenFigures({ input: 80, output: 20, total: 1100, cacheRead: 900, cacheWrite: 100 }), {
-      fresh: 100,
+      fresh: 200,
       cacheRead: 900,
+    });
+    // Cache-creating first turn: the written prefix must not vanish from the count.
+    assert.deepEqual(tokenFigures({ input: 6000, output: 1000, total: 207000, cacheRead: 0, cacheWrite: 200000 }), {
+      fresh: 207000,
+      cacheRead: 0,
     });
     // Estimate-only (provider reported nothing): the scalar total survives as fresh.
     assert.deepEqual(tokenFigures({ input: 0, output: 0, total: 800, cacheRead: 0, cacheWrite: 0 }), {
@@ -243,6 +249,22 @@ describe("renderWorkflowText", () => {
     ] as never[];
     const text = renderWorkflowLines(snap).join("\n");
     assert.ok(/\[384 tok\]/.test(text), `cost-only agent should show its scalar estimate; got: ${text}`);
+  });
+
+  it("suppresses the header token segment for an all-zero usage aggregate (#57 regression)", async () => {
+    const { createWorkflowSnapshot, renderWorkflowLines } = await loadDisplay();
+    const snap = createWorkflowSnapshot(fakeMeta());
+    // e.g. a fully journal-replayed resume, or a run whose agents were all skipped.
+    snap.tokenUsage = { input: 0, output: 0, total: 0 };
+    const text = renderWorkflowLines(snap).join("\n");
+    assert.ok(!/\b0 tok/.test(text), `an all-zero aggregate must not render "0 tok"; got: ${text}`);
+  });
+
+  it("fmtCost never renders a real cost as a zero-looking figure", async () => {
+    const { fmtCost } = await loadDisplay();
+    assert.equal(fmtCost(6.7), "$6.70");
+    assert.equal(fmtCost(0.0042), "$0.0042");
+    assert.equal(fmtCost(0.00003), "<$0.0001");
   });
 
   it("truncates long agent labels", async () => {

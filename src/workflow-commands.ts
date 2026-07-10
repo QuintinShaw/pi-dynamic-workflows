@@ -4,7 +4,13 @@
  */
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { recomputeWorkflowSnapshot, renderWorkflowText, type WorkflowSnapshot } from "./display.js";
+import {
+  fmtTokenSegment,
+  recomputeWorkflowSnapshot,
+  renderWorkflowText,
+  tokenFigures,
+  type WorkflowSnapshot,
+} from "./display.js";
 import { type EffortState, effortDirective } from "./effort-command.js";
 import type { PersistedRunState } from "./run-persistence.js";
 import { registerSavedWorkflow } from "./saved-commands.js";
@@ -31,7 +37,8 @@ function summarizeRun(run: PersistedRunState): string {
   const icon = STATUS_ICON[run.status] ?? "?";
   const done = run.agents.filter((a) => a.status === "done").length;
   const total = run.agents.length;
-  const tokens = run.tokenUsage ? ` · ${run.tokenUsage.total.toLocaleString()} tok` : "";
+  const segment = fmtTokenSegment(tokenFigures(run.tokenUsage), (n) => n.toLocaleString());
+  const tokens = segment ? ` · ${segment}` : "";
   return `${icon} ${run.runId}  ${run.workflowName} [${run.status}] ${done}/${total} agents${tokens}`;
 }
 
@@ -97,7 +104,8 @@ function renderPersistedStatus(run: PersistedRunState): string {
       agent.status === "done" ? "✓" : agent.status === "error" ? "✗" : agent.status === "running" ? "◆" : "·";
     lines.push(`  ${icon} ${agent.label}`);
   }
-  if (run.tokenUsage) lines.push(`  tokens: ${run.tokenUsage.total.toLocaleString()}`);
+  const tokenSegment = fmtTokenSegment(tokenFigures(run.tokenUsage), (n) => n.toLocaleString());
+  if (tokenSegment) lines.push(`  tokens: ${tokenSegment}`);
   if (run.durationMs) lines.push(`  duration: ${(run.durationMs / 1000).toFixed(1)}s`);
   return lines.join("\n");
 }

@@ -68,21 +68,23 @@ export interface WorkflowDisplayOptions {
  * estimate. The token pipeline has two sources that don't always agree: the
  * provider-reported breakdown (input/output/cacheRead/cacheWrite) and a scalar
  * estimate (`total` at run level, `tokens` per agent) that keeps accruing even
- * when the provider reports nothing. Rule: `fresh` is the reported input+output,
- * but never less than what the estimate can account for after removing cache
- * reads/writes. That keeps estimate-only providers, cost-only providers
- * (billed but zero token counts), and mixed runs at the count the display
- * showed before the split existed, instead of a false "0 tok".
+ * when the provider reports nothing. Two rules:
+ * - `fresh` counts input+output+cacheWrite: cache writes are first-time
+ *   ingestion billed at full (or premium) price, so hiding them would
+ *   under-report real spend; only cacheRead is the cheap reuse shown apart.
+ * - `fresh` is never less than what the estimate can account for after
+ *   removing cache reads, so estimate-only providers, cost-only providers
+ *   (billed but zero token counts), and mixed runs keep the count the display
+ *   showed before the split existed, instead of a false "0 tok".
  */
 export function tokenFigures(
   usage: Partial<AgentUsage> | undefined,
   scalarTokens?: number,
 ): { fresh: number; cacheRead: number } {
   const cacheRead = usage?.cacheRead ?? 0;
-  const cacheWrite = usage?.cacheWrite ?? 0;
-  const reported = (usage?.input ?? 0) + (usage?.output ?? 0);
+  const reported = (usage?.input ?? 0) + (usage?.output ?? 0) + (usage?.cacheWrite ?? 0);
   const estimate = Math.max(scalarTokens ?? 0, usage?.total ?? 0);
-  return { fresh: Math.max(reported, estimate - cacheRead - cacheWrite), cacheRead };
+  return { fresh: Math.max(reported, estimate - cacheRead), cacheRead };
 }
 
 /** Sum a set of agents into fresh vs cacheRead totals, via {@link tokenFigures}. */
@@ -105,17 +107,30 @@ export function aggregateAgentUsage(agents: ReadonlyArray<Pick<WorkflowAgentSnap
  * "89K tok · 3.0M cached" when there were cache reads. The cache segment is shown
  * only when `cacheRead > 0`, so a non-caching provider (or a single-turn agent that
  * never re-reads its cache) reads as a plain "tok" rather than a bare, contextless
- * "fresh". `cacheWrite` (the one-time cache-creation premium) is intentionally left
- * out of both figures; its dollar impact already shows in the cost readout. `fmt`
- * adapts the number style per surface (compact in panels, full in the print view).
+ * "fresh". `fmt` adapts the number style per surface (compact in panels, full in
+ * the print view).
  */
 export function fmtTokenCount(fresh: number, cacheRead: number, fmt: (n: number) => string): string {
   const f = fmt(fresh) || "0";
   return cacheRead > 0 ? `${f} tok · ${fmt(cacheRead)} cached` : `${f} tok`;
 }
 
-/** "$1.23" from one cent up, four decimals below it — a real sub-cent cost never shows as "$0.00". */
+/**
+ * Like {@link fmtTokenCount}, but "" when nothing is known yet (both figures 0),
+ * so surfaces omit the segment instead of rendering a false "0 tok" — e.g. for a
+ * journal-replayed resume or a run whose agents were all skipped. Every surface
+ * should use this rather than re-implementing the zero guard.
+ */
+export function fmtTokenSegment(figures: { fresh: number; cacheRead: number }, fmt: (n: number) => string): string {
+  return figures.fresh + figures.cacheRead > 0 ? fmtTokenCount(figures.fresh, figures.cacheRead, fmt) : "";
+}
+
+/**
+ * "$1.23" from one cent up, four decimals below it, and "<$0.0001" for
+ * anything smaller — a real cost never rounds to a zero-looking "$0.00".
+ */
 export function fmtCost(cost: number): string {
+  if (cost > 0 && cost < 0.0001) return "<$0.0001";
   return `$${cost.toFixed(cost >= 0.01 ? 2 : 4)}`;
 }
 
@@ -230,9 +245,8 @@ const NO_THEME: ThemeLike = { fg: (_c, t) => t, bold: (t) => t };
 
 /** The bracketed per-agent token cell (" [89 tok · 3,000 cached]"), or "" when nothing is known yet. */
 function agentTokenCell(agent: WorkflowAgentSnapshot, theme: ThemeLike): string {
-  const { fresh, cacheRead } = tokenFigures(agent.tokenUsage, agent.tokens);
-  if (fresh + cacheRead <= 0) return "";
-  return theme.fg("dim", ` [${fmtTokenCount(fresh, cacheRead, fmtFull)}]`);
+  const segment = fmtTokenSegment(tokenFigures(agent.tokenUsage, agent.tokens), fmtFull);
+  return segment ? theme.fg("dim", ` [${segment}]`) : "";
 }
 
 export function renderWorkflowLines(
@@ -251,8 +265,8 @@ export function renderWorkflowLines(
   // Build header with token info (and cost when the provider reports it)
   const usage = snapshot.tokenUsage;
   const costInfo = usage?.cost ? ` · ${fmtCost(usage.cost)}` : "";
-  const figures = tokenFigures(usage);
-  const tokenInfo = usage ? ` · ${fmtTokenCount(figures.fresh, figures.cacheRead, fmtFull)}${costInfo}` : "";
+  const segment = fmtTokenSegment(tokenFigures(usage), fmtFull);
+  const tokenInfo = `${segment ? ` · ${segment}` : ""}${costInfo}`;
   const lines = [
     `${theme.bold(`◆ Workflow: ${snapshot.name}`)} (${snapshot.doneCount}/${snapshot.agentCount} done${state}${tokenInfo})`,
   ];

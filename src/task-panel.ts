@@ -12,7 +12,7 @@ import { type Component, type TUI, truncateToWidth, visibleWidth } from "@earend
 import {
   aggregateAgentUsage,
   fmtCost,
-  fmtTokenCount,
+  fmtTokenSegment,
   shorten,
   statusIcon,
   tokenFigures,
@@ -101,8 +101,8 @@ export function deliverText(run: ManagedRun, opts: { resultPath?: string; maxCha
   const summary = summarizeResult(run.result?.result, opts.maxChars);
   const tu = run.result?.tokenUsage;
   const cost = tu?.cost ? ` · ${fmtCost(tu.cost)}` : "";
-  const fig = tokenFigures(tu);
-  const tokens = tu ? ` · ${fmtTokenCount(fig.fresh, fig.cacheRead, fmtTokensShort)}${cost}` : "";
+  const segment = fmtTokenSegment(tokenFigures(tu), fmtTokensShort);
+  const tokens = `${segment ? ` · ${segment}` : ""}${cost}`;
   const agents = run.result?.agentCount ?? run.snapshot.agentCount;
   const duration = run.result?.durationMs ? ` · ${(run.result.durationMs / 1000).toFixed(1)}s` : "";
   const lines = [
@@ -322,14 +322,11 @@ function renderRunBody(
     const skipped = phaseAgents.filter((a) => a.status === "skipped").length;
     const complete = done + errors + skipped === phaseAgents.length;
     const marker = running > 0 || (!complete && snap.currentPhase === title) ? "▶" : complete ? "✓" : " ";
-    const phaseUsage = aggregateAgentUsage(phaseAgents);
     const phaseMeta = [
       `${done}/${phaseAgents.length} agents`,
       running ? `${running} running` : "",
       errors ? `${errors} errors` : "",
-      phaseUsage.fresh + phaseUsage.cacheRead > 0
-        ? fmtTokenCount(phaseUsage.fresh, phaseUsage.cacheRead, fmtTokensShort)
-        : "",
+      fmtTokenSegment(aggregateAgentUsage(phaseAgents), fmtTokensShort),
     ]
       .filter(Boolean)
       .join(" · ");
@@ -337,9 +334,8 @@ function renderRunBody(
 
     const visible = phaseAgents.slice(-maxAgents);
     for (const a of visible) {
-      const fig = tokenFigures(a.tokenUsage, a.tokens);
-      const tok =
-        fig.fresh + fig.cacheRead > 0 ? dim(` ${fmtTokenCount(fig.fresh, fig.cacheRead, fmtTokensShort)}`) : "";
+      const segment = fmtTokenSegment(tokenFigures(a.tokenUsage, a.tokens), fmtTokensShort);
+      const tok = segment ? dim(` ${segment}`) : "";
       const mdl = shortModel(a.model);
       const model = mdl ? dim(` · ${mdl}`) : "";
       lines.push(`    [${a.id}] ${statusIcon(a.status)} ${shorten(a.label, 40)}${tok}${model}`);
@@ -377,21 +373,20 @@ export function renderPanelDetailed(
     const icon = r.status === "paused" ? "⏸" : "◆";
     const usage = snap?.tokenUsage ?? r.tokenUsage;
     // The run-level tokenUsage aggregate is only finalized when the run ends, so
-    // it reads 0 for the whole live run. Per-agent `tokens` update on each agent
-    // completion, so sum those for a live total (and keep the header consistent
-    // with the per-phase subtotals). Note: tokens land at agent-completion
-    // granularity, so the rate reflects completion throughput — it decays to 0
-    // during a single long-running agent or a stall (which is the intended signal).
-    const total = agents.reduce((n, a) => n + (a.tokens ?? 0), 0);
-    // Sample the running total and derive the rolling token/s. Paused runs don't
-    // accrue tokens, so their rate is suppressed (a stalled rate would mislead).
-    sampleTokens(r.runId, total, now);
-    const rate = r.status === "running" ? tokensPerSecond(r.runId) : 0;
+    // it reads 0 for the whole live run; per-agent figures update on each agent
+    // completion, so aggregate those instead. The rate samples the same
+    // fresh+cacheRead sum the header displays, so tok/s tracks the visible
+    // figures. Tokens land at agent-completion granularity, so the rate reflects
+    // completion throughput — it decays to 0 during a single long-running agent
+    // or a stall (which is the intended signal). Paused runs don't accrue
+    // tokens, so their rate is suppressed (a stalled rate would mislead).
     const runUsage = aggregateAgentUsage(agents);
+    sampleTokens(r.runId, runUsage.fresh + runUsage.cacheRead, now);
+    const rate = r.status === "running" ? tokensPerSecond(r.runId) : 0;
     const meta = [
       `${done}/${agents.length} agents`,
       snap?.currentPhase || "",
-      runUsage.fresh + runUsage.cacheRead > 0 ? fmtTokenCount(runUsage.fresh, runUsage.cacheRead, fmtTokensShort) : "",
+      fmtTokenSegment(runUsage, fmtTokensShort),
       // (cost is only known once the run finalizes its usage.)
       usage?.cost ? fmtCost(usage.cost) : "",
       rate > 0 ? `${Math.round(rate)} tok/s` : "",

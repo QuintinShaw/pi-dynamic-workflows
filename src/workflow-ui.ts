@@ -18,7 +18,7 @@ import type { Component, Focusable, TUI } from "@earendil-works/pi-tui";
 import { parseKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import type { AgentUsage } from "./agent.js";
 import type { WorkflowAgentSnapshot, WorkflowSnapshot } from "./display.js";
-import { aggregateAgentUsage, fmtCost, fmtTokenCount, tokenFigures } from "./display.js";
+import { aggregateAgentUsage, fmtCost, fmtTokenCount, fmtTokenSegment, tokenFigures } from "./display.js";
 import type { PersistedRunState } from "./run-persistence.js";
 import { registerSavedWorkflow } from "./saved-commands.js";
 import type { WorkflowManager } from "./workflow-manager.js";
@@ -112,7 +112,14 @@ export class NavigatorModel {
       const live = this.manager.getRun(p.runId);
       const agents = (live?.snapshot.agents ?? p.agents) as WorkflowAgentSnapshot[];
       const usage = live?.snapshot.tokenUsage ?? p.tokenUsage;
-      const figures = tokenFigures(usage);
+      // The run-level aggregate is authoritative but only lands when the run
+      // ends; per-agent figures update live. Use whichever accounts for more
+      // tokens, so live runs show a count in the list (agreeing with the phase
+      // view) and finished/legacy runs keep the final aggregate.
+      const fromUsage = tokenFigures(usage);
+      const fromAgents = aggregateAgentUsage(agents);
+      const figures =
+        fromAgents.fresh + fromAgents.cacheRead > fromUsage.fresh + fromUsage.cacheRead ? fromAgents : fromUsage;
       return {
         runId: p.runId,
         name: live?.snapshot.name ?? p.workflowName,
@@ -471,8 +478,7 @@ function rightAgentRow(
   theme: ThemeLike,
 ): string {
   const dotColor = AGENT_DOT_COLOR[a.status] ?? "dim";
-  const fig = tokenFigures(a.tokenUsage, a.tokens);
-  const stats = fmtTokenCount(fig.fresh, fig.cacheRead, compactTokens);
+  const stats = fmtTokenSegment(tokenFigures(a.tokenUsage, a.tokens), compactTokens);
   const model = shortModel(a.model) ?? "";
 
   // Stable 2-cell marker so columns never shift on selection: "› " | "  ".
@@ -784,7 +790,7 @@ export function renderNavigator(
     // Render runs
     runs.forEach((r, i) => {
       const icon = STATUS_ICON[r.status] ?? "?";
-      const tok = r.fresh + r.cacheRead > 0 ? fmtTokenCount(r.fresh, r.cacheRead, pad) : "";
+      const tok = fmtTokenSegment(r, pad);
       const meta = [`${r.done}/${r.total}`, tok, r.cost > 0 ? fmtCost(r.cost) : ""].filter(Boolean).join(" · ");
       lines.push(sel(i, `${icon} ${r.name}  ${dim(`${r.runId} · ${r.status} · ${meta}`)}`));
     });
@@ -886,7 +892,8 @@ function twoPaneHeader(
   const line0 = theme.fg("accent", theme.bold(nameText));
 
   // Line 1 — left status, right summary.
-  const rightRaw = `${done}/${total} ${pluralize("agent", total)}${fresh + cacheRead > 0 ? ` · ${fmtTokenCount(fresh, cacheRead, compactTokens)}` : ""}`;
+  const headerSegment = fmtTokenSegment({ fresh, cacheRead }, compactTokens);
+  const rightRaw = `${done}/${total} ${pluralize("agent", total)}${headerSegment ? ` · ${headerSegment}` : ""}`;
   const rightW = visibleWidth(rightRaw);
   const gap = 2;
   let line1: string;

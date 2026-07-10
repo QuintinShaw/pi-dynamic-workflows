@@ -708,10 +708,11 @@ test("persisted runs keep the per-agent split across sessions (#57 regression)",
   const agents = model.agents("r-split", "Build");
   assert.equal(agents[0].tokenUsage?.cacheRead, 900);
   const phases = model.phases("r-split");
-  assert.equal(phases[0].fresh, 80);
+  // fresh = input+output+cacheWrite (cache writes are billed first-time ingestion).
+  assert.equal(phases[0].fresh, 180);
   assert.equal(phases[0].cacheRead, 900);
   const runs = model.runs();
-  assert.equal(runs[0].fresh, 80);
+  assert.equal(runs[0].fresh, 180);
   assert.equal(runs[0].cacheRead, 900);
 });
 
@@ -734,4 +735,40 @@ test("runs list never under-reports mixed runs (reported + estimate-only agents)
   assert.equal(model.runs()[0].fresh, 900);
   const lines = renderNavigator(new NavigatorState(), model, 80);
   assert.match(lines.join("\n"), /900 tok/);
+});
+
+test("runs list aggregates per-agent figures for live runs whose run-level usage has not landed (#57 regression)", () => {
+  const snapshot = {
+    name: "live-run",
+    phases: ["P"],
+    currentPhase: "P",
+    logs: [],
+    agents: [
+      { id: 1, label: "a", phase: "P", prompt: "x", status: "done", tokens: 1200 },
+      { id: 2, label: "b", phase: "P", prompt: "y", status: "running", tokens: 0 },
+    ],
+    agentCount: 2,
+    runningCount: 1,
+    doneCount: 1,
+    errorCount: 0,
+    // Run-level aggregate only lands at completion — absent while live.
+  } as unknown as WorkflowSnapshot;
+  const model = new NavigatorModel({
+    listRuns: () => [
+      {
+        runId: "r-live",
+        workflowName: "live-run",
+        status: "running",
+        phases: ["P"],
+        agents: snapshot.agents,
+        logs: [],
+      } as unknown as PersistedRunState,
+    ],
+    getRun: (id: string) =>
+      id === "r-live" ? ({ runId: "r-live", status: "running", snapshot } as unknown as ManagedRun) : undefined,
+  });
+  // The list must agree with the phase view (both aggregate per-agent figures).
+  assert.equal(model.runs()[0].fresh, 1200);
+  const lines = renderNavigator(new NavigatorState(), model, 80);
+  assert.match(lines.join("\n"), /1,200 tok|1[ .\u00a0]200 tok/);
 });
