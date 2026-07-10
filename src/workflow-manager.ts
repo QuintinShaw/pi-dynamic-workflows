@@ -176,9 +176,16 @@ export class WorkflowManager extends EventEmitter {
     args?: unknown,
     exec: ExecOptions = {},
   ): { runId: string; promise: Promise<WorkflowRunResult> } {
-    const runId = generateRunId();
-    const controller = new AbortController();
     const parsed = parseWorkflowScript(script);
+    const slug = parsed.meta.name
+      ? parsed.meta.name
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, "-")
+          .replace(/^-+|-+$/g, "")
+          .slice(0, 40) || "workflow"
+      : "";
+    const runId = slug ? `${slug}-${generateRunId()}` : generateRunId();
+    const controller = new AbortController();
     const lease = this.persistence.acquireRunLease(runId);
     if (!lease) throw new Error(`Could not acquire workflow run lease for ${runId}`);
 
@@ -260,8 +267,16 @@ export class WorkflowManager extends EventEmitter {
   /** Build a fresh managed run with an empty snapshot. */
   private createManaged(script: string, args?: unknown): ManagedRun {
     const parsed = parseWorkflowScript(script);
+    const slug = parsed.meta.name
+      ? parsed.meta.name
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, "-")
+          .replace(/^-+|-+$/g, "")
+          .slice(0, 40) || "workflow"
+      : "";
+    const runId = slug ? `${slug}-${generateRunId()}` : generateRunId();
     return {
-      runId: generateRunId(),
+      runId,
       status: "running",
       snapshot: {
         name: parsed.meta.name,
