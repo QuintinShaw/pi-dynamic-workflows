@@ -43,7 +43,7 @@ export function modelRoutingGuideline(registry?: ModelRegistry | (() => ModelReg
     "Big tier: synthesis/judgment/decision agents spanning the full context.",
     "An agent with no opts.tier and no opts.model falls back to the user's medium tier; do not rely on that — tag agents explicitly so small/big are used where they fit.",
     "If the user named a specific model, use opts.model with that exact provider/id; opts.model always takes precedence over opts.tier.",
-    "Exact model specs may include Pi CLI-style thinking suffixes such as openai-codex/gpt-5.5:xhigh when the user requests a specific effort level.",
+    "Exact model specs may include Pi CLI-style thinking suffixes such as openai-codex/gpt-5.5:xhigh or anthropic/claude-fable-5:max when the user requests a specific effort level.",
     list,
   ].join(" ");
 }
