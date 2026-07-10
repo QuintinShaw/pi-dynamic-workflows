@@ -189,9 +189,9 @@ describe("renderWorkflowText", () => {
       }),
     ] as never[];
     const text = renderWorkflowLines(snap).join("\n");
-    // fresh = input+output = 100,000; cache = cacheRead = 3,000,000 (locale-flexible separators)
-    assert.ok(/100[ ,.\u00a0]000 fresh/.test(text), "shows fresh = input+output");
-    assert.ok(/3[ ,.\u00a0]000[ ,.\u00a0]000 cache/.test(text), "shows cache = cacheRead");
+    // fresh (input+output = 100,000) reads as "tok"; cacheRead (3,000,000) as "cached" (locale-flexible separators)
+    assert.ok(/100[ ,.\u00a0]000 tok/.test(text), "shows fresh (input+output) as tok");
+    assert.ok(/3[ ,.\u00a0]000[ ,.\u00a0]000 cached/.test(text), "shows cacheRead as cached");
   });
 
   it("truncates long agent labels", async () => {
@@ -648,8 +648,8 @@ describe("deliverText", () => {
   it("includes token count when available", async () => {
     const { deliverText } = await loadTaskPanel();
     const text = deliverText(fakeManagedRun());
-    assert.ok(text.includes("150"), "should show fresh token count");
-    assert.ok(text.includes("fresh"), "should label fresh tokens");
+    assert.ok(text.includes("150"), "should show the token count");
+    assert.ok(text.includes("tok"), "should label the token count");
   });
 
   it("includes agent count", async () => {

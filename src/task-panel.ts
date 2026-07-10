@@ -9,7 +9,14 @@
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionUIContext, Theme } from "@earendil-works/pi-coding-agent";
 import { type Component, type TUI, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { shorten, statusIcon, type WorkflowAgentSnapshot, type WorkflowSnapshot } from "./display.js";
+import {
+  aggregateAgentUsage,
+  fmtTokenCount,
+  shorten,
+  statusIcon,
+  type WorkflowAgentSnapshot,
+  type WorkflowSnapshot,
+} from "./display.js";
 import type { ManagedRun, WorkflowManager } from "./workflow-manager.js";
 import type { WorkflowStorage } from "./workflow-saved.js";
 import type { WorkflowSettings } from "./workflow-settings.js";
@@ -92,7 +99,7 @@ export function deliverText(run: ManagedRun, opts: { resultPath?: string; maxCha
   const summary = summarizeResult(run.result?.result, opts.maxChars);
   const tu = run.result?.tokenUsage;
   const cost = tu?.cost ? ` · $${tu.cost.toFixed(tu.cost >= 0.01 ? 2 : 4)}` : "";
-  const tokens = tu ? ` · ${fmtFreshCache(tu.input, tu.output, tu.cacheRead ?? 0)}${cost}` : "";
+  const tokens = tu ? ` · ${fmtTokenCount(tu.input + tu.output, tu.cacheRead ?? 0, fmtTokensShort)}${cost}` : "";
   const agents = run.result?.agentCount ?? run.snapshot.agentCount;
   const duration = run.result?.durationMs ? ` · ${(run.result.durationMs / 1000).toFixed(1)}s` : "";
   const lines = [
@@ -279,19 +286,6 @@ function fmtTokensShort(n: number): string {
   return `${(n / 1_000_000).toFixed(1)}M`;
 }
 
-/**
- * Format a fresh (input+output) vs cache (cacheRead) token split. The cache segment
- * is omitted when there were no cache reads (e.g. a provider without prompt caching),
- * so it reads "6.3M fresh" rather than a dangling "6.3M fresh ·  cache". cacheWrite (the
- * one-time cache-creation premium) is intentionally excluded from both counts; its dollar
- * impact already shows in the delivery line's $cost.
- */
-function fmtFreshCache(input: number, output: number, cacheRead: number): string {
-  const fresh = fmtTokensShort(input + output) || "0";
-  const cache = fmtTokensShort(cacheRead);
-  return cache ? `${fresh} fresh · ${cache} cache` : `${fresh} fresh`;
-}
-
 /** Normalize the configured per-phase agent cap to a sane integer (default 8). */
 export function clampMaxAgents(value: number | undefined): number {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 1) return 8;
@@ -325,12 +319,14 @@ function renderRunBody(
     const skipped = phaseAgents.filter((a) => a.status === "skipped").length;
     const complete = done + errors + skipped === phaseAgents.length;
     const marker = running > 0 || (!complete && snap.currentPhase === title) ? "▶" : complete ? "✓" : " ";
-    const phaseTokens = phaseAgents.reduce((n, a) => n + (a.tokens ?? 0), 0);
+    const phaseUsage = aggregateAgentUsage(phaseAgents);
     const phaseMeta = [
       `${done}/${phaseAgents.length} agents`,
       running ? `${running} running` : "",
       errors ? `${errors} errors` : "",
-      phaseTokens > 0 ? `${fmtTokensShort(phaseTokens)} tok` : "",
+      phaseUsage.fresh + phaseUsage.cacheRead > 0
+        ? fmtTokenCount(phaseUsage.fresh, phaseUsage.cacheRead, fmtTokensShort)
+        : "",
     ]
       .filter(Boolean)
       .join(" · ");
@@ -339,7 +335,7 @@ function renderRunBody(
     const visible = phaseAgents.slice(-maxAgents);
     for (const a of visible) {
       const tok = a.tokenUsage
-        ? dim(` ${fmtFreshCache(a.tokenUsage.input, a.tokenUsage.output, a.tokenUsage.cacheRead)}`)
+        ? dim(` ${fmtTokenCount(a.tokenUsage.input + a.tokenUsage.output, a.tokenUsage.cacheRead, fmtTokensShort)}`)
         : a.tokens
           ? dim(` ${fmtTokensShort(a.tokens)} tok`)
           : "";
@@ -390,10 +386,11 @@ export function renderPanelDetailed(
     // accrue tokens, so their rate is suppressed (a stalled rate would mislead).
     sampleTokens(r.runId, total, now);
     const rate = r.status === "running" ? tokensPerSecond(r.runId) : 0;
+    const runUsage = aggregateAgentUsage(agents);
     const meta = [
       `${done}/${agents.length} agents`,
       snap?.currentPhase || "",
-      total > 0 ? `${fmtTokensShort(total)} tok` : "",
+      total > 0 ? fmtTokenCount(runUsage.fresh, runUsage.cacheRead, fmtTokensShort) : "",
       // 2 decimals for ≥1¢, 4 for sub-cent so a real cost never shows as "$0.00".
       // (cost is only known once the run finalizes its usage.)
       usage?.cost ? `$${usage.cost.toFixed(usage.cost >= 0.01 ? 2 : 4)}` : "",

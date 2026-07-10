@@ -17,6 +17,7 @@ import type { ExtensionAPI, ExtensionUIContext, Theme } from "@earendil-works/pi
 import type { Component, Focusable, TUI } from "@earendil-works/pi-tui";
 import { parseKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import type { WorkflowAgentSnapshot, WorkflowSnapshot } from "./display.js";
+import { aggregateAgentUsage, fmtTokenCount } from "./display.js";
 import type { PersistedRunState } from "./run-persistence.js";
 import { registerSavedWorkflow } from "./saved-commands.js";
 import type { WorkflowManager } from "./workflow-manager.js";
@@ -59,6 +60,10 @@ interface RunRow {
   done: number;
   total: number;
   tokens: number;
+  /** Fresh (input+output) tokens for the whole run. */
+  fresh: number;
+  /** Cache-read tokens for the whole run. */
+  cacheRead: number;
   cost: number;
 }
 interface PhaseRow {
@@ -66,6 +71,10 @@ interface PhaseRow {
   done: number;
   total: number;
   tokens: number;
+  /** Fresh (input+output) tokens summed across the phase's agents. */
+  fresh: number;
+  /** Cache-read tokens summed across the phase's agents. */
+  cacheRead: number;
 }
 interface AgentRow {
   id: number;
@@ -110,14 +119,17 @@ export class NavigatorModel {
     return this.manager.listRuns().map((p) => {
       const live = this.manager.getRun(p.runId);
       const agents = (live?.snapshot.agents ?? p.agents) as WorkflowAgentSnapshot[];
+      const usage = live?.snapshot.tokenUsage ?? p.tokenUsage;
       return {
         runId: p.runId,
         name: live?.snapshot.name ?? p.workflowName,
         status: live?.status ?? p.status,
         done: agents.filter((a) => a.status === "done").length,
         total: agents.length,
-        tokens: (live?.snapshot.tokenUsage ?? p.tokenUsage)?.total ?? 0,
-        cost: (live?.snapshot.tokenUsage ?? p.tokenUsage)?.cost ?? 0,
+        tokens: usage?.total ?? 0,
+        fresh: (usage?.input ?? 0) + (usage?.output ?? 0),
+        cacheRead: usage?.cacheRead ?? 0,
+        cost: usage?.cost ?? 0,
       };
     });
   }
@@ -155,11 +167,14 @@ export class NavigatorModel {
     }
     return order.map((title) => {
       const agents = byPhase.get(title) ?? [];
+      const usage = aggregateAgentUsage(agents);
       return {
         title,
         done: agents.filter((a) => a.status === "done").length,
         total: agents.length,
         tokens: agents.reduce((n, a) => n + (a.tokens ?? 0), 0),
+        fresh: usage.fresh,
+        cacheRead: usage.cacheRead,
       };
     });
   }
@@ -468,9 +483,7 @@ function rightAgentRow(
 ): string {
   const dotColor = AGENT_DOT_COLOR[a.status] ?? "dim";
   const stats = a.tokenUsage
-    ? `${compactTokens(a.tokenUsage.input + a.tokenUsage.output)} fresh${
-        a.tokenUsage.cacheRead > 0 ? ` · ${compactTokens(a.tokenUsage.cacheRead)} cache` : ""
-      }`
+    ? fmtTokenCount(a.tokenUsage.input + a.tokenUsage.output, a.tokenUsage.cacheRead, compactTokens)
     : `${compactTokens(a.tokens ?? 0)} tok`;
   const model = shortModel(a.model) ?? "";
 
@@ -783,9 +796,10 @@ export function renderNavigator(
     // Render runs
     runs.forEach((r, i) => {
       const icon = STATUS_ICON[r.status] ?? "?";
-      const meta = [`${r.done}/${r.total}`, fmtTokens(r.tokens), r.cost > 0 ? `$${r.cost.toFixed(4)}` : ""]
-        .filter(Boolean)
-        .join(" · ");
+      // Prefer the fresh/cached split; fall back to the total for legacy
+      // persisted runs whose usage predates the breakdown.
+      const tok = r.fresh + r.cacheRead > 0 ? fmtTokenCount(r.fresh, r.cacheRead, pad) : fmtTokens(r.tokens);
+      const meta = [`${r.done}/${r.total}`, tok, r.cost > 0 ? `$${r.cost.toFixed(4)}` : ""].filter(Boolean).join(" · ");
       lines.push(sel(i, `${icon} ${r.name}  ${dim(`${r.runId} · ${r.status} · ${meta}`)}`));
     });
     // Render saved workflows after a separator
@@ -874,17 +888,21 @@ function twoPaneHeader(
   let done = 0;
   let total = 0;
   let tokens = 0;
+  let fresh = 0;
+  let cacheRead = 0;
   for (const p of phases) {
     done += p.done;
     total += p.total;
     tokens += p.tokens;
+    fresh += p.fresh;
+    cacheRead += p.cacheRead;
   }
   // Line 0 — name (accent + bold), truncated to width if needed.
   const nameText = truncateToWidth(name, width, ELLIPSIS, false);
   const line0 = theme.fg("accent", theme.bold(nameText));
 
   // Line 1 — left status, right summary.
-  const rightRaw = `${done}/${total} ${pluralize("agent", total)}${tokens > 0 ? ` · ${compactTokens(tokens)} tok` : ""}`;
+  const rightRaw = `${done}/${total} ${pluralize("agent", total)}${tokens > 0 ? ` · ${fmtTokenCount(fresh, cacheRead, compactTokens)}` : ""}`;
   const rightW = visibleWidth(rightRaw);
   const gap = 2;
   let line1: string;

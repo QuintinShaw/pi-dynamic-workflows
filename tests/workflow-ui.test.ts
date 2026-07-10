@@ -41,7 +41,7 @@ function fakeManager(): Pick<WorkflowManager, "listRuns" | "getRun"> {
     runningCount: 1,
     doneCount: 2,
     errorCount: 0,
-    tokenUsage: { input: 100, output: 50, total: 150, cost: 0 },
+    tokenUsage: { input: 100, output: 50, total: 1050, cost: 0, cacheRead: 900, cacheWrite: 0 },
   };
   return {
     listRuns: () => [
@@ -132,6 +132,8 @@ function persistedRunManager(): Pick<WorkflowManager, "listRuns" | "getRun"> {
         phases: ["Build"],
         agents: [{ id: 1, label: "builder", phase: "Build", status: "done", prompt: "build it", result: "ok" }],
         logs: ["done"],
+        // Legacy persisted usage: total only, no fresh/cache breakdown.
+        tokenUsage: { total: 500, cost: 0 },
       } as unknown as PersistedRunState,
     ],
     getRun: () => undefined,
@@ -180,7 +182,9 @@ test("NavigatorModel reads runs, phases, agents, and detail", () => {
   assert.equal(runs.length, 1);
   assert.equal(runs[0].done, 2);
   assert.equal(runs[0].total, 3);
-  assert.equal(runs[0].tokens, 150);
+  assert.equal(runs[0].tokens, 1050);
+  assert.equal(runs[0].fresh, 150);
+  assert.equal(runs[0].cacheRead, 900);
 
   const phases = model.phases("run-1");
   assert.deepEqual(
@@ -222,6 +226,13 @@ test("NavigatorModel reads from persisted runs when no live snapshot", () => {
   assert.equal(runs[0].name, "old-run");
   assert.equal(runs[0].done, 1);
   assert.equal(runs[0].total, 1);
+  assert.equal(runs[0].tokens, 500);
+  assert.equal(runs[0].fresh, 0);
+  assert.equal(runs[0].cacheRead, 0);
+
+  // The runs list falls back to the plain total for legacy usage.
+  const lines = renderNavigator(new NavigatorState(), model, 80);
+  assert.match(lines.join("\n"), /1\/1 · 500 tok/);
 
   const phases = model.phases("r-old");
   assert.equal(phases.length, 1);
@@ -399,6 +410,7 @@ test("renderNavigator shows runs view with selected row and footer hint", () => 
   const text = lines.join("\n");
   assert.match(text, /Workflows/);
   assert.match(text, /❯ ◆ audit/);
+  assert.match(text, /2\/3 · 150 tok · 900 cached/);
   assert.match(text, /enter open/);
 });
 

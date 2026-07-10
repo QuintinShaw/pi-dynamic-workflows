@@ -69,6 +69,42 @@ export interface WorkflowDisplayOptions {
   showResultPreviews?: boolean;
 }
 
+/**
+ * Sum a set of agents into fresh (input+output) vs cacheRead totals. Agents whose
+ * provider reported no usage breakdown contribute their scalar `tokens` as fresh, so
+ * a mixed run (some agents with a breakdown, some without) still aggregates sensibly.
+ */
+export function aggregateAgentUsage(agents: ReadonlyArray<Pick<WorkflowAgentSnapshot, "tokens" | "tokenUsage">>): {
+  fresh: number;
+  cacheRead: number;
+} {
+  let fresh = 0;
+  let cacheRead = 0;
+  for (const a of agents) {
+    if (a.tokenUsage) {
+      fresh += a.tokenUsage.input + a.tokenUsage.output;
+      cacheRead += a.tokenUsage.cacheRead;
+    } else {
+      fresh += a.tokens ?? 0;
+    }
+  }
+  return { fresh, cacheRead };
+}
+
+/**
+ * Format a token count for a display surface: "12.4K tok" on its own, or
+ * "89K tok · 3.0M cached" when there were cache reads. The cache segment is shown
+ * only when `cacheRead > 0`, so a non-caching provider (or a single-turn agent that
+ * never re-reads its cache) reads as a plain "tok" rather than a bare, contextless
+ * "fresh". `cacheWrite` (the one-time cache-creation premium) is intentionally left
+ * out of both figures; its dollar impact already shows in the cost readout. `fmt`
+ * adapts the number style per surface (compact in panels, full in the print view).
+ */
+export function fmtTokenCount(fresh: number, cacheRead: number, fmt: (n: number) => string): string {
+  const f = fmt(fresh) || "0";
+  return cacheRead > 0 ? `${f} tok · ${fmt(cacheRead)} cached` : `${f} tok`;
+}
+
 export function createWorkflowSnapshot(meta: WorkflowMeta): WorkflowSnapshot {
   return {
     name: meta.name,
@@ -192,7 +228,9 @@ export function renderWorkflowLines(
   // Build header with token info (and cost when the provider reports it)
   const usage = snapshot.tokenUsage;
   const costInfo = usage?.cost ? ` · $${usage.cost.toFixed(4)}` : "";
-  const tokenInfo = usage ? ` · ${usage.total.toLocaleString()} tokens${costInfo}` : "";
+  const tokenInfo = usage
+    ? ` · ${fmtTokenCount(usage.input + usage.output, usage.cacheRead ?? 0, (n) => n.toLocaleString())}${costInfo}`
+    : "";
   const lines = [
     `${theme.bold(`◆ Workflow: ${snapshot.name}`)} (${snapshot.doneCount}/${snapshot.agentCount} done${state}${tokenInfo})`,
   ];
@@ -226,9 +264,9 @@ export function renderWorkflowLines(
       const agentTokens = agent.tokenUsage
         ? theme.fg(
             "dim",
-            ` [${(agent.tokenUsage.input + agent.tokenUsage.output).toLocaleString()} fresh${
-              agent.tokenUsage.cacheRead > 0 ? ` · ${agent.tokenUsage.cacheRead.toLocaleString()} cache` : ""
-            }]`,
+            ` [${fmtTokenCount(agent.tokenUsage.input + agent.tokenUsage.output, agent.tokenUsage.cacheRead, (n) =>
+              n.toLocaleString(),
+            )}]`,
           )
         : agent.tokens
           ? theme.fg("dim", ` [${agent.tokens.toLocaleString()} tok]`)
@@ -247,9 +285,9 @@ export function renderWorkflowLines(
       const agentTokens = agent.tokenUsage
         ? theme.fg(
             "dim",
-            ` [${(agent.tokenUsage.input + agent.tokenUsage.output).toLocaleString()} fresh${
-              agent.tokenUsage.cacheRead > 0 ? ` · ${agent.tokenUsage.cacheRead.toLocaleString()} cache` : ""
-            }]`,
+            ` [${fmtTokenCount(agent.tokenUsage.input + agent.tokenUsage.output, agent.tokenUsage.cacheRead, (n) =>
+              n.toLocaleString(),
+            )}]`,
           )
         : agent.tokens
           ? theme.fg("dim", ` [${agent.tokens.toLocaleString()} tok]`)

@@ -92,9 +92,9 @@ describe("installResultDelivery", () => {
     assert.ok(calls[0].content.includes("All tests passed"), "should contain All tests passed");
     assert.ok(calls[0].content.includes("test-workflow"), "should contain test-workflow");
     assert.ok(calls[0].content.includes("3 agents"), "should contain 3 agents");
-    // deliverText shows the fresh/cache split; the cache segment is omitted with no cache reads.
-    assert.ok(calls[0].content.includes("50.0K fresh"), "should show fresh tokens (input+output)");
-    assert.ok(!calls[0].content.includes("cache"), "omits the cache segment when cacheRead is 0");
+    // deliverText shows "N tok"; the cached segment is omitted with no cache reads.
+    assert.ok(calls[0].content.includes("50.0K tok"), "should show the token count (input+output)");
+    assert.ok(!calls[0].content.includes("cached"), "omits the cached segment when cacheRead is 0");
     assert.ok(calls[0].content.includes("1.5s"), "should contain 1.5s");
   });
 
@@ -116,8 +116,8 @@ describe("installResultDelivery", () => {
     manager.emit("complete", { runId: "test-run-1" });
 
     const content = (pi as unknown as { _calls: { content: string }[] })._calls[0].content;
-    assert.ok(content.includes("100.0K fresh"), `fresh should be input+output; got: ${content}`);
-    assert.ok(content.includes("6.0M cache"), `cache should be cacheRead; got: ${content}`);
+    assert.ok(content.includes("100.0K tok"), `fresh (input+output) should read as tok; got: ${content}`);
+    assert.ok(content.includes("6.0M cached"), `cacheRead should read as cached; got: ${content}`);
     assert.ok(content.includes("$6.70"), `cost should be shown; got: ${content}`);
   });
 
@@ -619,8 +619,8 @@ describe("renderPanelDetailed", () => {
     };
     const lines = renderPanelDetailed(manager as never, theme as never, undefined, 8, 1000);
     assert.ok(
-      lines.some((l) => l.includes("[1] ✓ cached_agent") && /100\.0K fresh/.test(l) && /3\.0M cache/.test(l)),
-      `expected a per-agent fresh/cache row, got:\n${lines.join("\n")}`,
+      lines.some((l) => l.includes("[1] ✓ cached_agent") && /100\.0K tok/.test(l) && /3\.0M cached/.test(l)),
+      `expected a per-agent tok/cached row, got:\n${lines.join("\n")}`,
     );
   });
 
