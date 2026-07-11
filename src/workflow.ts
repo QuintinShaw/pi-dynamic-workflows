@@ -69,8 +69,9 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   mainModel?: string;
   /**
    * Named subagent definitions for `agent({ agentType })`. Snapshotted once per
-   * run for determinism. Defaults to scanning `.pi/agents` (project) + `~/.pi/agents`.
-   * Injectable for tests.
+   * run for determinism. Defaults to scanning `.pi/agents` (project) +
+   * `~/.pi/agent/agents` (user, primary) + `~/.pi/agents` (user, deprecated
+   * fallback). Injectable for tests.
    */
   agentRegistry?: AgentRegistry;
   concurrency?: number;
