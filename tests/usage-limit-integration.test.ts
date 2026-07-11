@@ -31,15 +31,15 @@ const USAGE_LIMIT_MSG = "Codex usage limit reached (plus plan). Resets in ~3h.";
  * else fall back to the bare specifier — which, when npm has deduped to a single
  * copy, resolves to that same shared instance. Robust to both layouts.
  */
-async function loadFaux(): Promise<typeof import("@earendil-works/pi-ai")> {
+async function loadFaux(): Promise<typeof import("@earendil-works/pi-ai/compat")> {
   const nested = fileURLToPath(
     new URL(
-      "../node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/index.js",
+      "../node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/compat.js",
       import.meta.url,
     ),
   );
-  const entry = existsSync(nested) ? nested : "@earendil-works/pi-ai";
-  return import(entry) as Promise<typeof import("@earendil-works/pi-ai")>;
+  const entry = existsSync(nested) ? nested : "@earendil-works/pi-ai/compat";
+  return import(entry) as Promise<typeof import("@earendil-works/pi-ai/compat")>;
 }
 
 /**

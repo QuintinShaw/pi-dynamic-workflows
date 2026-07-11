@@ -113,7 +113,7 @@ The same model — on Pi, plus the production pieces a real run needs:
                             switch the live panel between the compact one-liner and the detailed
                             per-phase/per-agent view (with tokens, cost, and a live tok/s rate)
 /workflows-progress-max <N> cap agents shown per phase in detailed mode (1-1000, default 8)
-/workflows-models           map the small / medium / big tiers to real models
+/workflows-models           map the small / medium / big tiers to real models, optionally with thinking levels
 /ultracode [off]            ultracode: auto-arm an exhaustive workflow for every substantive message
 /effort off|high|ultra      finer control over the standing opt-in (high = thorough, ultra = ultracode)
 
@@ -140,6 +140,20 @@ In the navigator: `↑/↓` select · `enter`/`→` open · `esc`/`←` back · 
 ## Storage
 
 Workflow state is stored under `~/.pi/workflows` so projects do not accumulate extension-owned `.pi/workflows` directories. Global settings and model tiers live at `~/.pi/workflows/settings.json` and `~/.pi/workflows/model-tiers.json`; project-scoped run history, resume journals, locks, and saved workflow overrides live under `~/.pi/workflows/projects/<project>/`. Older project-local `.pi/workflows/runs` and `.pi/workflows/saved` data is still read as a fallback, but new writes go to the user-level workflow store.
+
+`model-tiers.json` uses Pi CLI-style model parsing. A tier can be a plain model spec or include an optional thinking suffix:
+
+```json
+{
+  "tiers": {
+    "small": "openai-codex/gpt-5.4-mini:low",
+    "medium": "openai-codex/gpt-5.4:medium",
+    "big": "openai-codex/gpt-5.5:xhigh"
+  }
+}
+```
+
+Use `/workflows-models` to edit these in the TUI: choose the base model first, then choose `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or the session default.
 
 To avoid accidental keyword triggers, configure a custom trigger word in `~/.pi/workflows/settings.json`:
 
@@ -168,8 +182,8 @@ The full guide — every global, agent option, `agentType` definitions, structur
 
 | Agent option | Description |
 | --- | --- |
-| `tier` | `"small"` \| `"medium"` \| `"big"` — coarse model routing (configure via `/workflows-models`). |
-| `model` | Exact `provider/modelId` (always wins over `tier`). |
+| `tier` | `"small"` \| `"medium"` \| `"big"` — coarse model routing (configure via `/workflows-models`; tiers may store `provider/modelId:thinking`). |
+| `model` | Exact `provider/modelId` or `provider/modelId:thinking` (always wins over `tier`). |
 | `agentType` | A named definition (`.pi/agents/<name>.md`) binding tools + model + role prompt. |
 | `isolation: "worktree"` | Run in a throwaway git worktree for conflict-free parallel edits. |
 | `schema` | JSON Schema → the subagent returns a validated object. |
@@ -183,6 +197,8 @@ For larger or flakier fan-outs, the `workflow` tool also accepts `concurrency` (
 By default, each workflow subagent runs in an in-memory session: the full transcript is discarded when the run ends, and only a compacted excerpt survives inside the run JSON. Set `{ "persistAgentSessions": true }` in `~/.pi/workflows/settings.json` (or a project-level override, which wins) to persist every subagent transcript as a real pi session file in the standard sessions directory for the project (`~/.pi/agent/sessions/<encoded-cwd>/`), named `workflow:<runId> <agent label>` so it's identifiable in `/resume` and other session tooling. Sessions are keyed by the project cwd even when an agent runs in a temporary git worktree. Default is `false` (current behavior). Caveat: large fan-out runs create one session file per agent, which can clutter session pickers.
 
 The live "Workflows running" panel is configured in the same `~/.pi/workflows/settings.json`: `"progressPanelMode"` is `"compact"` (default, one line per run) or `"detailed"` (per-phase/per-agent rows with tokens, cost, and a live tok/s rate), and `"progressPanelMaxAgents"` (default `8`, range `1`–`1000`) caps how many agents each phase shows in detailed mode before a `… N earlier agents` line. Toggle them live with `/workflows-progress compact|detailed` and `/workflows-progress-max <N>` — changes take effect on the next render without a restart.
+
+When a background run finishes, its result is delivered back into the conversation with a `↳ Full result: <path>` pointer to the persisted `~/.pi/workflows/projects/<project>/runs/<id>.json`, so nothing is lost even when the summary is shortened. Only the JSON-dump fallback (a result object without a `verdict`/`report`/`summary` string field) is truncated — at `"deliveredResultMaxChars"` characters (default `400`) in the same `~/.pi/workflows/settings.json` — and the dropped size is shown inline, e.g. `…(truncated 3.2 KB)`.
 
 Workflows run in a Node `vm` sandbox; `Date.now()`, `Math.random()`, `new Date()`, and `require`/`import`/`fs`/network are unavailable, so runs stay reproducible — which is what makes resume reliable.
 

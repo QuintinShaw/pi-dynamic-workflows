@@ -6,6 +6,7 @@
  *    conversation so the paused task continues with the outcome.
  */
 
+import { join } from "node:path";
 import type { ExtensionAPI, ExtensionUIContext, Theme } from "@earendil-works/pi-coding-agent";
 import { type Component, type TUI, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { shorten, statusIcon, type WorkflowAgentSnapshot, type WorkflowSnapshot } from "./display.js";
@@ -43,12 +44,25 @@ export interface TaskPanelOptions {
   loadSettings?: () => WorkflowSettings;
 }
 
+/** Default cap on the JSON-dump fallback in a delivered result summary. Overridable
+ *  via the `deliveredResultMaxChars` setting in ~/.pi/workflows/settings.json. */
+const DEFAULT_DELIVERED_MAX_CHARS = 400;
+
+/** Human-readable byte size for the dropped-tail hint: 512 B, 3.2 KB, 1.4 MB. */
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 /**
  * Pick a clean human-readable summary from a workflow result, in order of
  * preference: a `verdict`/`report`/`summary` string field, a bare string
- * result, else a truncated JSON dump.
+ * result, else a JSON dump capped at `maxChars`. When the dump is truncated the
+ * dropped size is reported (the full result is still reachable via the pointer
+ * that {@link deliverText} appends).
  */
-function summarizeResult(result: unknown): string {
+function summarizeResult(result: unknown, maxChars: number = DEFAULT_DELIVERED_MAX_CHARS): string {
   if (typeof result === "string") return result;
   if (result == null) return "null";
   if (typeof result === "object") {
@@ -59,7 +73,12 @@ function summarizeResult(result: unknown): string {
     }
   }
   const json = JSON.stringify(result, null, 2);
-  return json.length > 400 ? `${json.slice(0, 400)}\n…(truncated)` : json;
+  if (json.length <= maxChars) return json;
+  // Slice once (the kept head); derive the dropped size by byte-length subtraction
+  // so we don't also allocate the (potentially large) truncated tail to measure it.
+  const kept = json.slice(0, maxChars);
+  const droppedBytes = Buffer.byteLength(json, "utf8") - Buffer.byteLength(kept, "utf8");
+  return `${kept}\n…(truncated ${formatBytes(droppedBytes)})`;
 }
 
 function fitLine(line: string, width?: number): string {
@@ -69,16 +88,40 @@ function fitLine(line: string, width?: number): string {
   return truncateToWidth(line, maxWidth);
 }
 
-export function deliverText(run: ManagedRun): string {
-  const summary = summarizeResult(run.result?.result);
+export function deliverText(run: ManagedRun, opts: { resultPath?: string; maxChars?: number } = {}): string {
+  const summary = summarizeResult(run.result?.result, opts.maxChars);
   const tokens = run.result?.tokenUsage ? ` · ${run.result.tokenUsage.total.toLocaleString()} tokens` : "";
   const agents = run.result?.agentCount ?? run.snapshot.agentCount;
   const duration = run.result?.durationMs ? ` · ${(run.result.durationMs / 1000).toFixed(1)}s` : "";
-  return [
+  const lines = [
     `✓ Background workflow "${run.snapshot.name}" finished (${agents} agents${tokens}${duration}).`,
     "",
     summary,
-  ].join("\n");
+  ];
+  // Always point at the full persisted result so the tail is never lost — even when
+  // the summary above is a complete verdict/summary field or an untruncated dump.
+  if (opts.resultPath) lines.push("", `↳ Full result: ${opts.resultPath}`);
+  return lines.join("\n");
+}
+
+/** Absolute path to a run's persisted result JSON. Undefined if the persistence
+ *  layer can't be resolved — delivery must never throw in the complete handler. */
+function persistedResultPath(manager: WorkflowManager, runId: string): string | undefined {
+  try {
+    return join(manager.getPersistence().getRunsDir(), `${runId}.json`);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Delivered JSON-dump truncation threshold from settings (already normalized),
+ *  defaulting to 400 when unset or unreadable. */
+function deliveredMaxChars(opts: { loadSettings?: () => WorkflowSettings }): number {
+  try {
+    return opts.loadSettings?.().deliveredResultMaxChars ?? DEFAULT_DELIVERED_MAX_CHARS;
+  } catch {
+    return DEFAULT_DELIVERED_MAX_CHARS;
+  }
 }
 
 /**
@@ -93,7 +136,11 @@ export function deliverText(run: ManagedRun): string {
  *
  * Set up once per extension; idempotent via an internal guard.
  */
-export function installResultDelivery(pi: ExtensionAPI, manager: WorkflowManager): void {
+export function installResultDelivery(
+  pi: ExtensionAPI,
+  manager: WorkflowManager,
+  opts: { loadSettings?: () => WorkflowSettings } = {},
+): void {
   // Mutable holder on manager so shared across re-calls (e.g. session_start after /reload).
   const m = manager as unknown as { __deliveryInstalled?: boolean; __holder?: { pi: ExtensionAPI } };
   if (m.__deliveryInstalled) {
@@ -123,7 +170,9 @@ export function installResultDelivery(pi: ExtensionAPI, manager: WorkflowManager
     const run = manager.getRun(runId);
     // Only background/resumed runs are delivered: a foreground (sync) run already
     // returns its result inline as the tool result, so re-delivering would dup it.
-    if (run?.background) deliver(deliverText(run));
+    if (run?.background) {
+      deliver(deliverText(run, { resultPath: persistedResultPath(manager, runId), maxChars: deliveredMaxChars(opts) }));
+    }
   });
   manager.on("error", ({ runId, error }: { runId: string; error?: { message?: string } }) => {
     if (!manager.getRun(runId)?.background) return;

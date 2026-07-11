@@ -30,6 +30,11 @@ export interface WorkflowSettings {
    * and only the compacted history embedded in the run JSON survives.
    */
   persistAgentSessions?: boolean;
+  /**
+   * Character cap on a delivered background-run result's JSON-dump fallback before
+   * truncation (default 400). String/`verdict`/`summary` results are never truncated.
+   */
+  deliveredResultMaxChars?: number;
 }
 
 export interface WorkflowSettingsStore {
@@ -144,6 +149,8 @@ function normalizeSettings(value: unknown): WorkflowSettings {
   if (typeof raw.persistAgentSessions === "boolean") {
     settings.persistAgentSessions = raw.persistAgentSessions;
   }
+  const deliveredResultMaxChars = normalizeInteger(raw.deliveredResultMaxChars, 1, 1_000_000);
+  if (deliveredResultMaxChars !== undefined) settings.deliveredResultMaxChars = deliveredResultMaxChars;
   return settings;
 }
 
