@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+import { unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { AssistantMessage, Model, TextContent } from "@earendil-works/pi-ai";
 import {
@@ -377,9 +379,36 @@ export class WorkflowAgent {
    * Session manager for one subagent run. File-backed (persisted under the
    * standard sessions dir, keyed by the runner's project cwd — never a
    * per-call worktree cwd) when persistAgentSessions is on; in-memory otherwise.
+   *
+   * SessionManager.create() only creates the session directory — the SDK writes
+   * the session file lazily (synchronous fs calls, uncaught) on the first
+   * assistant message, deep inside session.prompt(). A failure there would
+   * otherwise throw mid-run and abort this subagent. Probe writability up front
+   * so any create/write failure (permissions, disk full) degrades this single
+   * agent to an in-memory session instead — the run continues, just without a
+   * persisted transcript.
    */
   private createSessionManager(): SessionManager {
-    return this.persistAgentSessions ? SessionManager.create(this.cwd) : SessionManager.inMemory();
+    if (!this.persistAgentSessions) return SessionManager.inMemory();
+    try {
+      const manager = SessionManager.create(this.cwd);
+      this.assertSessionDirWritable(manager.getSessionDir());
+      return manager;
+    } catch (error) {
+      console.warn(
+        `[workflow] persistAgentSessions: could not persist this agent's session (${
+          error instanceof Error ? error.message : String(error)
+        }); continuing with an in-memory session`,
+      );
+      return SessionManager.inMemory();
+    }
+  }
+
+  /** Best-effort write probe: throws if the session directory isn't actually writable. */
+  private assertSessionDirWritable(dir: string): void {
+    const probePath = join(dir, `.write-probe-${randomUUID()}`);
+    writeFileSync(probePath, "");
+    unlinkSync(probePath);
   }
 
   async run<TSchemaDef extends TSchema | undefined = undefined>(

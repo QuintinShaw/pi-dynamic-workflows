@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import type { AgentRunOptions, AgentUsage } from "../src/agent.js";
 import { listAvailableModelSpecs, resolveAgentModelSpec, WorkflowAgent } from "../src/agent.js";
@@ -48,6 +48,39 @@ test("WorkflowAgent with persistAgentSessions=true creates a file-backed manager
       // createSessionManager() takes no per-call cwd by design; assert the
       // manager saw the project cwd.
       assert.equal(manager.getCwd(), projectCwd);
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("WorkflowAgent degrades to in-memory when the session directory can't be created", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-persist-agent-fail-"));
+  const projectCwd = join(dir, "project");
+  const fakeHome = join(dir, "home");
+  try {
+    withFakeHome(fakeHome, () => {
+      // Pre-occupy the sessions directory with a plain file so the SDK's
+      // mkdirSync(recursive) inside SessionManager.create() throws ENOTDIR —
+      // simulating a permissions/disk-full failure at session-creation time.
+      const sessionsPath = join(fakeHome, ".pi", "agent", "sessions");
+      mkdirSync(dirname(sessionsPath), { recursive: true });
+      writeFileSync(sessionsPath, "not a directory");
+
+      const originalWarn = console.warn;
+      const warnings: unknown[][] = [];
+      console.warn = (...args: unknown[]) => warnings.push(args);
+      try {
+        const agent = new WorkflowAgent({ cwd: projectCwd, persistAgentSessions: true });
+        const manager = (agent as unknown as WorkflowAgentPrivates).createSessionManager();
+        assert.equal(manager.isPersisted(), false, "must degrade to in-memory rather than throw");
+        assert.ok(
+          warnings.some((args) => String(args[0]).includes("persistAgentSessions")),
+          "should log a warning about the degradation",
+        );
+      } finally {
+        console.warn = originalWarn;
+      }
     });
   } finally {
     rmSync(dir, { recursive: true, force: true });
