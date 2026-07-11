@@ -23,6 +23,11 @@ export interface WorkflowSettings {
   progressPanelMode?: "compact" | "detailed";
   /** Max agents shown per phase in detailed progress mode (default 8). */
   progressPanelMaxAgents?: number;
+  /**
+   * Character cap on a delivered background-run result's JSON-dump fallback before
+   * truncation (default 400). String/`verdict`/`summary` results are never truncated.
+   */
+  deliveredResultMaxChars?: number;
 }
 
 export interface WorkflowSettingsStore {
@@ -134,6 +139,8 @@ function normalizeSettings(value: unknown): WorkflowSettings {
   ) {
     settings.progressPanelMaxAgents = Math.min(1000, Math.floor(raw.progressPanelMaxAgents));
   }
+  const deliveredResultMaxChars = normalizeInteger(raw.deliveredResultMaxChars, 1, 1_000_000);
+  if (deliveredResultMaxChars !== undefined) settings.deliveredResultMaxChars = deliveredResultMaxChars;
   return settings;
 }
 

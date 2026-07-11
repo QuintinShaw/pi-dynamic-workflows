@@ -2,9 +2,10 @@
  * Model tier configuration for workflow subagent model routing.
  *
  * A tier is a named slot (small/medium/big) holding exactly ONE model spec
- * string (e.g. "openai/gpt-4.1-mini"). When an agent() call specifies
- * opts.tier, that single model is resolved and used as the subagent's model
- * (unless an explicit opts.model is given, which always wins — see agent.ts).
+ * string (e.g. "openai/gpt-4.1-mini" or "openai-codex/gpt-5.5:xhigh").
+ * When an agent() call specifies opts.tier, that single model is resolved with
+ * Pi CLI-style parsing and used as the subagent's model/thinking level (unless
+ * an explicit opts.model is given, which always wins — see agent.ts).
  *
  * This augments the phase-pattern routing in model-routing.ts: phase routing
  * maps workflow phases → models via the script's meta; tiers give scripts a
@@ -24,7 +25,8 @@ import { MODEL_TIERS_FILE } from "./config.js";
 
 /**
  * Model tier configuration. Maps tier names (e.g. "small", "medium", "big")
- * to a single model spec string (e.g. "gpt-4.1-mini" or "openai/gpt-4.1-mini").
+ * to a single model spec string (e.g. "gpt-4.1-mini", "openai/gpt-4.1-mini",
+ * or "openai-codex/gpt-5.5:xhigh").
  */
 export interface ModelTierConfig {
   tiers: Record<string, string>;

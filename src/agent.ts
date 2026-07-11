@@ -16,6 +16,7 @@ import { Check, Convert } from "typebox/value";
 import { type AgentHistoryEntry, compactAgentHistory } from "./agent-history.js";
 import { applyToolPolicy } from "./agent-registry.js";
 import { classifyProviderLimit, WorkflowError, WorkflowErrorCode } from "./errors.js";
+import { canonicalModelSpec, resolveModelSpecWithThinking } from "./model-spec.js";
 import { loadModelTierConfig, type ModelTierConfig, resolveTierModel } from "./model-tier-config.js";
 import { createStructuredOutputTool, type StructuredOutputCapture } from "./structured-output.js";
 
@@ -220,13 +221,14 @@ export interface WorkflowAgentOptions {
  */
 export function listAvailableModelSpecs(registry?: ModelRegistry): string[] {
   try {
-    if (registry) {
-      return registry.getAvailable().map((m) => `${m.provider}/${m.id}`);
-    }
-    const dir = getAgentDir();
-    const auth = AuthStorage.create(join(dir, "auth.json"));
-    const r = ModelRegistry.create(auth, join(dir, "models.json"));
-    return r.getAvailable().map((m) => `${m.provider}/${m.id}`);
+    const modelRegistry =
+      registry ??
+      (() => {
+        const dir = getAgentDir();
+        const auth = AuthStorage.create(join(dir, "auth.json"));
+        return ModelRegistry.create(auth, join(dir, "models.json"));
+      })();
+    return modelRegistry.getAvailable().map(canonicalModelSpec);
   } catch {
     return [];
   }
@@ -355,20 +357,6 @@ export class WorkflowAgent {
     return this.registry;
   }
 
-  /**
-   * Resolve a model spec to a Model. Accepts `provider/modelId` (unambiguous)
-   * or a bare `modelId` (prefers auth-configured models, then any known model).
-   * Returns undefined when nothing matches.
-   */
-  private resolveModel(spec: string, perRunRegistry?: ModelRegistry): Model<any> | undefined {
-    const registry = this.getRegistry(perRunRegistry);
-    const slash = spec.indexOf("/");
-    if (slash > 0) {
-      return registry.find(spec.slice(0, slash), spec.slice(slash + 1));
-    }
-    return registry.getAvailable().find((m) => m.id === spec) ?? registry.getAll().find((m) => m.id === spec);
-  }
-
   async run<TSchemaDef extends TSchema | undefined = undefined>(
     prompt: string,
     options: AgentRunOptions<TSchemaDef> = {},
@@ -400,13 +388,20 @@ export class WorkflowAgent {
     // options.model when a phase pattern matches — so an explicit model wins.
     const modelSpec = resolveAgentModelSpec(options, this.mainModel);
 
-    // Resolve a requested model spec to a Model object. A given-but-unresolved
-    // spec falls back to the session default (with a warning) rather than failing.
+    // Resolve a requested model spec to a Model object. Specs use Pi CLI-style
+    // parsing, including an optional :thinking suffix such as gpt-5.5:xhigh.
+    // A given-but-unresolved spec falls back to the session default (with a
+    // warning) rather than failing.
+    const modelRegistry = this.getRegistry(options.modelRegistry);
     let resolvedModel: Model<any> | undefined;
+    let resolvedThinkingLevel: CreateAgentSessionOptions["thinkingLevel"] | undefined;
     if (modelSpec) {
-      resolvedModel = this.resolveModel(modelSpec, options.modelRegistry);
-      if (resolvedModel) {
-        options.onModelResolved?.(`${resolvedModel.provider}/${resolvedModel.id}`);
+      const resolved = resolveModelSpecWithThinking(modelSpec, modelRegistry);
+      if (resolved.warning) console.warn(`[workflow] ${resolved.warning}`);
+      if (resolved.model) {
+        resolvedModel = resolved.model;
+        resolvedThinkingLevel = resolved.thinkingLevel;
+        options.onModelResolved?.(resolved.resolvedSpec ?? canonicalModelSpec(resolved.model));
       } else {
         console.warn(`[workflow] model "${modelSpec}" not found; using session default`);
         options.onModelFallback?.(modelSpec);
@@ -424,14 +419,15 @@ export class WorkflowAgent {
       // not have valid auth, causing silent empty responses.
       settingsManager: SettingsManager.create(this.cwd, agentDir),
       customTools,
-      // Per-run modelRegistry wins over the constructor's shared registry, same
-      // precedence as resolveModel() above.
+      // Per-run modelRegistry wins over the constructor's shared registry
+      // (see getRegistry() precedence above).
       ...(options.modelRegistry || this.sharedRegistry
         ? { modelRegistry: options.modelRegistry ?? this.sharedRegistry }
         : {}),
       ...this.sessionOptions,
-      // Per-call model wins over any sessionOptions.model.
+      // Per-call model/thinking wins over any sessionOptions defaults.
       ...(resolvedModel ? { model: resolvedModel } : {}),
+      ...(resolvedThinkingLevel ? { thinkingLevel: resolvedThinkingLevel } : {}),
     });
 
     let removeAbortListener: (() => void) | undefined;
