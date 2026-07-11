@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { generateAdversarialReviewWorkflow, generateMultiPerspectiveWorkflow } from "../src/adversarial-review.js";
+import { generateCodeReviewWorkflow } from "../src/code-review.js";
 import { generateCodebaseAuditWorkflow, generateDeepResearchWorkflow } from "../src/deep-research.js";
 import { createWebTools } from "../src/web-tools.js";
 import { parseWorkflowScript } from "../src/workflow.js";
@@ -132,4 +133,23 @@ test("generateMultiPerspectiveWorkflow returns analyses and synthesis", () => {
 test("createWebTools exposes web_search and web_fetch", () => {
   const tools = createWebTools();
   assert.deepEqual(tools.map((t) => t.name).sort(), ["web_fetch", "web_search"]);
+});
+
+// ─── Code Review ────────────────────────────────────────────────────────────────
+
+test("generateCodeReviewWorkflow produces a valid, parseable script", () => {
+  const { meta, body } = parseWorkflowScript(generateCodeReviewWorkflow());
+  assert.equal(meta.name, "code_review");
+  assert.deepEqual(
+    meta.phases?.map((p) => p.title),
+    ["Find", "Verify", "Report"],
+  );
+  assert.match(body, /parallel/);
+  assert.match(body, /candidateSchema/);
+});
+
+test("generateCodeReviewWorkflow truncates an oversized diff and surfaces it", () => {
+  const { body } = parseWorkflowScript(generateCodeReviewWorkflow());
+  assert.match(body, /MAX_DIFF_CHARS/);
+  assert.match(body, /diffTruncated/);
 });

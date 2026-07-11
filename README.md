@@ -76,7 +76,7 @@ return await agent('Synthesize and double-check these findings:\n' + findings.jo
 - **Interactive `/workflows` TUI** — drill runs → phases → agents → detail; inspect per-agent failures and compact subagent history; pause, stop, restart, and save runs from the keyboard.
 - **Quality patterns built in** — `verify()`, `judgePanel()`, `loopUntilDry()`, and `completenessCheck()` for adversarial review, best-of-N, and exhaustive discovery.
 - **Ultracode** — `/ultracode` is a standing opt-in that auto-arms an exhaustive multi-agent workflow for every substantive message, the way Claude Code's ultracode does. `/effort high` is the lighter tier.
-- **Bundled `/deep-research` + `/adversarial-review`** — real web search, source cross-checking, and cited reports.
+- **Bundled `/deep-research` + `/adversarial-review` + `/code-review`** — real web search, source cross-checking, cited reports, and a 7-angle parallel code review with a verify pass.
 - **Saved & nested workflows** — turn any run into a `/<name>` command, and compose saved workflows from inside other scripts.
 
 ## How it maps to Claude Code dynamic workflows
@@ -121,6 +121,8 @@ The same model — on Pi, plus the production pieces a real run needs:
 /adversarial-review <task>  findings vetted by skeptical reviewers
 /multi-perspective "<topic>" [angle …]
                             analyze a topic from several independent angles, then synthesize
+/code-review [target]       7 parallel finder angles (correctness, reuse, simplification, efficiency,
+                            altitude) + a verify pass → ranked findings
 /codebase-audit <scope> "<check>" …
                             run parallel checks over a scope, then cross-validate and report
 ```
@@ -134,6 +136,17 @@ The same model — on Pi, plus the production pieces a real run needs:
 ```
 
 `/multi-perspective` needs a topic; with fewer than two angles it defaults to `technical, product, security, user experience, maintainability`. `/codebase-audit` needs a scope and at least one check.
+
+`/code-review` reads its target from `[target]`, defaulting to your working diff when omitted:
+
+```
+/code-review                  review git diff HEAD (your working changes)
+/code-review HEAD~3..HEAD     review a git range
+/code-review src/foo.ts       review a git diff scoped to one path
+/code-review 42               review gh pr diff 42 (needs the gh CLI + auth)
+```
+
+It fans out 7 finder agents in parallel — 3 on correctness (line-by-line scan, removed-behavior audit, cross-file call-site tracing), 3 on cleanup (reuse, simplification, efficiency), and 1 on abstraction-level fit — dedupes their candidates, verifies each one, and returns a ranked markdown report (correctness first, cleanup next, abstraction last, capped at the top 10). A diff over ~200k characters is truncated with a clear notice rather than silently cut or blowing up the prompt.
 
 In the navigator: `↑/↓` select · `enter`/`→` open · `esc`/`←` back · `p` pause · `x` stop · `r` restart · `s` save · `q` quit. Each agent shows the model it ran on; the detail view shows its prompt, result, error diagnostics, and compact message/tool history.
 

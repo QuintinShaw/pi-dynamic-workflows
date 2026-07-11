@@ -7,6 +7,7 @@ export { compactAgentHistory } from "./agent-history.js";
 export type { AgentDefinition, AgentRegistry } from "./agent-registry.js";
 export { applyToolPolicy, listAgentTypes, loadAgentRegistry, resolveAgentType } from "./agent-registry.js";
 export { registerBuiltinWorkflows } from "./builtin-commands.js";
+export { generateCodeReviewWorkflow, MAX_DIFF_CHARS } from "./code-review.js";
 export * from "./config.js";
 export type { DeepResearchConfig } from "./deep-research.js";
 export { generateCodebaseAuditWorkflow, generateDeepResearchWorkflow } from "./deep-research.js";
