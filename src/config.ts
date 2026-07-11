@@ -44,8 +44,12 @@ export function normalizeKeywordTriggerWord(value: unknown): string | undefined 
 }
 
 /**
- * Named workflow subagent definitions directory. Resolved both project-relative
- * (cwd/.pi/agents) and home-relative (~/.pi/agents); project entries win on name
- * collision. Each `*.md` file is an agent definition (frontmatter + body prompt).
+ * Named workflow subagent definitions directory. Resolved project-relative
+ * (cwd/.pi/agents), plus user-level at `~/.pi/agent/agents/` (the primary
+ * location, via `getAgentDir()` in agent-registry.ts) with the legacy
+ * `~/.pi/agents/` (this constant, home-relative) scanned as a deprecated
+ * fallback. Project entries win on name collision, then the primary user
+ * location, then the legacy one. Each `*.md` file is an agent definition
+ * (frontmatter + body prompt).
  */
 export const AGENTS_DIR = ".pi/agents";

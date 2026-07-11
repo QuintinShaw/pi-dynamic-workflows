@@ -184,7 +184,7 @@ The full guide — every global, agent option, `agentType` definitions, structur
 | --- | --- |
 | `tier` | `"small"` \| `"medium"` \| `"big"` — coarse model routing (configure via `/workflows-models`; tiers may store `provider/modelId:thinking`). |
 | `model` | Exact `provider/modelId` or `provider/modelId:thinking` (always wins over `tier`). |
-| `agentType` | A named definition (`.pi/agents/<name>.md`) binding tools + model + role prompt. |
+| `agentType` | A named definition (`.pi/agents/<name>.md` project-level, or `~/.pi/agent/agents/<name>.md` user-level — `~/.pi/agents/<name>.md` still works as a deprecated fallback) binding tools + model + role prompt. |
 | `isolation: "worktree"` | Run in a throwaway git worktree for conflict-free parallel edits. |
 | `schema` | JSON Schema → the subagent returns a validated object. |
 | `label` / `phase` / `timeoutMs` | Display label / phase override / optional per-agent hard timeout. Omit `timeoutMs` for no hard timeout. |

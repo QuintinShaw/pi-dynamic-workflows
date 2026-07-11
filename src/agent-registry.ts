@@ -6,8 +6,13 @@
  *   agent("audit this dir", { agentType: "security-auditor" })
  *
  * Definitions live as Markdown files under `.pi/agents/*.md` (project, cwd-relative)
- * and `~/.pi/agents/*.md` (user). Frontmatter binds the subagent's tools, model,
- * and a body prompt; project definitions win on a name collision. This mirrors
+ * and `~/.pi/agent/agents/*.md` (user — `getAgentDir() + "agents"`, honoring the
+ * `PI_CODING_AGENT_DIR` override), matching pi-coding-agent's own built-in agent
+ * discovery convention. The legacy `~/.pi/agents/*.md` location is still scanned as
+ * a deprecated fallback (with a one-time warning) so users who followed this repo's
+ * earlier docs are not silently broken; the new location wins on a name collision.
+ * Frontmatter binds the subagent's tools, model, and a body prompt; project
+ * definitions win over both user-level locations on a name collision. This mirrors
  * Claude Code's `.claude/agents` registry: agentType is a real binding of
  * tools+model+system-prompt, not a prose hint.
  *
@@ -19,7 +24,7 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
-import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { AGENTS_DIR } from "./config.js";
 
 export interface AgentDefinition {
@@ -44,9 +49,22 @@ export interface AgentDefinition {
 export type AgentRegistry = Map<string, AgentDefinition>;
 
 function toStringArray(value: unknown): string[] | undefined {
-  if (!Array.isArray(value)) return undefined;
-  const arr = value.filter((v): v is string => typeof v === "string" && v.trim().length > 0).map((v) => v.trim());
-  return arr.length ? arr : undefined;
+  if (value == null) return undefined;
+  // YAML list form: ["read", "grep"]
+  if (Array.isArray(value)) {
+    const arr = value.filter((v): v is string => typeof v === "string" && v.trim().length > 0).map((v) => v.trim());
+    return arr.length ? arr : undefined;
+  }
+  // Comma-separated string form: "read, grep, find" — the form pi-coding-agent's
+  // parseFrontmatter returns and the form the official subagent example uses.
+  if (typeof value === "string" && value.trim().length > 0) {
+    const arr = value
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    return arr.length ? arr : undefined;
+  }
+  return undefined;
 }
 
 /**
@@ -105,15 +123,32 @@ function readDefsFromDir(dir: string, source: "project" | "user"): AgentDefiniti
 }
 
 /**
- * Load the agent registry once for a run. Scans the project dir then the user
- * dir; the FIRST definition for a name wins (project > user, then filename
+ * Load the agent registry once for a run. Scans the project dir, then the
+ * user dir, then — as a deprecated fallback — the legacy user dir; the FIRST
+ * definition for a name wins (project > user > legacy user, then filename
  * order), so a name collision is resolved deterministically and silently.
+ *
+ * When a definition is only found at the legacy location (not shadowed by
+ * the new user dir), a single deprecation warning is logged for this call
+ * telling the user to move their files — not one warning per legacy file.
  *
  * `opts` overrides the scanned directories (used by tests).
  */
-export function loadAgentRegistry(cwd: string, opts?: { projectDir?: string; userDir?: string }): AgentRegistry {
+export function loadAgentRegistry(
+  cwd: string,
+  opts?: { projectDir?: string; userDir?: string; legacyUserDir?: string },
+): AgentRegistry {
   const projectDir = opts?.projectDir ?? join(cwd, AGENTS_DIR);
-  const userDir = opts?.userDir ?? join(homedir(), AGENTS_DIR);
+  // User-level definitions live under the agent dir (e.g. ~/.pi/agent/agents/),
+  // matching the convention used by pi-coding-agent's built-in agent discovery
+  // and the official subagent extension example. Reading getAgentDir() also
+  // honors the PI_CODING_AGENT_DIR env override.
+  const userDir = opts?.userDir ?? join(getAgentDir(), "agents");
+  // Deprecated: this repo's docs used to point users at ~/.pi/agents/ before
+  // pi-coding-agent's convention (~/.pi/agent/agents/) was known. Keep scanning
+  // it as a fallback so those files don't silently stop resolving.
+  const legacyUserDir = opts?.legacyUserDir ?? join(homedir(), AGENTS_DIR);
+
   const registry: AgentRegistry = new Map();
   for (const def of readDefsFromDir(projectDir, "project")) {
     if (def.name && !registry.has(def.name)) registry.set(def.name, def);
@@ -121,6 +156,21 @@ export function loadAgentRegistry(cwd: string, opts?: { projectDir?: string; use
   if (userDir !== projectDir) {
     for (const def of readDefsFromDir(userDir, "user")) {
       if (def.name && !registry.has(def.name)) registry.set(def.name, def);
+    }
+  }
+  if (legacyUserDir !== projectDir && legacyUserDir !== userDir) {
+    let warnedLegacy = false;
+    for (const def of readDefsFromDir(legacyUserDir, "user")) {
+      if (def.name && !registry.has(def.name)) {
+        registry.set(def.name, def);
+        if (!warnedLegacy) {
+          console.warn(
+            `[agent-registry] Loaded agent definition(s) from the deprecated location "${legacyUserDir}". ` +
+              `Move them to "${userDir}" — the old location may stop being read in a future release.`,
+          );
+          warnedLegacy = true;
+        }
+      }
     }
   }
   return registry;
