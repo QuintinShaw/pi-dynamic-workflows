@@ -170,6 +170,26 @@ function isBackspace(data: string): boolean {
 }
 
 /**
+ * Pi's CustomEditor still forwards `(tui, theme, keybindings)` to the legacy
+ * pi-tui Editor constructor. OMP's CustomEditor has no constructor and extends
+ * the newer `Editor(theme)`. Select the argument layout from the base Editor's
+ * required parameter count so one extension can run in either host.
+ */
+function customEditorConstructorArgs(
+  tui: TUI,
+  theme: EditorTheme,
+  keybindings: ConstructorParameters<typeof CustomEditor>[2],
+): ConstructorParameters<typeof CustomEditor> {
+  const baseEditor = Object.getPrototypeOf(CustomEditor) as { readonly length: number };
+  if (baseEditor.length === 1) {
+    // The installed Pi types describe the legacy signature; OMP provides the
+    // runtime-only `(theme, keybindings)` signature.
+    return [theme, keybindings] as unknown as ConstructorParameters<typeof CustomEditor>;
+  }
+  return [tui, theme, keybindings];
+}
+
+/**
  * Editor that paints the trigger words and owns the on/off toggle. Reads/writes
  * `state.active` so the extension's `input` handler can decide whether to force a
  * workflow at submit time.
@@ -182,12 +202,12 @@ export class WorkflowEditor extends CustomEditor {
   private wasTriggered = false;
 
   constructor(
-    tui: TUI,
+    private readonly hostTui: TUI,
     theme: EditorTheme,
     keybindings: ConstructorParameters<typeof CustomEditor>[2],
     private readonly modeState: WorkflowModeState,
   ) {
-    super(tui, theme, keybindings);
+    super(...customEditorConstructorArgs(hostTui, theme, keybindings));
   }
 
   /** Highlighted/armed: a trigger is present and the user hasn't toggled it off. */
@@ -205,7 +225,7 @@ export class WorkflowEditor extends CustomEditor {
       this.disabled = true;
       this.modeState.suppressedKeywordText = this.getText().trim();
       this.syncState();
-      this.tui.requestRender();
+      this.hostTui.requestRender();
       return;
     }
     const before = this.getText();
@@ -261,7 +281,7 @@ export class WorkflowEditor extends CustomEditor {
     if (shouldRun && !this.timer) {
       this.timer = setInterval(() => {
         this.tick = (this.tick + 1) % (RAINBOW.length * 6);
-        this.tui.requestRender();
+        this.hostTui.requestRender();
       }, 90);
       // Don't keep the process alive for the animation.
       (this.timer as { unref?: () => void }).unref?.();
