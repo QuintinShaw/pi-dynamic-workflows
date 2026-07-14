@@ -66,6 +66,9 @@
   "dependencies": {
     "acorn": "^8.16.0"
   },
+  "optionalDependencies": {
+    "@tavily/core": "^0.6.0"
+  },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.80.6",
     "@earendil-works/pi-tui": ">=0.80.6",

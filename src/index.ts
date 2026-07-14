@@ -76,7 +76,7 @@ export { createSharedStoreTools, SharedStore } from "./shared-store.js";
 export type { StructuredOutputCapture, StructuredOutputToolOptions } from "./structured-output.js";
 export { createStructuredOutputTool } from "./structured-output.js";
 export { deliverText, installResultDelivery, installTaskPanel, type TaskPanelOptions } from "./task-panel.js";
-export { createWebFetchTool, createWebSearchTool, createWebTools } from "./web-tools.js";
+export { createTavilySearchTool, createWebFetchTool, createWebSearchTool, createWebTools } from "./web-tools.js";
 export type {
   AgentOptions,
   JournalEntry,

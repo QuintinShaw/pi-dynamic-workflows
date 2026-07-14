@@ -10,6 +10,15 @@
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
+type SearchResult = { url: string; title: string };
+
+async function tavilySearch(query: string, limit: number): Promise<SearchResult[]> {
+  const { tavily } = await import("@tavily/core");
+  const client = tavily({ apiKey: process.env.TAVILY_API_KEY! });
+  const response = await client.search(query, { maxResults: limit });
+  return response.results.map((r: { url: string; title: string }) => ({ url: r.url, title: r.title }));
+}
+
 const UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36";
 
@@ -69,16 +78,56 @@ export function createWebSearchTool(): ToolDefinition {
     async execute(_id, params: { query: string; count?: number }) {
       const limit = Math.min(Math.max(params.count ?? 6, 1), 10);
       try {
-        const { status, body } = await fetchText(`https://www.bing.com/search?q=${encodeURIComponent(params.query)}`);
-        const results = parseBingResults(body, limit);
+        let results: SearchResult[];
+        if (process.env.TAVILY_API_KEY) {
+          results = await tavilySearch(params.query, limit);
+        } else {
+          const { status, body } = await fetchText(`https://www.bing.com/search?q=${encodeURIComponent(params.query)}`);
+          results = parseBingResults(body, limit);
+          if (!results.length) {
+            return {
+              content: [{ type: "text", text: `No results parsed (HTTP ${status}). Try a different query or fetch a known URL directly.` }],
+              details: { results },
+            };
+          }
+        }
         const text = results.length
           ? results.map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}`).join("\n")
-          : `No results parsed (HTTP ${status}). Try a different query or fetch a known URL directly.`;
+          : "No results found. Try a different query or fetch a known URL directly.";
         return { content: [{ type: "text", text }], details: { results } };
       } catch (error) {
         return {
           content: [{ type: "text", text: `web_search failed: ${error instanceof Error ? error.message : error}` }],
-          details: { results: [] as Array<{ url: string; title: string }> },
+          details: { results: [] as SearchResult[] },
+        };
+      }
+    },
+  }) as unknown as ToolDefinition;
+}
+
+/** A tool that always uses Tavily for search (requires TAVILY_API_KEY). */
+export function createTavilySearchTool(): ToolDefinition {
+  return defineTool({
+    name: "web_search",
+    label: "Web Search (Tavily)",
+    description: "Search the web via Tavily and return a list of result URLs and titles. Use before web_fetch to find sources.",
+    promptSnippet: "Search the web for sources",
+    parameters: Type.Object({
+      query: Type.String({ description: "The search query." }),
+      count: Type.Optional(Type.Number({ description: "Max results (default 6)." })),
+    }),
+    async execute(_id, params: { query: string; count?: number }) {
+      const limit = Math.min(Math.max(params.count ?? 6, 1), 10);
+      try {
+        const results = await tavilySearch(params.query, limit);
+        const text = results.length
+          ? results.map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}`).join("\n")
+          : "No results found. Try a different query or fetch a known URL directly.";
+        return { content: [{ type: "text", text }], details: { results } };
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: `web_search failed: ${error instanceof Error ? error.message : error}` }],
+          details: { results: [] as SearchResult[] },
         };
       }
     },
