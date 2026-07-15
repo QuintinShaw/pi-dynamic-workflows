@@ -3,10 +3,20 @@ import test from "node:test";
 import { createEffortState, effortDirective, isSubstantive, registerEffortCommand } from "../src/effort-command.js";
 import { buildForcedWorkflowPrompt } from "../src/workflow-editor.js";
 
-test("effortDirective returns a tier nudge for high/ultra, nothing for off", () => {
+test("effortDirective uses structural limits and does not impose a token gate", () => {
   assert.equal(effortDirective("off"), undefined);
-  assert.match(effortDirective("high") ?? "", /HIGH/);
-  assert.match(effortDirective("ultra") ?? "", /ULTRA/);
+  for (const level of ["high", "ultra"] as const) {
+    const directive = effortDirective(level) ?? "";
+    assert.match(directive, new RegExp(level, "i"));
+    assert.match(directive, /maxAgents/, "effort mode should retain a structural agent ceiling");
+    assert.match(
+      directive,
+      /omit tokenBudget unless the operator explicitly requested/i,
+      "effort mode must not add an arbitrary cumulative-session token gate",
+    );
+    assert.doesNotMatch(directive, /set (?:a |an )?(?:moderate|generous|bounded) tokenBudget/i);
+    assert.doesNotMatch(directive, /set explicit caps[^.]*tokenBudget/i);
+  }
 });
 
 test("isSubstantive accepts real requests, rejects terse text and slash commands", () => {

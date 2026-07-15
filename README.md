@@ -71,7 +71,7 @@ return await agent('Synthesize and double-check these findings:\n' + findings.jo
 - **Real model routing** — `small` / `medium` / `big` tiers (or an exact `model`) per agent. It actually switches the subagent's model — cheap work on a light one, hard synthesis on a big one.
 - **Journaled resume** — an interrupted run replays finished agents from a journal (no re-run, no tokens) and runs only what's left or what you changed.
 - **Git worktree isolation** — `isolation: "worktree"` gives an agent its own branch, so parallel agents can edit the same files without clobbering each other.
-- **Real token & cost accounting** — read from each subagent's session, not estimated. Runs have no default token cap; `tokenBudget`, phase budgets, and `budget` let you add explicit gates when you want them.
+- **Real token & cost accounting** — read from each subagent's session, not estimated. Runs have no default token cap; `tokenBudget`, phase budgets, and `budget` add optional between-launch gates when requested (not hard in-flight caps).
 - **Background by default** — the turn ends right away, a live "Workflows running" panel tracks runs, and each result is delivered back so the conversation auto-continues when it finishes. The panel is compact by default; `/workflows-progress detailed` expands it inline to per-phase/per-agent rows with tokens, cost, and a live tok/s rate (so a stalled agent shows as 0 tok/s) — no need to open `/workflows`.
 - **Interactive `/workflows` TUI** — drill runs → phases → agents → detail; inspect per-agent failures and compact subagent history; pause, stop, restart, and save runs from the keyboard.
 - **Quality patterns built in** — `verify()`, `judgePanel()`, `loopUntilDry()`, and `completenessCheck()` for adversarial review, best-of-N, and exhaustive discovery.
@@ -187,7 +187,7 @@ The full guide — every global, agent option, `agentType` definitions, structur
 | `agent(prompt, opts)` | Spawn an isolated subagent. Returns its final text, or a validated object with `opts.schema`; recoverable failures return `null` with diagnostics in `/workflows`. |
 | `parallel(thunks)` | Run `() => agent(...)` thunks concurrently; results in input order. |
 | `pipeline(items, ...stages)` | Fan items through sequential stages `(prev, original, index)`. |
-| `phase(title, { budget? })` | Group agents in the live view; optional per-phase token sub-budget. |
+| `phase(title, { budget? })` | Group agents in the live view; optional per-phase cumulative-token launch gate. |
 | `verify` / `judgePanel` / `loopUntilDry` / `completenessCheck` | Built-in quality patterns. |
 | `workflow(name, args)` | Run a saved workflow inline (shares the global caps). |
 | `checkpoint(prompt, opts)` | A journaled, replayable human approval gate. |
@@ -203,7 +203,7 @@ The full guide — every global, agent option, `agentType` definitions, structur
 | `label` / `phase` / `timeoutMs` | Display label / phase override / optional per-agent hard timeout. Omit `timeoutMs` for no hard timeout. |
 | `retries` | Retry attempts after a recoverable failure (timeout, connection failure, empty output) for this agent. Overrides the run-level `agentRetries`. Default `0`. |
 
-By default, workflows do not set a run-wide token budget or per-agent hard timeout. Use the `workflow` tool's `tokenBudget` / `agentTimeoutMs`, per-phase budgets, or per-agent `timeoutMs` only when you want an explicit cap. A global fallback timeout can also be set in `~/.pi/workflows/settings.json` as `{ "defaultAgentTimeoutMs": 600000 }`; set it to `null` or omit it for no default hard timeout.
+By default, workflows do not set a run-wide token gate or per-agent hard timeout. Use the `workflow` tool's `tokenBudget` only when the operator explicitly requests a token/spend gate, and use `agentTimeoutMs`, per-phase budgets, or per-agent `timeoutMs` only when those bounds are intentional. `tokenBudget` is checked before each agent launch and charged after completion, so agents already running concurrently may overshoot it before subsequent launches are blocked. Its total is Pi's cumulative session usage across every assistant turn — input + output + cache reads + cache writes, including history later compacted away — not generated-output length or current-context size. A global fallback timeout can also be set in `~/.pi/workflows/settings.json` as `{ "defaultAgentTimeoutMs": 600000 }`; set it to `null` or omit it for no default hard timeout.
 
 For larger or flakier fan-outs, the `workflow` tool also accepts `concurrency` (max agents running at once, clamped to the runtime maximum of `16`) and `agentRetries` (retry attempts after a recoverable agent failure such as a timeout, connection failure, or empty output). Both can be defaulted in `~/.pi/workflows/settings.json` as `{ "defaultConcurrency": 4, "defaultAgentRetries": 2 }`; a per-run tool value overrides the default, and a per-agent `retries` overrides `agentRetries`. Retries default to `0` (off) unless configured or passed, and only recoverable failures retry — nonrecoverable errors still abort the run.
 

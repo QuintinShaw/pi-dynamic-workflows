@@ -89,6 +89,17 @@ test("createWorkflowTool schema describes unbounded default timeout", () => {
   assert.match(description, /only when the user asks/i);
 });
 
+test("createWorkflowTool describes tokenBudget as a cumulative between-launch gate", () => {
+  const tool = createWorkflowTool();
+  const parameters = tool.parameters as { properties?: Record<string, { description?: string }> };
+  const description = parameters.properties?.tokenBudget?.description ?? "";
+  assert.match(description, /cumulative-session-token launch gate/i);
+  assert.match(description, /running in parallel can overshoot/i);
+  assert.match(description, /input, output, cache-read, and cache-write/i);
+  assert.match(description, /only when the user explicitly asks/i);
+  assert.doesNotMatch(description, /hard total-token budget/i);
+});
+
 test("createWorkflowTool schema exposes concurrency and agentRetries", () => {
   const tool = createWorkflowTool();
   const parameters = tool.parameters as { properties?: Record<string, { description?: string }> };
