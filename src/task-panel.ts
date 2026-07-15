@@ -8,7 +8,7 @@
 
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionUIContext, Theme } from "@earendil-works/pi-coding-agent";
-import { type Component, type TUI, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { type Component, type TUI, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { shorten, statusIcon, type WorkflowAgentSnapshot, type WorkflowSnapshot } from "./display.js";
 import type { ManagedRun, WorkflowManager } from "./workflow-manager.js";
 import type { WorkflowStorage } from "./workflow-saved.js";
@@ -19,11 +19,16 @@ import { shortModel } from "./workflow-ui.js";
 // as tokens accrue (not only on agent start/end). It is harmless in compact mode —
 // it redraws identical content.
 const RUN_EVENTS = [
+  "agentQueued",
+  "agentSession",
   "agentStart",
+  "agentUsage",
+  "agentHistory",
   "agentEnd",
   "phase",
   "log",
   "tokenUsage",
+  "concurrencyChanged",
   "complete",
   "error",
   "stopped",
@@ -86,6 +91,11 @@ function fitLine(line: string, width?: number): string {
   const maxWidth = Math.max(0, Math.floor(width));
   if (visibleWidth(line) <= maxWidth) return line;
   return truncateToWidth(line, maxWidth);
+}
+
+function wrapLine(line: string, width?: number): string[] {
+  if (typeof width !== "number" || !Number.isFinite(width) || visibleWidth(line) <= width) return [line];
+  return wrapTextWithAnsi(line, Math.max(1, Math.floor(width)));
 }
 
 export function deliverText(run: ManagedRun, opts: { resultPath?: string; maxChars?: number } = {}): string {
@@ -211,13 +221,34 @@ export function renderPanel(manager: WorkflowManager, theme: Theme, width?: numb
   const all = manager.listRuns();
   const active = all.filter((r) => r.status === "running" || r.status === "paused");
   if (!active.length) return [];
-  const rows = active.map((r) => {
+  const rows = active.flatMap((r) => {
     const live = manager.getRun(r.runId);
     const agents = live?.snapshot.agents ?? r.agents;
     const done = agents.filter((a) => a.status === "done").length;
+    const running = agents.filter((a) => a.status === "running");
+    const paused = agents.filter((a) => a.status === "paused");
+    const queued = agents.filter((a) => a.status === "queued").length;
     const icon = r.status === "paused" ? "⏸" : "◆";
     const phase = live?.snapshot.currentPhase ? ` · ${live.snapshot.currentPhase}` : "";
-    return `  ${icon} ${r.workflowName}  ${done}/${agents.length} agents${phase}`;
+    const summary = `  ${icon} ${r.workflowName}  ${done}/${agents.length} agents · ${running.length} running · ${paused.length} paused · ${queued} not started${phase}`;
+    const pausedLines = paused.length
+      ? wrapLine(
+          `    Paused mid-run (${paused.length}): ${paused
+            .map((agent) => `${agent.label}${agent.sessionFile ? " (session saved)" : " (fresh restart)"}`)
+            .join(", ")}`,
+          width,
+        )
+      : [];
+    if (!running.length) return [summary, ...pausedLines];
+    const cap = live?.execution?.effectiveConcurrency ?? r.effectiveConcurrency ?? running.length;
+    return [
+      summary,
+      ...wrapLine(
+        `    Running now (${running.length}/${cap}): ${running.map((agent) => agent.label).join(", ")}`,
+        width,
+      ),
+      ...pausedLines,
+    ];
   });
   // Finished runs leave this live panel but are kept in the navigator. Tell the
   // user so a completed run doesn't look like it vanished.
@@ -235,38 +266,46 @@ export function renderPanel(manager: WorkflowManager, theme: Theme, width?: numb
 
 /** Rolling window for the token/s rate. Older samples age out so a stall decays to 0. */
 const RATE_WINDOW_MS = 10_000;
-/** Per-run (timestamp, cumulative total) samples, keyed by the persisted runId so
- *  the rolling rate survives pause→resume. Cleared when a run ends. */
-const tokenSamples = new Map<string, Array<{ ts: number; total: number }>>();
+/** Per-invocation samples grouped by run. Stable execution IDs prevent duplicate
+ * labels from sharing a token-rate series. */
+const tokenSamples = new Map<string, Map<string, Array<{ ts: number; total: number }>>>();
+const RUN_TOTAL_SAMPLE = "__run__";
 
-/** Record a token-total sample for `runId` at time `now` (ms). */
-export function sampleTokens(runId: string, total: number, now: number): void {
-  const samples = tokenSamples.get(runId) ?? [];
+/** Record a token-total sample for one invocation (or the run aggregate by default). */
+export function sampleTokens(runId: string, total: number, now: number, executionId = RUN_TOTAL_SAMPLE): void {
+  const byAgent = tokenSamples.get(runId) ?? new Map<string, Array<{ ts: number; total: number }>>();
+  const samples = byAgent.get(executionId) ?? [];
   const last = samples[samples.length - 1];
-  // Collapse repeat renders within the same instant (e.g. width recalcs).
   if (last && last.ts === now && last.total === total) return;
   samples.push({ ts: now, total });
-  // Drop samples beyond the rolling window, always keeping ≥2 so a rate is computable.
   while (samples.length > 2 && now - samples[0].ts > RATE_WINDOW_MS) samples.shift();
-  tokenSamples.set(runId, samples);
+  byAgent.set(executionId, samples);
+  tokenSamples.set(runId, byAgent);
 }
 
-/** Tokens/second over the rolling window; 0 when too few samples or totals plateau. */
-export function tokensPerSecond(runId: string): number {
-  const samples = tokenSamples.get(runId);
+function sampleRate(samples: Array<{ ts: number; total: number }> | undefined): number {
   if (!samples || samples.length < 2) return 0;
   const oldest = samples[0];
   const newest = samples[samples.length - 1];
   const elapsedMs = newest.ts - oldest.ts;
-  if (elapsedMs <= 0) return 0;
   const delta = newest.total - oldest.total;
-  if (delta <= 0) return 0;
-  return (delta / elapsedMs) * 1000;
+  return elapsedMs > 0 && delta > 0 ? (delta / elapsedMs) * 1000 : 0;
 }
 
-/** Forget a run's samples (call when it finishes) so the map can't grow unbounded. */
-export function clearTokenSamples(runId: string): void {
-  tokenSamples.delete(runId);
+/** Tokens/second for one invocation, or the aggregate compatibility series. */
+export function tokensPerSecond(runId: string, executionId = RUN_TOTAL_SAMPLE): number {
+  return sampleRate(tokenSamples.get(runId)?.get(executionId));
+}
+
+/** Forget a run or one terminal invocation's samples. */
+export function clearTokenSamples(runId: string, executionId?: string): void {
+  if (!executionId) {
+    tokenSamples.delete(runId);
+    return;
+  }
+  const byAgent = tokenSamples.get(runId);
+  byAgent?.delete(executionId);
+  if (byAgent?.size === 0) tokenSamples.delete(runId);
 }
 
 /** Compact token count for the space-constrained panel: 980, 12.4K, 1.3M. */
@@ -306,14 +345,19 @@ function renderRunBody(
     if (!phaseAgents.length) continue;
     const done = phaseAgents.filter((a) => a.status === "done").length;
     const running = phaseAgents.filter((a) => a.status === "running").length;
+    const paused = phaseAgents.filter((a) => a.status === "paused").length;
+    const queued = phaseAgents.filter((a) => a.status === "queued").length;
     const errors = phaseAgents.filter((a) => a.status === "error").length;
     const skipped = phaseAgents.filter((a) => a.status === "skipped").length;
     const complete = done + errors + skipped === phaseAgents.length;
-    const marker = running > 0 || (!complete && snap.currentPhase === title) ? "▶" : complete ? "✓" : " ";
+    const marker =
+      paused > 0 ? "⏸" : running > 0 || (!complete && snap.currentPhase === title) ? "▶" : complete ? "✓" : " ";
     const phaseTokens = phaseAgents.reduce((n, a) => n + (a.tokens ?? 0), 0);
     const phaseMeta = [
       `${done}/${phaseAgents.length} agents`,
       running ? `${running} running` : "",
+      paused ? `${paused} paused` : "",
+      queued ? `${queued} not started` : "",
       errors ? `${errors} errors` : "",
       phaseTokens > 0 ? `${fmtTokensShort(phaseTokens)} tok` : "",
     ]
@@ -323,10 +367,12 @@ function renderRunBody(
 
     const visible = phaseAgents.slice(-maxAgents);
     for (const a of visible) {
-      const tok = a.tokens ? dim(` ${fmtTokensShort(a.tokens)} tok`) : "";
+      const tok = a.tokens ? dim(` ${a.tokensEstimated ? "~" : ""}${fmtTokensShort(a.tokens)} tok`) : "";
       const mdl = shortModel(a.model);
       const model = mdl ? dim(` · ${mdl}`) : "";
-      lines.push(`    [${a.id}] ${statusIcon(a.status)} ${shorten(a.label, 40)}${tok}${model}`);
+      const state =
+        a.status === "paused" ? `paused mid-run (${a.sessionFile ? "session saved" : "fresh restart"})` : a.status;
+      lines.push(`    [${a.id}] ${statusIcon(a.status)} ${shorten(a.label, 40)}${tok}${model}${dim(` · ${state}`)}`);
     }
     if (phaseAgents.length > visible.length) {
       lines.push(dim(`    … ${phaseAgents.length - visible.length} earlier agents`));
@@ -349,6 +395,10 @@ export function renderPanelDetailed(
 ): string[] {
   const all = manager.listRuns();
   const active = all.filter((r) => r.status === "running" || r.status === "paused");
+  const knownRunIds = new Set(all.map((run) => run.runId));
+  for (const sampledRunId of tokenSamples.keys()) {
+    if (!knownRunIds.has(sampledRunId)) tokenSamples.delete(sampledRunId);
+  }
   if (!active.length) return [];
   const dim = (t: string) => theme.fg("dim", t);
   const out: string[] = [theme.bold(`Workflows running (${active.length}):`)];
@@ -358,23 +408,27 @@ export function renderPanelDetailed(
     const snap = live?.snapshot;
     const agents = (snap?.agents ?? r.agents) as WorkflowAgentSnapshot[];
     const done = agents.filter((a) => a.status === "done").length;
+    const running = agents.filter((a) => a.status === "running");
+    const paused = agents.filter((a) => a.status === "paused");
+    const queued = agents.filter((a) => a.status === "queued").length;
     const icon = r.status === "paused" ? "⏸" : "◆";
     const usage = snap?.tokenUsage ?? r.tokenUsage;
-    // The run-level tokenUsage aggregate is only finalized when the run ends, so
-    // it reads 0 for the whole live run. Per-agent `tokens` update on each agent
-    // completion, so sum those for a live total (and keep the header consistent
-    // with the per-phase subtotals). Note: tokens land at agent-completion
-    // granularity, so the rate reflects completion throughput — it decays to 0
-    // during a single long-running agent or a stall (which is the intended signal).
     const total = agents.reduce((n, a) => n + (a.tokens ?? 0), 0);
-    // Sample the running total and derive the rolling token/s. Paused runs don't
-    // accrue tokens, so their rate is suppressed (a stalled rate would mislead).
-    sampleTokens(r.runId, total, now);
-    const rate = r.status === "running" ? tokensPerSecond(r.runId) : 0;
+    const estimated = agents.some((agent) => agent.tokensEstimated && (agent.tokens ?? 0) > 0);
+    let rate = 0;
+    for (const agent of running) {
+      const executionId = agent.executionId ?? `${r.runId}:${agent.callIndex ?? agent.id - 1}`;
+      sampleTokens(r.runId, agent.tokens ?? 0, now, executionId);
+      rate += tokensPerSecond(r.runId, executionId);
+    }
+    if (r.status !== "running") rate = 0;
     const meta = [
       `${done}/${agents.length} agents`,
+      `${running.length} running`,
+      `${paused.length} paused`,
+      `${queued} not started`,
       snap?.currentPhase || "",
-      total > 0 ? `${fmtTokensShort(total)} tok` : "",
+      total > 0 ? `${estimated ? "~" : ""}${fmtTokensShort(total)} tok` : "",
       // 2 decimals for ≥1¢, 4 for sub-cent so a real cost never shows as "$0.00".
       // (cost is only known once the run finalizes its usage.)
       usage?.cost ? `$${usage.cost.toFixed(usage.cost >= 0.01 ? 2 : 4)}` : "",
@@ -383,6 +437,28 @@ export function renderPanelDetailed(
       .filter(Boolean)
       .join(" · ");
     out.push(`  ${icon} ${theme.bold(r.workflowName)}  ${dim(meta)}`);
+    if (running.length) {
+      const cap = live?.execution?.effectiveConcurrency ?? r.effectiveConcurrency ?? running.length;
+      out.push(
+        ...wrapLine(
+          dim(`    Running now (${running.length}/${cap}): ${running.map((agent) => agent.label).join(", ")}`),
+          width,
+        ),
+      );
+    }
+    if (paused.length) {
+      out.push(
+        ...wrapLine(
+          theme.fg(
+            "warning",
+            `    Paused mid-run (${paused.length}): ${paused
+              .map((agent) => `${agent.label}${agent.sessionFile ? " (session saved)" : " (fresh restart)"}`)
+              .join(", ")}`,
+          ),
+          width,
+        ),
+      );
+    }
     if (snap) out.push(...renderRunBody(snap, agents, maxAgents, theme));
   }
 
@@ -433,6 +509,9 @@ export function installTaskPanel(
     (tui: TUI, theme: Theme) => {
       const onEvent = () => tui.requestRender();
       for (const ev of RUN_EVENTS) manager.on(ev, onEvent);
+      const onAgentEnd = ({ runId, executionId }: { runId: string; executionId: string }) =>
+        clearTokenSamples(runId, executionId);
+      manager.on("agentEnd", onAgentEnd);
       const onRunEnd = ({ runId }: { runId: string }) => clearTokenSamples(runId);
       for (const ev of RUN_END_EVENTS) manager.on(ev, onRunEnd);
       // In detailed mode, force a redraw every 2s while a run is active so the
@@ -456,6 +535,7 @@ export function installTaskPanel(
         dispose: () => {
           clearInterval(timer);
           for (const ev of RUN_EVENTS) manager.off(ev, onEvent);
+          manager.off("agentEnd", onAgentEnd);
           for (const ev of RUN_END_EVENTS) manager.off(ev, onRunEnd);
         },
       };

@@ -25,7 +25,16 @@ If you add a `workflow` tool parameter or a `~/.pi/workflows/settings.json` sett
 
 Fake-agent unit tests are necessary but not sufficient. Any change to how agents actually run — retries, timeouts, model routing, token accounting, concurrency, resume — must also be verified **end-to-end against a real Pi subagent session** (real `createAgentSession` → real model), because the real SDK path behaves differently than a mock. If you don't have a real-provider environment, say so in the PR and a maintainer will run it before merge.
 
-A throwaway harness for this should live in the repo root (not `/tmp`, whose symlink breaks relative imports), import from `./src`, and be deleted before commit — don't commit harnesses.
+A throwaway harness for this should live in the repo root (not `/tmp`, whose symlink breaks relative imports), import from `./src`, and be deleted before commit — don't commit harnesses, credentials, or provider output. Record the provider/model and observed results in the PR instead.
+
+For workflow runtime reliability changes, exercise every affected item in this real-provider checklist:
+
+1. **Safe typing:** Submit ordinary prompts containing `workflow`, `workflows`, mixed case, punctuation, paths, and slash commands. With fresh/default settings, none may rewrite the prompt or emit a forced-tool message. Explicit `/workflows-trigger on` must restore only word-bounded activation.
+2. **Autonomous management:** Let Pi start a background run with `workflow`, then have Pi use `workflow_control` to `list`, inspect `status`, `pause`, `resume`, and `stop` it without asking the user to type `/workflows` commands.
+3. **Active fleet:** Start 42 independent agents with Pi selecting `concurrency: 8`. Confirm no more than eight run simultaneously, all active labels appear in `Running now (N/8)`, and remaining work is shown as queued.
+4. **Live usage:** Run a multi-turn child. Confirm `~N tok` moves during streaming, exact tokens replace the estimate at assistant-message boundaries, and terminal reconciliation remains exact.
+5. **Restart/resume:** Interrupt after at least 27 completed calls, restart Pi, and resume the same run. Confirm completed agents retain status and tokens, aggregate usage remains monotonic, no rows duplicate, and the original concurrency/options remain in effect. Repeat with an older run artifact when changing persistence migration.
+6. **Human compatibility:** Confirm `/workflows` commands, navigator pause/stop/restart, `q` close, `x` stop, trigger opt-in, saved workflows, and stale-run recovery still work.
 
 ## Style
 

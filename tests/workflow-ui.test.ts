@@ -1,11 +1,18 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import test from "node:test";
 import type { WorkflowSnapshot } from "../src/display.js";
 import { WorkflowErrorCode } from "../src/errors.js";
 import type { PersistedRunState } from "../src/run-persistence.js";
 import type { ManagedRun, WorkflowManager } from "../src/workflow-manager.js";
 import type { SavedWorkflow } from "../src/workflow-saved.js";
-import { keyToAction, NavigatorModel, NavigatorState, renderNavigator } from "../src/workflow-ui.js";
+import {
+  keyToAction,
+  NavigatorModel,
+  NavigatorState,
+  openWorkflowNavigator,
+  renderNavigator,
+} from "../src/workflow-ui.js";
 
 /** Fake manager exposing one running run with two phases. */
 function fakeManager(): Pick<WorkflowManager, "listRuns" | "getRun"> {
@@ -138,6 +145,55 @@ function persistedRunManager(): Pick<WorkflowManager, "listRuns" | "getRun"> {
   };
 }
 
+function fleetManager(): Pick<WorkflowManager, "listRuns" | "getRun"> {
+  const agents: WorkflowSnapshot["agents"] = Array.from({ length: 42 }, (_, index) => ({
+    id: index + 1,
+    executionId: `fleet:${index}`,
+    callIndex: index,
+    label: `agent-${index + 1}`,
+    phase: "Fleet",
+    prompt: `task ${index + 1}`,
+    status: index < 8 ? "running" : "queued",
+    tokens: index === 0 ? 120 : index === 1 ? 200 : undefined,
+    tokensEstimated: index === 0,
+  }));
+  const snapshot: WorkflowSnapshot = {
+    name: "fleet",
+    phases: ["Fleet"],
+    currentPhase: "Fleet",
+    logs: [],
+    agents,
+    agentCount: 42,
+    runningCount: 8,
+    doneCount: 0,
+    errorCount: 0,
+    effectiveConcurrency: 8,
+  };
+  return {
+    listRuns: () =>
+      [
+        {
+          runId: "fleet",
+          workflowName: "fleet",
+          status: "running",
+          phases: ["Fleet"],
+          agents,
+          logs: [],
+          effectiveConcurrency: 8,
+        },
+      ] as unknown as PersistedRunState[],
+    getRun: (id: string) =>
+      id === "fleet"
+        ? ({
+            runId: "fleet",
+            status: "running",
+            snapshot,
+            execution: { requestedConcurrency: 8, effectiveConcurrency: 8 },
+          } as unknown as ManagedRun)
+        : undefined,
+  };
+}
+
 function savedStorage(): { list(): SavedWorkflow[]; delete(name: string, location?: string): boolean } {
   return {
     list: () => [
@@ -230,6 +286,62 @@ test("NavigatorModel reads from persisted runs when no live snapshot", () => {
   const agents = model.agents("r-old", "Build");
   assert.equal(agents.length, 1);
   assert.equal(agents[0].label, "builder");
+});
+
+test("NavigatorModel preserves persisted identity, exact usage, and concurrency", () => {
+  const manager = {
+    listRuns: () =>
+      [
+        {
+          runId: "restored",
+          workflowName: "restored",
+          status: "completed",
+          phases: ["P"],
+          logs: [],
+          effectiveConcurrency: 8,
+          agents: [
+            {
+              id: 1,
+              executionId: "restored:0",
+              callIndex: 0,
+              label: "same-label",
+              phase: "P",
+              prompt: "p",
+              status: "done",
+              usage: { input: 200, output: 121, cacheRead: 0, cacheWrite: 0, total: 321, cost: 0.01 },
+              tokens: 0,
+              startedAt: "2026-07-14T00:00:00.000Z",
+              endedAt: "2026-07-14T00:00:01.000Z",
+            },
+          ],
+        },
+      ] as unknown as PersistedRunState[],
+    getRun: () => undefined,
+  };
+  const model = new NavigatorModel(manager);
+
+  assert.equal(model.agents("restored", "P")[0].executionId, "restored:0");
+  assert.equal(model.agents("restored", "P")[0].tokens, 321);
+  assert.equal(model.agentDetail("restored", 1)?.usage?.total, 321);
+  assert.equal(model.agentDetail("restored", 1)?.startedAt, "2026-07-14T00:00:00.000Z");
+  assert.equal(model.activity("restored").effectiveConcurrency, 8);
+});
+
+test("NavigatorModel and navigator show eight running and 34 not-started agents with all active labels", () => {
+  const model = new NavigatorModel(fleetManager());
+  const run = model.runs()[0];
+  assert.equal(run.total, 42);
+  assert.equal(run.running, 8);
+  assert.equal(run.queued, 34);
+
+  const state = new NavigatorState();
+  state.drill(model);
+  const text = renderNavigator(state, model, 300, undefined, 30).join("\n");
+  assert.match(text, /8 running/);
+  assert.match(text, /34 not started/);
+  assert.match(text, /Running now \(8\/8\): agent-1, agent-2, agent-3, agent-4, agent-5, agent-6, agent-7, agent-8/);
+  assert.match(text, /~120 tok · running/);
+  assert.match(text, /200 tok · running/);
 });
 
 test("NavigatorState drills runs -> phases -> agents -> detail and back", () => {
@@ -497,6 +609,77 @@ test("renderNavigator shows correct footer hint per view", () => {
   state.drill(model);
   const detailLines = renderNavigator(state, model, 80);
   assert.match(detailLines.join("\n"), /j\/k scroll/);
+});
+
+test("open navigator delegates restart to the guarded manager method", () => {
+  const manager = new EventEmitter() as EventEmitter & Partial<WorkflowManager>;
+  manager.listRuns = () =>
+    [
+      {
+        runId: "done-1",
+        workflowName: "done",
+        script: "export const meta = { name: 'done', description: 'done' }; return agent('x')",
+        status: "completed",
+        phases: [],
+        agents: [],
+        logs: [],
+      },
+    ] as unknown as PersistedRunState[];
+  manager.getRun = () => undefined;
+  const restarted: string[] = [];
+  manager.restart = (runId: string) => {
+    restarted.push(runId);
+    return { runId: "done-2", promise: Promise.resolve({} as never) };
+  };
+  let component: { handleInput(data: string): void; dispose?(): void } | undefined;
+  const notifications: string[] = [];
+  const theme = {
+    fg: (_color: string, text: string) => text,
+    bg: (_color: string, text: string) => text,
+    bold: (text: string) => text,
+  };
+  const ui = {
+    notify: (message: string) => notifications.push(message),
+    custom: (factory: (...args: unknown[]) => typeof component) => {
+      component = factory({ requestRender: () => {}, terminal: { rows: 24 } }, theme, undefined, () => {});
+      return Promise.resolve();
+    },
+  };
+
+  void openWorkflowNavigator({} as never, manager as WorkflowManager, ui as never);
+  component?.handleInput("r");
+
+  assert.deepEqual(restarted, ["done-1"]);
+  assert.match(notifications[0], /Restarted done as done-2/);
+  component?.dispose?.();
+});
+
+test("open navigator rerenders on usage and history-only events", () => {
+  const base = fakeManager();
+  const manager = new EventEmitter() as EventEmitter & Pick<WorkflowManager, "listRuns" | "getRun">;
+  manager.listRuns = base.listRuns;
+  manager.getRun = base.getRun;
+  let component: { dispose?(): void } | undefined;
+  let renders = 0;
+  const theme = {
+    fg: (_color: string, text: string) => text,
+    bg: (_color: string, text: string) => text,
+    bold: (text: string) => text,
+  };
+  const ui = {
+    custom: (factory: (...args: unknown[]) => { dispose?(): void }) => {
+      component = factory({ requestRender: () => renders++, terminal: { rows: 24 } }, theme, undefined, () => {});
+      return Promise.resolve();
+    },
+  };
+
+  void openWorkflowNavigator({} as never, manager as never, ui as never);
+  manager.emit("agentUsage", { runId: "run-1", executionId: "run-1:2" });
+  manager.emit("agentHistory", { runId: "run-1", executionId: "run-1:2" });
+  manager.emit("tokenUsage", { runId: "run-1" });
+
+  assert.equal(renders, 3);
+  component?.dispose?.();
 });
 
 // ═══════════════════════════════════════════════════════════════════════════

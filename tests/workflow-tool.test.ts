@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { Check } from "typebox/value";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { backgroundStartedText, createWorkflowTool, modelRoutingGuideline } from "../src/workflow-tool.js";
 
@@ -89,12 +90,72 @@ test("createWorkflowTool schema describes unbounded default timeout", () => {
   assert.match(description, /only when the user asks/i);
 });
 
-test("createWorkflowTool schema exposes concurrency and agentRetries", () => {
+test("createWorkflowTool schema exposes bounded integer concurrency and agentRetries", () => {
   const tool = createWorkflowTool();
-  const parameters = tool.parameters as { properties?: Record<string, { description?: string }> };
+  const parameters = tool.parameters as {
+    properties?: Record<string, { type?: string; minimum?: number; maximum?: number; description?: string }>;
+  };
+  const concurrency = parameters.properties?.concurrency;
 
-  assert.match(parameters.properties?.concurrency?.description ?? "", /Maximum concurrent agents/i);
+  assert.equal(concurrency?.type, "integer");
+  assert.equal(concurrency?.minimum, 1);
+  assert.equal(concurrency?.maximum, undefined);
+  assert.match(concurrency?.description ?? "", /Maximum concurrent agents/i);
+  assert.match(concurrency?.description ?? "", /configured default/i);
+  assert.match(parameters.properties?.maxAgents?.description ?? "", /whole run/i);
   assert.match(parameters.properties?.agentRetries?.description ?? "", /Retry attempts/i);
+});
+
+test("createWorkflowTool concurrency schema accepts any positive integer", () => {
+  const schema = createWorkflowTool().parameters;
+  const script = "export const meta = { name: 't', description: 't' }; agent('x')";
+
+  assert.equal(Check(schema, { script, concurrency: 1 }), true);
+  assert.equal(Check(schema, { script, concurrency: 16 }), true);
+  assert.equal(Check(schema, { script, concurrency: 128 }), true);
+  assert.equal(Check(schema, { script, concurrency: 10_000 }), true);
+  assert.equal(Check(schema, { script, concurrency: 0 }), false);
+  assert.equal(Check(schema, { script, concurrency: 1.5 }), false);
+});
+
+test("createWorkflowTool forwards model-selected concurrency", async () => {
+  let forwarded: number | undefined;
+  const manager = {
+    getModelRegistry: () => undefined,
+    startInBackground: (_script: string, _args: unknown, options: { concurrency?: number }) => {
+      forwarded = options.concurrency;
+      return { runId: "run-1", promise: Promise.resolve() };
+    },
+  } as unknown as WorkflowManager;
+  const tool = createWorkflowTool({ manager });
+  const script = "export const meta = { name: 't', description: 't' }; agent('x')";
+
+  const result = await (tool.execute as any)("call-1", { script, concurrency: 6 }, undefined, undefined, {});
+
+  assert.equal(forwarded, 6);
+  assert.equal(result.details.requestedConcurrency, 6);
+  assert.equal(result.details.effectiveConcurrency, 6);
+  assert.match(result.content[0].text, /requested 6; effective 6/i);
+});
+
+test("createWorkflowTool delegates unvalidated legacy concurrency to the manager without losing the request", async () => {
+  let forwarded: number | undefined;
+  const manager = {
+    getModelRegistry: () => undefined,
+    startInBackground: (_script: string, _args: unknown, options: { concurrency?: number }) => {
+      forwarded = options.concurrency;
+      return { runId: "run-legacy", promise: Promise.resolve() };
+    },
+  } as unknown as WorkflowManager;
+  const tool = createWorkflowTool({ manager });
+  const script = "export const meta = { name: 't', description: 't' }; agent('x')";
+
+  const result = await (tool.execute as any)("call-1", { script, concurrency: 99 }, undefined, undefined, {});
+
+  assert.equal(forwarded, 99);
+  assert.equal(result.details.requestedConcurrency, 99);
+  assert.equal(result.details.effectiveConcurrency, 99);
+  assert.match(result.content[0].text, /requested 99; effective 99/i);
 });
 
 test("createWorkflowTool promptGuidelines mention retry and concurrency controls", () => {
@@ -102,6 +163,10 @@ test("createWorkflowTool promptGuidelines mention retry and concurrency controls
   const all = tool.promptGuidelines.join(" ");
 
   assert.match(all, /low concurrency/i);
+  assert.match(all, /independent tasks/i);
+  assert.match(all, /configured default \(16 unless overridden\)/i);
+  assert.match(all, /concurrency: 24/i);
+  assert.match(all, /maxAgents: 24/i);
   assert.match(all, /agentRetries/i);
   assert.match(all, /null handling/i);
 });

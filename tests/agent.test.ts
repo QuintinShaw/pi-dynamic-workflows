@@ -1,25 +1,42 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import type { AgentRunOptions, AgentUsage } from "../src/agent.js";
-import { listAvailableModelSpecs, resolveAgentModelSpec, WorkflowAgent } from "../src/agent.js";
+import {
+  createAgentUsageEventHandler,
+  listAvailableModelSpecs,
+  resolveAgentModelSpec,
+  WorkflowAgent,
+} from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { resolveModelSpecWithThinking } from "../src/model-spec.js";
 import type { ModelTierConfig } from "../src/model-tier-config.js";
 import { runWorkflow } from "../src/workflow.js";
+import { workflowProjectPaths } from "../src/workflow-paths.js";
 import { withFakeHome } from "./helpers/fake-home.js";
 
 // Private methods used for testing - cast to this type to access them without `any`
 type WorkflowAgentPrivates = {
   buildPrompt(prompt: string, options: AgentRunOptions<any>, structured: boolean): string;
   lastAssistantText(messages: unknown[]): string;
-  createSessionManager(): { isPersisted(): boolean; getCwd(): string };
+  createSessionManager(): {
+    isPersisted(): boolean;
+    getCwd(): string;
+    getSessionDir(): string;
+    usesDefaultSessionDir(): boolean;
+  };
+  resolveSessionManager(
+    resumeSessionFile: string | undefined,
+    runCwd: string,
+  ): { manager: { isPersisted(): boolean; getCwd(): string; getSessionFile(): string | undefined }; resumed: boolean };
+  buildResumePrompt(structured: boolean): string;
 };
 
 // ═══════════════════════════════════════════════════════════════════════
-// persistAgentSessions — in-memory by default, file-backed keyed by project cwd
+// persistAgentSessions — in-memory by default, file-backed outside /resume
 // ═══════════════════════════════════════════════════════════════════════
 
 test("WorkflowAgent uses an in-memory session manager by default", () => {
@@ -34,7 +51,7 @@ test("WorkflowAgent with persistAgentSessions=false explicitly stays in-memory",
   assert.equal(manager.isPersisted(), false);
 });
 
-test("WorkflowAgent with persistAgentSessions=true creates a file-backed manager keyed by the project cwd", () => {
+test("WorkflowAgent with persistAgentSessions=true creates a private file-backed manager outside /resume", () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-persist-agent-"));
   const projectCwd = join(dir, "project");
   const fakeHome = join(dir, "home");
@@ -43,15 +60,83 @@ test("WorkflowAgent with persistAgentSessions=true creates a file-backed manager
       const agent = new WorkflowAgent({ cwd: projectCwd, persistAgentSessions: true });
       const manager = (agent as unknown as WorkflowAgentPrivates).createSessionManager();
       assert.equal(manager.isPersisted(), true, "flag must yield a file-backed session manager");
-      // Sessions must be keyed by the runner's project cwd — never a per-call
-      // worktree cwd — so transcripts group under the project's session dir.
-      // createSessionManager() takes no per-call cwd by design; assert the
-      // manager saw the project cwd.
       assert.equal(manager.getCwd(), projectCwd);
+      assert.equal(manager.getSessionDir(), workflowProjectPaths(projectCwd).agentSessionsDir);
+      assert.equal(manager.usesDefaultSessionDir(), false, "normal Pi /resume must not index workflow children");
     });
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("WorkflowAgent reopens a persisted child session at its durable boundary", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-resume-agent-"));
+  const projectCwd = join(dir, "project");
+  const fakeHome = join(dir, "home");
+  try {
+    withFakeHome(fakeHome, () => {
+      const original = SessionManager.create(projectCwd, workflowProjectPaths(projectCwd).agentSessionsDir);
+      original.appendMessage({
+        role: "user",
+        content: [{ type: "text", text: "resume probe" }],
+        timestamp: Date.now(),
+      });
+      original.appendMessage({
+        role: "assistant",
+        content: [{ type: "text", text: "checkpoint" }],
+        api: "test",
+        provider: "test",
+        model: "test",
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 0,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
+        stopReason: "stop",
+        timestamp: Date.now(),
+      } as never);
+      const sessionFile = original.getSessionFile();
+      assert.ok(sessionFile && existsSync(sessionFile));
+
+      const agent = new WorkflowAgent({ cwd: projectCwd, persistAgentSessions: true });
+      const resolved = (agent as unknown as WorkflowAgentPrivates).resolveSessionManager(sessionFile, projectCwd);
+      assert.equal(resolved.resumed, true);
+      assert.equal(resolved.manager.getSessionFile(), sessionFile);
+      assert.equal(resolved.manager.getCwd(), projectCwd);
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("WorkflowAgent falls back to a fresh session when the persisted child session is missing", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-resume-missing-"));
+  const projectCwd = join(dir, "project");
+  const fakeHome = join(dir, "home");
+  try {
+    withFakeHome(fakeHome, () => {
+      const agent = new WorkflowAgent({ cwd: projectCwd, persistAgentSessions: true });
+      const resolved = (agent as unknown as WorkflowAgentPrivates).resolveSessionManager(
+        join(dir, "missing.jsonl"),
+        projectCwd,
+      );
+      assert.equal(resolved.resumed, false);
+      assert.equal(resolved.manager.isPersisted(), true);
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("WorkflowAgent resume prompt explicitly avoids repeating completed side effects", () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp" });
+  const prompt = (agent as unknown as WorkflowAgentPrivates).buildResumePrompt(true);
+  assert.match(prompt, /last durable message\/tool-result boundary/i);
+  assert.match(prompt, /Do not repeat completed side effects/i);
+  assert.match(prompt, /structured_output/);
 });
 
 test("WorkflowAgent degrades to in-memory when the session directory can't be created", () => {
@@ -60,10 +145,9 @@ test("WorkflowAgent degrades to in-memory when the session directory can't be cr
   const fakeHome = join(dir, "home");
   try {
     withFakeHome(fakeHome, () => {
-      // Pre-occupy the sessions directory with a plain file so the SDK's
-      // mkdirSync(recursive) inside SessionManager.create() throws ENOTDIR —
-      // simulating a permissions/disk-full failure at session-creation time.
-      const sessionsPath = join(fakeHome, ".pi", "agent", "sessions");
+      // Pre-occupy the workflow state root with a plain file so the SDK's
+      // mkdirSync(recursive) for the private session directory throws ENOTDIR.
+      const sessionsPath = join(fakeHome, ".pi", "workflows");
       mkdirSync(dirname(sessionsPath), { recursive: true });
       writeFileSync(sessionsPath, "not a directory");
 
@@ -388,6 +472,78 @@ test("lastAssistantText picks the last assistant message, not first", () => {
   assert.equal(text, "final");
 });
 
+test("usage events emit throttled estimates then exact cumulative message usage", () => {
+  const events: AgentUsage[] = [];
+  let timestamp = 0;
+  const handle = createAgentUsageEventHandler(
+    (usage) => events.push(usage),
+    () => timestamp,
+  );
+  const updatingMessage = {
+    role: "assistant",
+    content: [{ type: "text", text: "12345678" }],
+  };
+
+  handle({ type: "message_update", message: updatingMessage, assistantMessageEvent: {} } as never);
+  timestamp = 100;
+  updatingMessage.content[0].text = "123456789012";
+  handle({ type: "message_update", message: updatingMessage, assistantMessageEvent: {} } as never);
+  timestamp = 250;
+  handle({ type: "message_update", message: updatingMessage, assistantMessageEvent: {} } as never);
+
+  const endedMessage = {
+    role: "assistant",
+    content: [{ type: "text", text: "done" }],
+    usage: {
+      input: 7,
+      output: 3,
+      cacheRead: 2,
+      cacheWrite: 1,
+      totalTokens: 13,
+      cost: { input: 0.01, output: 0.02, cacheRead: 0, cacheWrite: 0, total: 0.03 },
+    },
+  };
+  handle({ type: "message_end", message: endedMessage } as never);
+  handle({ type: "message_end", message: endedMessage } as never);
+
+  assert.deepEqual(
+    events.map((usage) => ({ total: usage.total, output: usage.output, estimated: usage.estimated })),
+    [
+      { total: 2, output: 2, estimated: true },
+      { total: 3, output: 3, estimated: true },
+      { total: 13, output: 3, estimated: false },
+    ],
+  );
+  assert.equal(events[2].input, 7);
+  assert.equal(events[2].cacheRead, 2);
+  assert.equal(events[2].cost, 0.03);
+});
+
+test("usage message_end events accumulate across assistant turns", () => {
+  const events: AgentUsage[] = [];
+  const handle = createAgentUsageEventHandler((usage) => events.push(usage));
+  const message = (input: number, output: number) => ({
+    role: "assistant",
+    content: [{ type: "text", text: "done" }],
+    usage: {
+      input,
+      output,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: input + output,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.001 },
+    },
+  });
+
+  handle({ type: "message_end", message: message(10, 4) } as never);
+  handle({ type: "message_end", message: message(6, 2) } as never);
+
+  assert.equal(events.at(-1)?.input, 16);
+  assert.equal(events.at(-1)?.output, 6);
+  assert.equal(events.at(-1)?.total, 22);
+  assert.equal(events.at(-1)?.cost, 0.002);
+});
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Full agent() pipeline inside runWorkflow — verifies the agent() function
 // in workflow.ts correctly invokes the runner with all options.
@@ -638,8 +794,8 @@ test("agent() in workflow fires onTokenUsage after run", async () => {
       onTokenUsage: (u) => usageEvents.push({ input: u.input, output: u.output, total: u.total }),
     },
   );
-  assert.equal(usageEvents.length, 1, "should fire onTokenUsage once");
-  assert.equal(usageEvents[0].total, 30, "should accumulate from agent usage");
+  assert.ok(usageEvents.length >= 1, "should fire onTokenUsage during the run");
+  assert.equal(usageEvents.at(-1)?.total, 30, "should finish with accumulated agent usage");
 });
 
 test("agent() passes onModelResolved callback for display model updates", async () => {
@@ -673,8 +829,8 @@ test("agent() accumulates usage across multiple agents", async () => {
       onTokenUsage: (u) => usageEvents.push({ total: u.total }),
     },
   );
-  assert.equal(usageEvents.length, 1, "one final usage event");
-  assert.equal(usageEvents[0].total, 60, "two agents × 30 tokens each");
+  assert.ok(usageEvents.length >= 2, "usage should update as each agent reports");
+  assert.equal(usageEvents.at(-1)?.total, 60, "two agents × 30 tokens each");
 });
 
 test("agent() with timeout should handle gracefully (timeout returns null)", async () => {

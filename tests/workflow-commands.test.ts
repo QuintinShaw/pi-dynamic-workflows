@@ -51,6 +51,10 @@ function harness(
     listRuns: () => [],
     getSnapshot: () => null,
     getRun: () => undefined,
+    setConcurrency: (id: string, concurrency: number) => {
+      calls.push(`concurrency:${id}:${concurrency}`);
+      return { previousConcurrency: 4, requestedConcurrency: concurrency, effectiveConcurrency: concurrency };
+    },
     stop: (id: string) => {
       calls.push(`stop:${id}`);
       return true;
@@ -231,6 +235,26 @@ test("/workflows status watches a running run: live status bar + prints on compl
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+// concurrency — resizes a live/resumable run
+// ═══════════════════════════════════════════════════════════════════════════
+
+test("/workflows concurrency <id> <n> calls manager.setConcurrency", async () => {
+  const h = harness();
+  await h.run("concurrency run-c1 12");
+  assert.deepEqual(h.calls, ["concurrency:run-c1:12"]);
+  assert.match(h.notified[0].message, /4 → 12/);
+});
+
+test("/workflows concurrency requires a positive integer", async () => {
+  for (const args of ["concurrency", "concurrency run-c1", "concurrency run-c1 0", "concurrency run-c1 1.5"]) {
+    const h = harness();
+    await h.run(args);
+    assert.deepEqual(h.calls, []);
+    assert.equal(h.notified[0].type, "warning");
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
 // pause — calls manager.pause, shows notify
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -311,6 +335,19 @@ test("/workflows rm <id> calls manager.deleteRun and notifies Removed", async ()
     h.notified.some((n) => n.message.includes("Removed")),
     "should notify Removed",
   );
+});
+
+test("/workflows rm requires running and paused runs to be stopped first", async () => {
+  const statuses = ["running", "paused"] as const;
+  for (const status of statuses) {
+    const h = harness({
+      listRuns: () => [{ runId: `run-${status}`, workflowName: "demo", status, phases: [], agents: [], logs: [] }],
+    });
+    await h.run(`rm run-${status}`);
+    assert.deepEqual(h.calls, []);
+    assert.match(h.notified[0].message, /stop it first/);
+    assert.equal(h.notified[0].type, "warning");
+  }
 });
 
 test("/workflows rm without id warns usage", async () => {

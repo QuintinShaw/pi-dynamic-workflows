@@ -3,6 +3,7 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { listAvailableModelSpecs } from "./agent.js";
 import { listAgentTypes, loadAgentRegistry } from "./agent-registry.js";
+import { DEFAULT_CONCURRENCY } from "./config.js";
 import {
   createToolUpdateWorkflowDisplay,
   createWorkflowSnapshot,
@@ -85,13 +86,14 @@ const workflowToolSchema = Type.Object({
   ),
   maxAgents: Type.Optional(
     Type.Number({
-      description: "Maximum number of agents allowed in this run. Default: 1000.",
+      description:
+        "Maximum total number of agents allowed across the whole run. Default: 1000. This is separate from concurrency, which limits how many run simultaneously.",
     }),
   ),
   concurrency: Type.Optional(
-    Type.Number({
-      description:
-        "Maximum concurrent agents for this run. Clamped to the runtime maximum. Use when provider/transport stability matters.",
+    Type.Integer({
+      minimum: 1,
+      description: `Maximum concurrent agents allowed to run simultaneously (positive integer, no plugin hard cap). Choose it based on independent task count and provider stability; omission uses the configured default (${DEFAULT_CONCURRENCY} unless overridden). This does not change maxAgents, the whole-run total.`,
     }),
   ),
   agentRetries: Type.Optional(
@@ -183,7 +185,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
         "For workflow, parallel() takes functions, not promises: use `await parallel(items.map(item => () => agent('...', { label: '...' })))`, never `await parallel(items.map(item => agent(...)))`. Results are returned in input order.",
         "For workflow, pipeline(items, ...stages) runs each item through stages sequentially, while different items may run concurrently. Each stage receives (previousValue, originalItem, index).",
         "For workflow, every agent() call should include a unique short label option, 2-5 words, such as { label: 'repo inventory' } or { label: 'source modules' }; unique labels make live status and error reporting readable.",
-        "For workflow, use low concurrency and agentRetries for unstable provider/transport fan-out runs; retries apply only to recoverable agent failures and still require explicit null handling after exhaustion.",
+        `For workflow, choose any positive-integer concurrency per run based on the number of independent tasks and provider stability; the plugin has no hard concurrency cap, and omission uses the configured default (${DEFAULT_CONCURRENCY} unless overridden). For example, 24 independent tasks can use concurrency: 24 while maxAgents: 24 limits the whole-run total. Use low concurrency and agentRetries for unstable provider/transport fan-out runs; retries apply only to recoverable agent failures and still require explicit null handling after exhaustion.`,
         "For workflow, failed agent(), parallel(), or pipeline() branches return null and log the failure unless the workflow is aborted. Check for nulls before synthesizing conclusions.",
         "For workflow, include a final synthesis/assertion agent when combining multiple subagent results; return a compact JSON-serializable value with ok/verdict plus the important outputs.",
         "For workflow, the default quality shape for fan-out work is finder -> verify -> merge: run one agent per angle or work-unit (in parallel), pass each candidate finding through verify() and drop the unconfirmed, then a single synthesis agent that de-duplicates, ranks by confidence/severity, and caps the output. If nothing survives verification, return an empty result and say so rather than padding.",
@@ -203,6 +205,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const script = normalizeWorkflowScript(params.script);
       const parsed = parseWorkflowScript(script);
+      const concurrency = requestedConcurrency(params.concurrency);
 
       // checkpoint() reaches the human only on a UI-bearing foreground run; a
       // background run is detached, so checkpoint() falls back to its headless
@@ -228,8 +231,13 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           tokenBudget: params.tokenBudget,
         });
         return {
-          content: [{ type: "text", text: backgroundStartedText(parsed.meta.name, runId) }],
-          details: { runId, background: true },
+          content: [{ type: "text", text: backgroundStartedText(parsed.meta.name, runId, concurrency) }],
+          details: {
+            runId,
+            background: true,
+            requestedConcurrency: concurrency?.requested,
+            effectiveConcurrency: concurrency?.effective,
+          },
         };
       }
 
@@ -295,12 +303,13 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
 
       const formattedResult =
         result.result !== undefined ? `\n\`\`\`json\n${JSON.stringify(result.result, null, 2)}\n\`\`\`` : "";
+      const concurrencyInfo = concurrency ? `\n\n${formatConcurrency(concurrency)}` : "";
 
       return {
         content: [
           {
             type: "text",
-            text: `Workflow **${result.meta.name}** completed with **${result.agentCount}** agent(s).${tokenInfo}\n\n## Result${formattedResult}`,
+            text: `Workflow **${result.meta.name}** completed with **${result.agentCount}** agent(s).${tokenInfo}${concurrencyInfo}\n\n## Result${formattedResult}`,
           },
         ],
         details: {
@@ -312,6 +321,8 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           durationMs: result.durationMs,
           tokenUsage: result.tokenUsage,
           runId: result.runId,
+          requestedConcurrency: concurrency?.requested,
+          effectiveConcurrency: concurrency?.effective,
         },
       };
     },
@@ -360,17 +371,34 @@ function resolveWorkflowToolDefaults(
  * own and the conversation will resume automatically when it finishes, so the
  * user can just wait here (or go do something else).
  */
-export function backgroundStartedText(name: string, runId: string): string {
+export function backgroundStartedText(
+  name: string,
+  runId: string,
+  concurrency?: { requested: number; effective: number },
+): string {
   return [
     `Workflow "${name}" started in the background.`,
     `Run ID: ${runId}`,
+    concurrency ? formatConcurrency(concurrency) : undefined,
     "It keeps running on its own. When it finishes, the result is delivered back",
     "here and the conversation continues automatically — the user does not need to",
     "do anything. Tell the user they can simply wait here for it to finish (it will",
     "resume the conversation by itself), or keep chatting / working on other things",
     "in the meantime; either way the result will come back to this conversation.",
     `They can also track or cancel it with /workflows status ${runId} or /workflows stop ${runId}.`,
-  ].join("\n");
+  ]
+    .filter((line): line is string => line !== undefined)
+    .join("\n");
+}
+
+function requestedConcurrency(requested: number | undefined): { requested: number; effective: number } | undefined {
+  if (requested === undefined) return undefined;
+  const effective = !Number.isFinite(requested) || requested < 1 ? 1 : Math.floor(requested);
+  return { requested, effective };
+}
+
+function formatConcurrency(concurrency: { requested: number; effective: number }): string {
+  return `Concurrency: requested ${concurrency.requested}; effective ${concurrency.effective}.`;
 }
 
 function normalizeWorkflowToolArgs(args: unknown): WorkflowToolInput {

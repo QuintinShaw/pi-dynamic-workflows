@@ -15,6 +15,7 @@ import {
   saveWorkflowSettingsForCwd,
   WorkflowManager,
 } from "../src/index.js";
+import { createWorkflowControlTool } from "../src/workflow-control-tool.js";
 
 export default function extension(pi: ExtensionAPI) {
   // Single manager/storage shared by the workflow tool and the /workflows command,
@@ -32,7 +33,9 @@ export default function extension(pi: ExtensionAPI) {
   });
 
   const workflowTool = createWorkflowTool({ cwd, manager, storage });
+  const workflowControlTool = createWorkflowControlTool({ manager });
   pi.registerTool(workflowTool);
+  pi.registerTool(workflowControlTool);
   // Standing /effort opt-in (off|high|ultra): auto-arms a workflow for substantive
   // messages, like CC's ultracode. Shared with the editor's input hook below and
   // with the explicit /workflows run <prompt> manual trigger.
@@ -58,9 +61,9 @@ export default function extension(pi: ExtensionAPI) {
     // advertise the shared registry's models.
     manager.setModelRegistry(ctx.modelRegistry);
     const active = pi.getActiveTools();
-    if (!active.includes(workflowTool.name)) {
-      pi.setActiveTools([...active, workflowTool.name]);
-    }
+    const workflowTools = [workflowTool.name, workflowControlTool.name];
+    const missing = workflowTools.filter((name) => !active.includes(name));
+    if (missing.length) pi.setActiveTools([...active, ...missing]);
     // Scope the /workflows history to this session: runs persist on disk across
     // sessions, but the navigator/task panel show only the current session's runs.
     // Switching back to a previous session re-shows that session's runs.

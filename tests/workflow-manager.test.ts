@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { AgentUsage } from "../src/agent.js";
+import { recomputeWorkflowSnapshot, renderWorkflowText } from "../src/display.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
@@ -206,6 +207,40 @@ test(
 );
 
 test(
+  "accepted checkpoint is durable before later blocked work and survives manager reload",
+  withTempCwd(async (cwd) => {
+    const blocked = deferredAgent();
+    const manager = new WorkflowManager({ cwd, agent: blocked.runner });
+    const agentStarted = new Promise<void>((resolve) => manager.once("agentStart", () => resolve()));
+    const script = `export const meta = { name: 'checkpoint_crash', description: 'durable checkpoint' }
+const approved = await checkpoint('Approve?', { kind: 'confirm' })
+const later = await agent('later work', { label: 'later' })
+return { approved, later }`;
+
+    const { runId, promise } = manager.startInBackground(script, undefined, {
+      confirm: async () => "accepted",
+    });
+    await agentStarted;
+
+    const beforeReload = manager.getPersistence().load(runId);
+    assert.equal(beforeReload?.journal?.[0]?.result, "accepted", "checkpoint must be saved before agent end");
+
+    const live = manager.getRun(runId);
+    assert.ok(live?.lease, "running test fixture should own a lease");
+    manager.getPersistence().releaseRunLease(live.lease);
+    live.lease = undefined;
+
+    const reloaded = new WorkflowManager({ cwd });
+    const recovered = reloaded.listRuns().find((run) => run.runId === runId);
+    assert.equal(recovered?.status, "paused");
+    assert.equal(recovered?.journal?.[0]?.result, "accepted", "reloaded manager keeps the accepted reply");
+
+    blocked.resolve("done");
+    await promise;
+  }),
+);
+
+test(
   "each agent's model is recorded for /workflows: explicit opts.model, else the main model",
   withTempCwd(async (cwd) => {
     const manager = new WorkflowManager({ cwd, agent: fakeAgent(), mainModel: "anthropic/claude-opus-4-8" });
@@ -365,6 +400,31 @@ test(
 );
 
 test(
+  "manager snapshots carry effective concurrency into live display rendering",
+  withTempCwd(async (cwd) => {
+    const deferred = deferredAgent();
+    const manager = new WorkflowManager({ cwd, agent: deferred.runner });
+    const twoAgents = `export const meta = { name: 'display_cap', description: 'display concurrency' }
+return await parallel(['a', 'b'].map((label) => () => agent(label, { label })))`;
+    const { runId, promise } = manager.startInBackground(twoAgents);
+    for (let attempt = 0; attempt < 50; attempt++) {
+      if (manager.getSnapshot(runId)?.agents.filter((agent) => agent.status === "running").length === 2) break;
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+
+    const snapshot = manager.getSnapshot(runId);
+    assert.ok(snapshot);
+    assert.equal(snapshot.requestedConcurrency, 16);
+    assert.equal(snapshot.effectiveConcurrency, 16);
+    assert.match(renderWorkflowText(recomputeWorkflowSnapshot(snapshot)), /Running now \(2\/16\): a, b/);
+
+    manager.stop(runId);
+    deferred.resolve("done");
+    await promise.catch(() => {});
+  }),
+);
+
+test(
   "deleteRun removes the run from memory and persistence",
   withTempCwd(async (cwd) => {
     const manager = new WorkflowManager({ cwd, agent: fakeAgent() });
@@ -431,6 +491,99 @@ test(
     assert.ok(p, "p should be truthy");
     assert.equal(typeof p.save, "function");
     assert.equal(typeof p.list, "function");
+  }),
+);
+
+test(
+  "setConcurrency resizes a live FIFO limiter without aborting running agents",
+  withTempCwd(async (cwd) => {
+    const started: string[] = [];
+    const resolvers: Array<() => void> = [];
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt: string) {
+          started.push(prompt);
+          return new Promise<string>((resolve) => {
+            resolvers.push(() => resolve(`done:${prompt}`));
+          });
+        },
+      },
+    });
+    const script = `export const meta = { name: 'live_resize', description: 'live resize' }
+return await parallel(['a', 'b', 'c', 'd', 'e'].map((label) => () => agent(label, { label })))`;
+    const waitForStarts = async (count: number) => {
+      for (let attempt = 0; attempt < 100; attempt++) {
+        if (started.length >= count) return;
+        await new Promise((resolve) => setTimeout(resolve, 2));
+      }
+      assert.fail(`expected ${count} started agents, saw ${started.length}`);
+    };
+    const changes: Array<{ previousConcurrency?: number; effectiveConcurrency: number }> = [];
+    manager.on("concurrencyChanged", (event) => changes.push(event));
+
+    const { runId, promise } = manager.startInBackground(script, undefined, { concurrency: 1 });
+    await waitForStarts(1);
+
+    assert.deepEqual(manager.setConcurrency(runId, 3), {
+      previousConcurrency: 1,
+      requestedConcurrency: 3,
+      effectiveConcurrency: 3,
+    });
+    await waitForStarts(3);
+    assert.equal(manager.getSnapshot(runId)?.effectiveConcurrency, 3);
+    assert.equal(manager.listRuns().find((run) => run.runId === runId)?.effectiveConcurrency, 3);
+
+    assert.equal(manager.setConcurrency(runId, 1)?.effectiveConcurrency, 1);
+    resolvers[0]?.();
+    resolvers[1]?.();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(started.length, 3, "decreasing waits for excess running agents instead of aborting them");
+
+    resolvers[2]?.();
+    await waitForStarts(4);
+    assert.equal(manager.setConcurrency(runId, 2)?.effectiveConcurrency, 2);
+    await waitForStarts(5);
+    resolvers[3]?.();
+    resolvers[4]?.();
+    await promise;
+
+    assert.equal(manager.getRun(runId)?.status, "completed");
+    assert.deepEqual(
+      changes.map((event) => event.effectiveConcurrency),
+      [3, 1, 2],
+    );
+  }),
+);
+
+test(
+  "setConcurrency updates a cold paused run for its next resume",
+  withTempCwd(async (cwd) => {
+    const bootstrap = new WorkflowManager({ cwd, agent: fakeAgent() });
+    bootstrap.getPersistence().save({
+      runId: "cold-resize",
+      workflowName: "cold_resize",
+      script: oneAgentScript,
+      status: "paused",
+      phases: ["Work"],
+      agents: [],
+      logs: [],
+      requestedConcurrency: 2,
+      effectiveConcurrency: 2,
+      startedAt: "2026-07-14T00:00:00.000Z",
+      updatedAt: "2026-07-14T00:00:01.000Z",
+    });
+
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent() });
+    assert.equal(manager.getRun("cold-resize"), undefined);
+    assert.deepEqual(manager.setConcurrency("cold-resize", 9), {
+      previousConcurrency: 2,
+      requestedConcurrency: 9,
+      effectiveConcurrency: 9,
+    });
+    const persisted = manager.getPersistence().load("cold-resize");
+    assert.equal(persisted?.requestedConcurrency, 9);
+    assert.equal(persisted?.effectiveConcurrency, 9);
   }),
 );
 
@@ -790,16 +943,14 @@ test(
     assert.equal(paused, true);
     assert.equal(manager.getRun(runId)?.status, "paused");
 
-    // Resume — replays journal (empty for single-agent that never completed) and
-    // re-runs the live agent with a fresh (non-aborted) controller.
-    const resumed = await manager.resume(runId);
+    // Resume waits for the aborted execution to settle before starting its replacement.
+    const resumePromise = manager.resume(runId);
+    da.resolve("resumed-done");
+    const resumed = await resumePromise;
     assert.equal(resumed, true, "resume should succeed");
 
     // The resumed run should be running
     assert.equal(manager.getRun(runId)?.status, "running", "resumed run should be running");
-
-    // Resolve the deferred agent so the resumed run's agent completes
-    da.resolve("resumed-done");
 
     // The original promise will reject (its controller was aborted). Suppress it.
     await origPromise.catch(() => {});
@@ -1089,6 +1240,82 @@ test(
 );
 
 test(
+  "startup marks orphaned running agent rows paused in resumable artifacts",
+  withTempCwd(async (cwd) => {
+    const bootstrap = new WorkflowManager({ cwd });
+    const runId = "paused-orphan-agent";
+    bootstrap.getPersistence().save({
+      runId,
+      workflowName: "paused_orphan",
+      script: oneAgentScript,
+      status: "paused",
+      phases: [],
+      agents: [
+        {
+          id: 1,
+          executionId: `${runId}:0`,
+          callIndex: 0,
+          label: "orphan",
+          prompt: "work",
+          status: "running",
+          startedAt: "2026-07-14T00:00:00.000Z",
+          sessionFile: "C:/sessions/orphan.jsonl",
+        },
+      ],
+      logs: [],
+      startedAt: "2026-07-14T00:00:00.000Z",
+      updatedAt: "2026-07-14T00:00:01.000Z",
+    });
+
+    const recovered = new WorkflowManager({ cwd }).listRuns().find((run) => run.runId === runId);
+    assert.equal(recovered?.status, "paused");
+    assert.equal(recovered?.agents[0]?.status, "paused");
+    assert.equal(recovered?.agents[0]?.sessionFile, "C:/sessions/orphan.jsonl");
+    assert.equal(recovered?.agents[0]?.endedAt, undefined);
+  }),
+);
+
+test(
+  "startup terminalizes orphaned running rows in completed and aborted artifacts",
+  withTempCwd(async (cwd) => {
+    const bootstrap = new WorkflowManager({ cwd });
+    for (const status of ["completed", "aborted"] as const) {
+      const runId = `${status}-orphan-agent`;
+      bootstrap.getPersistence().save({
+        runId,
+        workflowName: `${status}_orphan`,
+        script: oneAgentScript,
+        status,
+        phases: [],
+        agents: [
+          {
+            id: 1,
+            executionId: `${runId}:0`,
+            callIndex: 0,
+            label: "orphan",
+            prompt: "work",
+            status: "running",
+            startedAt: "2026-07-14T00:00:00.000Z",
+          },
+        ],
+        logs: [],
+        startedAt: "2026-07-14T00:00:00.000Z",
+        updatedAt: "2026-07-14T00:00:01.000Z",
+        completedAt: status === "completed" ? "2026-07-14T00:00:02.000Z" : undefined,
+      });
+    }
+
+    const recovered = new WorkflowManager({ cwd }).listRuns();
+    for (const status of ["completed", "aborted"] as const) {
+      const run = recovered.find((candidate) => candidate.runId === `${status}-orphan-agent`);
+      assert.equal(run?.status, status);
+      assert.equal(run?.agents[0]?.status, "skipped");
+      assert.ok(run?.agents[0]?.endedAt, `${status} orphan should have a terminal timestamp`);
+    }
+  }),
+);
+
+test(
   "cold-start recovery leaves a live leased running run untouched",
   withTempCwd(async (cwd) => {
     const manager = new WorkflowManager({ cwd });
@@ -1153,6 +1380,85 @@ test(
   }),
 );
 
+test(
+  "parallel journal hole reruns done rows as queued then running while cached rows keep completion metadata",
+  withTempCwd(async (cwd) => {
+    const script = `export const meta = { name: 'parallel_hole', description: 'parallel resume hole' }
+const values = await parallel(['a', 'b', 'c'].map((p) => () => agent(p, { label: p })))
+return values`;
+    const initial = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt: string) {
+          return `first:${prompt}`;
+        },
+      },
+    });
+    await initial.runSync(script, undefined, { concurrency: 3 });
+    const persisted = initial.listRuns().find((run) => run.workflowName === "parallel_hole");
+    assert.ok(persisted?.journal);
+    const cachedEndedAt = persisted.agents.find((agent) => agent.callIndex === 0)?.endedAt;
+    initial.getPersistence().save({
+      ...persisted,
+      status: "paused",
+      journal: persisted.journal.filter((entry) => entry.index !== 1),
+    });
+
+    const releases = new Map<string, (value: string) => void>();
+    let startedCount = 0;
+    let resolveStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      resolveStarted = resolve;
+    });
+    const resumed = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt: string) {
+          startedCount++;
+          if (startedCount === 2) resolveStarted();
+          return new Promise<string>((resolve) => releases.set(prompt, resolve));
+        },
+      },
+    });
+
+    assert.equal(await resumed.resume(persisted.runId), true);
+    await started;
+    const liveByLabel = new Map(resumed.getSnapshot(persisted.runId)?.agents.map((agent) => [agent.label, agent]));
+    assert.equal(liveByLabel.get("a")?.status, "done", "actual cache replay remains done");
+    assert.equal(liveByLabel.get("b")?.status, "running", "journal hole must rerun live");
+    assert.equal(liveByLabel.get("c")?.status, "running", "suffix after the hole must rerun live");
+
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    const durableByLabel = new Map(
+      resumed
+        .listRuns()
+        .find((run) => run.runId === persisted.runId)
+        ?.agents.map((agent) => [agent.label, agent]),
+    );
+    assert.equal(durableByLabel.get("a")?.endedAt, cachedEndedAt, "cached replay preserves completion time");
+    assert.equal(durableByLabel.get("b")?.endedAt, undefined, "live rerun clears stale completion time");
+    assert.equal(durableByLabel.get("c")?.endedAt, undefined, "live suffix clears stale completion time");
+
+    const cEnded = new Promise<void>((resolve) => {
+      resumed.on("agentEnd", (event: { label: string }) => {
+        if (event.label === "c") resolve();
+      });
+    });
+    releases.get("c")?.("second:c");
+    await cEnded;
+    const outOfOrder = new Map(
+      resumed.getSnapshot(persisted.runId)?.agents.map((agent) => [agent.label, agent.status]),
+    );
+    assert.equal(outOfOrder.get("b"), "running");
+    assert.equal(outOfOrder.get("c"), "done");
+
+    const completed = new Promise<void>((resolve) => resumed.once("complete", () => resolve()));
+    releases.get("b")?.("second:b");
+    await completed;
+    assert.equal(resumed.getRun(persisted.runId)?.status, "completed");
+  }),
+);
+
 // ─── getRun tests ──────────────────────────────────────────────────────────────
 
 test(
@@ -1209,7 +1515,7 @@ test(
     const { runId, promise } = manager.startInBackground(oneAgentScript);
     await new Promise((r) => setTimeout(r, 20));
 
-    // Stop first, then delete
+    assert.equal(manager.deleteRun(runId), false, "running run must be stopped before removal");
     manager.stop(runId);
     const deleted = manager.deleteRun(runId);
     assert.equal(deleted, true);
@@ -1219,13 +1525,18 @@ test(
 
     da.resolve("done");
     await promise.catch(() => {});
+    assert.equal(
+      manager.listRuns().some((item) => item.runId === runId),
+      false,
+      "settlement must not resurrect it",
+    );
   }),
 );
 
 // ─── deleteRun tests ───────────────────────────────────────────────────────────
 
 test(
-  "deleteRun can delete a running run (removes from memory and persistence)",
+  "deleteRun refuses running and paused runs until they are stopped",
   withTempCwd(async (cwd) => {
     const da = deferredAgent();
     const manager = new WorkflowManager({ cwd, agent: da.runner });
@@ -1233,22 +1544,18 @@ test(
     const { runId, promise } = manager.startInBackground(oneAgentScript);
     await new Promise((r) => setTimeout(r, 20));
 
-    // Delete while running — should succeed (removes from tracking)
-    const deleted = manager.deleteRun(runId);
-    assert.equal(deleted, true);
-
-    // Should not be in memory
-    assert.equal(manager.getRun(runId), undefined);
-
-    // Should not be in persistence
-    const runs = manager.listRuns();
-    assert.equal(
-      runs.find((r) => r.runId === runId),
-      undefined,
-    );
+    assert.equal(manager.deleteRun(runId), false);
+    manager.pause(runId);
+    assert.equal(manager.deleteRun(runId), false);
+    manager.stop(runId);
+    assert.equal(manager.deleteRun(runId), true);
 
     da.resolve("done");
     await promise.catch(() => {});
+    assert.equal(
+      manager.listRuns().some((run) => run.runId === runId),
+      false,
+    );
   }),
 );
 
@@ -1382,7 +1689,9 @@ test(
     await new Promise((resolve) => setTimeout(resolve, 20));
     manager.pause(runId);
 
-    const resumed = await manager.resume(runId);
+    const resumePromise = manager.resume(runId);
+    da.resolve("done");
+    const resumed = await resumePromise;
     const persisted = manager.listRuns().find((run) => run.runId === runId);
 
     assert.equal(resumed, true);
@@ -1408,7 +1717,9 @@ test(
     const { runId, promise } = manager.startInBackground(oneAgentScript);
     await new Promise((r) => setTimeout(r, 20));
     manager.pause(runId);
-    await manager.resume(runId);
+    const resumePromise = manager.resume(runId);
+    da.resolve("done");
+    await resumePromise;
 
     assert.ok(resumedEvent, "resumed event should fire");
     assert.equal(resumedEvent?.runId, runId);
@@ -1466,12 +1777,13 @@ test(
     assert.equal(manager.pause(runId), true);
     assert.equal(manager.getRun(runId)?.status, "paused", "should be paused after pause");
 
-    const resumed = await manager.resume(runId);
+    const resumePromise = manager.resume(runId);
+    da.resolve("resumed-done");
+    const resumed = await resumePromise;
     assert.equal(resumed, true);
     assert.equal(manager.getRun(runId)?.status, "running", "should be running after resume");
 
     // Complete the resumed run
-    da.resolve("resumed-done");
     await origPromise.catch(() => {});
     await new Promise((r) => setTimeout(r, 30));
 
@@ -1597,8 +1909,10 @@ test(
     assert.equal(manager.pause(runId), true);
     assert.equal(manager.getRun(runId)?.status, "paused");
 
-    // First resume should succeed
-    const firstResume = await manager.resume(runId);
+    // First resume waits for the old execution to settle, then succeeds.
+    const firstResumePromise = manager.resume(runId);
+    da.resolve("done");
+    const firstResume = await firstResumePromise;
     assert.equal(firstResume, true, "first resume should succeed");
 
     // The resumed run is now running; second resume should return false
@@ -1660,8 +1974,10 @@ test(
     });
 
     try {
-      // Resume — executeRun calls runWorkflow which calls the mocked runner
-      const resumed = await manager.resume(runId);
+      // Resume waits for the old execution, then calls the mocked runner.
+      const resumePromise = manager.resume(runId);
+      da.resolve("done");
+      const resumed = await resumePromise;
       assert.equal(resumed, true, "resume should schedule the run");
 
       // Wait for the background executed run to process the agent error
@@ -1732,8 +2048,10 @@ test(
     });
 
     try {
-      // Resume — the run will fail because the mocked agent throws
-      const resumed = await manager.resume(runId);
+      // Resume waits for the old execution, then fails because the mocked agent throws.
+      const resumePromise = manager.resume(runId);
+      da.resolve("done");
+      const resumed = await resumePromise;
       assert.equal(resumed, true, "resume should schedule the run");
       await new Promise((r) => setTimeout(r, 100));
 
@@ -1774,8 +2092,10 @@ test(
     });
 
     try {
-      // Resume — the run will fail
-      const resumed = await manager.resume(runId);
+      // Resume waits for the old execution, then fails.
+      const resumePromise = manager.resume(runId);
+      da.resolve("done");
+      const resumed = await resumePromise;
       assert.equal(resumed, true, "resume should schedule the run");
       await new Promise((r) => setTimeout(r, 100));
 
@@ -1816,8 +2136,10 @@ test(
     });
 
     try {
-      // Resume — the run will fail
-      await manager.resume(runId);
+      // Resume waits for the old execution, then fails.
+      const resumePromise = manager.resume(runId);
+      da.resolve("done");
+      await resumePromise;
       await new Promise((r) => setTimeout(r, 100));
 
       // Verify the run is now in failed state
@@ -1899,11 +2221,11 @@ test(
   withTempCwd(async (cwd) => {
     const manager = new WorkflowManager({ cwd, agent: fakeAgent(), persistAgentSessions: true });
     // The manager forwards the flag on every runWorkflow call; the flag is
-    // captured at construction and defaults to false when omitted.
+    // captured at construction and defaults to true for resumable workflow agents.
     assert.equal((manager as unknown as { persistAgentSessions: boolean }).persistAgentSessions, true);
 
     const defaulted = new WorkflowManager({ cwd, agent: fakeAgent() });
-    assert.equal((defaulted as unknown as { persistAgentSessions: boolean }).persistAgentSessions, false);
+    assert.equal((defaulted as unknown as { persistAgentSessions: boolean }).persistAgentSessions, true);
 
     // The run still completes normally with the flag set (injected agent
     // runner, so no real session is created here).
@@ -1930,6 +2252,79 @@ test(
     assert.equal(result.agentCount, 1);
     assert.equal(seen.length, 1);
     assert.equal(seen[0].label, "a");
-    assert.match(seen[0].sessionName ?? "", /^workflow:run-[a-z0-9]+ a$/);
+    assert.match(seen[0].sessionName ?? "", /^workflow:tracked-demo-[a-z0-9-]+ a$/);
+  }),
+);
+
+test(
+  "pause distinguishes interrupted agents from not-started work and resume reopens the child session",
+  withTempCwd(async (cwd) => {
+    const childSession = join(cwd, "first-child.jsonl");
+    let startedResolve!: () => void;
+    const started = new Promise<void>((resolve) => {
+      startedResolve = resolve;
+    });
+    const calls: Array<{ prompt: string; resumeSessionFile?: string }> = [];
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(
+          prompt: string,
+          options?: {
+            signal?: AbortSignal;
+            resumeSessionFile?: string;
+            onSession?: (checkpoint: { sessionFile?: string; resumed: boolean }) => void;
+          },
+        ) {
+          calls.push({ prompt, resumeSessionFile: options?.resumeSessionFile });
+          const resumed = options?.resumeSessionFile === childSession;
+          const sessionFile = prompt === "first" ? childSession : join(cwd, "second-child.jsonl");
+          options?.onSession?.({ sessionFile, resumed });
+          if (prompt === "first" && !resumed) {
+            startedResolve();
+            await new Promise<never>((_resolve, reject) => {
+              const abort = () => reject(new Error("Subagent was aborted"));
+              if (options?.signal?.aborted) abort();
+              else options?.signal?.addEventListener("abort", abort, { once: true });
+            });
+          }
+          return resumed ? "continued-first" : "fresh-second";
+        },
+      },
+    });
+    const script = `export const meta = { name: 'resume_children', description: 'resume child sessions' }
+return await parallel([
+  () => agent('first', { label: 'first' }),
+  () => agent('second', { label: 'second' })
+])`;
+
+    const { runId, promise } = manager.startInBackground(script, undefined, { concurrency: 1 });
+    await started;
+    assert.equal(manager.pause(runId), true);
+    await promise.catch(() => {});
+
+    const paused = manager.listRuns().find((run) => run.runId === runId);
+    assert.equal(paused?.status, "paused");
+    assert.deepEqual(
+      paused?.agents.map((agent) => agent.status),
+      ["paused", "queued"],
+      "only the invocation that entered the runner is paused mid-run",
+    );
+    assert.equal(paused?.agents[0].sessionFile, childSession);
+    assert.equal(paused?.agents[1].sessionFile, undefined);
+
+    assert.equal(await manager.resume(runId), true);
+    for (let i = 0; i < 100 && manager.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(manager.getRun(runId)?.status, "completed");
+    assert.ok(
+      calls.some((call) => call.prompt === "first" && call.resumeSessionFile === childSession),
+      "the interrupted invocation reopens its child session",
+    );
+    assert.ok(
+      calls.some((call) => call.prompt === "second" && call.resumeSessionFile === undefined),
+      "never-started work begins in a fresh child session",
+    );
   }),
 );

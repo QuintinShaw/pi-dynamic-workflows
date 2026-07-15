@@ -22,7 +22,7 @@ Built for **codebase-wide audits, multi-perspective review, large refactors, and
 pi install npm:@quintinshaw/pi-dynamic-workflows
 ```
 
-Then `/reload` in Pi. You get the `workflow` tool plus the `/workflows`, `/deep-research`, and `/adversarial-review` commands.
+Then `/reload` in Pi. You get the `workflow` start tool, the `workflow_control` management tool, plus the `/workflows`, `/deep-research`, and `/adversarial-review` commands.
 
 ## Try it
 
@@ -32,11 +32,13 @@ Ask in plain language:
 Run a workflow to audit every route under src/routes/ for missing auth checks.
 ```
 
-Pi writes the script and runs it in the background — your turn ends immediately and a live panel tracks progress while you keep working. Or just type **workflow** or **workflows** in any message to force one. To force one explicitly — even with the keyword trigger off — run `/workflows run <prompt>`. If that causes false triggers, set a custom trigger such as `pi-workflow` with `/workflows-trigger set pi-workflow` or by adding `{ "keywordTriggerWord": "pi-workflow" }` to `~/.pi/workflows/settings.json`. With that setting, only `pi-workflow` auto-arms workflows mode. If you only want to discuss workflows without triggering one, run `/workflows-trigger off`; preferences are saved for new sessions. Check the current state with `/workflows-trigger status`, and turn it back on with `/workflows-trigger on`.
+Pi writes the script and runs it in the background — your turn ends immediately and a live panel tracks progress while you keep working. Keyword activation is **off by default**, so ordinary mentions of `workflow` or `workflows` are never rewritten. To enable it, run `/workflows-trigger on`; enabled triggers are case-insensitive, word-bounded literal terms and do not match paths, slash commands, or identifier-like text. You can choose a custom term with `/workflows-trigger set pi-workflow`, restore `workflow`/`workflows` with `/workflows-trigger reset`, inspect it with `/workflows-trigger status`, or disable it again with `/workflows-trigger off`. Preferences are saved for new sessions.
+
+To force a workflow without enabling keyword activation, run `/workflows run <prompt>`. This explicit command always works.
 
 ![Workflows mode in the input box](https://raw.githubusercontent.com/QuintinShaw/pi-dynamic-workflows/main/docs/media/workflows-mode.jpg)
 
-If another Pi extension has already installed a custom editor component, pi-dynamic-workflows leaves it in place and keeps the submit-time workflow trigger active. In that compatibility mode, the animated keyword highlight and Backspace one-shot disarm affordance are skipped because the existing editor remains responsible for rendering and input handling; use `/workflows-trigger off` or `/workflows-trigger set <word>` when you need to discuss workflow/workflows without auto-triggering, including in future sessions. Editor composition is load-order dependent: whichever extension installs a visual editor last owns the editor surface, while pi-dynamic-workflows still keeps its submit-time hook registered.
+If another Pi extension has already installed a custom editor component, pi-dynamic-workflows leaves it in place. The default-off submit hook leaves input and active tools untouched. When keyword activation is explicitly enabled, submit-time detection still works in compatibility mode, but the animated highlight and Backspace one-shot disarm affordance are unavailable because the existing editor owns rendering and input handling. Editor composition is load-order dependent: whichever extension installs a visual editor last owns the editor surface.
 
 ## What a workflow looks like
 
@@ -67,13 +69,13 @@ return await agent('Synthesize and double-check these findings:\n' + findings.jo
 
 ## Highlights
 
-- **Fan-out orchestration** — `agent()`, `parallel()`, `pipeline()`, `phase()` in a sandboxed script. Up to 16 concurrent / 1000 total subagents; intermediate results stay in variables, not the chat.
+- **Fan-out orchestration** — `agent()`, `parallel()`, `pipeline()`, `phase()` in a sandboxed script. Pi can select 1–16 concurrent agents for each run independently of the 1000-agent whole-run cap; intermediate results stay in variables, not the chat.
 - **Real model routing** — `small` / `medium` / `big` tiers (or an exact `model`) per agent. It actually switches the subagent's model — cheap work on a light one, hard synthesis on a big one.
-- **Journaled resume** — an interrupted run replays finished agents from a journal (no re-run, no tokens) and runs only what's left or what you changed.
+- **Durable journaled resume** — an interrupted run preserves completed agent identities and exact usage, replays finished agents without charging them twice, and resumes unfinished work with the original run controls.
 - **Git worktree isolation** — `isolation: "worktree"` gives an agent its own branch, so parallel agents can edit the same files without clobbering each other.
-- **Real token & cost accounting** — read from each subagent's session, not estimated. Runs have no default token cap; `tokenBudget`, phase budgets, and `budget` let you add explicit gates when you want them.
-- **Background by default** — the turn ends right away, a live "Workflows running" panel tracks runs, and each result is delivered back so the conversation auto-continues when it finishes. The panel is compact by default; `/workflows-progress detailed` expands it inline to per-phase/per-agent rows with tokens, cost, and a live tok/s rate (so a stalled agent shows as 0 tok/s) — no need to open `/workflows`.
-- **Interactive `/workflows` TUI** — drill runs → phases → agents → detail; inspect per-agent failures and compact subagent history; pause, stop, restart, and save runs from the keyboard.
+- **Live token & cost accounting** — `~N tok` marks a streaming, display-only estimate; exact cumulative usage replaces it at each assistant-message boundary and is reconciled from the subagent session at completion. Runs have no default token cap; `tokenBudget`, phase budgets, and `budget` use exact usage for explicit gates.
+- **Background by default** — the turn ends right away, a live "Workflows running" panel tracks runs, and each result is delivered back so the conversation auto-continues when it finishes. Queued and running counts are separate, and `Running now (N/M)` names every active agent against the run's concurrency cap. The panel is compact by default; `/workflows-progress detailed` expands it inline to per-phase/per-agent rows with live usage — no need to open `/workflows`.
+- **Interactive `/workflows` TUI** — drill runs → phases → agents → detail; inspect queued/running/done/error/skipped state, per-agent usage, failures, and compact history; pause, stop, restart, and save runs from the keyboard.
 - **Quality patterns built in** — `verify()`, `judgePanel()`, `loopUntilDry()`, and `completenessCheck()` for adversarial review, best-of-N, and exhaustive discovery.
 - **Ultracode** — `/ultracode` is a standing opt-in that auto-arms an exhaustive multi-agent workflow for every substantive message, the way Claude Code's ultracode does. `/effort high` is the lighter tier.
 - **Bundled `/deep-research` + `/adversarial-review` + `/code-review`** — real web search, source cross-checking, cited reports, and a 7-angle parallel code review with a verify pass.
@@ -86,13 +88,38 @@ The same model — on Pi, plus the production pieces a real run needs:
 | Claude Code dynamic workflows | pi-dynamic-workflows (on Pi) |
 | --- | --- |
 | Code-mode orchestration — the model writes a script that drives subagents | A JS `workflow` tool running `agent()` / `parallel()` / `pipeline()` / `phase()` in a vm sandbox |
-| Subagents with isolated context | Fresh in-memory Pi sessions; results held in script variables, not the chat |
+| Subagents with isolated context | Private Pi sessions outside `/resume`; results held in script variables, not the chat |
 | Structured outputs | JSON-Schema `schema` → a validated object, with bounded repair if the model misses |
-| Background runs | Non-blocking by default, a live task panel, and auto-continue delivery |
-| Resume | **Journaled + replayable** — survives restarts and replays the unchanged prefix |
+| Background runs | Non-blocking by default, a live task panel, autonomous `workflow_control`, and auto-continue delivery |
+| Resume | **Durable, journaled, and replayable** — survives restarts with completed status/usage and run controls intact |
 | Model selection | **Per-agent / per-phase routing** across any provider Pi is authenticated for |
 | Ultracode (standing maximal-effort opt-in) | **`/ultracode`** (or `/effort ultra`) — auto-arms an exhaustive workflow for every substantive message |
 | — | **Git worktree isolation**, **real cost accounting**, **`/deep-research`**, and a **quality-pattern stdlib** |
+
+## Pi tools
+
+Pi starts work with `workflow`, then manages background runs directly with `workflow_control`; it does not need to ask you to type a slash command. `workflow_control` supports `list`, `status`, `set_concurrency`, `pause`, `resume`, `stop`, `restart`, and `remove`. Every action except `list` requires the canonical `runId` returned by `workflow` or `workflow_control list`.
+
+For example, you can ask Pi:
+
+```text
+Start a background workflow with concurrency 8, then list its status.
+Pause that run, resume it when I say continue, and stop it if I say quit.
+```
+
+Pi can make the corresponding calls itself:
+
+```json
+{ "action": "list" }
+{ "action": "status", "runId": "<canonical-run-id>" }
+{ "action": "pause", "runId": "<canonical-run-id>" }
+{ "action": "resume", "runId": "<canonical-run-id>" }
+{ "action": "stop", "runId": "<canonical-run-id>" }
+{ "action": "restart", "runId": "<canonical-run-id>" }
+{ "action": "remove", "runId": "<canonical-run-id>" }
+```
+
+`stop` means terminate/quit the run. In the navigator, `x` also stops the selected run, while `q` only closes the navigator.
 
 ## Commands
 
@@ -102,10 +129,10 @@ The same model — on Pi, plus the production pieces a real run needs:
 /workflows save <name>      save the latest run's script as a reusable /<name> command
 /workflows pause|resume|stop|rm <id>
 /workflows-trigger off|on|status
-                            persistently disable, restore, or inspect keyword triggering
+                            persistently disable, enable, or inspect keyword triggering (off by default)
 /workflows-trigger set <word>|reset
-                            customize or reset the keyword trigger word (default "workflow",
-                            also matches "workflows"; custom words match exactly, case-insensitive)
+                            customize or reset the word-bounded trigger (default "workflow",
+                            also matches "workflows"; all trigger words are literal and case-insensitive)
 /workflows run <prompt>     force a dynamic workflow from <prompt> on demand — the explicit
                             twin of the keyword trigger. Works even when the keyword trigger
                             is off (/workflows-trigger off); the run shows in the panel + /workflows.
@@ -148,7 +175,7 @@ The same model — on Pi, plus the production pieces a real run needs:
 
 It fans out 7 finder agents in parallel — 3 on correctness (line-by-line scan, removed-behavior audit, cross-file call-site tracing), 3 on cleanup (reuse, simplification, efficiency), and 1 on abstraction-level fit — dedupes their candidates, verifies each one, and returns a ranked markdown report (correctness first, cleanup next, abstraction last, capped at the top 10). A diff over ~200k characters is truncated with a clear notice rather than silently cut or blowing up the prompt.
 
-In the navigator: `↑/↓` select · `enter`/`→` open · `esc`/`←` back · `p` pause · `x` stop · `r` restart · `s` save · `q` quit. Each agent shows the model it ran on; the detail view shows its prompt, result, error diagnostics, and compact message/tool history.
+In the navigator: `↑/↓` select · `enter`/`→` open · `esc`/`←` back · `p` pause · `x` stop run · `r` restart · `s` save · `q` close. `q` never terminates a run. Each agent shows its explicit state and model; the detail view shows its prompt, live or exact token usage, result, error diagnostics, and compact message/tool history.
 
 ## Storage
 
@@ -168,15 +195,16 @@ Workflow state is stored under `~/.pi/workflows` so projects do not accumulate e
 
 Use `/workflows-models` to edit these in the TUI: choose the base model first, then choose `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or the session default.
 
-To avoid accidental keyword triggers, configure a custom trigger word in `~/.pi/workflows/settings.json`:
+Keyword triggering is disabled when `keywordTriggerEnabled` is missing or `false`. To opt in with a custom term, configure `~/.pi/workflows/settings.json`:
 
 ```json
 {
+  "keywordTriggerEnabled": true,
   "keywordTriggerWord": "pi-workflow"
 }
 ```
 
-The default `"workflow"` preserves the legacy behavior and also matches `"workflows"`. Custom trigger words are literal, case-insensitive terms with no spaces and no leading slash; for example, `"pi-workflow"` does not match `"workflow"`, `"workflows"`, or `"pi-workflows"`.
+The built-in `"workflow"` trigger also matches `"workflows"`. All trigger words are literal, case-insensitive, and word-bounded, with no spaces or leading slash; they do not activate inside paths, slash commands, or identifiers. For example, `"pi-workflow"` does not match `"workflow"`, `"workflows"`, or `"pi-workflows"`.
 
 ## Reference
 
@@ -205,15 +233,19 @@ The full guide — every global, agent option, `agentType` definitions, structur
 
 By default, workflows do not set a run-wide token budget or per-agent hard timeout. Use the `workflow` tool's `tokenBudget` / `agentTimeoutMs`, per-phase budgets, or per-agent `timeoutMs` only when you want an explicit cap. A global fallback timeout can also be set in `~/.pi/workflows/settings.json` as `{ "defaultAgentTimeoutMs": 600000 }`; set it to `null` or omit it for no default hard timeout.
 
-For larger or flakier fan-outs, the `workflow` tool also accepts `concurrency` (max agents running at once, clamped to the runtime maximum of `16`) and `agentRetries` (retry attempts after a recoverable agent failure such as a timeout, connection failure, or empty output). Both can be defaulted in `~/.pi/workflows/settings.json` as `{ "defaultConcurrency": 4, "defaultAgentRetries": 2 }`; a per-run tool value overrides the default, and a per-agent `retries` overrides `agentRetries`. Retries default to `0` (off) unless configured or passed, and only recoverable failures retry — nonrecoverable errors still abort the run.
+For larger or flakier fan-outs, Pi may set the `workflow` tool's per-run positive-integer `concurrency` based on independent task count and provider stability. The plugin imposes no hard concurrency cap. If omitted, `defaultConcurrency` from `~/.pi/workflows/settings.json` is used; the runtime fallback is `16`. The selected requested/effective concurrency is persisted and reused on resume. Resize a running or paused run with `workflow_control set_concurrency` or `/workflows concurrency <runId> <n>`. Increasing the limit releases queued agents immediately; decreasing it lets already-running agents finish and starts no replacements until activity falls below the new limit. `concurrency` only limits simultaneous agents; `maxAgents` separately limits the whole-run total (default `1000`), so provider capacity and `maxAgents` remain the practical ceilings.
 
-By default, each workflow subagent runs in an in-memory session: the full transcript is discarded when the run ends, and only a compacted excerpt survives inside the run JSON. Set `{ "persistAgentSessions": true }` in `~/.pi/workflows/settings.json` (or a project-level override, which wins) to persist every subagent transcript as a real pi session file in the standard sessions directory for the project (`~/.pi/agent/sessions/<encoded-cwd>/`), named `workflow:<runId> <agent label>` so it's identifiable in `/resume` and other session tooling. Sessions are keyed by the project cwd even when an agent runs in a temporary git worktree. Default is `false` (current behavior). Caveat: large fan-out runs create one session file per agent, which can clutter session pickers. Caveat: unlike the compacted run JSON, the persisted transcript is full and untruncated, so anything a subagent reads into context — including secrets — lands on disk when this is enabled. If a session can't be created or written (permissions, disk full), that agent silently falls back to an in-memory session rather than aborting the run.
+The tool also accepts `agentRetries` for recoverable failures such as a timeout, connection failure, or empty assistant output. Defaults can be set as `{ "defaultConcurrency": 4, "defaultAgentRetries": 2 }`; a per-run tool value overrides the configured default, and a per-agent `retries` overrides `agentRetries`. Retries default to `0` (off) unless configured or passed, and nonrecoverable errors still abort the run.
 
-The live "Workflows running" panel is configured in the same `~/.pi/workflows/settings.json`: `"progressPanelMode"` is `"compact"` (default, one line per run) or `"detailed"` (per-phase/per-agent rows with tokens, cost, and a live tok/s rate), and `"progressPanelMaxAgents"` (default `8`, range `1`–`1000`) caps how many agents each phase shows in detailed mode before a `… N earlier agents` line. Toggle them live with `/workflows-progress compact|detailed` and `/workflows-progress-max <N>` — changes take effect on the next render without a restart.
+By default, each workflow subagent uses a file-backed Pi session under the workflow project's private state directory (`~/.pi/workflows/projects/<project>/agent-sessions/`), named `workflow:<runId> <agent label>`. These child sessions are intentionally outside Pi's standard session directory, so they do not clutter the normal `/resume` picker; the run artifact links each agent to its transcript for workflow-specific analysis and turn-boundary resume. A paused or crash-interrupted agent can reopen its transcript and continue from the last durable assistant-message/tool-result boundary instead of restarting the whole agent. Sessions are keyed by the project cwd, and an isolated agent's worktree is preserved while paused so its coding tools reopen in the same cwd. Set `{ "persistAgentSessions": false }` in `~/.pi/workflows/settings.json` (or a project override) to opt out; interrupted agents then fall back to a fresh session. Large fan-outs create one session file per agent and full transcripts can contain sensitive context. If a saved session is missing, corrupt, or unwritable, only that agent restarts fresh and the fallback is shown in workflow logs/UI.
+
+The live "Workflows running" panel is configured in the same `~/.pi/workflows/settings.json`: `"progressPanelMode"` is `"compact"` (default, one summary per run) or `"detailed"`, and `"progressPanelMaxAgents"` (default `8`, range `1`–`1000`) caps rows per phase. Both views separately show finished agents, `paused mid-run` agents, and queued agents that have `not started`; paused rows say whether a child session was saved or a fresh restart is required. Active labels remain listed as `Running now (N/M)`. Token text prefixed with `~` is an in-progress estimate; exact cumulative usage replaces it at message boundaries and terminal reconciliation. Estimates are display-only and are not persisted or charged to budgets.
 
 When a background run finishes, its result is delivered back into the conversation with a `↳ Full result: <path>` pointer to the persisted `~/.pi/workflows/projects/<project>/runs/<id>.json`, so nothing is lost even when the summary is shortened. Only the JSON-dump fallback (a result object without a `verdict`/`report`/`summary` string field) is truncated — at `"deliveredResultMaxChars"` characters (default `400`) in the same `~/.pi/workflows/settings.json` — and the dropped size is shown inline, e.g. `…(truncated 3.2 KB)`.
 
-Workflows run in a Node `vm` sandbox; `Date.now()`, `Math.random()`, `new Date()`, and `require`/`import`/`fs`/network are unavailable, so runs stay reproducible — which is what makes resume reliable.
+Run artifacts are versioned. On Pi restart, completed agents keep their stable identities, status, history, usage, and results; agents that had started are recovered as `paused` with their child-session/worktree checkpoint, while agents that never entered the runner remain `queued`. Runs do not auto-resume. `/workflows resume <id>` or `workflow_control resume` replays completed journal entries, reopens paused child sessions, and starts never-started work fresh with the persisted concurrency, limits, retries, timeout, and token budget. A provider stream cannot resume mid-token, and a tool interrupted before its result was durably recorded is inherently uncertain; the continuation prompt tells the agent to inspect existing state and avoid repeating completed side effects. Older artifacts are migrated defensively, and missing/corrupt child sessions fall back per-agent to a fresh restart.
+
+Workflows run in a Node `vm` sandbox; `Date.now()`, `Math.random()`, `new Date()`, and `require`/`import`/`fs`/network are unavailable, so runs stay reproducible — which is what makes durable replay reliable.
 
 ## Default tier assignment
 

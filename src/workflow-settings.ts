@@ -7,10 +7,11 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { MAX_AGENT_RETRIES, MAX_CONCURRENCY, normalizeKeywordTriggerWord } from "./config.js";
+import { MAX_AGENT_RETRIES, normalizeKeywordTriggerWord } from "./config.js";
 import { workflowHomeDir, workflowProjectPaths } from "./workflow-paths.js";
 
 export interface WorkflowSettings {
+  /** Opt-in keyword activation. Missing values default to false. */
   keywordTriggerEnabled?: boolean;
   /** Literal keyword that arms workflows mode from interactive input. */
   keywordTriggerWord?: string;
@@ -24,10 +25,10 @@ export interface WorkflowSettings {
   /** Max agents shown per phase in detailed progress mode (default 8). */
   progressPanelMaxAgents?: number;
   /**
-   * Persist each workflow subagent transcript as a real pi session file under
-   * the standard sessions directory (~/.pi/agent/sessions/<encoded-cwd>/),
-   * keyed by the project cwd. Default false: subagent sessions stay in-memory
-   * and only the compacted history embedded in the run JSON survives.
+   * Persist each workflow subagent transcript under the workflow project's
+   * private agent-sessions directory (outside Pi's /resume picker), keyed by
+   * the project cwd. Default true so paused agents can continue from
+   * their last durable message/tool-result boundary. Set false to opt out.
    */
   persistAgentSessions?: boolean;
   /**
@@ -132,7 +133,7 @@ function normalizeSettings(value: unknown): WorkflowSettings {
   ) {
     settings.defaultAgentTimeoutMs = raw.defaultAgentTimeoutMs;
   }
-  const defaultConcurrency = normalizeInteger(raw.defaultConcurrency, 1, MAX_CONCURRENCY);
+  const defaultConcurrency = normalizeInteger(raw.defaultConcurrency, 1);
   if (defaultConcurrency !== undefined) settings.defaultConcurrency = defaultConcurrency;
   const defaultAgentRetries = normalizeInteger(raw.defaultAgentRetries, 0, MAX_AGENT_RETRIES);
   if (defaultAgentRetries !== undefined) settings.defaultAgentRetries = defaultAgentRetries;
@@ -154,9 +155,10 @@ function normalizeSettings(value: unknown): WorkflowSettings {
   return settings;
 }
 
-function normalizeInteger(value: unknown, min: number, max: number): number | undefined {
+function normalizeInteger(value: unknown, min: number, max?: number): number | undefined {
   if (typeof value !== "number" || !Number.isFinite(value) || value < min) return undefined;
-  return Math.min(max, Math.floor(value));
+  const normalized = Math.floor(value);
+  return max === undefined ? normalized : Math.min(max, normalized);
 }
 
 function readObject(path: string): Record<string, unknown> {

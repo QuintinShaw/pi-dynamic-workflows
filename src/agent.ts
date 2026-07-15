@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { AssistantMessage, Model, TextContent } from "@earendil-works/pi-ai";
 import {
+  type AgentSessionEvent,
   AuthStorage,
   type CreateAgentSessionOptions,
   createAgentSession,
@@ -21,6 +22,7 @@ import { classifyProviderLimit, WorkflowError, WorkflowErrorCode } from "./error
 import { canonicalModelSpec, resolveModelSpecWithThinking } from "./model-spec.js";
 import { loadModelTierConfig, type ModelTierConfig, resolveTierModel } from "./model-tier-config.js";
 import { createStructuredOutputTool, type StructuredOutputCapture } from "./structured-output.js";
+import { workflowProjectPaths } from "./workflow-paths.js";
 
 /**
  * Find a JSON object/array in free-form text: a fenced ```json block if present,
@@ -215,9 +217,8 @@ export interface WorkflowAgentOptions {
    */
   modelRegistry?: ModelRegistry;
   /**
-   * Persist each subagent transcript as a real pi session file under the
-   * standard sessions directory (keyed by the runner's project cwd), instead
-   * of the default in-memory session that is discarded when the run ends.
+   * Persist each subagent transcript as a private pi session file under the
+   * workflow project's state directory, outside Pi's normal /resume picker.
    * Default: false (current behavior).
    */
   persistAgentSessions?: boolean;
@@ -243,7 +244,7 @@ export function listAvailableModelSpecs(registry?: ModelRegistry): string[] {
   }
 }
 
-/** Real token/cost usage for a single subagent run, read from the SDK session. */
+/** Token/cost usage for a single subagent run. */
 export interface AgentUsage {
   input: number;
   output: number;
@@ -251,6 +252,69 @@ export interface AgentUsage {
   cacheWrite: number;
   total: number;
   cost: number;
+  /** True only for an in-progress output-token estimate. */
+  estimated?: boolean;
+}
+
+/**
+ * Convert session events into absolute cumulative usage. Exact message usage is
+ * emitted at message_end; throttled message_update events add only a temporary
+ * output estimate, which the next exact event replaces.
+ */
+export function createAgentUsageEventHandler(
+  onUsage: (usage: AgentUsage) => void,
+  now: () => number = Date.now,
+): (event: AgentSessionEvent) => void {
+  const exact: AgentUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 };
+  const endedMessages = new WeakSet<object>();
+  let lastEstimateEmit = Number.NEGATIVE_INFINITY;
+  const emit = (usage: AgentUsage) => {
+    try {
+      onUsage(usage);
+    } catch {
+      // Telemetry is best-effort; never interrupt the child session.
+    }
+  };
+
+  return (event) => {
+    if (event.type === "message_end" && event.message.role === "assistant") {
+      if (endedMessages.has(event.message)) return;
+      endedMessages.add(event.message);
+      const usage = event.message.usage;
+      exact.input += usage.input;
+      exact.output += usage.output;
+      exact.cacheRead += usage.cacheRead;
+      exact.cacheWrite += usage.cacheWrite;
+      exact.total += usage.totalTokens;
+      exact.cost += usage.cost.total;
+      lastEstimateEmit = Number.NEGATIVE_INFINITY;
+      emit({ ...exact, estimated: false });
+      return;
+    }
+
+    if (event.type !== "message_update" || event.message.role !== "assistant") return;
+    const timestamp = now();
+    if (timestamp - lastEstimateEmit < 250) return;
+    lastEstimateEmit = timestamp;
+    const text = event.message.content
+      .map((part) => (part.type === "text" ? part.text : part.type === "thinking" ? part.thinking : ""))
+      .join("");
+    const estimatedOutput = Math.ceil(text.length / 4);
+    if (estimatedOutput <= 0) return;
+    emit({
+      ...exact,
+      output: exact.output + estimatedOutput,
+      total: exact.total + estimatedOutput,
+      estimated: true,
+    });
+  };
+}
+
+export interface AgentSessionCheckpoint {
+  /** File-backed Pi child session. Undefined means this invocation cannot resume in-place. */
+  sessionFile?: string;
+  /** True when the existing session was reopened rather than created fresh. */
+  resumed: boolean;
 }
 
 export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefined> {
@@ -267,11 +331,15 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
   instructions?: string;
   signal?: AbortSignal;
   /**
-   * Called once with this subagent's real usage, read from the session right
-   * before disposal. Fires on both the success and error paths so partial
-   * usage is never lost. `total === 0` means the provider reported no usage.
+   * Called with absolute cumulative usage during the run and once more with
+   * authoritative session totals before disposal. Streaming estimates have
+   * `estimated: true`; message-boundary and terminal updates are exact.
    */
   onUsage?: (usage: AgentUsage) => void;
+  /** Reopen this persisted Pi child session and continue from its last durable turn boundary. */
+  resumeSessionFile?: string;
+  /** Called before prompting so workflow persistence can durably link the invocation to its child session. */
+  onSession?: (checkpoint: AgentSessionCheckpoint) => void;
   /**
    * Model spec for this subagent: either `provider/modelId` (unambiguous) or a
    * bare `modelId`. When it can't be resolved, the session default is used and
@@ -376,9 +444,9 @@ export class WorkflowAgent {
   }
 
   /**
-   * Session manager for one subagent run. File-backed (persisted under the
-   * standard sessions dir, keyed by the runner's project cwd — never a
-   * per-call worktree cwd) when persistAgentSessions is on; in-memory otherwise.
+   * Session manager for one subagent run. File-backed in the workflow project's
+   * private agent-sessions directory (never the normal Pi /resume directory and
+   * never a per-call worktree cwd) when persistence is on; in-memory otherwise.
    *
    * SessionManager.create() only creates the session directory — the SDK writes
    * the session file lazily (synchronous fs calls, uncaught) on the first
@@ -391,7 +459,7 @@ export class WorkflowAgent {
   private createSessionManager(): SessionManager {
     if (!this.persistAgentSessions) return SessionManager.inMemory();
     try {
-      const manager = SessionManager.create(this.cwd);
+      const manager = SessionManager.create(this.cwd, workflowProjectPaths(this.cwd).agentSessionsDir);
       this.assertSessionDirWritable(manager.getSessionDir());
       return manager;
     } catch (error) {
@@ -402,6 +470,28 @@ export class WorkflowAgent {
       );
       return SessionManager.inMemory();
     }
+  }
+
+  /** Reopen a durable child session when possible; otherwise create the configured fresh session. */
+  private resolveSessionManager(
+    resumeSessionFile: string | undefined,
+    runCwd: string,
+  ): {
+    manager: SessionManager;
+    resumed: boolean;
+  } {
+    if (resumeSessionFile && existsSync(resumeSessionFile)) {
+      try {
+        return { manager: SessionManager.open(resumeSessionFile, undefined, runCwd), resumed: true };
+      } catch (error) {
+        console.warn(
+          `[workflow] could not reopen child session ${resumeSessionFile} (${
+            error instanceof Error ? error.message : String(error)
+          }); restarting this agent from a fresh session`,
+        );
+      }
+    }
+    return { manager: this.createSessionManager(), resumed: false };
   }
 
   /** Best-effort write probe: throws if the session directory isn't actually writable. */
@@ -463,11 +553,13 @@ export class WorkflowAgent {
     }
 
     const agentDir = getAgentDir();
-    // Key persisted sessions by the runner's project cwd (this.cwd), NOT the
-    // per-call runCwd: agents working in short-lived git worktrees should still
-    // group under the project's session dir instead of scattering across
-    // temporary worktree paths.
-    const sessionManager = this.createSessionManager();
+    // Key new persisted sessions by the runner's project cwd (this.cwd), NOT the
+    // per-call runCwd. A resumed session is reopened with runCwd as its cwd override
+    // so coding tools continue in the same shared tree or preserved worktree.
+    const resolvedSession = this.sessionOptions.sessionManager
+      ? { manager: this.sessionOptions.sessionManager, resumed: false }
+      : this.resolveSessionManager(options.resumeSessionFile, runCwd);
+    const sessionManager = resolvedSession.manager;
     const { session } = await createAgentSession({
       cwd: runCwd,
       agentDir,
@@ -489,9 +581,21 @@ export class WorkflowAgent {
       ...(resolvedThinkingLevel ? { thinkingLevel: resolvedThinkingLevel } : {}),
     });
 
-    // Name the persisted session so it's identifiable in session pickers.
-    // Skip when an injected session.sessionManager override won (tests/embedders).
-    if (this.persistAgentSessions && !this.sessionOptions.sessionManager && options.sessionName) {
+    // Persist the child-session link before the model starts, so a crash can recover it.
+    try {
+      options.onSession?.({ sessionFile: sessionManager.getSessionFile(), resumed: resolvedSession.resumed });
+    } catch {
+      // Session-link telemetry is best-effort; never block the child.
+    }
+
+    // Name a newly persisted session so it's identifiable in session pickers.
+    // Skip reopened sessions and injected managers to avoid duplicate session_info entries.
+    if (
+      this.persistAgentSessions &&
+      !resolvedSession.resumed &&
+      !this.sessionOptions.sessionManager &&
+      options.sessionName
+    ) {
       try {
         sessionManager.appendSessionInfo(options.sessionName);
       } catch {
@@ -499,8 +603,9 @@ export class WorkflowAgent {
       }
     }
 
+    const initialStats = resolvedSession.resumed ? session.getSessionStats() : undefined;
     let removeAbortListener: (() => void) | undefined;
-    let removeHistoryListener: (() => void) | undefined;
+    let removeSessionListener: (() => void) | undefined;
     let lastHistoryEmit = 0;
     const emitHistory = () => options.onHistory?.(compactAgentHistory(session.messages));
     const maybeEmitHistory = () => {
@@ -510,6 +615,7 @@ export class WorkflowAgent {
       lastHistoryEmit = now;
       emitHistory();
     };
+    const handleUsageEvent = options.onUsage ? createAgentUsageEventHandler(options.onUsage) : undefined;
     try {
       if (options.signal?.aborted) throw new Error("Subagent was aborted");
       if (options.signal) {
@@ -517,11 +623,18 @@ export class WorkflowAgent {
         options.signal.addEventListener("abort", onAbort, { once: true });
         removeAbortListener = () => options.signal?.removeEventListener("abort", onAbort);
       }
-      if (options.onHistory) {
-        removeHistoryListener = session.subscribe(() => maybeEmitHistory());
+      if (options.onHistory || handleUsageEvent) {
+        removeSessionListener = session.subscribe((event) => {
+          maybeEmitHistory();
+          handleUsageEvent?.(event);
+        });
       }
 
-      await session.prompt(this.buildPrompt(prompt, options as AgentRunOptions<any>, Boolean(options.schema)));
+      await session.prompt(
+        resolvedSession.resumed
+          ? this.buildResumePrompt(Boolean(options.schema))
+          : this.buildPrompt(prompt, options as AgentRunOptions<any>, Boolean(options.schema)),
+      );
 
       if (options.signal?.aborted) throw new Error("Subagent was aborted");
 
@@ -547,7 +660,7 @@ export class WorkflowAgent {
       return text as AgentRunResult<TSchemaDef>;
     } finally {
       removeAbortListener?.();
-      removeHistoryListener?.();
+      removeSessionListener?.();
       try {
         emitHistory();
       } catch {
@@ -558,12 +671,13 @@ export class WorkflowAgent {
         try {
           const { tokens, cost } = session.getSessionStats();
           options.onUsage({
-            input: tokens.input,
-            output: tokens.output,
-            cacheRead: tokens.cacheRead,
-            cacheWrite: tokens.cacheWrite,
-            total: tokens.total,
-            cost,
+            input: Math.max(0, tokens.input - (initialStats?.tokens.input ?? 0)),
+            output: Math.max(0, tokens.output - (initialStats?.tokens.output ?? 0)),
+            cacheRead: Math.max(0, tokens.cacheRead - (initialStats?.tokens.cacheRead ?? 0)),
+            cacheWrite: Math.max(0, tokens.cacheWrite - (initialStats?.tokens.cacheWrite ?? 0)),
+            total: Math.max(0, tokens.total - (initialStats?.tokens.total ?? 0)),
+            cost: Math.max(0, cost - (initialStats?.cost ?? 0)),
+            estimated: false,
           });
         } catch {
           // Usage is best-effort; never let stats failure mask the real result/error.
@@ -571,6 +685,20 @@ export class WorkflowAgent {
       }
       session.dispose();
     }
+  }
+
+  private buildResumePrompt(structured: boolean): string {
+    const parts = [
+      "Continue the interrupted task from the existing session at the last durable message/tool-result boundary.",
+      "Review the prior messages and current filesystem state before acting. Do not repeat completed side effects.",
+      "Finish the original task and return its requested final result.",
+    ];
+    if (structured) {
+      parts.push(
+        "When finished, call structured_output with the required schema, even if it was called before interruption.",
+      );
+    }
+    return parts.join("\n\n");
   }
 
   private buildPrompt(prompt: string, options: AgentRunOptions<any>, structured: boolean): string {

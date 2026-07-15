@@ -6,8 +6,8 @@
  *        ◀── (saved items in runs view) ──enter──▶ saved detail
  *
  * Keys: ↑/↓ (or j/k) select · enter/→ drill in · esc/← back (esc at top closes)
- *       On runs: p pause · x stop · r restart · s save · q quit
- *       On saved: x delete · q quit
+ *       On runs: p pause · x stop · r restart · s save · q close
+ *       On saved: x delete · q close
  *
  * The state machine and line rendering are pure and unit-tested; the pi-tui
  * Component shell (openWorkflowNavigator) wires them to live manager events.
@@ -57,6 +57,9 @@ interface RunRow {
   name: string;
   status: string;
   done: number;
+  running: number;
+  paused: number;
+  queued: number;
   total: number;
   tokens: number;
   cost: number;
@@ -64,16 +67,22 @@ interface RunRow {
 interface PhaseRow {
   title: string;
   done: number;
+  running: number;
+  paused: number;
+  queued: number;
   total: number;
   tokens: number;
 }
 interface AgentRow {
   id: number;
+  executionId?: string;
   label: string;
   status: string;
   phase?: string;
   tokens?: number;
+  tokensEstimated?: boolean;
   model?: string;
+  sessionFile?: string;
 }
 
 /** Short, human-friendly model label: drop the provider prefix for display. */
@@ -92,7 +101,16 @@ export class NavigatorModel {
 
   private snapshot(runId: string): { snapshot: WorkflowSnapshot; status: string } | undefined {
     const live = this.manager.getRun(runId);
-    if (live) return { snapshot: live.snapshot, status: live.status };
+    if (live) {
+      return {
+        snapshot: {
+          ...live.snapshot,
+          requestedConcurrency: live.execution?.requestedConcurrency,
+          effectiveConcurrency: live.execution?.effectiveConcurrency,
+        },
+        status: live.status,
+      };
+    }
     const p = this.manager.listRuns().find((r) => r.runId === runId);
     if (!p) return undefined;
     return { snapshot: persistedToSnapshot(p), status: p.status };
@@ -107,6 +125,9 @@ export class NavigatorModel {
         name: live?.snapshot.name ?? p.workflowName,
         status: live?.status ?? p.status,
         done: agents.filter((a) => a.status === "done").length,
+        running: agents.filter((a) => a.status === "running").length,
+        paused: agents.filter((a) => a.status === "paused").length,
+        queued: agents.filter((a) => a.status === "queued").length,
         total: agents.length,
         tokens: (live?.snapshot.tokenUsage ?? p.tokenUsage)?.total ?? 0,
         cost: (live?.snapshot.tokenUsage ?? p.tokenUsage)?.cost ?? 0,
@@ -150,6 +171,9 @@ export class NavigatorModel {
       return {
         title,
         done: agents.filter((a) => a.status === "done").length,
+        running: agents.filter((a) => a.status === "running").length,
+        paused: agents.filter((a) => a.status === "paused").length,
+        queued: agents.filter((a) => a.status === "queued").length,
         total: agents.length,
         tokens: agents.reduce((n, a) => n + (a.tokens ?? 0), 0),
       };
@@ -161,7 +185,51 @@ export class NavigatorModel {
     if (!snap) return [];
     return snap.agents
       .filter((a) => (a.phase ?? "(no phase)") === phase)
-      .map((a) => ({ id: a.id, label: a.label, status: a.status, phase: a.phase, tokens: a.tokens, model: a.model }));
+      .map((a) => ({
+        id: a.id,
+        executionId: a.executionId,
+        label: a.label,
+        status: a.status,
+        phase: a.phase,
+        tokens: a.tokens,
+        tokensEstimated: a.tokensEstimated,
+        model: a.model,
+        sessionFile: a.sessionFile,
+      }));
+  }
+
+  activity(runId: string): { running: AgentRow[]; paused: AgentRow[]; queued: number; effectiveConcurrency?: number } {
+    const snap = this.snapshot(runId)?.snapshot;
+    if (!snap) return { running: [], paused: [], queued: 0 };
+    return {
+      running: snap.agents
+        .filter((agent) => agent.status === "running")
+        .map((agent) => ({
+          id: agent.id,
+          executionId: agent.executionId,
+          label: agent.label,
+          status: agent.status,
+          phase: agent.phase,
+          tokens: agent.tokens,
+          tokensEstimated: agent.tokensEstimated,
+          model: agent.model,
+        })),
+      paused: snap.agents
+        .filter((agent) => agent.status === "paused")
+        .map((agent) => ({
+          id: agent.id,
+          executionId: agent.executionId,
+          label: agent.label,
+          status: agent.status,
+          phase: agent.phase,
+          tokens: agent.tokens,
+          tokensEstimated: agent.tokensEstimated,
+          model: agent.model,
+          sessionFile: agent.sessionFile,
+        })),
+      queued: snap.agents.filter((agent) => agent.status === "queued").length,
+      effectiveConcurrency: snap.effectiveConcurrency,
+    };
   }
 
   agentDetail(runId: string, agentId: number): WorkflowAgentSnapshot | undefined {
@@ -186,17 +254,27 @@ function persistedToSnapshot(p: PersistedRunState): WorkflowSnapshot {
     logs: p.logs,
     agents: p.agents.map((a) => ({
       id: a.id,
+      executionId: a.executionId,
+      callIndex: a.callIndex,
       label: a.label,
       phase: a.phase,
       prompt: a.prompt,
       status: a.status,
       resultPreview:
-        a.result == null ? undefined : String(typeof a.result === "string" ? a.result : JSON.stringify(a.result)),
+        a.resultPreview ??
+        (a.result == null ? undefined : String(typeof a.result === "string" ? a.result : JSON.stringify(a.result))),
       error: a.error,
       errorCode: a.errorCode,
       recoverable: a.recoverable,
       history: a.history,
+      tokens: a.usage?.total ?? a.tokens,
+      tokensEstimated: false,
+      usage: a.usage ? { ...a.usage, estimated: false } : undefined,
+      startedAt: a.startedAt,
+      endedAt: a.endedAt,
       model: a.model,
+      sessionFile: a.sessionFile,
+      worktree: a.worktree,
     })),
     agentCount: p.agents.length,
     runningCount: p.agents.filter((a) => a.status === "running").length,
@@ -204,6 +282,8 @@ function persistedToSnapshot(p: PersistedRunState): WorkflowSnapshot {
     errorCount: p.agents.filter((a) => a.status === "error").length,
     tokenUsage: p.tokenUsage ? { ...p.tokenUsage } : undefined,
     runId: p.runId,
+    requestedConcurrency: p.requestedConcurrency,
+    effectiveConcurrency: p.effectiveConcurrency,
   };
 }
 
@@ -375,7 +455,7 @@ function pluralize(word: string, n: number): string {
 /** Aggregate phase status precedence: ERR > RUN > all-done(OK) > PEND. */
 function phaseStatusColor(p: { done: number; total: number }, agents: AgentRow[]): string {
   if (agents.some((a) => a.status === "error" || a.status === "failed")) return "error";
-  if (agents.some((a) => a.status === "running")) return "warning";
+  if (agents.some((a) => a.status === "running" || a.status === "paused")) return "warning";
   if (p.total > 0 && p.done === p.total) return "success";
   return "dim";
 }
@@ -384,7 +464,7 @@ const AGENT_DOT_COLOR: Record<string, string> = {
   running: "warning",
   queued: "dim",
   pending: "dim",
-  paused: "dim",
+  paused: "warning",
   done: "success",
   completed: "success",
   error: "error",
@@ -451,7 +531,9 @@ function rightAgentRow(
   theme: ThemeLike,
 ): string {
   const dotColor = AGENT_DOT_COLOR[a.status] ?? "dim";
-  const stats = `${compactTokens(a.tokens ?? 0)} tok`;
+  const status =
+    a.status === "paused" ? `paused mid-run (${a.sessionFile ? "session saved" : "fresh restart"})` : a.status;
+  const stats = `${a.tokensEstimated ? "~" : ""}${compactTokens(a.tokens ?? 0)} tok · ${status}`;
   const model = shortModel(a.model) ?? "";
 
   // Stable 2-cell marker so columns never shift on selection: "› " | "  ".
@@ -486,7 +568,7 @@ function rightAgentRow(
   const statsStyled = theme.fg("dim", stats);
 
   // Assemble with explicit cell padding (visibleWidth-driven gaps).
-  let out = marker + dot + " " + nameStyled;
+  let out = `${marker + dot} ${nameStyled}`;
   const afterName = nameStart + visibleWidth(nameOut);
   if (modelOut) {
     out += " ".repeat(Math.max(0, modelStart - afterName)) + modelStyled;
@@ -763,7 +845,14 @@ export function renderNavigator(
     // Render runs
     runs.forEach((r, i) => {
       const icon = STATUS_ICON[r.status] ?? "?";
-      const meta = [`${r.done}/${r.total}`, fmtTokens(r.tokens), r.cost > 0 ? `$${r.cost.toFixed(4)}` : ""]
+      const meta = [
+        `${r.done}/${r.total}`,
+        `${r.running} running`,
+        r.paused ? `${r.paused} paused mid-run` : "",
+        `${r.queued} not started`,
+        fmtTokens(r.tokens),
+        r.cost > 0 ? `$${r.cost.toFixed(4)}` : "",
+      ]
         .filter(Boolean)
         .join(" · ");
       lines.push(sel(i, `${icon} ${r.name}  ${dim(`${r.runId} · ${r.status} · ${meta}`)}`));
@@ -781,17 +870,18 @@ export function renderNavigator(
   } else if (state.kind === "phases" && state.runId) {
     const phases = model.phases(state.runId);
     state.clamp(phases.length);
-    // Two-line header (name + description/status) then the combined frame.
-    lines.push(...twoPaneHeader(model, state.runId, phases, width, theme));
-    // Body cap: total height minus 2 header + 2 frame rules + blank + footer.
-    const bodyCap = Math.max(1, viewportRows - 2 /*header*/ - 2 /*rules*/ - 2 /*blank+footer*/);
+    // Header (name, counts, wrapped active inventory) then the combined frame.
+    const header = twoPaneHeader(model, state.runId, phases, width, theme);
+    lines.push(...header);
+    const bodyCap = Math.max(1, viewportRows - header.length - 2 /*rules*/ - 2 /*blank+footer*/);
     lines.push(...renderPhasesAgents(state, model, state.runId, width, theme, bodyCap));
   } else if (state.kind === "agents" && state.runId && state.phase) {
     const agents = model.agents(state.runId, state.phase);
     state.clamp(agents.length);
     const phases = model.phases(state.runId);
-    lines.push(...twoPaneHeader(model, state.runId, phases, width, theme));
-    const bodyCap = Math.max(1, viewportRows - 2 - 2 - 2);
+    const header = twoPaneHeader(model, state.runId, phases, width, theme);
+    lines.push(...header);
+    const bodyCap = Math.max(1, viewportRows - header.length - 2 - 2);
     lines.push(...renderPhasesAgents(state, model, state.runId, width, theme, bodyCap));
   } else if (state.kind === "detail" && state.runId && state.agentId != null) {
     const a = model.agentDetail(state.runId, state.agentId);
@@ -800,6 +890,10 @@ export function renderNavigator(
       const body: string[] = [];
       body.push(dim("Status: ") + (a.status ?? ""));
       if (a.model) body.push(dim("Model: ") + (shortModel(a.model) ?? ""));
+      if (a.tokens) body.push(`${dim("Tokens: ")}${a.tokensEstimated ? "~" : ""}${pad(a.tokens)} tok`);
+      if (a.status === "paused") {
+        body.push(dim("Resume: ") + (a.sessionFile ? "continue saved child session" : "restart agent fresh"));
+      }
       if (a.error) body.push(dim("Error: ") + a.error);
       if (a.errorCode) body.push(`${dim("Error code: ")}${a.errorCode}${a.recoverable ? " (recoverable)" : ""}`);
       body.push("", dim("Prompt:"));
@@ -836,9 +930,10 @@ export function renderNavigator(
 }
 
 /**
- * Two-line header above the Phases | agents frame (spec §1):
+ * Header above the Phases | agents frame (spec §1):
  *   line 0: <name>                          (ACCENT_BOLD)
- *   line 1: <status>            <done>/<total> agent[s] · <tokens>   (DIM)
+ *   line 1: <status>  <done>/<total> · <running> running · <queued> queued · <tokens>
+ *   line 2+: Running now (N/M): <all active labels>, wrapped as needed
  * Right segment is built first and never truncated; the left segment is
  * truncated to the remaining width with an ellipsis.
  */
@@ -852,10 +947,16 @@ function twoPaneHeader(
   const name = model.runName(runId);
   const status = model.runStatus(runId);
   let done = 0;
+  let running = 0;
+  let paused = 0;
+  let queued = 0;
   let total = 0;
   let tokens = 0;
   for (const p of phases) {
     done += p.done;
+    running += p.running;
+    paused += p.paused;
+    queued += p.queued;
     total += p.total;
     tokens += p.tokens;
   }
@@ -864,7 +965,7 @@ function twoPaneHeader(
   const line0 = theme.fg("accent", theme.bold(nameText));
 
   // Line 1 — left status, right summary.
-  const rightRaw = `${done}/${total} ${pluralize("agent", total)}${tokens > 0 ? ` · ${compactTokens(tokens)} tok` : ""}`;
+  const rightRaw = `${done}/${total} ${pluralize("agent", total)} · ${running} running · ${paused} paused · ${queued} not started${tokens > 0 ? ` · ${compactTokens(tokens)} tok` : ""}`;
   const rightW = visibleWidth(rightRaw);
   const gap = 2;
   let line1: string;
@@ -878,7 +979,21 @@ function twoPaneHeader(
     const fill = " ".repeat(Math.max(gap, width - leftW - rightW));
     line1 = theme.fg("dim", leftText) + fill + theme.fg("dim", rightRaw);
   }
-  return [line0, line1];
+  const activity = model.activity(runId);
+  const cap = activity.effectiveConcurrency ?? activity.running.length;
+  const activityText = activity.running.length
+    ? `Running now (${activity.running.length}/${cap}): ${activity.running.map((agent) => agent.label).join(", ")}`
+    : `Running now (0/${cap || 0}): none`;
+  const activityLines = wrapTextWithAnsi(activityText, Math.max(1, width)).map((line) => theme.fg("dim", line));
+  const pausedText = activity.paused.length
+    ? `Paused mid-run (${activity.paused.length}): ${activity.paused
+        .map((agent) => `${agent.label}${agent.sessionFile ? " (session saved)" : " (fresh restart)"}`)
+        .join(", ")}`
+    : undefined;
+  const pausedLines = pausedText
+    ? wrapTextWithAnsi(pausedText, Math.max(1, width)).map((line) => theme.fg("warning", line))
+    : [];
+  return [line0, line1, ...activityLines, ...pausedLines];
 }
 
 function historyLabel(entry: NonNullable<WorkflowAgentSnapshot["history"]>[number]): string {
@@ -901,15 +1016,15 @@ function footerHint(state: NavigatorState, model: NavigatorModel, theme: ThemeLi
       const itemKind = model.saved().length > 0 ? state.itemKindAt(model, state.cursor) : "run";
       parts.push("↑/↓ select", "enter open", "esc back");
       if (itemKind === "run") {
-        parts.push("p pause", "x stop", "r restart", "s save");
+        parts.push("p pause", "x stop run", "r restart", "s save");
       } else {
         parts.push("x delete");
       }
-      parts.push("q quit");
+      parts.push("q close");
       break;
     }
     default:
-      parts.push("↑/↓ select", "enter open", "esc back", "q quit");
+      parts.push("↑/↓ select", "enter open", "esc back", "q close");
   }
   return theme.fg("dim", parts.join(" · "));
 }
@@ -999,7 +1114,22 @@ export function openWorkflowNavigator(
   return ui.custom<void>(
     (tui: TUI, theme: Theme, _keybindings, done: (r: undefined) => void) => {
       const rerender = () => tui.requestRender();
-      const events = ["agentStart", "agentEnd", "phase", "log", "complete", "error", "stopped", "paused", "resumed"];
+      const events = [
+        "agentQueued",
+        "agentStart",
+        "agentUsage",
+        "agentHistory",
+        "agentEnd",
+        "tokenUsage",
+        "phase",
+        "log",
+        "complete",
+        "error",
+        "stopped",
+        "paused",
+        "resumed",
+        "concurrencyChanged",
+      ];
       const onEvent = () => rerender();
       for (const ev of events) manager.on(ev, onEvent);
       const cleanup = () => {
@@ -1055,12 +1185,17 @@ export function openWorkflowNavigator(
           case "restart": {
             const id = state.activeRunId(model);
             const run = id ? manager.listRuns().find((r) => r.runId === id) : undefined;
-            if (!run?.script) {
+            if (!id || !run?.script) {
               ui.notify(id ? `Cannot restart ${id} (no script saved)` : "No run selected to restart", "warning");
               break;
             }
-            const { runId: newId } = manager.startInBackground(run.script, run.args);
-            ui.notify(`Restarted ${run.workflowName || "workflow"} as ${newId}`, "info");
+            const restarted = manager.restart(id);
+            ui.notify(
+              restarted
+                ? `Restarted ${run.workflowName || "workflow"} as ${restarted.runId}`
+                : `Cannot restart ${id} while it is running`,
+              restarted ? "info" : "warning",
+            );
             break;
           }
           case "save": {

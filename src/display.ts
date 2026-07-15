@@ -2,11 +2,15 @@ import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import type { AgentHistoryEntry } from "./agent-history.js";
 import type { WorkflowErrorCode } from "./errors.js";
 import type { WorkflowMeta } from "./workflow.js";
+import type { Worktree } from "./worktree.js";
 
-export type WorkflowAgentStatus = "queued" | "running" | "done" | "error" | "skipped";
+export type WorkflowAgentStatus = "queued" | "running" | "paused" | "done" | "error" | "skipped";
 
 export interface WorkflowAgentSnapshot {
   id: number;
+  /** Stable runtime identity (`runId:callIndex`). */
+  executionId?: string;
+  callIndex?: number;
   label: string;
   phase?: string;
   prompt: string;
@@ -18,8 +22,26 @@ export interface WorkflowAgentSnapshot {
   history?: AgentHistoryEntry[];
   /** Tokens used by this agent. */
   tokens?: number;
+  /** Whether tokens is a live streaming estimate. */
+  tokensEstimated?: boolean;
+  startedAt?: string;
+  endedAt?: string;
+  /** Absolute cumulative usage for this invocation. */
+  usage?: {
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheWrite: number;
+    total: number;
+    cost: number;
+    estimated?: boolean;
+  };
   /** The model this agent ran on (provider/id), when known. */
   model?: string;
+  /** File-backed Pi child session used to continue this invocation after pause/restart. */
+  sessionFile?: string;
+  /** Preserved isolated cwd required by a resumed child session. */
+  worktree?: Worktree;
 }
 
 export interface WorkflowSnapshot {
@@ -44,6 +66,8 @@ export interface WorkflowSnapshot {
     cacheWrite?: number;
   };
   runId?: string;
+  requestedConcurrency?: number;
+  effectiveConcurrency?: number;
 }
 
 export interface WorkflowDisplay {
@@ -174,19 +198,37 @@ export function renderWorkflowLines(
 ): string[] {
   const maxAgents = options.maxAgents ?? 8;
   const showResultPreviews = options.showResultPreviews ?? false;
-  const state =
-    snapshot.errorCount > 0
-      ? `, ${snapshot.errorCount} errors`
-      : snapshot.runningCount > 0
-        ? `, ${snapshot.runningCount} running`
-        : "";
-  // Build header with token info (and cost when the provider reports it)
+  const queuedCount = snapshot.agents.filter((agent) => agent.status === "queued").length;
+  const pausedAgents = snapshot.agents.filter((agent) => agent.status === "paused");
+  const skippedCount = snapshot.agents.filter((agent) => agent.status === "skipped").length;
   const usage = snapshot.tokenUsage;
   const costInfo = usage?.cost ? ` · $${usage.cost.toFixed(4)}` : "";
   const tokenInfo = usage ? ` · ${usage.total.toLocaleString()} tokens${costInfo}` : "";
+  const state = [
+    snapshot.runningCount ? `${snapshot.runningCount} running` : "",
+    pausedAgents.length ? `${pausedAgents.length} paused mid-run` : "",
+    queuedCount ? `${queuedCount} not started` : "",
+    snapshot.errorCount ? `${snapshot.errorCount} errors` : "",
+    skippedCount ? `${skippedCount} skipped` : "",
+  ]
+    .filter(Boolean)
+    .join(", ");
   const lines = [
-    `${theme.bold(`◆ Workflow: ${snapshot.name}`)} (${snapshot.doneCount}/${snapshot.agentCount} done${state}${tokenInfo})`,
+    `${theme.bold(`◆ Workflow: ${snapshot.name}`)} (${snapshot.doneCount}/${snapshot.agentCount} done${state ? `, ${state}` : ""}${tokenInfo})`,
   ];
+  const activeLabels = snapshot.agents.filter((agent) => agent.status === "running").map((agent) => agent.label);
+  if (activeLabels.length) {
+    lines.push(
+      `  Running now (${activeLabels.length}/${snapshot.effectiveConcurrency ?? activeLabels.length}): ${activeLabels.join(", ")}`,
+    );
+  }
+  if (pausedAgents.length) {
+    lines.push(
+      `  Paused mid-run (${pausedAgents.length}): ${pausedAgents
+        .map((agent) => `${agent.label}${agent.sessionFile ? " (session saved)" : " (fresh restart)"}`)
+        .join(", ")}`,
+    );
+  }
 
   const phaseNames = snapshot.phases.length
     ? snapshot.phases
@@ -198,15 +240,18 @@ export function renderWorkflowLines(
     for (const agent of agents) rendered.add(agent);
     const done = agents.filter((agent) => agent.status === "done").length;
     const running = agents.filter((agent) => agent.status === "running").length;
+    const paused = agents.filter((agent) => agent.status === "paused").length;
+    const queued = agents.filter((agent) => agent.status === "queued").length;
     const errors = agents.filter((agent) => agent.status === "error").length;
     const skipped = agents.filter((agent) => agent.status === "skipped").length;
     const complete = agents.length > 0 && done + errors + skipped === agents.length;
-    const marker = running > 0 || (!complete && snapshot.currentPhase === phase) ? "▶" : complete ? "✓" : " ";
+    const marker =
+      paused > 0 ? "⏸" : running > 0 || (!complete && snapshot.currentPhase === phase) ? "▶" : complete ? "✓" : " ";
     lines.push(
       theme.fg("accent", `  ${marker} ${phase}`) +
         theme.fg(
           "dim",
-          ` ${done}/${agents.length}${running ? ` · ${running} running` : ""}${errors ? ` · ${errors} errors` : ""}${skipped ? ` · ${skipped} skipped` : ""}`,
+          ` ${done}/${agents.length}${running ? ` · ${running} running` : ""}${paused ? ` · ${paused} paused` : ""}${queued ? ` · ${queued} not started` : ""}${errors ? ` · ${errors} errors` : ""}${skipped ? ` · ${skipped} skipped` : ""}`,
         ),
     );
 
@@ -214,8 +259,10 @@ export function renderWorkflowLines(
     for (const agent of visibleAgents) {
       const order = `[${agent.id}]`;
       const result = showResultPreviews && agent.resultPreview ? ` — ${agent.resultPreview}` : "";
-      const agentTokens = agent.tokens ? theme.fg("dim", ` [${agent.tokens.toLocaleString()} tok]`) : "";
-      lines.push(`    ${order} ${statusIcon(agent.status)} ${shorten(agent.label, 48)}${agentTokens}${result}`);
+      const agentTokens = formatAgentTokens(agent, theme);
+      lines.push(
+        `    ${order} ${statusIcon(agent.status)} ${shorten(agent.label, 48)}${agentTokens} · ${agentStatusLabel(agent)}${result}`,
+      );
     }
     if (agents.length > visibleAgents.length)
       lines.push(theme.fg("dim", `    … ${agents.length - visibleAgents.length} earlier agents`));
@@ -226,12 +273,24 @@ export function renderWorkflowLines(
     lines.push(theme.fg("accent", "  Unphased"));
     for (const agent of unphased.slice(-maxAgents)) {
       const result = showResultPreviews && agent.resultPreview ? ` — ${agent.resultPreview}` : "";
-      const agentTokens = agent.tokens ? theme.fg("dim", ` [${agent.tokens.toLocaleString()} tok]`) : "";
-      lines.push(`    [${agent.id}] ${statusIcon(agent.status)} ${shorten(agent.label, 48)}${agentTokens}${result}`);
+      const agentTokens = formatAgentTokens(agent, theme);
+      lines.push(
+        `    [${agent.id}] ${statusIcon(agent.status)} ${shorten(agent.label, 48)}${agentTokens} · ${agentStatusLabel(agent)}${result}`,
+      );
     }
   }
 
   return lines;
+}
+
+function agentStatusLabel(agent: WorkflowAgentSnapshot): string {
+  if (agent.status !== "paused") return agent.status;
+  return agent.sessionFile ? "paused mid-run (session saved)" : "paused mid-run (fresh restart)";
+}
+
+function formatAgentTokens(agent: WorkflowAgentSnapshot, theme: ThemeLike): string {
+  if (!agent.tokens) return "";
+  return theme.fg("dim", ` [${agent.tokensEstimated ? "~" : ""}${agent.tokens.toLocaleString()} tok]`);
 }
 
 export function renderWorkflowText(snapshot: WorkflowSnapshot, completed = false): string {
@@ -243,6 +302,9 @@ function statusLine(snapshot: WorkflowSnapshot, completed: boolean): string {
   if (completed) return `workflow ✓ ${snapshot.name}: ${snapshot.doneCount}/${snapshot.agentCount}`;
   if (snapshot.runningCount > 0)
     return `workflow ${snapshot.name}: ${snapshot.runningCount} running, ${snapshot.doneCount}/${snapshot.agentCount} done`;
+  const paused = snapshot.agents.filter((agent) => agent.status === "paused").length;
+  if (paused > 0)
+    return `workflow ${snapshot.name}: ${paused} paused mid-run, ${snapshot.doneCount}/${snapshot.agentCount} done`;
   return `workflow ${snapshot.name}: ${snapshot.doneCount}/${snapshot.agentCount} done`;
 }
 
@@ -252,6 +314,8 @@ export function statusIcon(status: WorkflowAgentStatus): string {
       return "○";
     case "running":
       return "●";
+    case "paused":
+      return "⏸";
     case "done":
       return "✓";
     case "error":

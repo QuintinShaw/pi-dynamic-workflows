@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { join } from "node:path";
 import { before, describe, it } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
@@ -173,7 +174,7 @@ describe("installResultDelivery", () => {
 
     const content = (pi as unknown as { _calls: { content: string }[] })._calls[0].content;
     assert.ok(content.includes("Full result:"), "should include the pointer label");
-    assert.ok(content.includes("/runs/test-run-1.json"), "should point at <runsDir>/<runId>.json");
+    assert.ok(content.includes(join("/runs", "test-run-1.json")), "should point at <runsDir>/<runId>.json");
     // The verdict summary itself is unchanged apart from the appended pointer.
     assert.ok(content.includes("All tests passed"), "verdict text preserved");
   });
@@ -206,7 +207,7 @@ describe("installResultDelivery", () => {
     const content = (pi as unknown as { _calls: { content: string }[] })._calls[0].content;
     assert.ok(/…\(truncated [\d.]+ (B|KB|MB)\)/.test(content), "the 50-char setting truncates a sub-400 dump");
     assert.ok(!content.includes("z".repeat(200)), "the body is cut at the configured threshold");
-    assert.ok(content.includes("/runs/test-run-1.json"), "pointer still appended");
+    assert.ok(content.includes(join("/runs", "test-run-1.json")), "pointer still appended");
   });
 
   // ── installResultDelivery: guard / stale ctx ──
@@ -374,6 +375,34 @@ describe("installTaskPanel", () => {
     assert.equal(registeredPlacement, "belowEditor");
   });
 
+  it("rerenders on queued, usage, and history-only events", () => {
+    const manager = new EventEmitter() as ReturnType<typeof EventEmitter> & {
+      getRun: (...args: unknown[]) => unknown;
+      listRuns: () => unknown[];
+    };
+    manager.getRun = () => undefined;
+    manager.listRuns = () => [];
+    let factory: ((tui: { requestRender(): void }, theme: unknown) => { dispose?(): void }) | undefined;
+    const ui = {
+      setWidget: (_name: string, registeredFactory: typeof factory) => {
+        factory = registeredFactory;
+      },
+    };
+    mod.installTaskPanel(null, manager, ui);
+    let renders = 0;
+    const component = factory?.(
+      { requestRender: () => renders++ },
+      { fg: (_c: string, t: string) => t, bold: (t: string) => t },
+    );
+
+    manager.emit("agentQueued", { runId: "r1", executionId: "r1:0" });
+    manager.emit("agentUsage", { runId: "r1", executionId: "r1:0" });
+    manager.emit("agentHistory", { runId: "r1", executionId: "r1:0" });
+
+    assert.equal(renders, 3);
+    component?.dispose?.();
+  });
+
   it("passes the render width through to the task panel", () => {
     const manager = new EventEmitter() as ReturnType<typeof EventEmitter> & {
       getRun: (...args: unknown[]) => unknown;
@@ -445,6 +474,29 @@ describe("renderPanel", () => {
       getRun: () => undefined,
     };
     assert.deepEqual(renderPanel(manager as never, theme as never), []);
+  });
+
+  it("shows finished, paused-mid-run, and not-started agents separately", async () => {
+    const { renderPanel } = await import("../src/task-panel.js");
+    const manager = {
+      listRuns: () => [
+        {
+          runId: "paused-run",
+          workflowName: "paused_work",
+          status: "paused",
+          agents: [
+            { id: 1, label: "finished", status: "done" },
+            { id: 2, label: "interrupted", status: "paused", sessionFile: "C:/sessions/child.jsonl" },
+            { id: 3, label: "later", status: "queued" },
+          ],
+          logs: [],
+        },
+      ],
+      getRun: () => undefined,
+    };
+    const text = renderPanel(manager as never, theme as never).join("\n");
+    assert.match(text, /1\/3 agents · 0 running · 1 paused · 1 not started/);
+    assert.match(text, /Paused mid-run \(1\): interrupted \(session saved\)/);
   });
 
   it("truncates every rendered line to the requested visible width", async () => {
@@ -527,10 +579,9 @@ describe("token rate", () => {
 describe("renderPanelDetailed", () => {
   const theme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
 
-  // `blueTokens` drives the first agent's live token count; the run aggregate and
-  // token/s are summed from per-agent tokens (the run-level tokenUsage aggregate is
-  // not live — see renderPanelDetailed), so growing blueTokens grows the rate.
-  function detailedManager(blueTokens: number, status = "running") {
+  // `blueTokens` drives the completed agent subtotal; `runningTokens` drives the
+  // active invocation's stable-identity token-rate series.
+  function detailedManager(blueTokens: number, status = "running", runningTokens = 1800) {
     const snapshot = {
       name: "auth_audit",
       phases: ["Scan", "Review"],
@@ -545,7 +596,14 @@ describe("renderPanelDetailed", () => {
           tokens: blueTokens,
           model: "anthropic/claude-haiku-4-5",
         },
-        { id: 2, label: "audit_auth", status: "running", phase: "Scan", tokens: 1800 },
+        {
+          id: 2,
+          executionId: "r1:1",
+          label: "audit_auth",
+          status: "running",
+          phase: "Scan",
+          tokens: runningTokens,
+        },
         { id: 3, label: "scan_middleware", status: "queued", phase: "Scan" },
         { id: 4, label: "cross_check", status: "queued", phase: "Review" },
       ],
@@ -554,9 +612,16 @@ describe("renderPanelDetailed", () => {
     };
     return {
       listRuns: () => [
-        { runId: "r1", workflowName: "auth_audit", status, agents: snapshot.agents, tokenUsage: snapshot.tokenUsage },
+        {
+          runId: "r1",
+          workflowName: "auth_audit",
+          status,
+          agents: snapshot.agents,
+          tokenUsage: snapshot.tokenUsage,
+          effectiveConcurrency: 8,
+        },
       ],
-      getRun: (id: string) => (id === "r1" ? { snapshot, status } : undefined),
+      getRun: (id: string) => (id === "r1" ? { snapshot, status, execution: { effectiveConcurrency: 8 } } : undefined),
     };
   }
 
@@ -595,12 +660,29 @@ describe("renderPanelDetailed", () => {
     );
   });
 
+  it("marks streaming token estimates with a tilde", async () => {
+    const { renderPanelDetailed, clearTokenSamples } = await import("../src/task-panel.js");
+    clearTokenSamples("r1");
+    const manager = detailedManager(2100) as ReturnType<typeof detailedManager>;
+    const run = manager.getRun("r1");
+    if (run) run.snapshot.agents[1].tokensEstimated = true;
+    const text = renderPanelDetailed(manager as never, theme as never, undefined, 8, 1000).join("\n");
+    assert.match(text, /~1\.8K tok/);
+    assert.match(text, /Running now \(1\/8\): audit_auth/);
+  });
+
   it("shows a live token/s after two growing samples", async () => {
     const { renderPanelDetailed, clearTokenSamples } = await import("../src/task-panel.js");
     clearTokenSamples("r1");
-    // aggregate goes 3900 → 5900 over 1s = 2000 tok/s
-    renderPanelDetailed(detailedManager(2100) as never, theme as never, undefined, 8, 1000);
-    const lines = renderPanelDetailed(detailedManager(4100) as never, theme as never, undefined, 8, 2000);
+    // Running invocation goes 1800 → 3800 over 1s = 2000 tok/s.
+    renderPanelDetailed(detailedManager(2100, "running", 1800) as never, theme as never, undefined, 8, 1000);
+    const lines = renderPanelDetailed(
+      detailedManager(2100, "running", 3800) as never,
+      theme as never,
+      undefined,
+      8,
+      2000,
+    );
     assert.ok(
       lines.some((l) => /2000 tok\/s/.test(l)),
       `expected a tok/s readout, got:\n${lines.join("\n")}`,

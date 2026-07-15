@@ -11,11 +11,11 @@
  */
 
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { WorkflowAgent } from "../src/agent.js";
 import { WorkflowErrorCode } from "../src/errors.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
@@ -38,7 +38,7 @@ async function loadFaux(): Promise<typeof import("@earendil-works/pi-ai/compat")
       import.meta.url,
     ),
   );
-  const entry = existsSync(nested) ? nested : "@earendil-works/pi-ai/compat";
+  const entry = existsSync(nested) ? pathToFileURL(nested).href : "@earendil-works/pi-ai/compat";
   return import(entry) as Promise<typeof import("@earendil-works/pi-ai/compat")>;
 }
 
@@ -106,6 +106,41 @@ test("a successful real turn whose text merely mentions 'rate limit' is NOT misc
     const agent = new WorkflowAgent({ cwd, session: { model: model as never } });
     const text = await agent.run("do the task", { label: "ok" });
     assert.ok(typeof text === "string" && text.includes("Done."), `expected normal text, got ${String(text)}`);
+  }));
+
+test("a paused real child session reopens the same Pi session file on resume", () =>
+  withFauxSession(async ({ cwd, model, setResponses, fauxAssistantMessage }) => {
+    const managerAgent = new WorkflowAgent({ cwd, session: { model: model as never }, persistAgentSessions: true });
+    const manager = new WorkflowManager({ cwd, agent: managerAgent, persistAgentSessions: true });
+    manager.on("error", () => {});
+    const script = `export const meta = { name: 'session_resume', description: 'resume one child' }
+return await agent('finish the task', { label: 'resumable' })`;
+
+    setResponses([fauxAssistantMessage("", { stopReason: "error", errorMessage: USAGE_LIMIT_MSG })]);
+    const { runId, promise } = manager.startInBackground(script);
+    await promise.catch(() => {});
+
+    const paused = manager.listRuns().find((run) => run.runId === runId);
+    assert.equal(paused?.status, "paused");
+    assert.equal(paused?.agents[0].status, "paused");
+    const sessionFile = paused?.agents[0].sessionFile;
+    assert.ok(sessionFile && existsSync(sessionFile), "paused invocation stores a durable Pi child session");
+    const before = readFileSync(sessionFile, "utf8");
+    assert.match(before, /usage limit reached/i);
+
+    setResponses([fauxAssistantMessage("continued-result", { stopReason: "stop" })]);
+    assert.equal(await manager.resume(runId), true);
+    for (let i = 0; i < 100 && manager.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    const completed = manager.getRun(runId);
+    assert.equal(completed?.status, "completed");
+    assert.equal(completed?.snapshot.agents[0].sessionFile, sessionFile, "resume keeps the same child session file");
+    assert.equal(completed?.result?.result, "continued-result");
+    const after = readFileSync(sessionFile, "utf8");
+    assert.ok(after.length > before.length, "continuation appends to the existing child session");
+    assert.match(after, /continued-result/);
   }));
 
 test("through the manager: a usage limit pauses the run (not fails) and resume replays the journal", () =>

@@ -8,8 +8,8 @@ export const MAX_AGENTS_PER_RUN = 1000;
 /** Default timeout for a single agent in milliseconds. null means no hard timeout. */
 export const DEFAULT_AGENT_TIMEOUT_MS = null;
 
-/** Maximum concurrent agents (matches Claude Code limit). */
-export const MAX_CONCURRENCY = 16;
+/** Concurrent agents used when a run does not specify a limit. */
+export const DEFAULT_CONCURRENCY = 16;
 
 /** Maximum automatic retry attempts after a recoverable agent failure. */
 export const MAX_AGENT_RETRIES = 3;

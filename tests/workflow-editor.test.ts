@@ -129,6 +129,41 @@ describe("hasTrigger", () => {
     assert.equal(hasTrigger("/workflow"), false);
   });
 
+  it("requires token boundaries for the built-in trigger", async () => {
+    const { hasTrigger } = await load();
+    for (const text of [
+      "myworkflow",
+      "workflows2",
+      "workflow_name",
+      "workflow-based",
+      "src/workflow-editor.ts",
+      "src\\workflow-editor.ts",
+    ]) {
+      assert.equal(hasTrigger(text), false, `${text} should not trigger`);
+    }
+    for (const text of ["workflow, please", "(workflows)", "WORKFLOW!", "Discuss workflows."]) {
+      assert.equal(hasTrigger(text), true, `${text} should trigger`);
+    }
+  });
+
+  it("rejects Unicode identifier and dollar boundaries on either side", async () => {
+    const { hasTrigger } = await load();
+    for (const text of [
+      "$workflow",
+      "workflow$",
+      "caféworkflow",
+      "workflowcafé",
+      "变量workflow变量",
+      "变量workflow",
+      "workflow变量",
+    ]) {
+      assert.equal(hasTrigger(text), false, `${text} should not trigger`);
+    }
+    for (const text of ["¿workflow?", "café, workflow!", "变量：workflow。", "workflow—please"]) {
+      assert.equal(hasTrigger(text), true, `${text} should trigger`);
+    }
+  });
+
   it("returns false for unrelated text", async () => {
     const { hasTrigger } = await load();
     assert.equal(hasTrigger("hello world"), false);
@@ -611,6 +646,88 @@ describe("installWorkflowEditor", () => {
     assert.equal(setActiveToolsCalls, 1, "workflow trigger should still add the workflow tool");
   });
 
+  it("leaves ordinary workflow mentions untouched in fresh settings and compatibility mode", async () => {
+    const mod = await load();
+    const captured: Array<{ event: string; handler: (...args: unknown[]) => unknown }> = [];
+    let setEditorCalls = 0;
+    let setActiveToolsCalls = 0;
+    const pi = {
+      on: (event: string, handler: (...args: unknown[]) => unknown) => {
+        captured.push({ event, handler });
+      },
+      registerCommand: () => {},
+      getActiveTools: () => ["bash", "read"],
+      setActiveTools: () => {
+        setActiveToolsCalls++;
+      },
+    } as unknown as ExtensionAPI;
+    const ui = {
+      getEditorComponent: () => () => ({ kind: "existing-editor" }),
+      setEditorComponent: () => {
+        setEditorCalls++;
+      },
+    } as unknown as ExtensionUIContext;
+
+    const state = mod.installWorkflowEditor(pi, ui, undefined, {
+      settingsStore: { load: () => ({}), save: () => {} },
+    });
+    state.suppressedKeywordText = "leave this marker unchanged";
+
+    assert.equal(state.keywordTriggerEnabled, false);
+    assert.equal(setEditorCalls, 0, "existing custom editor should remain installed");
+    const inputHandler = captured.find((h) => h.event === "input")?.handler;
+    assert.ok(inputHandler, "input handler should still be registered");
+    for (const text of [
+      "Discuss workflow design.",
+      "Compare workflows, please.",
+      "WORKFLOW!",
+      "myworkflow identifier",
+      "src/workflow-editor.ts",
+      "/workflows status",
+    ]) {
+      assert.deepEqual(inputHandler({ source: "interactive", text }), { action: "continue" });
+    }
+    assert.equal(setActiveToolsCalls, 0);
+    assert.equal(state.suppressedKeywordText, "leave this marker unchanged");
+  });
+
+  it("explicit opt-in restores bounded keyword transformation", async () => {
+    const mod = await load();
+    const captured: Array<{ event: string; handler: (...args: unknown[]) => unknown }> = [];
+    const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
+    let setActiveToolsCalls = 0;
+    const pi = {
+      on: (event: string, handler: (...args: unknown[]) => unknown) => {
+        captured.push({ event, handler });
+      },
+      registerCommand: (name: string, command: { handler: (args: string, ctx: unknown) => Promise<void> }) => {
+        commands.set(name, command);
+      },
+      sendMessage: () => {},
+      getActiveTools: () => ["bash", "read"],
+      setActiveTools: () => {
+        setActiveToolsCalls++;
+      },
+    } as unknown as ExtensionAPI;
+    const ui = { setEditorComponent: () => {} } as unknown as ExtensionUIContext;
+    const store = memorySettingsOptions(false);
+
+    const state = mod.installWorkflowEditor(pi, ui, undefined, store.options);
+    assert.equal(state.keywordTriggerEnabled, false);
+    await commands.get("workflows-trigger")?.handler("on", {});
+    assert.equal(state.keywordTriggerEnabled, true);
+
+    const inputHandler = captured.find((h) => h.event === "input")?.handler;
+    assert.ok(inputHandler, "input handler should be registered");
+    assert.deepEqual(inputHandler({ source: "interactive", text: "myworkflow identifier" }), {
+      action: "continue",
+    });
+    const result = inputHandler({ source: "interactive", text: "Please run a workflow, now." });
+    assert.equal((result as { action?: string }).action, "transform");
+    assert.equal(setActiveToolsCalls, 1);
+    assert.deepEqual(store.settings, { keywordTriggerEnabled: true });
+  });
+
   it("registers /workflows-trigger and toggles the keyword trigger", async () => {
     const mod = await load();
     const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
@@ -633,7 +750,7 @@ describe("installWorkflowEditor", () => {
     } as unknown as ExtensionUIContext;
 
     const state = mod.installWorkflowEditor(pi, ui, undefined, store.options);
-    assert.equal(state.keywordTriggerEnabled, true, "keyword trigger should default on");
+    assert.equal(state.keywordTriggerEnabled, true, "persisted on preference should be restored");
     assert.equal(state.keywordTriggerWord, "workflow", "keyword trigger word should default to workflow");
 
     const command = commands.get("workflows-trigger");

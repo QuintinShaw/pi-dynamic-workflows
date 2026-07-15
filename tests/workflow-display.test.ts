@@ -153,6 +153,54 @@ describe("renderWorkflowText", () => {
     assert.ok(text.includes("1 skipped"), "should show skipped count");
   });
 
+  it("shows running inventory, queued count, explicit statuses, and estimated tokens", async () => {
+    const { createWorkflowSnapshot, renderWorkflowLines, recomputeWorkflowSnapshot } = await loadDisplay();
+    const snap = createWorkflowSnapshot(fakeMeta("fleet", "d", ["Fleet"]));
+    snap.effectiveConcurrency = 8;
+    snap.agents = Array.from({ length: 42 }, (_, index) => ({
+      id: index + 1,
+      executionId: `fleet:${index}`,
+      callIndex: index,
+      label: `agent-${index + 1}`,
+      phase: "Fleet",
+      prompt: "p",
+      status: index < 8 ? ("running" as const) : ("queued" as const),
+      tokens: index === 0 ? 120 : undefined,
+      tokensEstimated: index === 0,
+    }));
+
+    const text = renderWorkflowLines(recomputeWorkflowSnapshot(snap), { maxAgents: 42 }).join("\n");
+    assert.match(text, /8 running/);
+    assert.match(text, /34 not started/);
+    assert.match(text, /Running now \(8\/8\): agent-1, agent-2, agent-3, agent-4, agent-5, agent-6, agent-7, agent-8/);
+    assert.match(text, /● agent-1 \[~120 tok\] · running/);
+    assert.match(text, /○ agent-42 · queued/);
+  });
+
+  it("distinguishes finished, paused-mid-run, and never-started agents", async () => {
+    const { createWorkflowSnapshot, renderWorkflowLines, recomputeWorkflowSnapshot } = await loadDisplay();
+    const snap = createWorkflowSnapshot(fakeMeta("paused", "d", ["Work"]));
+    snap.agents = [
+      { id: 1, label: "finished", phase: "Work", prompt: "p", status: "done" },
+      {
+        id: 2,
+        label: "interrupted",
+        phase: "Work",
+        prompt: "p",
+        status: "paused",
+        sessionFile: "C:/sessions/child.jsonl",
+      },
+      { id: 3, label: "later", phase: "Work", prompt: "p", status: "queued" },
+    ];
+    const text = renderWorkflowLines(recomputeWorkflowSnapshot(snap), { maxAgents: 3 }).join("\n");
+    assert.match(text, /1 paused mid-run/);
+    assert.match(text, /1 not started/);
+    assert.match(text, /Paused mid-run \(1\): interrupted \(session saved\)/);
+    assert.match(text, /⏸ interrupted · paused mid-run \(session saved\)/);
+    assert.match(text, /○ later · queued/);
+    assert.match(text, /✓ finished · done/);
+  });
+
   it("shows unphased agents when agents have no phase", async () => {
     const { createWorkflowSnapshot, renderWorkflowLines } = await loadDisplay();
     const snap = createWorkflowSnapshot(fakeMeta("t", "d", []));

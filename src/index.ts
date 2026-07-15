@@ -1,6 +1,6 @@
 export type { AdversarialReviewConfig } from "./adversarial-review.js";
 export { generateAdversarialReviewWorkflow, generateMultiPerspectiveWorkflow } from "./adversarial-review.js";
-export type { AgentRunOptions, AgentRunResult, WorkflowAgentOptions } from "./agent.js";
+export type { AgentRunOptions, AgentRunResult, AgentSessionCheckpoint, WorkflowAgentOptions } from "./agent.js";
 export { listAvailableModelSpecs, WorkflowAgent } from "./agent.js";
 export type { AgentHistoryEntry, AgentHistoryKind, AgentHistoryRole } from "./agent-history.js";
 export { compactAgentHistory } from "./agent-history.js";
@@ -80,14 +80,17 @@ export { createWebFetchTool, createWebSearchTool, createWebTools } from "./web-t
 export type {
   AgentOptions,
   JournalEntry,
+  ResumeAgentState,
   SharedRuntime,
+  WorkflowConcurrencyLimiter,
   WorkflowMeta,
   WorkflowMetaPhase,
   WorkflowRunOptions,
   WorkflowRunResult,
 } from "./workflow.js";
-export { parseWorkflowScript, runWorkflow } from "./workflow.js";
+export { createConcurrencyLimiter, parseWorkflowScript, runWorkflow } from "./workflow.js";
 export { registerWorkflowCommands } from "./workflow-commands.js";
+export { createWorkflowControlTool } from "./workflow-control-tool.js";
 export {
   buildForcedWorkflowPrompt,
   colorizeWorkflow,
@@ -102,7 +105,7 @@ export {
   WorkflowEditor,
   type WorkflowModeState,
 } from "./workflow-editor.js";
-export type { ManagedRun, WorkflowManagerOptions } from "./workflow-manager.js";
+export type { ConcurrencyUpdate, ManagedRun, WorkflowManagerOptions } from "./workflow-manager.js";
 export { WorkflowManager } from "./workflow-manager.js";
 export type { WorkflowProjectPaths } from "./workflow-paths.js";
 export {

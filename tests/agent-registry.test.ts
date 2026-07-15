@@ -16,6 +16,7 @@ import {
   resolveAgentType,
 } from "../src/agent-registry.js";
 import { runWorkflow } from "../src/workflow.js";
+import { withFakeHome } from "./helpers/fake-home.js";
 
 // ── parseAgentDefinition ───────────────────────────────────────────────────
 
@@ -146,23 +147,21 @@ describe("loadAgentRegistry", () => {
 
   it("default userDir resolution uses getAgentDir() (~/.pi/agent/agents) with no injected opts", () => {
     const tmpHome = mkdtempSync(join(tmpdir(), "pi-home-"));
-    const originalHome = process.env.HOME;
     const originalAgentDirEnv = process.env.PI_CODING_AGENT_DIR;
     delete process.env.PI_CODING_AGENT_DIR;
-    process.env.HOME = tmpHome;
     try {
-      const expectedUserDir = join(getAgentDir(), "agents");
-      assert.equal(expectedUserDir, join(tmpHome, ".pi", "agent", "agents"), "sanity: HOME override took effect");
-      writeDef(expectedUserDir, "scout.md", "---\nname: scout\n---\nUser-level scout.");
+      withFakeHome(tmpHome, () => {
+        const expectedUserDir = join(getAgentDir(), "agents");
+        assert.equal(expectedUserDir, join(tmpHome, ".pi", "agent", "agents"), "sanity: home override took effect");
+        writeDef(expectedUserDir, "scout.md", "---\nname: scout\n---\nUser-level scout.");
 
-      const cwd = mkdtempSync(join(tmpdir(), "pi-cwd-"));
-      const reg = loadAgentRegistry(cwd);
-      assert.equal(reg.get("scout")?.source, "user");
-      assert.equal(reg.get("scout")?.prompt, "User-level scout.");
-      rmSync(cwd, { recursive: true, force: true });
+        const cwd = mkdtempSync(join(tmpdir(), "pi-cwd-"));
+        const reg = loadAgentRegistry(cwd);
+        assert.equal(reg.get("scout")?.source, "user");
+        assert.equal(reg.get("scout")?.prompt, "User-level scout.");
+        rmSync(cwd, { recursive: true, force: true });
+      });
     } finally {
-      if (originalHome === undefined) delete process.env.HOME;
-      else process.env.HOME = originalHome;
       if (originalAgentDirEnv === undefined) delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = originalAgentDirEnv;
       rmSync(tmpHome, { recursive: true, force: true });

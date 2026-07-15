@@ -23,6 +23,7 @@ return { ok, name }`;
   assert.equal(res.result.ok, true);
   assert.equal(res.result.name, "fallback");
   assert.equal(journal.length, 2, "both checkpoints journaled");
+  assert.ok(journal.every((entry) => entry.source === "checkpoint"));
 });
 
 test("checkpoint(): headless 'abort' throws when no UI is threaded in", async () => {

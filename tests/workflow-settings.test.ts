@@ -33,13 +33,19 @@ describe("workflow settings", () => {
     });
   });
 
-  it("saves and loads keyword trigger preferences", () => {
+  it("saves and loads explicit keyword trigger preferences", () => {
     withSettingsPath((settingsPath) => {
       saveWorkflowSettings({ keywordTriggerEnabled: false, keywordTriggerWord: "pi-workflow" }, settingsPath);
 
       assert.ok(existsSync(settingsPath), "settings file should be created");
       assert.deepEqual(loadWorkflowSettings(settingsPath), {
         keywordTriggerEnabled: false,
+        keywordTriggerWord: "pi-workflow",
+      });
+
+      saveWorkflowSettings({ keywordTriggerEnabled: true }, settingsPath);
+      assert.deepEqual(loadWorkflowSettings(settingsPath), {
+        keywordTriggerEnabled: true,
         keywordTriggerWord: "pi-workflow",
       });
     });
@@ -77,7 +83,7 @@ describe("workflow settings", () => {
       assert.deepEqual(loadWorkflowSettings(settingsPath), { defaultConcurrency: 4, defaultAgentRetries: 2 });
 
       writeFileSync(settingsPath, JSON.stringify({ defaultConcurrency: 99, defaultAgentRetries: 99 }), "utf-8");
-      assert.deepEqual(loadWorkflowSettings(settingsPath), { defaultConcurrency: 16, defaultAgentRetries: 3 });
+      assert.deepEqual(loadWorkflowSettings(settingsPath), { defaultConcurrency: 99, defaultAgentRetries: 3 });
 
       writeFileSync(settingsPath, JSON.stringify({ defaultConcurrency: 0, defaultAgentRetries: -1 }), "utf-8");
       assert.deepEqual(loadWorkflowSettings(settingsPath), {});
