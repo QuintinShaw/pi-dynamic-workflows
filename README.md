@@ -197,11 +197,13 @@ The full guide — every global, agent option, `agentType` definitions, structur
 | --- | --- |
 | `tier` | `"small"` \| `"medium"` \| `"big"` — coarse model routing (configure via `/workflows-models`; tiers may store `provider/modelId:thinking`). |
 | `model` | Exact `provider/modelId` or `provider/modelId:thinking` (always wins over `tier`). |
-| `agentType` | A named definition (`.pi/agents/<name>.md` project-level, or `~/.pi/agent/agents/<name>.md` user-level — `~/.pi/agents/<name>.md` still works as a deprecated fallback) binding tools + model + role prompt. |
+| `agentType` | A named definition (`.pi/agents/<name>.md` project-level, or `~/.pi/agent/agents/<name>.md` user-level — `~/.pi/agents/<name>.md` still works as a deprecated fallback) binding tools + model + role prompt. Its tool policy constrains Pi's final built-in/custom/extension registry; narrowed selectors such as `ext:pi-web-access/web_search` are supported. |
 | `isolation: "worktree"` | Run in a throwaway git worktree for conflict-free parallel edits. |
 | `schema` | JSON Schema → the subagent returns a validated object. |
 | `label` / `phase` / `timeoutMs` | Display label / phase override / optional per-agent hard timeout. Omit `timeoutMs` for no hard timeout. |
 | `retries` | Retry attempts after a recoverable failure (timeout, connection failure, empty output) for this agent. Overrides the run-level `agentRetries`. Default `0`. |
+
+Workflow subagents deny recursive orchestration tools (`Agent`, `get_subagent_result`, `steer_subagent`, `workflow`, and the lowercase `agent` variant) by default so nested work cannot bypass the run's agent count, limiter, model routing, or accounting. A restrictive `agentType` tool allowlist is applied to Pi's final registry, including extension tools. To permit recursion deliberately, list the exact orchestration tool name in that agentType's `tools` allowlist.
 
 By default, workflows do not set a run-wide token budget or per-agent hard timeout. Use the `workflow` tool's `tokenBudget` / `agentTimeoutMs`, per-phase budgets, or per-agent `timeoutMs` only when you want an explicit cap. A global fallback timeout can also be set in `~/.pi/workflows/settings.json` as `{ "defaultAgentTimeoutMs": 600000 }`; set it to `null` or omit it for no default hard timeout.
 

@@ -3,6 +3,8 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
+import { DefaultResourceLoader, defineTool, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 import type { AgentRunOptions, AgentUsage } from "../src/agent.js";
 import { listAvailableModelSpecs, resolveAgentModelSpec, WorkflowAgent } from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
@@ -249,6 +251,90 @@ test("WorkflowAgent.getRegistry: per-run registry wins, then constructor's share
 
   const bareAgent = new WorkflowAgent({ cwd: "/tmp" });
   assert.doesNotThrow(() => (bareAgent as any).getRegistry());
+});
+
+function probeTool(name: string) {
+  return defineTool({
+    name,
+    label: name,
+    description: name,
+    parameters: Type.Object({}),
+    execute: async () => ({ content: [{ type: "text" as const, text: "ok" }], details: {} }),
+  });
+}
+
+async function captureWorkflowAgentActiveTools(
+  runOptions: Pick<AgentRunOptions<any>, "toolNames" | "disallowedToolNames">,
+): Promise<string[]> {
+  const root = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-tool-policy-"));
+  try {
+    let activeTools: string[] = [];
+    const settingsManager = SettingsManager.inMemory();
+    const resourceLoader = new DefaultResourceLoader({
+      cwd: root,
+      agentDir: join(root, "agent"),
+      settingsManager,
+      noSkills: true,
+      noPromptTemplates: true,
+      noThemes: true,
+      noContextFiles: true,
+      extensionFactories: [
+        (pi) => {
+          for (const name of ["Agent", "get_subagent_result", "steer_subagent", "workflow", "web_search"]) {
+            pi.registerTool(probeTool(name));
+          }
+          // Capture the final active registry without making a provider request.
+          pi.on("input", () => {
+            activeTools = pi.getActiveTools();
+            return { action: "handled" as const };
+          });
+        },
+      ],
+    });
+    await resourceLoader.reload();
+
+    const agent = new WorkflowAgent({
+      cwd: root,
+      tools: [probeTool("read")],
+      session: {
+        resourceLoader,
+        settingsManager,
+        sessionManager: SessionManager.inMemory(root),
+      },
+    });
+    await assert.rejects(
+      () => agent.run("capture active tools", { label: "tool policy probe", ...runOptions }),
+      /no assistant output/i,
+    );
+    return activeTools;
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+test("WorkflowAgent applies agentType allowlists to the final extension tool registry", async () => {
+  const active = await captureWorkflowAgentActiveTools({
+    toolNames: ["read", "ext:pi-web-access/web_search"],
+  });
+  assert.deepEqual(active.sort(), ["read", "web_search"]);
+});
+
+test("WorkflowAgent denies recursive orchestration tools by default but keeps normal extensions", async () => {
+  const active = await captureWorkflowAgentActiveTools({});
+  assert.ok(active.includes("web_search"), "ordinary extension tools remain available without an agentType allowlist");
+  for (const forbidden of ["Agent", "get_subagent_result", "steer_subagent", "workflow"]) {
+    assert.ok(!active.includes(forbidden), `${forbidden} must be denied by default`);
+  }
+});
+
+test("WorkflowAgent applies agentType denylists to extension tools", async () => {
+  const active = await captureWorkflowAgentActiveTools({ disallowedToolNames: ["web_search"] });
+  assert.ok(!active.includes("web_search"));
+});
+
+test("WorkflowAgent permits an orchestration tool only when it is explicitly allowlisted", async () => {
+  const active = await captureWorkflowAgentActiveTools({ toolNames: ["Agent"] });
+  assert.deepEqual(active, ["Agent"]);
 });
 
 // ═══════════════════════════════════════════════════════════════════════════

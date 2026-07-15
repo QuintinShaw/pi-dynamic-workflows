@@ -12,6 +12,7 @@ import {
   applyToolPolicy,
   listAgentTypes,
   loadAgentRegistry,
+  normalizeToolPolicyNames,
   parseAgentDefinition,
   resolveAgentType,
 } from "../src/agent-registry.js";
@@ -303,6 +304,20 @@ describe("applyToolPolicy", () => {
       applyToolPolicy(tools, ["read", "write"], ["write"]).map((t) => t.name),
       ["read"],
     );
+  });
+  it("normalizes narrowed extension selectors to Pi tool names", () => {
+    const withExtensionTool = [...tools, { name: "web_search" }];
+    assert.deepEqual(
+      applyToolPolicy(withExtensionTool, ["read", "ext:pi-web-access/web_search"]).map((t) => t.name),
+      ["read", "web_search"],
+    );
+    assert.deepEqual(normalizeToolPolicyNames(["ext:pi-web-access/web_search", "read", "read"]), [
+      "web_search",
+      "read",
+    ]);
+  });
+  it("does not guess tool names from a bare extension selector", () => {
+    assert.deepEqual(normalizeToolPolicyNames(["ext:pi-web-access"]), []);
   });
 });
 
