@@ -183,18 +183,49 @@ export function resolveAgentType(name: string | undefined, registry: AgentRegist
 }
 
 /**
+ * Convert agent-definition tool selectors into Pi SDK tool names.
+ *
+ * Plain entries are already tool names. The shared pi-subagents definition
+ * format also supports a narrowed extension selector such as
+ * `ext:pi-web-access/web_search`; Pi's createAgentSession `tools` option needs
+ * the registered tool name (`web_search`), not that source-qualified selector.
+ * A bare `ext:package` selector cannot be resolved without enumerating the
+ * extension's registry, so it intentionally contributes no tool names here.
+ */
+export function normalizeToolPolicyNames(names: string[] | undefined): string[] | undefined {
+  if (names === undefined) return undefined;
+  const normalized: string[] = [];
+  for (const value of names) {
+    const name = value.trim();
+    if (!name) continue;
+    if (!name.startsWith("ext:")) {
+      normalized.push(name);
+      continue;
+    }
+    const slash = name.indexOf("/", "ext:".length);
+    if (slash === -1) continue;
+    const toolName = name.slice(slash + 1).trim();
+    if (toolName) normalized.push(toolName);
+  }
+  return [...new Set(normalized)];
+}
+
+/**
  * Apply a definition's tool policy to a tool list: keep only allowlisted names
- * (when an allowlist is given), then drop any denylisted names. Generic over any
- * object with a `name` so it is unit-testable without real ToolDefinitions.
+ * (when an allowlist is given), then drop any denylisted names. Narrowed `ext:`
+ * selectors are normalized to their registered Pi tool name first. Generic over
+ * any object with a `name` so it is unit-testable without real ToolDefinitions.
  */
 export function applyToolPolicy<T extends { name: string }>(tools: T[], allow?: string[], deny?: string[]): T[] {
   let out = tools;
-  if (allow?.length) {
-    const allowSet = new Set(allow);
+  const normalizedAllow = normalizeToolPolicyNames(allow);
+  const normalizedDeny = normalizeToolPolicyNames(deny);
+  if (normalizedAllow?.length) {
+    const allowSet = new Set(normalizedAllow);
     out = out.filter((t) => allowSet.has(t.name));
   }
-  if (deny?.length) {
-    const denySet = new Set(deny);
+  if (normalizedDeny?.length) {
+    const denySet = new Set(normalizedDeny);
     out = out.filter((t) => !denySet.has(t.name));
   }
   return out;

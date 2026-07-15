@@ -16,7 +16,7 @@ import {
 import type { Static, TSchema } from "typebox";
 import { Check, Convert } from "typebox/value";
 import { type AgentHistoryEntry, compactAgentHistory } from "./agent-history.js";
-import { applyToolPolicy } from "./agent-registry.js";
+import { applyToolPolicy, normalizeToolPolicyNames } from "./agent-registry.js";
 import { classifyProviderLimit, WorkflowError, WorkflowErrorCode } from "./errors.js";
 import { canonicalModelSpec, resolveModelSpecWithThinking } from "./model-spec.js";
 import { loadModelTierConfig, type ModelTierConfig, resolveTierModel } from "./model-tier-config.js";
@@ -296,13 +296,15 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
   /** Run this agent in a different working directory (e.g. an isolated worktree). */
   cwd?: string;
   /**
-   * Restrict the subagent's coding tools to these names (an agentType
-   * definition's `tools` allowlist). Undefined = all coding tools. The
-   * structured_output tool is always added after this filter, so a schema
-   * still works under a restrictive allowlist.
+   * Restrict the subagent's final Pi tool registry to these names (an agentType
+   * definition's `tools` allowlist), including extension tools. Narrowed
+   * `ext:package/tool` selectors are accepted. Undefined keeps the normal tool
+   * set, minus recursive orchestration tools. The structured_output tool is
+   * always added after this filter, so a schema still works under a restrictive
+   * allowlist.
    */
   toolNames?: string[];
-  /** Remove these coding-tool names after the allowlist (an agentType `disallowedTools` denylist). */
+  /** Remove these names from the final Pi tool registry after the allowlist. */
   disallowedToolNames?: string[];
   /**
    * With `schema`: how many extra repair turns to allow if the model finishes
@@ -330,6 +332,59 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
 export type AgentRunResult<TSchemaDef extends TSchema | undefined> = TSchemaDef extends TSchema
   ? Static<TSchemaDef>
   : string;
+
+/**
+ * Known Pi orchestration tools that can create or control work outside this
+ * workflow runtime's counters, limiter, model routing, and usage accounting.
+ * Workflow subagents deny these by default. An agentType/session allowlist may
+ * opt into an exact name deliberately; all other names stay denied.
+ */
+export const RECURSIVE_ORCHESTRATION_TOOL_NAMES = [
+  "Agent",
+  "agent",
+  "get_subagent_result",
+  "steer_subagent",
+  "workflow",
+] as const;
+
+function uniqueToolNames(names: Iterable<string>): string[] {
+  return [...new Set([...names].filter(Boolean))];
+}
+
+/** Build the Pi SDK policy that gates built-in, custom, and extension tools. */
+function buildSessionToolPolicy(
+  options: Pick<AgentRunOptions<any>, "toolNames" | "disallowedToolNames">,
+  sessionOptions: Partial<CreateAgentSessionOptions>,
+  alwaysAllowedToolNames: string[],
+): Pick<CreateAgentSessionOptions, "tools" | "excludeTools"> {
+  // An agentType allowlist is authoritative over a constructor-level session
+  // allowlist. Both forms may use narrowed ext:package/tool selectors.
+  const policyAllow = normalizeToolPolicyNames(options.toolNames);
+  const sessionAllow = normalizeToolPolicyNames(sessionOptions.tools);
+  const explicitAllow = policyAllow ?? sessionAllow;
+  const explicitlyAllowed = new Set(explicitAllow ?? []);
+
+  const denied = new Set([
+    ...(normalizeToolPolicyNames(sessionOptions.excludeTools) ?? []),
+    ...(normalizeToolPolicyNames(options.disallowedToolNames) ?? []),
+  ]);
+  for (const toolName of RECURSIVE_ORCHESTRATION_TOOL_NAMES) {
+    if (!explicitlyAllowed.has(toolName)) denied.add(toolName);
+  }
+
+  // Runtime-owned system/schema tools intentionally bypass agentType policy.
+  for (const toolName of alwaysAllowedToolNames) denied.delete(toolName);
+
+  if (explicitAllow !== undefined) {
+    const tools = uniqueToolNames([
+      ...explicitAllow.filter((toolName) => !denied.has(toolName)),
+      ...alwaysAllowedToolNames,
+    ]);
+    return { tools, excludeTools: [...denied] };
+  }
+
+  return { excludeTools: [...denied] };
+}
 
 export class WorkflowAgent {
   private readonly cwd: string;
@@ -437,6 +492,14 @@ export class WorkflowAgent {
       customTools.push(createStructuredOutputTool({ schema: options.schema, capture }) as unknown as ToolDefinition);
     }
 
+    const alwaysAllowedToolNames = uniqueToolNames([
+      ...(options.systemTools ?? []).map((tool) => tool.name),
+      ...(options.schema ? ["structured_output"] : []),
+    ]);
+    // Crucially, pass Pi's own tools/excludeTools policy. Filtering customTools
+    // alone does not constrain tools registered by globally loaded extensions.
+    const sessionToolPolicy = buildSessionToolPolicy(options, this.sessionOptions, alwaysAllowedToolNames);
+
     // Resolve the model spec (explicit model > tier > session default). This
     // composes with phase-based routing in workflow.ts, which only supplies
     // options.model when a phase pattern matches — so an explicit model wins.
@@ -484,6 +547,9 @@ export class WorkflowAgent {
         ? { modelRegistry: options.modelRegistry ?? this.sharedRegistry }
         : {}),
       ...this.sessionOptions,
+      // Final policy wins over sessionOptions so an agentType allowlist cannot
+      // be bypassed by extension/custom tools loaded during session creation.
+      ...sessionToolPolicy,
       // Per-call model/thinking wins over any sessionOptions defaults.
       ...(resolvedModel ? { model: resolvedModel } : {}),
       ...(resolvedThinkingLevel ? { thinkingLevel: resolvedThinkingLevel } : {}),
