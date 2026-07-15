@@ -51,8 +51,8 @@ export interface JournalEntry {
 
 /**
  * Global resources shared across a run and any workflow() nested inside it, so
- * the 16-concurrent / 1000-total caps and the token budget hold across nesting
- * instead of each level getting its own limiter and counters.
+ * the 16-concurrent / 1000-total caps and cumulative token launch gate share one
+ * limiter and set of counters instead of resetting at each nesting level.
  */
 export interface SharedRuntime {
   limiter: <T>(fn: () => Promise<T>) => Promise<T>;
@@ -77,6 +77,11 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   concurrency?: number;
   /** Retry attempts after a recoverable agent failure. Default 0. */
   agentRetries?: number;
+  /**
+   * Optional cumulative-session-token launch gate. Checked before each agent is
+   * launched and charged after completion, so an already-running concurrent wave
+   * can overshoot it. Includes input, output, cache-read, and cache-write usage.
+   */
   tokenBudget?: number | null;
   signal?: AbortSignal;
   /** Maximum number of agents allowed in this run. Default: 1000 */
@@ -202,11 +207,10 @@ export interface CheckpointOptions {
 interface RuntimeState {
   currentPhase?: string;
   /**
-   * Per-phase soft sub-budgets carved from the run total: phase title -> the
-   * ceiling and the run-wide spent at the moment the budget was declared. A phase
-   * exceeding its ceiling throws TOKEN_BUDGET_EXHAUSTED while the run's overall
-   * budget is untouched. Soft gate (like the global one): spent accrues after each
-   * agent, so an in-flight wave may overshoot slightly.
+   * Per-phase cumulative-token launch gates: phase title -> the ceiling and the
+   * run-wide spent at the moment the gate was declared. A phase exceeding its
+   * ceiling throws TOKEN_BUDGET_EXHAUSTED while the run-wide gate is untouched.
+   * Usage accrues after each agent, so an in-flight concurrent wave may overshoot.
    */
   phaseBudgets: Map<string, { budget: number; startSpent: number; warned: boolean }>;
   logs: string[];
@@ -322,7 +326,7 @@ export async function runWorkflow<T = unknown>(
   const phase = (title: string, phaseOptions?: { budget?: number }) => {
     state.currentPhase = title;
     if (!state.phases.includes(title)) state.phases.push(title);
-    // Carve a soft sub-budget from the run total for work done under this phase.
+    // Set a between-launch cumulative-token gate for work under this phase.
     // Re-declaring re-bases from the current spent (idempotent across resume: the
     // script re-runs phase() and the ceiling is recomputed from live spent).
     if (typeof phaseOptions?.budget === "number" && phaseOptions.budget > 0) {
@@ -363,10 +367,10 @@ export async function runWorkflow<T = unknown>(
 
     const assignedPhase = agentOptions.phase ?? state.currentPhase;
 
-    // Per-phase soft sub-budget gate: a noisy phase can exhaust its own ceiling
-    // without touching the run's overall budget. Soft (spent accrues post-agent),
-    // warns once at ~80%, throws at 100%. Scripts can try/catch around a phase's
-    // work so later phases still proceed.
+    // Per-phase between-launch gate: a noisy phase can exhaust its own ceiling
+    // without touching the run-wide gate. Usage accrues post-agent; warn once at
+    // ~80% and reject later launches at 100%. A concurrent wave can overshoot.
+    // Scripts can try/catch so later phases still proceed.
     if (assignedPhase) {
       const pb = state.phaseBudgets.get(assignedPhase);
       if (pb) {
@@ -419,11 +423,11 @@ export async function runWorkflow<T = unknown>(
     // below) with callIndex makes the key unique across the whole store.
     const deltaKey = `${runId}:${callIndex}`;
 
-    // Reserve the agent slot synchronously — atomic with the limit/budget gate
+    // Reserve the agent slot synchronously — atomic with the limit/launch gate
     // above (no await in between) — so a parallel() fan-out can't all observe the
-    // same agentCount and overshoot maxAgents. (Token budget stays a soft gate:
-    // spent accrues after each agent, matching Claude Code; in-flight agents may
-    // push slightly past total, then further agent() calls throw.)
+    // same agentCount and overshoot maxAgents. Token usage is only known after an
+    // agent completes, so in-flight agents can exceed tokenBudget; once charged,
+    // subsequent agent() launches throw.
     shared.agentCount++;
     const label = requestedLabel || defaultAgentLabel(assignedPhase, shared.agentCount);
 

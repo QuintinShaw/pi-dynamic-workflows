@@ -513,8 +513,35 @@ return { a, second }`;
   assert.equal(result.result.second, "blocked");
 });
 
+test("tokenBudget is a between-launch gate: an in-flight parallel wave can overshoot", async () => {
+  const script = `export const meta = { name: 'budget_wave', description: 'parallel budget contract' }
+const wave = await parallel([0, 1, 2].map((i) => () => agent('p' + i, { label: 'p' + i })))
+let next = null
+try { next = await agent('after wave', { label: 'after' }) }
+catch (e) { next = e && e.code }
+return { wave, next, spent: budget.spent(), remaining: budget.remaining() }`;
+
+  const result = await runWorkflow<{
+    wave: unknown[];
+    next: unknown;
+    spent: number;
+    remaining: number;
+  }>(script, {
+    agent: fakeAgent({ input: 100, output: 0, total: 100, cost: 0 }),
+    tokenBudget: 100,
+    concurrency: 3,
+    persistLogs: false,
+  });
+
+  assert.deepEqual([...result.result.wave], ["ok", "ok", "ok"], "the initial concurrent wave all launched");
+  assert.equal(result.result.spent, 300, "post-completion charging records the full overshoot");
+  assert.equal(result.tokenUsage?.total, 300);
+  assert.equal(result.result.remaining, 0);
+  assert.equal(result.result.next, WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED, "the next launch is blocked");
+});
+
 test("token budget exhaustion inside parallel() halts (non-recoverable, not swallowed)", async () => {
-  // A warm-up agent spends the whole budget (soft gate: spent accrues after it
+  // A warm-up agent spends the whole gate (usage accrues after it
   // finishes); the agent() inside parallel() then hits the gate and must
   // propagate the non-recoverable error, not become a null in the result array.
   const script = `export const meta = { name: 'pb', description: 'budget in parallel' }

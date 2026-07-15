@@ -1,12 +1,15 @@
 /**
  * Standing `/effort` opt-in (pi's answer to CC's ultracode): a session toggle that
  * auto-arms a workflow for substantive interactive messages, with effort-tier
- * guidance nudging fan-out breadth and the hard caps (tokenBudget / maxAgents) the
- * model should set on the workflow tool call.
+ * guidance nudging fan-out breadth and the structural maxAgents ceiling the
+ * model should set on the workflow tool call. A cumulative-session token launch
+ * gate is opt-in only when the operator explicitly requests one.
  *
  * Honest scope: the runtime cannot enforce "reviewer N / loop K" — those live in
  * the script the model writes — so the tiers are guidance plus the model setting
- * the real hard caps (tokenBudget/maxAgents are genuine runtime ceilings). The
+ * maxAgents as the real atomic fan-out ceiling. tokenBudget is only a between-
+ * launch gate and in-flight agents may overshoot it, so effort mode must not add
+ * one merely because the operator selected high/ultra. The
  * pre-flight ceiling-confirm dialog (roadmap P1-5 #4) is a downscope point: an
  * `input` hook transforms synchronously and can't await a confirm, so it is left
  * to a follow-up; `/effort` is explicit opt-in, which is the safety valve.
@@ -25,9 +28,9 @@ export function createEffortState(): EffortState {
 }
 
 const HIGH_DIRECTIVE =
-  "Effort: HIGH. Be thorough — use a few parallel reviewers/perspectives and an adversarial verify pass (see verify()/judgePanel()); set a moderate tokenBudget and maxAgents on the workflow tool call.";
+  "Effort: HIGH. Be thorough — use a few parallel reviewers/perspectives and an adversarial verify pass (see verify()/judgePanel()); set a moderate maxAgents on the workflow tool call. Omit tokenBudget unless the operator explicitly requested a token/spend cap.";
 const ULTRA_DIRECTIVE =
-  "Effort: ULTRA. Be exhaustive — fan out widely (more reviewers/judges, deeper loopUntilDry rounds, a completenessCheck at the end), and prefer the big tier for synthesis. This can spend a lot of tokens quickly, so set explicit caps you're comfortable paying for (a generous but bounded tokenBudget and a high maxAgents) on the workflow tool call rather than leaving them unbounded.";
+  "Effort: ULTRA. Be exhaustive — fan out widely (more reviewers/judges, deeper loopUntilDry rounds, a completenessCheck at the end), prefer the big tier for synthesis, and set a high but deliberate maxAgents structural ceiling. This can spend a lot of tokens quickly, but omit tokenBudget unless the operator explicitly requested a token/spend cap.";
 
 /** The extra directive appended to the forced-workflow prompt for an effort level. */
 export function effortDirective(level: EffortLevel): string | undefined {
