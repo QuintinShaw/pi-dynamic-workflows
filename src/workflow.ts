@@ -687,6 +687,13 @@ export async function runWorkflow<T = unknown>(
   // agent()/parallel() (so callSeq ordering stays stable and resume keeps working).
   // Injected as globals so workflow scripts compose them directly. ──
 
+  type QualityAgentRoutingOptions = Pick<AgentOptions, "tier" | "model" | "agentType">;
+  const qualityAgentRouting = (opts: QualityAgentRoutingOptions): QualityAgentRoutingOptions => ({
+    tier: opts.tier,
+    model: opts.model,
+    agentType: opts.agentType,
+  });
+
   const VERIFY_SCHEMA = {
     type: "object",
     properties: { real: { type: "boolean" }, reason: { type: "string" } },
@@ -694,7 +701,14 @@ export async function runWorkflow<T = unknown>(
   };
   const verify = async (
     item: unknown,
-    opts: { reviewers?: number; threshold?: number; lens?: string | string[] } = {},
+    opts: {
+      reviewers?: number;
+      threshold?: number;
+      lens?: string | string[];
+      tier?: string;
+      model?: string;
+      agentType?: string;
+    } = {},
   ) => {
     const reviewers = Math.max(1, opts.reviewers ?? 2);
     const threshold = opts.threshold ?? 0.5;
@@ -707,7 +721,7 @@ export async function runWorkflow<T = unknown>(
           (_v, i) => () =>
             agent(
               `Adversarially review whether the following is REAL/correct. Try to refute it; default to real=false if unsure.${lenses.length ? ` Focus lens: ${lenses[i % lenses.length]}.` : ""}\n\n${claim}`,
-              { label: `verify ${i + 1}`, schema: VERIFY_SCHEMA },
+              { label: `verify ${i + 1}`, schema: VERIFY_SCHEMA, ...qualityAgentRouting(opts) },
             ),
         ),
       )
@@ -721,7 +735,10 @@ export async function runWorkflow<T = unknown>(
     properties: { score: { type: "number" }, reason: { type: "string" } },
     required: ["score"],
   };
-  const judgePanel = async (attempts: unknown[], opts: { judges?: number; rubric?: string } = {}) => {
+  const judgePanel = async (
+    attempts: unknown[],
+    opts: { judges?: number; rubric?: string; tier?: string; model?: string; agentType?: string } = {},
+  ) => {
     const judges = Math.max(1, opts.judges ?? 3);
     const rubric = opts.rubric ?? "overall quality and correctness";
     const scored = (
@@ -738,6 +755,7 @@ export async function runWorkflow<T = unknown>(
                     {
                       label: `judge ${idx + 1}.${j + 1}`,
                       schema: JUDGE_SCHEMA,
+                      ...qualityAgentRouting(opts),
                     },
                   ),
               ),
@@ -797,10 +815,18 @@ export async function runWorkflow<T = unknown>(
     properties: { complete: { type: "boolean" }, missing: { type: "array", items: { type: "string" } } },
     required: ["complete"],
   };
-  const completenessCheck = (taskArgs: unknown, results: unknown) =>
+  const completenessCheck = (
+    taskArgs: unknown,
+    results: unknown,
+    opts: { tier?: string; model?: string; agentType?: string } = {},
+  ) =>
     agent(
       `Given the task and the results gathered so far, list what is still MISSING (modalities not covered, claims unverified, gaps). Be specific and concise.\n\nTask:\n${JSON.stringify(taskArgs)}\n\nResults so far:\n${JSON.stringify(results).slice(0, 4000)}`,
-      { label: "completeness critic", schema: COMPLETENESS_SCHEMA },
+      {
+        label: "completeness critic",
+        schema: COMPLETENESS_SCHEMA,
+        ...qualityAgentRouting(opts),
+      },
     );
 
   // Thin bounded-retry / validation-gate combinators. Sugar over the for-loop +
