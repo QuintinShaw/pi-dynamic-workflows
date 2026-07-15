@@ -74,7 +74,7 @@ return await agent('Synthesize and double-check these findings:\n' + findings.jo
 - **Real token & cost accounting** — read from each subagent's session, not estimated. Runs have no default token cap; `tokenBudget`, phase budgets, and `budget` let you add explicit gates when you want them.
 - **Background by default** — the turn ends right away, a live "Workflows running" panel tracks runs, and each result is delivered back so the conversation auto-continues when it finishes. The panel is compact by default; `/workflows-progress detailed` expands it inline to per-phase/per-agent rows with tokens, cost, and a live tok/s rate (so a stalled agent shows as 0 tok/s) — no need to open `/workflows`.
 - **Interactive `/workflows` TUI** — drill runs → phases → agents → detail; inspect per-agent failures and compact subagent history; pause, stop, restart, and save runs from the keyboard.
-- **Quality patterns built in** — `verify()`, `judgePanel()`, `loopUntilDry()`, and `completenessCheck()` for adversarial review, best-of-N, and exhaustive discovery.
+- **Quality patterns built in** — `verify()`, `judgePanel()`, `loopUntilDry()`, and `completenessCheck()` for adversarial review, best-of-N, and exhaustive discovery, with explicit `tier` / `model` / `agentType` routing for helper-created agents.
 - **Ultracode** — `/ultracode` is a standing opt-in that auto-arms an exhaustive multi-agent workflow for every substantive message, the way Claude Code's ultracode does. `/effort high` is the lighter tier.
 - **Bundled `/deep-research` + `/adversarial-review` + `/code-review`** — real web search, source cross-checking, cited reports, and a 7-angle parallel code review with a verify pass.
 - **Saved & nested workflows** — turn any run into a `/<name>` command, and compose saved workflows from inside other scripts.
@@ -188,7 +188,7 @@ The full guide — every global, agent option, `agentType` definitions, structur
 | `parallel(thunks)` | Run `() => agent(...)` thunks concurrently; results in input order. |
 | `pipeline(items, ...stages)` | Fan items through sequential stages `(prev, original, index)`. |
 | `phase(title, { budget? })` | Group agents in the live view; optional per-phase token sub-budget. |
-| `verify` / `judgePanel` / `loopUntilDry` / `completenessCheck` | Built-in quality patterns. |
+| `verify` / `judgePanel` / `loopUntilDry` / `completenessCheck` | Built-in quality patterns. `verify`, `judgePanel`, and `completenessCheck` accept `tier`, `model`, and `agentType` routing options. |
 | `workflow(name, args)` | Run a saved workflow inline (shares the global caps). |
 | `checkpoint(prompt, opts)` | A journaled, replayable human approval gate. |
 | `budget` | `{ total, spent(), remaining() }` real-token tracker. |

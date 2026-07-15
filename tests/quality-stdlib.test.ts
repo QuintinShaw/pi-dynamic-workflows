@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { AgentRegistry } from "../src/agent-registry.js";
 import { runWorkflow } from "../src/workflow.js";
 
 // Fake agents return a schema-shaped object when a schema is requested.
@@ -47,6 +48,61 @@ const r = await judgePanel(['lose one', 'WIN candidate', 'lose two'], { judges: 
 return { index: r.index, score: r.score }`;
   const res = await runWorkflow<{ index: number; score: number }>(script, { agent: scorer, persistLogs: false });
   assert.equal(res.result.index, 1, "the WIN candidate wins");
+});
+
+test("quality helpers forward tier/model/agentType routing to every created agent", async () => {
+  const calls: Array<{
+    model?: string;
+    tier?: string;
+    toolNames?: string[];
+    instructions?: string;
+  }> = [];
+  const recorder = {
+    async run(_prompt: string, options: any) {
+      calls.push({
+        model: options.model,
+        tier: options.tier,
+        toolNames: options.toolNames,
+        instructions: options.instructions,
+      });
+      const properties = options.schema?.properties ?? {};
+      if ("real" in properties) return { real: true, reason: "ok" };
+      if ("score" in properties) return { score: 0.8, reason: "ok" };
+      return { complete: true, missing: [] };
+    },
+  };
+  const registry: AgentRegistry = new Map([
+    [
+      "safe-verifier",
+      {
+        name: "safe-verifier",
+        tools: ["read", "ext:pi-web-access/web_search"],
+        prompt: "Use the safe verifier policy.",
+        source: "project",
+      },
+    ],
+  ]);
+  const script = `export const meta = { name: 'quality_routing', description: 'route helper agents' }
+const verified = await verify('claim', { reviewers: 2, tier: 'medium', model: 'vendor/verifier', agentType: 'safe-verifier' })
+const judged = await judgePanel(['candidate'], { judges: 1, tier: 'big', model: 'vendor/judge', agentType: 'safe-verifier' })
+const complete = await completenessCheck({ task: 1 }, [verified, judged], { tier: 'medium', model: 'vendor/critic', agentType: 'safe-verifier' })
+return { verified, judged, complete }`;
+
+  await runWorkflow(script, { agent: recorder, agentRegistry: registry, persistLogs: false });
+
+  assert.equal(calls.length, 4, "two reviewers, one judge, and one completeness critic");
+  assert.deepEqual(
+    calls.map((call) => call.model),
+    ["vendor/verifier", "vendor/verifier", "vendor/judge", "vendor/critic"],
+  );
+  assert.deepEqual(
+    calls.map((call) => call.tier),
+    ["medium", "medium", "big", "medium"],
+  );
+  for (const call of calls) {
+    assert.deepEqual(call.toolNames, ["read", "ext:pi-web-access/web_search"]);
+    assert.match(call.instructions ?? "", /safe verifier policy/i, "agentType role prompt should be bound");
+  }
 });
 
 test("loopUntilDry(): dedupes by key and stops after K empty rounds", async () => {

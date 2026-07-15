@@ -106,6 +106,15 @@ test("createWorkflowTool promptGuidelines mention retry and concurrency controls
   assert.match(all, /null handling/i);
 });
 
+test("createWorkflowTool tells authors to route quality-helper agents explicitly", () => {
+  const tool = createWorkflowTool();
+  const all = tool.promptGuidelines.join(" ");
+
+  assert.match(all, /verify\(.+tier, model, agentType/i);
+  assert.match(all, /judgePanel\(.+tier, model, agentType/i);
+  assert.match(all, /Route helper-created agents explicitly/i);
+});
+
 // ─── modelRoutingGuideline ──────────────────────────────────────────────────────
 
 test("modelRoutingGuideline mentions all three tier names", () => {
