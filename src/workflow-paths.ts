@@ -19,6 +19,8 @@ export interface WorkflowProjectPaths {
   rootDir: string;
   runsDir: string;
   savedDir: string;
+  /** Private child-session storage; intentionally outside Pi's /resume session index. */
+  agentSessionsDir: string;
   settingsPath: string;
   legacyRunsDir: string;
   legacySavedDir: string;
@@ -47,6 +49,7 @@ export function workflowProjectPaths(cwd: string): WorkflowProjectPaths {
     rootDir,
     runsDir: join(rootDir, "runs"),
     savedDir: join(rootDir, "saved"),
+    agentSessionsDir: join(rootDir, "agent-sessions"),
     settingsPath: join(rootDir, "settings.json"),
     legacyRunsDir: resolve(cwd, WORKFLOW_RUNS_DIR),
     legacySavedDir: resolve(cwd, WORKFLOW_SAVED_DIR),

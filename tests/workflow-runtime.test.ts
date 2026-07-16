@@ -1,8 +1,13 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import type { AgentUsage } from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { type JournalEntry, runWorkflow } from "../src/workflow.js";
+import { createWorktree, removeWorktree } from "../src/worktree.js";
 
 /** Agent runner that counts real invocations and echoes a per-call result. */
 function countingAgent() {
@@ -41,6 +46,21 @@ const a = await agent('first', { label: 'a' })
 const b = await agent('second', { label: 'b' })
 return { a, b }`;
 
+async function captureCallHashes(script: string, runId: string, cwd?: string): Promise<Map<number, string>> {
+  const hashes = new Map<number, string>();
+  await runWorkflow(script, {
+    runId,
+    cwd,
+    persistLogs: false,
+    persistAgentSessions: true,
+    agent: countingAgent().runner,
+    onAgentQueued: ({ callIndex, callHash }) => {
+      if (callHash) hashes.set(callIndex, callHash);
+    },
+  });
+  return hashes;
+}
+
 function createDeferred<T = void>(): { promise: Promise<T>; resolve: (value: T | PromiseLike<T>) => void } {
   let resolve!: (value: T | PromiseLike<T>) => void;
   const promise = new Promise<T>((r) => {
@@ -48,6 +68,64 @@ function createDeferred<T = void>(): { promise: Promise<T>; resolve: (value: T |
   });
   return { promise, resolve };
 }
+
+test("edited calls never reopen a positional child-session checkpoint", async () => {
+  const runId = "edited-child-session";
+  const before = `export const meta = { name: 'edited_child', description: 'edited child' }
+return await agent('OLD', { label: 'worker' })`;
+  const oldHash = (await captureCallHashes(before, runId)).get(0);
+  assert.ok(oldHash);
+  const seen: Array<string | undefined> = [];
+  const after = `export const meta = { name: 'edited_child', description: 'edited child' }
+return await agent('NEW', { label: 'worker' })`;
+
+  await runWorkflow(after, {
+    runId,
+    persistLogs: false,
+    persistAgentSessions: true,
+    resumeAgents: new Map([[`${runId}:0`, { sessionFile: "old-child.jsonl", callHash: oldHash }]]),
+    agent: {
+      async run(_prompt: string, options: { resumeSessionFile?: string }) {
+        seen.push(options.resumeSessionFile);
+        return "fresh";
+      },
+    },
+  });
+
+  assert.deepEqual(seen, [undefined]);
+});
+
+test("inserting a preceding call prevents shifted child-session reuse", async () => {
+  const runId = "shifted-child-session";
+  const header = `export const meta = { name: 'shifted_child', description: 'shifted child' }
+`;
+  const hashes = await captureCallHashes(
+    `${header}await agent('A')
+return await agent('B')`,
+    runId,
+  );
+  const seen: Array<{ prompt: string; resumeSessionFile?: string }> = [];
+
+  await runWorkflow(
+    `${header}await agent('inserted')
+await agent('A')
+return await agent('B')`,
+    {
+      runId,
+      persistLogs: false,
+      persistAgentSessions: true,
+      resumeAgents: new Map([[`${runId}:1`, { sessionFile: "old-b.jsonl", callHash: hashes.get(1) }]]),
+      agent: {
+        async run(prompt: string, options: { resumeSessionFile?: string }) {
+          seen.push({ prompt, resumeSessionFile: options.resumeSessionFile });
+          return prompt;
+        },
+      },
+    },
+  );
+
+  assert.equal(seen.find((call) => call.prompt === "A")?.resumeSessionFile, undefined);
+});
 
 test("runWorkflow concurrency caps parallel agents", async () => {
   let active = 0;
@@ -169,6 +247,57 @@ return await parallel(['a','b','c'].map((p) => () => agent(p, { label: p })))`,
   assert.equal(queued.length, 3, "all logical invocations remain visible");
   assert.equal(ended.length, 1, "only the invocation that actually started can be aborted");
   assert.ok(ended.every((event) => event.status === "skipped" && event.tokens === 0 && event.usage === undefined));
+});
+
+test("resumed invocation reuses its paused worktree cwd and removes it after terminal completion", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "pi-dw-resume-worktree-"));
+  const git = (...args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "pipe" });
+  let worktree: Awaited<ReturnType<typeof createWorktree>> | undefined;
+  try {
+    git("init");
+    git("config", "user.email", "test@example.com");
+    git("config", "user.name", "Test");
+    writeFileSync(join(repo, "file.txt"), "base\n");
+    git("add", ".");
+    git("commit", "-m", "init");
+    const script = `export const meta = { name: 'resume_worktree', description: 'resume worktree' }
+return await agent('continue', { label: 'worker', isolation: 'worktree' })`;
+    const callHash = (await captureCallHashes(script, "resume-worktree", repo)).get(0);
+    assert.ok(callHash);
+    worktree = await createWorktree(repo, "resume-worktree-0-worker");
+    assert.equal(worktree.isolated, true);
+    const sessionFile = join(repo, "child.jsonl");
+    const seen: Array<{ cwd?: string; resumeSessionFile?: string }> = [];
+
+    const result = await runWorkflow(script, {
+      cwd: repo,
+      runId: "resume-worktree",
+      persistAgentSessions: true,
+      persistLogs: false,
+      resumeAgents: new Map([["resume-worktree:0", { sessionFile, worktree, callHash }]]),
+      agent: {
+        async run(
+          _prompt: string,
+          options: {
+            cwd?: string;
+            resumeSessionFile?: string;
+            onSession?: (checkpoint: { sessionFile?: string; resumed: boolean }) => void;
+          },
+        ) {
+          seen.push({ cwd: options.cwd, resumeSessionFile: options.resumeSessionFile });
+          options.onSession?.({ sessionFile: options.resumeSessionFile, resumed: true });
+          return "continued";
+        },
+      },
+    });
+
+    assert.equal(result.result, "continued");
+    assert.deepEqual(seen, [{ cwd: worktree.cwd, resumeSessionFile: sessionFile }]);
+    assert.equal(existsSync(worktree.cwd), false, "terminal completion removes the preserved worktree");
+  } finally {
+    if (worktree) await removeWorktree(worktree);
+    rmSync(repo, { recursive: true, force: true });
+  }
 });
 
 test("incremental estimates are display-only and exact usage replaces them before completion", async () => {

@@ -77,7 +77,7 @@ return await agent(
 
 - **Real parallel orchestration** — fan out up to 16 concurrent and 1000 total subagents from one orchestration script.
 - **Per-agent model routing** — use `small`, `medium`, or `big` tiers, or choose an exact provider/model and thinking level.
-- **Journaled resume** — replay completed agents after interruption without rerunning them or spending their tokens again. The orchestrator can also resume with an **edited script** (`resumeFromRunId`): unchanged `agent()` calls replay from cache and only edited/new ones re-run — so a single bad prompt no longer means paying to re-run the whole workflow.
+- **Journaled resume** — replay completed agents without rerunning or repaying them, resume edited scripts from the unchanged prefix, and optionally continue interrupted child sessions from their last durable turn boundary.
 - **Git worktree isolation** — let parallel agents edit safely on throwaway branches with `isolation: "worktree"`.
 - **Measured usage** — report real tokens and cost from each subagent session; add run, phase, or agent budgets only when you want them.
 - **Visible background runs** — track phases, agents, models, fresh/cache tokens, cost, and live tok/s from the progress panel or `/workflows` navigator.
@@ -184,9 +184,11 @@ Extension state lives outside the repository under `~/.pi/workflows`:
 - project runs, journals, locks, and saved overrides: `~/.pi/workflows/projects/<project>/`
 - older project-local `.pi/workflows/runs` and `.pi/workflows/saved` remain readable as fallbacks
 
-Subagents are in-memory by default. Set `persistAgentSessions: true` to retain full transcripts in Pi's standard session directory. This creates one file per agent and may store sensitive material that an agent read, so enable it deliberately.
+Subagents are in-memory by default. Set `persistAgentSessions: true` in `~/.pi/workflows/settings.json` (or a project override) to opt in to durable child transcripts. They are stored under the project's private workflow state directory (`~/.pi/workflows/projects/<project>/agent-sessions/`), outside Pi's normal `/resume` picker. This creates one file per agent and may store secrets or other sensitive material that an agent read, so enable it deliberately.
 
-Run files use a versioned, backward-compatible state model with stable execution IDs, exact terminal usage, and crash-safe temp/rename writes plus backup recovery. After a crash, orphaned running work is recovered as paused and waits for an explicit resume. Resume replays the longest unchanged completed prefix—including nested workflows—then starts incomplete work fresh, without reopening child transcripts or double-charging completed usage.
+Run files use a versioned, backward-compatible state model with stable execution IDs, exact terminal usage, and crash-safe temp/rename writes plus backup recovery. After a crash, orphaned running work is recovered as paused and waits for an explicit resume. Resume replays the longest unchanged completed prefix—including nested workflows—without double-charging completed usage. With child persistence enabled, an interrupted agent reopens its private transcript and compatible isolated worktree; otherwise it starts fresh. Missing, corrupt, or unwritable child sessions also fall back to a fresh session and are reported in run logs.
+
+Continuation begins at the last durable Pi message/tool-result boundary. Provider streams cannot resume mid-token, and a tool interrupted before its result was durably recorded may have uncertain side effects; the continuation prompt tells the agent to inspect existing state before acting.
 
 Completed background runs persist their full result in the project run JSON. The conversation delivery includes a pointer to that file when the visible summary is shortened.
 

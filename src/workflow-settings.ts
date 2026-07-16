@@ -24,10 +24,9 @@ export interface WorkflowSettings {
   /** Max agents shown per phase in detailed progress mode (default 8). */
   progressPanelMaxAgents?: number;
   /**
-   * Persist each workflow subagent transcript as a real pi session file under
-   * the standard sessions directory (~/.pi/agent/sessions/<encoded-cwd>/),
-   * keyed by the project cwd. Default false: subagent sessions stay in-memory
-   * and only the compacted history embedded in the run JSON survives.
+   * Persist each workflow subagent transcript in the project's private workflow
+   * state directory, outside Pi's normal /resume picker. Default false: subagent
+   * sessions stay in-memory and interrupted agents restart fresh on resume.
    */
   persistAgentSessions?: boolean;
   /**

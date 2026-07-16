@@ -47,6 +47,7 @@ describe("workflow paths", () => {
       assert.ok(paths.rootDir.startsWith(join(home, WORKFLOW_HOME_RELATIVE_DIR, WORKFLOW_PROJECTS_SUBDIR)));
       assert.equal(paths.runsDir, join(paths.rootDir, "runs"));
       assert.equal(paths.savedDir, join(paths.rootDir, "saved"));
+      assert.equal(paths.agentSessionsDir, join(paths.rootDir, "agent-sessions"));
       assert.equal(paths.settingsPath, join(paths.rootDir, "settings.json"));
       assert.equal(paths.legacyRunsDir, normalize(join(cwd, ".pi/workflows/runs")));
       assert.equal(paths.legacySavedDir, normalize(join(cwd, ".pi/workflows/saved")));

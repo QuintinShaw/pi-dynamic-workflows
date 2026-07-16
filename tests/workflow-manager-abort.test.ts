@@ -1,12 +1,133 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { AgentUsage } from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
+import { createWorktree, removeWorktree } from "../src/worktree.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
+
+test("stopping a cold paused run removes its preserved worktree exactly once", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "pi-dw-stop-worktree-"));
+  const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-stop-worktree-home-"));
+  const git = (...args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "pipe" });
+  let worktree: Awaited<ReturnType<typeof createWorktree>> | undefined;
+  try {
+    git("init");
+    git("config", "user.email", "test@example.com");
+    git("config", "user.name", "Test");
+    writeFileSync(join(repo, "file.txt"), "base\n");
+    git("add", ".");
+    git("commit", "-m", "init");
+    worktree = await createWorktree(repo, "cold-stop-worker");
+    assert.equal(worktree.isolated, true);
+
+    await withFakeHomeAsync(fakeHome, async () => {
+      const manager = new WorkflowManager({ cwd: repo });
+      manager.getPersistence().save({
+        runId: "cold-stop-worktree",
+        workflowName: "cold_stop",
+        script: `export const meta = { name: 'cold_stop', description: 'stop' }\nreturn null`,
+        status: "paused",
+        phases: [],
+        agents: [
+          {
+            id: 1,
+            executionId: "cold-stop-worktree:0",
+            callIndex: 0,
+            label: "worker",
+            prompt: "work",
+            status: "paused",
+            sessionFile: join(repo, "child.jsonl"),
+            worktree,
+          },
+        ],
+        logs: [],
+        startedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+
+      assert.equal(manager.stop("cold-stop-worktree"), true);
+      for (let i = 0; i < 100 && existsSync(worktree.cwd); i++) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      assert.equal(existsSync(worktree.cwd), false);
+      assert.equal(manager.getPersistence().load("cold-stop-worktree")?.agents[0].worktree, undefined);
+    });
+  } finally {
+    if (worktree) await removeWorktree(worktree);
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(fakeHome, { recursive: true, force: true });
+  }
+});
+
+test("active stop leaves worktree cleanup to the unwinding runtime", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "pi-dw-active-stop-worktree-"));
+  const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-active-stop-worktree-home-"));
+  const git = (...args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "pipe" });
+  let release!: () => void;
+  try {
+    git("init");
+    git("config", "user.email", "test@example.com");
+    git("config", "user.name", "Test");
+    writeFileSync(join(repo, "file.txt"), "base\n");
+    git("add", ".");
+    git("commit", "-m", "init");
+
+    await withFakeHomeAsync(fakeHome, async () => {
+      let startedResolve!: () => void;
+      const started = new Promise<void>((resolve) => {
+        startedResolve = resolve;
+      });
+      let worktreeCwd: string | undefined;
+      const manager = new WorkflowManager({
+        cwd: repo,
+        persistAgentSessions: true,
+        agent: {
+          async run(
+            _prompt: string,
+            options?: {
+              cwd?: string;
+              onSession?: (checkpoint: { sessionFile?: string; resumed: boolean }) => void;
+            },
+          ) {
+            worktreeCwd = options?.cwd;
+            options?.onSession?.({ sessionFile: join(repo, "active-child.jsonl"), resumed: false });
+            startedResolve();
+            await new Promise<void>((resolve) => {
+              release = resolve;
+            });
+            return "done";
+          },
+        },
+      });
+      manager.on("error", () => {});
+      const script = `export const meta = { name: 'active_stop', description: 'active stop' }
+return await agent('work', { label: 'worker', isolation: 'worktree' })`;
+      const { runId, promise } = manager.startInBackground(script);
+      await started;
+      assert.ok(worktreeCwd);
+      const activeWorktree = worktreeCwd;
+      assert.equal(existsSync(activeWorktree), true);
+
+      assert.equal(manager.stop(runId), true);
+      assert.equal(existsSync(activeWorktree), true, "manager must not race runtime cleanup while the agent unwinds");
+      release();
+      await promise.catch(() => {});
+      for (let i = 0; i < 100 && existsSync(activeWorktree); i++) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      assert.equal(existsSync(activeWorktree), false);
+    });
+  } finally {
+    release?.();
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(fakeHome, { recursive: true, force: true });
+  }
+});
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
 

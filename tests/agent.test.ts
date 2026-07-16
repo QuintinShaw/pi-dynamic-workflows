@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import type { AgentRunOptions, AgentUsage } from "../src/agent.js";
 import {
   createAgentUsageEventHandler,
@@ -15,17 +16,28 @@ import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { resolveModelSpecWithThinking } from "../src/model-spec.js";
 import type { ModelTierConfig } from "../src/model-tier-config.js";
 import { runWorkflow } from "../src/workflow.js";
+import { workflowProjectPaths } from "../src/workflow-paths.js";
 import { withFakeHome } from "./helpers/fake-home.js";
 
 // Private methods used for testing - cast to this type to access them without `any`
 type WorkflowAgentPrivates = {
   buildPrompt(prompt: string, options: AgentRunOptions<any>, structured: boolean): string;
   lastAssistantText(messages: unknown[]): string;
-  createSessionManager(): { isPersisted(): boolean; getCwd(): string };
+  createSessionManager(): {
+    isPersisted(): boolean;
+    getCwd(): string;
+    getSessionDir(): string;
+    usesDefaultSessionDir(): boolean;
+  };
+  resolveSessionManager(
+    resumeSessionFile: string | undefined,
+    runCwd: string,
+  ): { manager: { isPersisted(): boolean; getCwd(): string; getSessionFile(): string | undefined }; resumed: boolean };
+  buildResumePrompt(structured: boolean): string;
 };
 
 // ═══════════════════════════════════════════════════════════════════════
-// persistAgentSessions — in-memory by default, file-backed keyed by project cwd
+// persistAgentSessions — in-memory by default, file-backed outside /resume
 // ═══════════════════════════════════════════════════════════════════════
 
 test("WorkflowAgent uses an in-memory session manager by default", () => {
@@ -40,7 +52,7 @@ test("WorkflowAgent with persistAgentSessions=false explicitly stays in-memory",
   assert.equal(manager.isPersisted(), false);
 });
 
-test("WorkflowAgent with persistAgentSessions=true creates a file-backed manager keyed by the project cwd", () => {
+test("WorkflowAgent with persistAgentSessions=true creates a private file-backed manager outside /resume", () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-persist-agent-"));
   const projectCwd = join(dir, "project");
   const fakeHome = join(dir, "home");
@@ -49,15 +61,97 @@ test("WorkflowAgent with persistAgentSessions=true creates a file-backed manager
       const agent = new WorkflowAgent({ cwd: projectCwd, persistAgentSessions: true });
       const manager = (agent as unknown as WorkflowAgentPrivates).createSessionManager();
       assert.equal(manager.isPersisted(), true, "flag must yield a file-backed session manager");
-      // Sessions must be keyed by the runner's project cwd — never a per-call
-      // worktree cwd — so transcripts group under the project's session dir.
-      // createSessionManager() takes no per-call cwd by design; assert the
-      // manager saw the project cwd.
       assert.equal(manager.getCwd(), projectCwd);
+      assert.equal(manager.getSessionDir(), workflowProjectPaths(projectCwd).agentSessionsDir);
+      assert.equal(manager.usesDefaultSessionDir(), false, "normal Pi /resume must not index workflow children");
     });
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("WorkflowAgent reopens a persisted child session at its durable boundary", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-resume-agent-"));
+  const projectCwd = join(dir, "project");
+  const fakeHome = join(dir, "home");
+  try {
+    withFakeHome(fakeHome, () => {
+      const original = SessionManager.create(projectCwd, workflowProjectPaths(projectCwd).agentSessionsDir);
+      original.appendMessage({
+        role: "user",
+        content: [{ type: "text", text: "resume probe" }],
+        timestamp: Date.now(),
+      });
+      original.appendMessage({
+        role: "assistant",
+        content: [{ type: "text", text: "checkpoint" }],
+        api: "test",
+        provider: "test",
+        model: "test",
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 0,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
+        stopReason: "stop",
+        timestamp: Date.now(),
+      } as never);
+      const sessionFile = original.getSessionFile();
+      assert.ok(sessionFile && existsSync(sessionFile));
+
+      const agent = new WorkflowAgent({ cwd: projectCwd, persistAgentSessions: true });
+      const resolved = (agent as unknown as WorkflowAgentPrivates).resolveSessionManager(sessionFile, projectCwd);
+      assert.equal(resolved.resumed, true);
+      assert.equal(resolved.manager.getSessionFile(), sessionFile);
+      assert.equal(resolved.manager.getCwd(), projectCwd);
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("WorkflowAgent ignores saved child sessions unless persistence is explicitly enabled", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-resume-opt-in-"));
+  try {
+    const sessionFile = join(dir, "child.jsonl");
+    writeFileSync(sessionFile, "{}\n");
+    const agent = new WorkflowAgent({ cwd: dir });
+    const resolved = (agent as unknown as WorkflowAgentPrivates).resolveSessionManager(sessionFile, dir);
+    assert.equal(resolved.resumed, false);
+    assert.equal(resolved.manager.isPersisted(), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("WorkflowAgent falls back to a fresh session when the persisted child session is missing or corrupt", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-resume-fallback-"));
+  const projectCwd = join(dir, "project");
+  const fakeHome = join(dir, "home");
+  try {
+    withFakeHome(fakeHome, () => {
+      const agent = new WorkflowAgent({ cwd: projectCwd, persistAgentSessions: true });
+      for (const sessionFile of [join(dir, "missing.jsonl"), join(dir, "corrupt.jsonl")]) {
+        if (sessionFile.endsWith("corrupt.jsonl")) writeFileSync(sessionFile, "not-json\n");
+        const resolved = (agent as unknown as WorkflowAgentPrivates).resolveSessionManager(sessionFile, projectCwd);
+        assert.equal(resolved.resumed, false);
+        assert.equal(resolved.manager.isPersisted(), true);
+      }
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("WorkflowAgent resume prompt states the durable boundary and side-effect limitation", () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp" });
+  const prompt = (agent as unknown as WorkflowAgentPrivates).buildResumePrompt(true);
+  assert.match(prompt, /last durable message\/tool-result boundary/i);
+  assert.match(prompt, /Do not repeat completed side effects/i);
+  assert.match(prompt, /structured_output/);
 });
 
 test("WorkflowAgent degrades to in-memory when the session directory can't be created", () => {
@@ -66,10 +160,9 @@ test("WorkflowAgent degrades to in-memory when the session directory can't be cr
   const fakeHome = join(dir, "home");
   try {
     withFakeHome(fakeHome, () => {
-      // Pre-occupy the sessions directory with a plain file so the SDK's
-      // mkdirSync(recursive) inside SessionManager.create() throws ENOTDIR —
-      // simulating a permissions/disk-full failure at session-creation time.
-      const sessionsPath = join(fakeHome, ".pi", "agent", "sessions");
+      // Pre-occupy the workflow state root so creation of the private child
+      // session directory fails with ENOTDIR.
+      const sessionsPath = join(fakeHome, ".pi", "workflows");
       mkdirSync(dirname(sessionsPath), { recursive: true });
       writeFileSync(sessionsPath, "not a directory");
 

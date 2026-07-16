@@ -27,6 +27,8 @@ Fake-agent unit tests are necessary but not sufficient. Any change to how agents
 
 A throwaway harness for this should live in the repo root (not `/tmp`, whose symlink breaks relative imports), import from `./src`, and be deleted before commit — don't commit harnesses.
 
+Child-session persistence changes must keep the default off and test the private storage path, missing/corrupt-session fallback, durable turn-boundary continuation, and paused-worktree cleanup. Tests must use an isolated fake home and never write transcripts into the developer's normal Pi session index.
+
 ## Style
 
 Formatting and linting are handled by Biome (`npm run format`, `npm run lint`). Match the existing code; don't reformat files you aren't otherwise changing.

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import vm from "node:vm";
 import type { Node } from "acorn";
 import { parse } from "acorn";
@@ -68,10 +69,19 @@ export interface SharedRuntime {
   spent: number;
   tokenUsage: { input: number; output: number; total: number; cost: number; cacheRead: number; cacheWrite: number };
   depth: number;
+  /** Resume-agent execution IDs reached by this run and nested workflows. */
+  claimedResumeAgentIds?: Set<string>;
   /** Scoped execution IDs replayed before the first cache miss. */
   replayedExecutionIds?: Set<string>;
   /** Shared resume boundary: after any parent/child miss, all later scoped calls run live. */
   resumeMissed?: boolean;
+}
+
+export interface ResumeAgentState {
+  sessionFile: string;
+  worktree?: Worktree;
+  /** Hash of the agent call that created this checkpoint. */
+  callHash?: string;
 }
 
 export interface WorkflowRunOptions extends WorkflowAgentOptions {
@@ -103,6 +113,8 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   resumeJournal?: ReadonlyMap<string | number, JournalEntry>;
   /** Resume: the run being resumed (informational; enables resume mode). */
   resumeFromRunId?: string;
+  /** Incomplete invocations that can reopen their persisted Pi child sessions. */
+  resumeAgents?: ReadonlyMap<string, ResumeAgentState>;
   /** Called after each live agent completes so the caller can persist the journal. */
   onAgentJournal?: (entry: JournalEntry) => void;
   /** Called once at the first replay miss with the execution IDs safe to retain. */
@@ -134,8 +146,11 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
     phase?: string;
     prompt: string;
     model?: string;
+    /** True when this invocation will reopen an interrupted child session. */
+    resuming?: boolean;
     /** True only when this callback represents a journal cache hit. */
     replayed?: boolean;
+    callHash?: string;
   }) => void;
   onAgentStart?: (event: {
     executionId: string;
@@ -144,8 +159,20 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
     phase?: string;
     prompt: string;
     model?: string;
+    resuming?: boolean;
     /** True only when this callback represents a journal cache hit. */
     replayed?: boolean;
+  }) => void;
+  /** Persist the child-session checkpoint before model execution starts. */
+  onAgentSession?: (event: {
+    executionId: string;
+    callIndex: number;
+    label: string;
+    phase?: string;
+    sessionFile?: string;
+    resumed: boolean;
+    worktree?: Worktree;
+    callHash?: string;
   }) => void;
   onAgentEnd?: (event: {
     executionId: string;
@@ -156,12 +183,14 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
     status: "done" | "error" | "skipped" | "paused";
     tokens?: number;
     usage?: AgentUsage;
+    worktree?: Worktree;
     model?: string;
     error?: string;
     errorCode?: WorkflowErrorCode;
     recoverable?: boolean;
     /** True only when this callback represents a journal cache hit. */
     replayed?: boolean;
+    callHash?: string;
   }) => void;
   onAgentHistory?: (event: {
     executionId: string;
@@ -364,10 +393,13 @@ export async function runWorkflow<T = unknown>(
     spent: 0,
     tokenUsage: { input: 0, output: 0, total: 0, cost: 0, cacheRead: 0, cacheWrite: 0 },
     depth: 0,
+    claimedResumeAgentIds: new Set(),
     replayedExecutionIds: new Set(),
     resumeMissed: false,
   };
   const limiter = shared.limiter;
+  if (!shared.claimedResumeAgentIds) shared.claimedResumeAgentIds = new Set();
+  const claimedResumeAgentIds = shared.claimedResumeAgentIds;
   if (!shared.replayedExecutionIds) shared.replayedExecutionIds = new Set();
   const replayedExecutionIds = shared.replayedExecutionIds;
   const markResumeMiss = () => {
@@ -471,19 +503,24 @@ export async function runWorkflow<T = unknown>(
     // key unique across the whole store.
     const executionId = `${runId}:${callIndex}`;
     const deltaKey = executionId;
+    claimedResumeAgentIds.add(executionId);
+    // Child-session continuation is opt-in at the runtime boundary as well as
+    // manager/agent construction, so stale artifacts cannot enable it implicitly.
+    const savedResumeAgent = options.persistAgentSessions ? options.resumeAgents?.get(executionId) : undefined;
 
     const label = requestedLabel || defaultAgentLabel(assignedPhase, shared.agentCount + 1);
     const invocation = { executionId, callIndex, label, phase: assignedPhase };
+    const prefixCompatible = !shared.resumeMissed && callIndex < state.firstMiss;
 
     // Longest-unchanged-prefix resume: replay a cached result before live-work
     // budget gates. Historical work is free even when the remaining budget is 0.
     const cached = cachedJournalEntry(executionId, callIndex);
     const hashMatches = cached != null && cached.hash === callHash;
     const cachedEmptyOutput = hashMatches && isEmptyTextAgentResult(cached.result, agentOptions.schema);
-    if (hashMatches && !cachedEmptyOutput && !shared.resumeMissed && callIndex < state.firstMiss) {
+    if (hashMatches && !cachedEmptyOutput && prefixCompatible) {
       shared.agentCount++;
       replayedExecutionIds.add(executionId);
-      options.onAgentQueued?.({ ...invocation, prompt, model: displayModel, replayed: true });
+      options.onAgentQueued?.({ ...invocation, prompt, model: displayModel, replayed: true, callHash });
       options.onAgentStart?.({ ...invocation, prompt, model: displayModel, replayed: true });
       if (cached.usage)
         options.onAgentUsage?.({ ...invocation, usage: { ...cached.usage, estimated: false }, replayed: true });
@@ -495,6 +532,7 @@ export async function runWorkflow<T = unknown>(
         usage: cached.usage,
         model: displayModel,
         replayed: true,
+        callHash,
       });
       if (cached.storeDelta) store.applyDelta(cached.storeDelta);
       return cached.result;
@@ -503,6 +541,7 @@ export async function runWorkflow<T = unknown>(
       state.firstMiss = Math.min(state.firstMiss, callIndex);
       markResumeMiss();
     }
+    const resumeAgent = prefixCompatible && savedResumeAgent?.callHash === callHash ? savedResumeAgent : undefined;
 
     if (budget.total !== null && budget.remaining() <= 0) {
       throw new WorkflowError("workflow token budget exhausted", WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED, {
@@ -533,6 +572,8 @@ export async function runWorkflow<T = unknown>(
       ...invocation,
       prompt,
       model: displayModel,
+      resuming: Boolean(resumeAgent?.sessionFile),
+      callHash,
     });
 
     return limiter(async () => {
@@ -546,6 +587,7 @@ export async function runWorkflow<T = unknown>(
         ...invocation,
         prompt,
         model: displayModel,
+        resuming: Boolean(resumeAgent?.sessionFile),
       });
 
       // Optional per-agent worktree isolation (deterministic name -> stable resume keys).
@@ -555,11 +597,23 @@ export async function runWorkflow<T = unknown>(
       // or override with a def that has no isolation field if opt-out is needed.
       let worktree: Worktree | undefined;
       const resolvedIsolation = agentOptions.isolation ?? agentDef?.isolation;
+      if (!resumeAgent && savedResumeAgent?.worktree?.isolated) await removeWorktree(savedResumeAgent.worktree);
       if (resolvedIsolation === "worktree") {
-        worktree = await createWorktree(baseCwd, `${runId}-${callIndex}-${label}`);
-        if (!worktree.isolated) log(`isolation ignored for "${label}" (${worktree.reason})`);
+        const saved = resumeAgent?.worktree;
+        if (saved?.isolated && existsSync(saved.cwd)) {
+          worktree = saved;
+        } else {
+          if (saved?.isolated) await removeWorktree(saved);
+          worktree = await createWorktree(baseCwd, `${runId}-${callIndex}-${label}`);
+          if (!worktree.isolated) log(`isolation ignored for "${label}" (${worktree.reason})`);
+        }
+      } else if (resumeAgent?.worktree?.isolated) {
+        // The resumed script/agent definition no longer requests isolation.
+        await removeWorktree(resumeAgent.worktree);
       }
       const runCwd = worktree?.isolated ? worktree.cwd : undefined;
+      let activeSessionFile: string | undefined;
+      let preserveWorktree = false;
 
       // Provider callbacks are absolute within an attempt. Only exact callbacks
       // enter durable/run accounting; estimates are provisional display values.
@@ -645,6 +699,18 @@ export async function runWorkflow<T = unknown>(
                 label,
                 // Identifiable name for persisted sessions (persistAgentSessions).
                 sessionName: `workflow:${runId} ${label}`,
+                ...(options.persistAgentSessions
+                  ? {
+                      resumeSessionFile: resumeAgent?.sessionFile,
+                      onSession: ({ sessionFile, resumed }: { sessionFile?: string; resumed: boolean }) => {
+                        activeSessionFile = sessionFile;
+                        options.onAgentSession?.({ ...invocation, sessionFile, resumed, worktree, callHash });
+                        if (resumeAgent?.sessionFile && !resumed) {
+                          log(`${label}: persisted child session unavailable — restarting this agent fresh`);
+                        }
+                      },
+                    }
+                  : {}),
                 schema: agentOptions.schema,
                 signal: options.signal,
                 instructions: buildAgentInstructions(assignedPhase, agentOptions, agentDef, resolvedIsolation),
@@ -702,7 +768,9 @@ export async function runWorkflow<T = unknown>(
               status: "done",
               tokens: usage.display?.total ?? 0,
               usage: usage.display,
+              worktree,
               model: displayModel,
+              callHash,
             });
             return result;
           } catch (error) {
@@ -710,16 +778,19 @@ export async function runWorkflow<T = unknown>(
               const usage = finishAttempt(null, false);
               activeAttempt = 0;
               const paused = options.signal.reason === WORKFLOW_PAUSE_ABORT_REASON;
+              preserveWorktree = paused && Boolean(activeSessionFile);
               options.onAgentEnd?.({
                 ...invocation,
                 result: null,
                 status: paused ? "paused" : "skipped",
                 tokens: usage.display?.total ?? usage.exact?.total ?? 0,
                 usage: usage.display ?? usage.exact,
+                worktree,
                 model: displayModel,
-                error: paused ? "Subagent paused; incomplete work will restart on resume" : "Subagent was aborted",
+                error: paused ? "Subagent paused at its last durable session boundary" : "Subagent was aborted",
                 errorCode: WorkflowErrorCode.WORKFLOW_ABORTED,
                 recoverable: true,
+                callHash,
               });
               throw error;
             }
@@ -737,16 +808,19 @@ export async function runWorkflow<T = unknown>(
             }
 
             const providerPaused = workflowError.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT;
+            preserveWorktree = providerPaused && Boolean(activeSessionFile);
             options.onAgentEnd?.({
               ...invocation,
               result: null,
               status: providerPaused ? "paused" : "error",
               tokens: usage.display?.total ?? usage.exact?.total ?? 0,
               usage: usage.display ?? usage.exact,
+              worktree,
               model: displayModel,
               error: workflowError.message,
               errorCode: workflowError.code,
               recoverable: workflowError.recoverable,
+              callHash,
             });
 
             if (providerPaused) throw workflowError;
@@ -761,7 +835,9 @@ export async function runWorkflow<T = unknown>(
         }
         return null;
       } finally {
-        if (worktree?.isolated) await removeWorktree(worktree);
+        // Paused agents keep their worktree only when a durable child session can
+        // reopen there. Terminal, stopped, and non-persisted work is cleaned up.
+        if (worktree?.isolated && !preserveWorktree) await removeWorktree(worktree);
       }
     });
   };
@@ -1114,6 +1190,15 @@ export async function runWorkflow<T = unknown>(
       tokenUsage: shared.tokenUsage,
     };
   } finally {
+    // Calls removed by an edited script are never reached, so their preserved
+    // worktrees are cleaned by the root after the whole nested tree settles.
+    if (!options.sharedRuntime) {
+      for (const [executionId, resumeAgent] of options.resumeAgents ?? []) {
+        if (!claimedResumeAgentIds.has(executionId) && resumeAgent.worktree?.isolated) {
+          await removeWorktree(resumeAgent.worktree);
+        }
+      }
+    }
     // Dispose the store only when this run created it; nested runs inherit the
     // parent's store and must not tear it down while the parent is still running.
     if (!options.sharedStore) store.dispose();

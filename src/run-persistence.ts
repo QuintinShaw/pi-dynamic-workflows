@@ -18,8 +18,9 @@ import type { AgentHistoryEntry } from "./agent-history.js";
 import type { WorkflowErrorCode } from "./errors.js";
 import type { JournalEntry } from "./workflow.js";
 import { workflowProjectPaths } from "./workflow-paths.js";
+import type { Worktree } from "./worktree.js";
 
-export const RUN_STATE_VERSION = 2;
+export const RUN_STATE_VERSION = 3;
 
 export type RunStatus = "pending" | "running" | "paused" | "completed" | "failed" | "aborted";
 
@@ -47,6 +48,12 @@ export interface PersistedAgentState {
   endedAt?: string;
   /** The model this agent ran on (provider/id), when known. */
   model?: string;
+  /** Hash of the agent call that owns this durable invocation. */
+  callHash?: string;
+  /** File-backed Pi child session used for turn-boundary continuation. */
+  sessionFile?: string;
+  /** Preserved isolated cwd for a paused child session. */
+  worktree?: Worktree;
 }
 
 export interface LoadedPersistedAgentState extends PersistedAgentState {
@@ -178,6 +185,19 @@ function exactUsage(value: unknown): AgentUsage | undefined {
   };
 }
 
+function migrateWorktree(value: unknown): Worktree | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const worktree = value as Record<string, unknown>;
+  if (typeof worktree.cwd !== "string" || typeof worktree.isolated !== "boolean") return undefined;
+  return {
+    cwd: worktree.cwd,
+    isolated: worktree.isolated,
+    ...(typeof worktree.branch === "string" ? { branch: worktree.branch } : {}),
+    ...(typeof worktree.repoRoot === "string" ? { repoRoot: worktree.repoRoot } : {}),
+    ...(typeof worktree.reason === "string" ? { reason: worktree.reason } : {}),
+  };
+}
+
 function migrateAgent(
   raw: unknown,
   runId: string,
@@ -212,6 +232,9 @@ function migrateAgent(
     startedAt: typeof agent.startedAt === "string" ? agent.startedAt : undefined,
     endedAt: typeof agent.endedAt === "string" ? agent.endedAt : undefined,
     model: typeof agent.model === "string" ? agent.model : undefined,
+    callHash: typeof agent.callHash === "string" ? agent.callHash : undefined,
+    sessionFile: typeof agent.sessionFile === "string" ? agent.sessionFile : undefined,
+    worktree: migrateWorktree(agent.worktree),
   };
 }
 
@@ -240,6 +263,11 @@ function migrateRunState(raw: unknown, source: string): LoadedPersistedRunState 
         }
         const agentRecord = agent as Record<string, unknown>;
         if (malformedUsage(agentRecord.usage ?? agentRecord.tokenUsage)) malformedNested = true;
+        if (agentRecord.callHash !== undefined && typeof agentRecord.callHash !== "string") malformedNested = true;
+        if (agentRecord.sessionFile !== undefined && typeof agentRecord.sessionFile !== "string") {
+          malformedNested = true;
+        }
+        if (agentRecord.worktree !== undefined && !migrateWorktree(agentRecord.worktree)) malformedNested = true;
         const migrated = migrateAgent(agent, runId, index, legacyIdentity);
         return migrated ? [migrated] : [];
       })

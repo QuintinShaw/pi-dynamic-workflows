@@ -2250,3 +2250,120 @@ test(
     assert.ok(promptsDuringResume.includes("SECOND-ORIGINAL"), "persisted script's original agent 2 re-ran");
   }),
 );
+
+test(
+  "child-session continuation is opt-in when resuming a persisted paused agent",
+  withTempCwd(async (cwd) => {
+    const sessionFile = join(cwd, "saved-child.jsonl");
+    const seen: Array<{ resumeSessionFile?: string; hasSessionCheckpoint: boolean }> = [];
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(
+          _prompt: string,
+          options?: { resumeSessionFile?: string; onSession?: (checkpoint: unknown) => void },
+        ) {
+          seen.push({
+            resumeSessionFile: options?.resumeSessionFile,
+            hasSessionCheckpoint: options?.onSession !== undefined,
+          });
+          return "fresh";
+        },
+      },
+    });
+    manager.getPersistence().save({
+      runId: "opt-in-child-resume",
+      workflowName: "tracked_demo",
+      script: oneAgentScript,
+      status: "paused",
+      phases: [],
+      agents: [
+        {
+          id: 1,
+          executionId: "opt-in-child-resume:0",
+          callIndex: 0,
+          label: "a",
+          prompt: "do work",
+          status: "paused",
+          sessionFile,
+        },
+      ],
+      logs: [],
+      startedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+
+    assert.equal(await manager.resume("opt-in-child-resume"), true);
+    for (let i = 0; i < 100 && manager.getRun("opt-in-child-resume")?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.deepEqual(seen, [{ resumeSessionFile: undefined, hasSessionCheckpoint: false }]);
+  }),
+);
+
+test(
+  "pause checkpoints only started work and opt-in resume reopens its child session",
+  withTempCwd(async (cwd) => {
+    const childSession = join(cwd, "first-child.jsonl");
+    let startedResolve!: () => void;
+    const started = new Promise<void>((resolve) => {
+      startedResolve = resolve;
+    });
+    const calls: Array<{ prompt: string; resumeSessionFile?: string }> = [];
+    const manager = new WorkflowManager({
+      cwd,
+      persistAgentSessions: true,
+      agent: {
+        async run(
+          prompt: string,
+          options?: {
+            signal?: AbortSignal;
+            resumeSessionFile?: string;
+            onSession?: (checkpoint: { sessionFile?: string; resumed: boolean }) => void;
+          },
+        ) {
+          calls.push({ prompt, resumeSessionFile: options?.resumeSessionFile });
+          const resumed = options?.resumeSessionFile === childSession;
+          const sessionFile = prompt === "first" ? childSession : join(cwd, "second-child.jsonl");
+          options?.onSession?.({ sessionFile, resumed });
+          if (prompt === "first" && !resumed) {
+            startedResolve();
+            await new Promise<never>((_resolve, reject) => {
+              const abort = () => reject(new Error("Subagent was aborted"));
+              if (options?.signal?.aborted) abort();
+              else options?.signal?.addEventListener("abort", abort, { once: true });
+            });
+          }
+          return resumed ? "continued-first" : "fresh-second";
+        },
+      },
+    });
+    const script = `export const meta = { name: 'resume_children', description: 'resume child sessions' }
+return await parallel([
+  () => agent('first', { label: 'first' }),
+  () => agent('second', { label: 'second' })
+])`;
+
+    const { runId, promise } = manager.startInBackground(script, undefined, { concurrency: 1 });
+    await started;
+    assert.equal(manager.pause(runId), true);
+    await promise.catch(() => {});
+
+    const paused = manager.listRuns().find((run) => run.runId === runId);
+    assert.deepEqual(
+      paused?.agents.map((agent) => agent.status),
+      ["paused", "queued"],
+    );
+    assert.equal(paused?.agents[0].sessionFile, childSession);
+    assert.ok(paused?.agents[0].callHash);
+    assert.equal(paused?.agents[1].sessionFile, undefined);
+
+    assert.equal(await manager.resume(runId), true);
+    for (let i = 0; i < 100 && manager.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(manager.getRun(runId)?.status, "completed");
+    assert.ok(calls.some((call) => call.prompt === "first" && call.resumeSessionFile === childSession));
+    assert.ok(calls.some((call) => call.prompt === "second" && call.resumeSessionFile === undefined));
+  }),
+);

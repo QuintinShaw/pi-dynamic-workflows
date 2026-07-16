@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { AssistantMessage, Model, TextContent } from "@earendil-works/pi-ai";
 import {
@@ -28,6 +28,7 @@ import {
   resolveTierModel,
 } from "./model-tier-config.js";
 import { createStructuredOutputTool, type StructuredOutputCapture } from "./structured-output.js";
+import { workflowProjectPaths } from "./workflow-paths.js";
 
 /**
  * Find a JSON object/array in free-form text: a fenced ```json block if present,
@@ -226,9 +227,8 @@ export interface WorkflowAgentOptions {
    */
   modelRegistry?: ModelRegistry;
   /**
-   * Persist each subagent transcript as a real pi session file under the
-   * standard sessions directory (keyed by the runner's project cwd), instead
-   * of the default in-memory session that is discarded when the run ends.
+   * Persist each subagent transcript as a private Pi session file under the
+   * workflow project's state directory, outside Pi's normal /resume picker.
    * Default: false (current behavior).
    */
   persistAgentSessions?: boolean;
@@ -391,12 +391,19 @@ export function usageFromStats(stats: {
   };
 }
 
+export interface AgentSessionCheckpoint {
+  /** File-backed Pi child session. Undefined means this invocation cannot resume in place. */
+  sessionFile?: string;
+  /** True when an existing session was reopened rather than created fresh. */
+  resumed: boolean;
+}
+
 export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefined> {
   label?: string;
   /**
-   * Display name recorded on the persisted session (session_info entry) when
-   * `persistAgentSessions` is enabled, so transcripts are identifiable in
-   * session pickers (e.g. `workflow:<runId> <label>`). Ignored for in-memory
+   * Display name recorded on the private persisted session (session_info entry)
+   * when `persistAgentSessions` is enabled, so workflow-owned transcripts remain
+   * identifiable outside Pi's normal `/resume` picker. Ignored for in-memory
    * sessions or when an explicit session.sessionManager override is injected.
    */
   sessionName?: string;
@@ -410,6 +417,10 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
    * `estimated: true`; message-boundary and terminal updates are exact.
    */
   onUsage?: (usage: AgentUsage) => void;
+  /** Reopen this persisted Pi child session at its last durable turn boundary. */
+  resumeSessionFile?: string;
+  /** Called before prompting so the workflow can durably link this invocation to its child session. */
+  onSession?: (checkpoint: AgentSessionCheckpoint) => void;
   /**
    * Model spec for this subagent: either `provider/modelId` (unambiguous) or a
    * bare `modelId`. When it can't be resolved, the session default is used and
@@ -514,9 +525,9 @@ export class WorkflowAgent {
   }
 
   /**
-   * Session manager for one subagent run. File-backed (persisted under the
-   * standard sessions dir, keyed by the runner's project cwd — never a
-   * per-call worktree cwd) when persistAgentSessions is on; in-memory otherwise.
+   * Session manager for one subagent run. File-backed in the workflow project's
+   * private child-session directory (never Pi's normal /resume directory and
+   * never a per-call worktree cwd) when persistence is on; in-memory otherwise.
    *
    * SessionManager.create() only creates the session directory — the SDK writes
    * the session file lazily (synchronous fs calls, uncaught) on the first
@@ -529,7 +540,7 @@ export class WorkflowAgent {
   private createSessionManager(): SessionManager {
     if (!this.persistAgentSessions) return SessionManager.inMemory();
     try {
-      const manager = SessionManager.create(this.cwd);
+      const manager = SessionManager.create(this.cwd, workflowProjectPaths(this.cwd).agentSessionsDir);
       this.assertSessionDirWritable(manager.getSessionDir());
       warnPersistSecretsOnce(manager.getSessionDir());
       return manager;
@@ -541,6 +552,25 @@ export class WorkflowAgent {
       );
       return SessionManager.inMemory();
     }
+  }
+
+  /** Reopen a durable child session when possible; otherwise create the configured fresh session. */
+  private resolveSessionManager(
+    resumeSessionFile: string | undefined,
+    runCwd: string,
+  ): { manager: SessionManager; resumed: boolean } {
+    if (this.persistAgentSessions && resumeSessionFile && existsSync(resumeSessionFile)) {
+      try {
+        return { manager: SessionManager.open(resumeSessionFile, undefined, runCwd), resumed: true };
+      } catch (error) {
+        console.warn(
+          `[workflow] could not reopen child session ${resumeSessionFile} (${
+            error instanceof Error ? error.message : String(error)
+          }); restarting this agent from a fresh session`,
+        );
+      }
+    }
+    return { manager: this.createSessionManager(), resumed: false };
   }
 
   /** Best-effort write probe: throws if the session directory isn't actually writable. */
@@ -604,11 +634,12 @@ export class WorkflowAgent {
     }
 
     const agentDir = getAgentDir();
-    // Key persisted sessions by the runner's project cwd (this.cwd), NOT the
-    // per-call runCwd: agents working in short-lived git worktrees should still
-    // group under the project's session dir instead of scattering across
-    // temporary worktree paths.
-    const sessionManager = this.createSessionManager();
+    // Key new sessions by the runner's project cwd. Reopened sessions use runCwd
+    // as their cwd override so coding tools continue in the preserved worktree.
+    const resolvedSession = this.sessionOptions.sessionManager
+      ? { manager: this.sessionOptions.sessionManager, resumed: false }
+      : this.resolveSessionManager(options.resumeSessionFile, runCwd);
+    const sessionManager = resolvedSession.manager;
     const { session } = await createAgentSession({
       cwd: runCwd,
       agentDir,
@@ -630,9 +661,18 @@ export class WorkflowAgent {
       ...(resolvedThinkingLevel ? { thinkingLevel: resolvedThinkingLevel } : {}),
     });
 
-    // Name the persisted session so it's identifiable in session pickers.
-    // Skip when an injected session.sessionManager override won (tests/embedders).
-    if (this.persistAgentSessions && !this.sessionOptions.sessionManager && options.sessionName) {
+    // Persist the link before model execution. A manager callback may throw when
+    // its durable checkpoint cannot be written; do not start the model in that case.
+    options.onSession?.({ sessionFile: sessionManager.getSessionFile(), resumed: resolvedSession.resumed });
+
+    // Name newly persisted sessions. Skip reopened and injected managers to avoid
+    // duplicate session_info entries.
+    if (
+      this.persistAgentSessions &&
+      !resolvedSession.resumed &&
+      !this.sessionOptions.sessionManager &&
+      options.sessionName
+    ) {
       try {
         sessionManager.appendSessionInfo(options.sessionName);
       } catch {
@@ -640,6 +680,7 @@ export class WorkflowAgent {
       }
     }
 
+    const initialStats = resolvedSession.resumed ? session.getSessionStats() : undefined;
     let removeAbortListener: (() => void) | undefined;
     let removeSessionListener: (() => void) | undefined;
     let lastHistoryEmit = 0;
@@ -666,7 +707,11 @@ export class WorkflowAgent {
         });
       }
 
-      await session.prompt(this.buildPrompt(prompt, options as AgentRunOptions<any>, Boolean(options.schema)));
+      await session.prompt(
+        resolvedSession.resumed
+          ? this.buildResumePrompt(Boolean(options.schema))
+          : this.buildPrompt(prompt, options as AgentRunOptions<any>, Boolean(options.schema)),
+      );
 
       if (options.signal?.aborted) throw new Error("Subagent was aborted");
 
@@ -698,10 +743,21 @@ export class WorkflowAgent {
       } catch {
         // History is diagnostic only; never let it mask the real result/error.
       }
-      // Emit authoritative terminal usage before disposing the session state.
+      // Emit authoritative usage for this invocation only. Reopened transcripts
+      // already contain earlier turns whose usage is accounted in the run artifact.
       if (options.onUsage) {
         try {
-          const usage = usageFromStats(session.getSessionStats());
+          const stats = session.getSessionStats();
+          const usage = usageFromStats({
+            tokens: {
+              input: Math.max(0, stats.tokens.input - (initialStats?.tokens.input ?? 0)),
+              output: Math.max(0, stats.tokens.output - (initialStats?.tokens.output ?? 0)),
+              cacheRead: Math.max(0, stats.tokens.cacheRead - (initialStats?.tokens.cacheRead ?? 0)),
+              cacheWrite: Math.max(0, stats.tokens.cacheWrite - (initialStats?.tokens.cacheWrite ?? 0)),
+              total: Math.max(0, stats.tokens.total - (initialStats?.tokens.total ?? 0)),
+            },
+            cost: Math.max(0, stats.cost - (initialStats?.cost ?? 0)),
+          });
           if (usage) options.onUsage({ ...usage, estimated: false });
         } catch {
           // Usage is best-effort; never let stats failure mask the real result/error.
@@ -709,6 +765,20 @@ export class WorkflowAgent {
       }
       session.dispose();
     }
+  }
+
+  private buildResumePrompt(structured: boolean): string {
+    const parts = [
+      "Continue the interrupted task from the existing session at the last durable message/tool-result boundary.",
+      "Review the prior messages and current filesystem state before acting. Do not repeat completed side effects.",
+      "Finish the original task and return its requested final result.",
+    ];
+    if (structured) {
+      parts.push(
+        "When finished, call structured_output with the required schema, even if it was called before interruption.",
+      );
+    }
+    return parts.join("\n\n");
   }
 
   private buildPrompt(prompt: string, options: AgentRunOptions<any>, structured: boolean): string {

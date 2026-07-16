@@ -387,6 +387,49 @@ test(
   }),
 );
 
+test(
+  "child session and paused worktree checkpoints round-trip through normalized persistence",
+  withTempCwd(async (cwd) => {
+    const persistence = createRunPersistence(cwd);
+    const sessionFile = join(cwd, "child.jsonl");
+    const worktree = {
+      isolated: true,
+      cwd: join(cwd, ".pi", "worktrees", "worker"),
+      branch: "pi/wf/worker",
+      repoRoot: cwd,
+    };
+    persistence.save({
+      runId: "child-checkpoint",
+      workflowName: "resume_child",
+      script: "return 1",
+      status: "paused",
+      phases: [],
+      agents: [
+        {
+          id: 1,
+          executionId: "child-checkpoint:0",
+          callIndex: 0,
+          label: "worker",
+          prompt: "work",
+          status: "paused",
+          callHash: "checkpoint-call-hash",
+          sessionFile,
+          worktree,
+        },
+      ],
+      logs: [],
+      startedAt: "2024-01-01T00:00:00.000Z",
+      updatedAt: "2024-01-01T00:00:00.000Z",
+    });
+
+    const loaded = persistence.load("child-checkpoint");
+    assert.equal(loaded?.version, RUN_STATE_VERSION);
+    assert.equal(loaded?.agents[0].callHash, "checkpoint-call-hash");
+    assert.equal(loaded?.agents[0].sessionFile, sessionFile);
+    assert.deepEqual(loaded?.agents[0].worktree, worktree);
+  }),
+);
+
 test("RunPersistence remains compatible with legacy PersistedRunState return types", () => {
   const state = {
     runId: "legacy-implementation",

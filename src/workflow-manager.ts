@@ -20,16 +20,21 @@ import {
   type JournalEntry,
   normalizeConcurrency,
   parseWorkflowScript,
+  type ResumeAgentState,
   runWorkflow,
   WORKFLOW_PAUSE_ABORT_REASON,
   type WorkflowRunResult,
 } from "./workflow.js";
+import { removeWorktree, type Worktree } from "./worktree.js";
 
 interface DurableAgentMetadata {
   result?: unknown;
   usage?: AgentUsage;
   startedAt?: string;
   endedAt?: string;
+  callHash?: string;
+  sessionFile?: string;
+  worktree?: Worktree;
 }
 
 interface DurableExecutionControls {
@@ -84,6 +89,8 @@ export interface ManagedRun {
 export interface ExecOptions {
   /** Replay these journaled results for the unchanged prefix (resume). */
   resumeJournal?: ReadonlyMap<string | number, JournalEntry>;
+  /** Reopen incomplete Pi child sessions instead of starting those invocations fresh. */
+  resumeAgents?: ReadonlyMap<string, ResumeAgentState>;
   /** Cap on total agents for this run. */
   maxAgents?: number;
   /** Per-agent timeout in milliseconds. null/omitted means no hard timeout. */
@@ -225,6 +232,15 @@ export class WorkflowManager extends EventEmitter {
    */
   getModelRegistry(): ModelRegistry | undefined {
     return this.modelRegistry;
+  }
+
+  private cleanupWorktrees(worktrees: Array<Worktree | undefined>): void {
+    const seen = new Set<string>();
+    for (const worktree of worktrees) {
+      if (!worktree?.isolated || seen.has(worktree.cwd)) continue;
+      seen.add(worktree.cwd);
+      void removeWorktree(worktree);
+    }
   }
 
   /**
@@ -414,7 +430,7 @@ export class WorkflowManager extends EventEmitter {
     args?: unknown,
     exec: ExecOptions = {},
   ): Promise<WorkflowRunResult> {
-    const { resumeJournal, externalSignal, onProgress, confirm } = exec;
+    const { resumeJournal, resumeAgents, externalSignal, onProgress, confirm } = exec;
     const controls = managed.execution;
     const runtimeTokenBudget =
       resumeJournal && controls.tokenBudget !== null
@@ -474,6 +490,7 @@ export class WorkflowManager extends EventEmitter {
         loadSavedWorkflow: this.loadSavedWorkflow,
         resumeJournal,
         resumeFromRunId: resumeJournal ? managed.runId : undefined,
+        resumeAgents,
         resumePhaseUsage,
         onResumeMiss: (replayedExecutionIds) => {
           if (!resumeJournal) return;
@@ -545,11 +562,28 @@ export class WorkflowManager extends EventEmitter {
             const metadata = managed.durableAgents.get(event.executionId) ?? {};
             metadata.result = undefined;
             metadata.endedAt = undefined;
+            if (!event.resuming) {
+              metadata.sessionFile = undefined;
+              metadata.worktree = undefined;
+            }
             managed.durableAgents.set(event.executionId, metadata);
             if (event.model) agent.model = event.model;
           }
+          const queuedMetadata = managed.durableAgents.get(event.executionId) ?? {};
+          queuedMetadata.callHash = event.callHash;
+          managed.durableAgents.set(event.executionId, queuedMetadata);
           this.schedulePersist(managed);
           this.emit("agentQueued", { runId: managed.runId, ...event });
+          refresh();
+        },
+        onAgentSession: (event) => {
+          const metadata = managed.durableAgents.get(event.executionId) ?? {};
+          metadata.sessionFile = event.sessionFile;
+          metadata.worktree = event.worktree;
+          metadata.callHash = event.callHash;
+          managed.durableAgents.set(event.executionId, metadata);
+          this.requirePersist(managed);
+          this.emit("agentSession", { runId: managed.runId, ...event });
           refresh();
         },
         onAgentStart: (event) => {
@@ -612,9 +646,11 @@ export class WorkflowManager extends EventEmitter {
             if (event.model) agent.model = event.model;
             const metadata = managed.durableAgents.get(event.executionId) ?? {};
             metadata.result = event.result;
+            metadata.worktree = terminalStatus === "paused" ? (event.worktree ?? metadata.worktree) : undefined;
             if (terminalStatus === "paused") metadata.endedAt = undefined;
             else metadata.endedAt ??= new Date().toISOString();
             if (usage && !usage.estimated) metadata.usage = { ...usage, estimated: false };
+            metadata.callHash = event.callHash;
             managed.durableAgents.set(event.executionId, metadata);
           }
           this.requirePersist(managed);
@@ -811,6 +847,9 @@ export class WorkflowManager extends EventEmitter {
             startedAt: metadata?.startedAt,
             endedAt: metadata?.endedAt,
             model: agent.model,
+            callHash: metadata?.callHash,
+            sessionFile: metadata?.sessionFile,
+            worktree: metadata?.worktree,
           };
         }),
         logs: [...managed.snapshot.logs],
@@ -909,6 +948,22 @@ export class WorkflowManager extends EventEmitter {
       tokenBudget: persisted.tokenBudget !== undefined ? persisted.tokenBudget : null,
       autoResume: persisted.autoResume,
     });
+    const resumeAgentEntries: Array<readonly [string, ResumeAgentState]> = this.persistAgentSessions
+      ? persisted.agents.flatMap((agent) =>
+          agent.status === "paused" && agent.sessionFile
+            ? [
+                [
+                  agent.executionId,
+                  { sessionFile: agent.sessionFile, worktree: agent.worktree, callHash: agent.callHash },
+                ] as const,
+              ]
+            : [],
+        )
+      : [];
+    const resumableAgentIds = new Set(resumeAgentEntries.map(([executionId]) => executionId));
+    const incompatibleWorktrees = persisted.agents.flatMap((agent) =>
+      agent.worktree && !resumableAgentIds.has(agent.executionId) ? [agent.worktree] : [],
+    );
     const agents = persisted.agents.map((agent) => ({
       id: agent.id,
       executionId: agent.executionId,
@@ -981,6 +1036,9 @@ export class WorkflowManager extends EventEmitter {
             usage: agent.usage ? { ...agent.usage, estimated: false } : undefined,
             startedAt: agent.startedAt,
             endedAt: agent.status === "running" || agent.status === "paused" ? undefined : agent.endedAt,
+            callHash: agent.callHash,
+            sessionFile: agent.sessionFile,
+            worktree: resumableAgentIds.has(agent.executionId) ? agent.worktree : undefined,
           },
         ]),
       ),
@@ -998,10 +1056,12 @@ export class WorkflowManager extends EventEmitter {
       throw err;
     }
 
+    this.cleanupWorktrees(incompatibleWorktrees);
     const resumeJournal = new Map(managed.journal.map((entry) => [entry.executionId ?? entry.index, entry] as const));
+    const resumeAgents = resumeAgentEntries.length ? new Map<string, ResumeAgentState>(resumeAgentEntries) : undefined;
     this.emit("resumed", { runId });
     // Run in the background; executeRun records status/errors on the managed run.
-    void this.beginExecution(managed, script, args, { resumeJournal }).catch(() => {});
+    void this.beginExecution(managed, script, args, { resumeJournal, resumeAgents }).catch(() => {});
     return true;
   }
 
@@ -1016,6 +1076,7 @@ export class WorkflowManager extends EventEmitter {
       if (!persisted?.script || !["paused", "completed", "failed", "aborted"].includes(persisted.status)) return null;
       if (persisted.status === "paused") {
         const endedAt = new Date().toISOString();
+        const preservedWorktrees = persisted.agents.map((agent) => agent.worktree);
         try {
           this.persistence.save({
             ...persisted,
@@ -1025,7 +1086,7 @@ export class WorkflowManager extends EventEmitter {
             resetHint: undefined,
             agents: persisted.agents.map((agent) =>
               agent.status === "queued" || agent.status === "running" || agent.status === "paused"
-                ? { ...agent, status: "skipped" as const, endedAt: agent.endedAt ?? endedAt }
+                ? { ...agent, status: "skipped" as const, endedAt: agent.endedAt ?? endedAt, worktree: undefined }
                 : agent,
             ),
           });
@@ -1046,6 +1107,7 @@ export class WorkflowManager extends EventEmitter {
           }
           active.snapshot = recomputeWorkflowSnapshot(active.snapshot);
         }
+        this.cleanupWorktrees(preservedWorktrees);
         this.emit("stopped", { runId });
       }
       return this.startInBackground(persisted.script, persisted.args, {
@@ -1068,6 +1130,7 @@ export class WorkflowManager extends EventEmitter {
     const managed = this.runs.get(runId);
     if (managed) {
       if (managed.status !== "running" && managed.status !== "paused") return false;
+      const preservedWorktrees = [...managed.durableAgents.values()].map((metadata) => metadata.worktree);
       if (!managed.lease) {
         managed.lease = this.persistence.acquireRunLease(runId) ?? undefined;
         if (!managed.lease) return false;
@@ -1080,6 +1143,7 @@ export class WorkflowManager extends EventEmitter {
         if (executionId) {
           const metadata = managed.durableAgents.get(executionId) ?? {};
           metadata.endedAt ??= endedAt;
+          metadata.worktree = undefined;
           managed.durableAgents.set(executionId, metadata);
         }
       }
@@ -1094,6 +1158,9 @@ export class WorkflowManager extends EventEmitter {
         this.runs.delete(runId);
         throw error;
       }
+      // Active execution owns its local worktree and cleans it while unwinding.
+      // Manager cleanup is only for cold/settled preserved worktrees.
+      if (!managed.executionPromise) this.cleanupWorktrees(preservedWorktrees);
       this.emit("stopped", { runId });
       if (!managed.executionPromise) this.releaseRunLease(managed);
       return true;
@@ -1106,6 +1173,7 @@ export class WorkflowManager extends EventEmitter {
     try {
       const current = this.persistence.load(runId);
       if (!current || (current.status !== "running" && current.status !== "paused")) return false;
+      const preservedWorktrees = current.agents.map((agent) => agent.worktree);
       try {
         this.persistence.save({
           ...current,
@@ -1118,6 +1186,7 @@ export class WorkflowManager extends EventEmitter {
                   ...agent,
                   status: "skipped" as const,
                   endedAt: agent.endedAt ?? new Date().toISOString(),
+                  worktree: undefined,
                 }
               : agent,
           ),
@@ -1129,6 +1198,7 @@ export class WorkflowManager extends EventEmitter {
           { recoverable: false, details: error },
         );
       }
+      this.cleanupWorktrees(preservedWorktrees);
       this.emit("stopped", { runId });
       return true;
     } finally {
