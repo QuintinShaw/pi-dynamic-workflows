@@ -285,6 +285,21 @@ function warnTierUnconfiguredOnce(mainModel: string | undefined, registry: Model
   }
 }
 
+/**
+ * Emitted at most once per process when persistAgentSessions is enabled and a
+ * session is actually persisted: full subagent transcripts (which may include
+ * secrets or other sensitive context) are being written to disk. Surface the
+ * privacy trade-off at run time, not only in the docs.
+ */
+let warnedPersistSecrets = false;
+function warnPersistSecretsOnce(sessionDir: string): void {
+  if (warnedPersistSecrets) return;
+  warnedPersistSecrets = true;
+  console.warn(
+    `[workflow] persistAgentSessions is ON: full subagent transcripts (which may include secrets or other sensitive context) are being written to disk under ${sessionDir}. Disable persistAgentSessions if that isn't intended.`,
+  );
+}
+
 /** Real token/cost usage for a single subagent run, read from the SDK session. */
 export interface AgentUsage {
   input: number;
@@ -458,6 +473,7 @@ export class WorkflowAgent {
     try {
       const manager = SessionManager.create(this.cwd);
       this.assertSessionDirWritable(manager.getSessionDir());
+      warnPersistSecretsOnce(manager.getSessionDir());
       return manager;
     } catch (error) {
       console.warn(
