@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="460" viewBox="0 0 1200 460" role="img" aria-labelledby="title desc">
+  <title id="title">How pi-dynamic-workflows orchestrates a task</title>
+  <desc id="desc">A task becomes deterministic orchestration, runs through parallel routed agents, then passes a verification gate before one result is returned.</desc>
+
+  <defs>
+    <pattern id="grid" width="46" height="46" patternUnits="userSpaceOnUse">
+      <path d="M46 0H0V46" fill="none" stroke="#D9D3C8" stroke-width="1"/>
+    </pattern>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0 0l10 5-10 5z" fill="#495266"/>
+    </marker>
+  </defs>
+
+  <rect width="1200" height="460" rx="28" fill="#F6F0E5"/>
+  <rect width="1200" height="460" rx="28" fill="url(#grid)" opacity=".52"/>
+
+  <g id="heading" transform="translate(54 44)" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif">
+    <text x="0" y="15" fill="#687286" font-size="14" font-weight="800" letter-spacing="3">A DETERMINISTIC PATH THROUGH PARALLEL WORK</text>
+    <rect x="0" y="33" width="54" height="6" rx="3" fill="#FF725E"/>
+    <text x="0" y="89" fill="#111827" font-size="36" font-weight="800" letter-spacing="-1">One task. Coordinated agents. One checked result.</text>
+  </g>
+
+  <g id="flow" transform="translate(48 172)" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif">
+    <path d="M250 126H278 M536 126H564 M822 126H850" fill="none" stroke="#495266" stroke-width="3" marker-end="url(#arrow)"/>
+
+    <g id="prompt-card">
+      <rect x="7" y="8" width="246" height="252" rx="18" fill="#AAA49B" opacity=".28"/>
+      <rect width="246" height="252" rx="18" fill="#111827"/>
+      <text x="22" y="33" fill="#61D2B4" font-size="13" font-weight="800" letter-spacing="1.4">01 / PROMPT</text>
+      <text x="22" y="75" fill="#F6F0E5" font-size="24" font-weight="800">Describe</text>
+      <text x="22" y="104" fill="#F6F0E5" font-size="24" font-weight="800">the task</text>
+      <rect x="22" y="130" width="202" height="76" rx="10" fill="#1E293B"/>
+      <text x="36" y="159" fill="#AAB3C6" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">audit every route</text>
+      <text x="36" y="183" fill="#AAB3C6" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">for missing auth</text>
+      <circle cx="216" cy="226" r="5" fill="#61D2B4"/>
+    </g>
+
+    <g id="orchestrate-card" transform="translate(286)">
+      <rect x="7" y="8" width="246" height="252" rx="18" fill="#AAA49B" opacity=".28"/>
+      <rect width="246" height="252" rx="18" fill="#DCD5FF"/>
+      <text x="22" y="33" fill="#5A49CB" font-size="13" font-weight="800" letter-spacing="1.4">02 / ORCHESTRATE</text>
+      <text x="22" y="75" fill="#171431" font-size="24" font-weight="800">Write the</text>
+      <text x="22" y="104" fill="#171431" font-size="24" font-weight="800">workflow</text>
+      <g transform="translate(22 139)" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13">
+        <text x="0" y="0" fill="#5A49CB">phase</text><text x="46" y="0" fill="#4A4560">('Review')</text>
+        <text x="0" y="30" fill="#5A49CB">parallel</text><text x="65" y="30" fill="#4A4560">(agents)</text>
+        <text x="0" y="60" fill="#5A49CB">verify</text><text x="49" y="60" fill="#4A4560">(findings)</text>
+      </g>
+    </g>
+
+    <g id="fanout-card" transform="translate(572)">
+      <rect x="7" y="8" width="246" height="252" rx="18" fill="#AAA49B" opacity=".28"/>
+      <rect width="246" height="252" rx="18" fill="#61D2B4"/>
+      <text x="22" y="33" fill="#15463D" font-size="13" font-weight="800" letter-spacing="1.4">03 / FAN OUT</text>
+      <text x="22" y="75" fill="#102D28" font-size="24" font-weight="800">Route parallel</text>
+      <text x="22" y="104" fill="#102D28" font-size="24" font-weight="800">agents</text>
+      <g transform="translate(22 130)" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" font-weight="700">
+        <rect width="202" height="28" rx="7" fill="#F6F0E5"/><text x="12" y="19" fill="#16342F">small  · scan</text>
+        <rect y="36" width="202" height="28" rx="7" fill="#111827"/><text x="12" y="55" fill="#F6F0E5">medium · review</text>
+        <rect y="72" width="202" height="28" rx="7" fill="#6C5CE7"/><text x="12" y="91" fill="#F6F0E5">big    · synthesize</text>
+      </g>
+    </g>
+
+    <g id="result-card" transform="translate(858)">
+      <rect x="7" y="8" width="246" height="252" rx="18" fill="#AAA49B" opacity=".28"/>
+      <rect width="246" height="252" rx="18" fill="#FFD166"/>
+      <text x="22" y="33" fill="#6A4B00" font-size="13" font-weight="800" letter-spacing="1.4">04 / RETURN</text>
+      <text x="22" y="75" fill="#2C240D" font-size="24" font-weight="800">Deliver one</text>
+      <text x="22" y="104" fill="#2C240D" font-size="24" font-weight="800">result</text>
+      <rect x="22" y="130" width="202" height="92" rx="12" fill="#F6F0E5" opacity=".72"/>
+      <circle cx="61" cy="176" r="25" fill="#111827"/>
+      <path d="M48 176l8 8 18-20" fill="none" stroke="#61D2B4" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+      <text x="96" y="169" fill="#46370C" font-size="14" font-weight="800">VERIFIED</text>
+      <text x="96" y="192" fill="#6A5518" font-size="11">journaled + resumable</text>
+    </g>
+  </g>
+</svg>

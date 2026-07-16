@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="420" viewBox="0 0 1200 420" role="img" aria-labelledby="title desc">
+  <title id="title">pi-dynamic-workflows</title>
+  <desc id="desc">One prompt fans out to small, medium, and big Pi agents before returning one verified result.</desc>
+
+  <defs>
+    <pattern id="grid" width="44" height="44" patternUnits="userSpaceOnUse">
+      <path d="M44 0H0V44" fill="none" stroke="#273045" stroke-width="1"/>
+    </pattern>
+    <linearGradient id="title-accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#61D2B4"/>
+      <stop offset="1" stop-color="#85E3CA"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1200" height="420" rx="28" fill="#111827"/>
+  <rect width="1200" height="420" rx="28" fill="url(#grid)" opacity=".58"/>
+  <circle cx="1160" cy="16" r="116" fill="#FF725E" opacity=".10"/>
+  <circle cx="1080" cy="420" r="126" fill="#61D2B4" opacity=".08"/>
+
+  <g id="title-block" transform="translate(62 58)">
+    <text x="0" y="0" fill="#AAB3C6" font-size="15" font-weight="700" letter-spacing="3" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif">ONE PROMPT · MANY AGENTS</text>
+    <rect x="0" y="20" width="56" height="6" rx="3" fill="#FF725E"/>
+    <text x="0" y="103" fill="#F6F0E5" font-size="64" font-weight="800" letter-spacing="-2" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif">pi-dynamic-</text>
+    <text x="0" y="168" fill="#F6F0E5" font-size="64" font-weight="800" letter-spacing="-2" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif">workflows</text>
+    <rect x="0" y="184" width="400" height="10" rx="5" fill="url(#title-accent)"/>
+    <text x="0" y="235" fill="#D7DCE7" font-size="22" font-weight="600" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif">Fan out. Route models. Cross-check.</text>
+    <text x="0" y="267" fill="#D7DCE7" font-size="22" font-weight="600" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif">Return one result.</text>
+    <text x="0" y="316" fill="#8F9AAF" font-size="14" font-weight="700" letter-spacing="2" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">JOURNALED RESUME · WORKTREE ISOLATION · REAL USAGE</text>
+  </g>
+
+  <g id="agent-cards">
+    <g transform="translate(745 55) rotate(5 160 64)">
+      <rect x="9" y="10" width="320" height="128" rx="20" fill="#05070B" opacity=".30"/>
+      <rect width="320" height="128" rx="20" fill="#F6F0E5"/>
+      <rect x="22" y="20" width="48" height="6" rx="3" fill="#FF725E"/>
+      <text x="22" y="52" fill="#111827" font-size="14" font-weight="800" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">SMALL / SCAN</text>
+      <rect x="22" y="69" width="276" height="38" rx="9" fill="#172133"/>
+      <path d="M40 81l8 7-8 7" fill="none" stroke="#61D2B4" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M58 94h86" stroke="#9FABC0" stroke-width="6" stroke-linecap="round"/>
+      <circle cx="279" cy="88" r="5" fill="#61D2B4"/>
+    </g>
+
+    <g transform="translate(678 181) rotate(-5 170 68)">
+      <rect x="9" y="10" width="340" height="136" rx="20" fill="#05070B" opacity=".26"/>
+      <rect width="340" height="136" rx="20" fill="#61D2B4"/>
+      <text x="24" y="39" fill="#12322D" font-size="14" font-weight="800" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">MEDIUM / REVIEW</text>
+      <text x="24" y="76" fill="#10231F" font-size="24" font-weight="800" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif">Parallel specialists</text>
+      <g transform="translate(24 93)">
+        <rect width="72" height="24" rx="7" fill="#F6F0E5"/>
+        <rect x="82" width="72" height="24" rx="7" fill="#111827"/>
+        <rect x="164" width="72" height="24" rx="7" fill="#6C5CE7"/>
+        <circle cx="18" cy="12" r="5" fill="#FF725E"/>
+        <circle cx="100" cy="12" r="5" fill="#61D2B4"/>
+        <circle cx="182" cy="12" r="5" fill="#F6F0E5"/>
+      </g>
+    </g>
+
+    <g transform="translate(908 264) rotate(5 128 64)">
+      <rect x="9" y="10" width="256" height="128" rx="20" fill="#05070B" opacity=".30"/>
+      <rect width="256" height="128" rx="20" fill="#6C5CE7"/>
+      <text x="22" y="35" fill="#E6E0FF" font-size="13" font-weight="800" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">BIG / SYNTHESIZE</text>
+      <path d="M32 86H73L94 66 126 94 157 61 202 86" fill="none" stroke="#F6F0E5" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+      <circle cx="32" cy="86" r="9" fill="#61D2B4"/>
+      <circle cx="94" cy="66" r="9" fill="#FF725E"/>
+      <circle cx="126" cy="94" r="9" fill="#FFD166"/>
+      <circle cx="157" cy="61" r="9" fill="#F6F0E5"/>
+      <circle cx="202" cy="86" r="11" fill="#111827" stroke="#F6F0E5" stroke-width="3"/>
+    </g>
+  </g>
+</svg>

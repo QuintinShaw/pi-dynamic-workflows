@@ -18,6 +18,7 @@
     "dist/",
     "extensions/",
     "src/",
+    "assets/readme/",
     "README.md"
   ],
   "scripts": {
@@ -52,7 +53,8 @@
   "pi": {
     "extensions": [
       "extensions/workflow.ts"
-    ]
+    ],
+    "image": "https://raw.githubusercontent.com/QuintinShaw/pi-dynamic-workflows/main/assets/readme/package-cover.png"
   },
   "repository": {
     "type": "git",

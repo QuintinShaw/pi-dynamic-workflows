@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="750" viewBox="0 0 1200 750" role="img" aria-labelledby="title desc">
+  <title id="title">pi-dynamic-workflows package cover</title>
+  <desc id="desc">A Pi extension that routes one prompt through parallel small, medium, and big agents and returns a verified result.</desc>
+  <defs>
+    <pattern id="grid" width="48" height="48" patternUnits="userSpaceOnUse">
+      <path d="M48 0H0V48" fill="none" stroke="#273045" stroke-width="1"/>
+    </pattern>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#61D2B4"/>
+      <stop offset="1" stop-color="#85E3CA"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1200" height="750" rx="32" fill="#111827"/>
+  <rect width="1200" height="750" rx="32" fill="url(#grid)" opacity=".58"/>
+  <circle cx="1164" cy="16" r="150" fill="#FF725E" opacity=".11"/>
+  <circle cx="44" cy="742" r="170" fill="#61D2B4" opacity=".08"/>
+
+  <g transform="translate(68 62)" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif">
+    <text x="0" y="16" fill="#AAB3C6" font-size="16" font-weight="800" letter-spacing="3">PI EXTENSION · MULTI-AGENT ORCHESTRATION</text>
+    <rect x="0" y="37" width="60" height="7" rx="3.5" fill="#FF725E"/>
+    <text x="0" y="126" fill="#F6F0E5" font-size="68" font-weight="800" letter-spacing="-2">pi-dynamic-workflows</text>
+    <rect x="0" y="149" width="510" height="10" rx="5" fill="url(#accent)"/>
+    <text x="0" y="207" fill="#D7DCE7" font-size="27" font-weight="650">One prompt. Routed agents. One checked result.</text>
+  </g>
+
+  <g transform="translate(68 340)" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif">
+    <path d="M310 103H370 M680 103H740" stroke="#78849A" stroke-width="4"/>
+    <path d="M352 93l18 10-18 10M722 93l18 10-18 10" fill="none" stroke="#78849A" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+
+    <g>
+      <rect x="10" y="12" width="300" height="206" rx="22" fill="#05070B" opacity=".34"/>
+      <rect width="300" height="206" rx="22" fill="#F6F0E5"/>
+      <text x="26" y="39" fill="#111827" font-size="15" font-weight="800" letter-spacing="1.5">01 / ORCHESTRATE</text>
+      <text x="26" y="84" fill="#111827" font-size="30" font-weight="800">Write the workflow</text>
+      <rect x="26" y="111" width="248" height="62" rx="10" fill="#172133"/>
+      <text x="43" y="137" fill="#61D2B4" font-size="14" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">parallel(agents)</text>
+      <text x="43" y="160" fill="#AAB3C6" font-size="14" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">verify(findings)</text>
+    </g>
+
+    <g transform="translate(370)">
+      <rect x="10" y="12" width="310" height="206" rx="22" fill="#05070B" opacity=".30"/>
+      <rect width="310" height="206" rx="22" fill="#61D2B4"/>
+      <text x="26" y="39" fill="#15463D" font-size="15" font-weight="800" letter-spacing="1.5">02 / FAN OUT</text>
+      <text x="26" y="84" fill="#102D28" font-size="30" font-weight="800">Route by model</text>
+      <g transform="translate(26 108)" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13" font-weight="700">
+        <rect width="258" height="25" rx="7" fill="#F6F0E5"/><text x="13" y="17" fill="#16342F">small  · scan</text>
+        <rect y="32" width="258" height="25" rx="7" fill="#111827"/><text x="13" y="49" fill="#F6F0E5">medium · review</text>
+        <rect y="64" width="258" height="25" rx="7" fill="#6C5CE7"/><text x="13" y="81" fill="#F6F0E5">big    · synthesize</text>
+      </g>
+    </g>
+
+    <g transform="translate(740)">
+      <rect x="10" y="12" width="320" height="206" rx="22" fill="#05070B" opacity=".30"/>
+      <rect width="320" height="206" rx="22" fill="#6C5CE7"/>
+      <text x="26" y="39" fill="#E6E0FF" font-size="15" font-weight="800" letter-spacing="1.5">03 / RETURN</text>
+      <text x="26" y="84" fill="#F6F0E5" font-size="30" font-weight="800">Verified result</text>
+      <circle cx="67" cy="143" r="28" fill="#111827"/>
+      <path d="M53 143l9 9 20-22" fill="none" stroke="#61D2B4" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+      <text x="110" y="137" fill="#F6F0E5" font-size="15" font-weight="800">JOURNALED</text>
+      <text x="110" y="161" fill="#DCD5FF" font-size="14">resumable without reruns</text>
+    </g>
+  </g>
+
+  <text x="68" y="699" fill="#8F9AAF" font-size="15" font-weight="700" letter-spacing="2.2" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">MODEL ROUTING · WORKTREE ISOLATION · REAL TOKEN &amp; COST ACCOUNTING</text>
+</svg>
