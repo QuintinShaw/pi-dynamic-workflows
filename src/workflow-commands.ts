@@ -17,6 +17,7 @@ import type { PersistedRunState } from "./run-persistence.js";
 import { registerSavedWorkflow } from "./saved-commands.js";
 import { buildForcedWorkflowPrompt, WORKFLOW_TOOL_NAME } from "./workflow-editor.js";
 import type { WorkflowManager } from "./workflow-manager.js";
+import { formatWorkflowReport } from "./workflow-report.js";
 import type { WorkflowStorage } from "./workflow-saved.js";
 import { openWorkflowNavigator } from "./workflow-ui.js";
 
@@ -30,7 +31,7 @@ const STATUS_ICON: Record<string, string> = {
 };
 
 const USAGE =
-  "Usage: /workflows [list] | run <prompt> | status <id> | watch <id> | stop <id> | pause <id> | resume <id> | rm <id> | save <name> [runId]";
+  "Usage: /workflows [list] | run <prompt> | status <id> | report <id> | watch <id> | stop <id> | pause <id> | resume <id> | rm <id> | save <name> [runId]";
 
 const RUN_USAGE = "Usage: /workflows run <prompt> — force a dynamic workflow from the prompt";
 
@@ -135,7 +136,7 @@ export function registerWorkflowCommands(
 
   pi.registerCommand("workflows", {
     description:
-      "Manage workflow runs — no args (opens navigator) | run <prompt> | status/stop/pause/resume <id> | rm <id> | save <name> [runId]",
+      "Manage workflow runs — no args (opens navigator) | run <prompt> | status/report/stop/pause/resume <id> | rm <id> | save <name> [runId]",
     async handler(args: string, ctx: ExtensionCommandContext) {
       const parts = args.trim().split(/\s+/).filter(Boolean);
       const sub = (parts[0] ?? "list").toLowerCase();
@@ -194,6 +195,25 @@ export function registerWorkflowCommands(
             return;
           }
           await print(["Workflow runs:", ...runs.map(summarizeRun), "", USAGE].join("\n"));
+          return;
+        }
+        case "report": {
+          if (!id) {
+            ctx.ui.notify(USAGE, "warning");
+            return;
+          }
+          let run: PersistedRunState | null;
+          try {
+            run = manager.getRunForReport(id);
+          } catch {
+            ctx.ui.notify("Invalid workflow run ID", "error");
+            return;
+          }
+          if (!run) {
+            ctx.ui.notify(`No workflow run "${id}"`, "error");
+            return;
+          }
+          await print(formatWorkflowReport(run));
           return;
         }
         case "watch":

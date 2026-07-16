@@ -12,6 +12,10 @@ import { workflowHomeDir, workflowProjectPaths } from "./workflow-paths.js";
 
 export interface WorkflowSettings {
   keywordTriggerEnabled?: boolean;
+  /** Exact, case-insensitive symbolic model names mapped to concrete model specs. */
+  modelAliases?: Record<string, string>;
+  /** Reject unresolved requested model specs instead of falling back to the session default. */
+  strictModelResolution?: boolean;
   /** Literal keyword that arms workflows mode from interactive input. */
   keywordTriggerWord?: string;
   defaultAgentTimeoutMs?: number | null;
@@ -121,6 +125,11 @@ function normalizeSettings(value: unknown): WorkflowSettings {
   if (typeof raw.keywordTriggerEnabled === "boolean") {
     settings.keywordTriggerEnabled = raw.keywordTriggerEnabled;
   }
+  const modelAliases = normalizeModelAliases(raw.modelAliases);
+  if (modelAliases !== undefined) settings.modelAliases = modelAliases;
+  if (typeof raw.strictModelResolution === "boolean") {
+    settings.strictModelResolution = raw.strictModelResolution;
+  }
   const keywordTriggerWord = normalizeKeywordTriggerWord(raw.keywordTriggerWord);
   if (keywordTriggerWord !== undefined) settings.keywordTriggerWord = keywordTriggerWord;
   if (raw.defaultAgentTimeoutMs === null) {
@@ -152,6 +161,27 @@ function normalizeSettings(value: unknown): WorkflowSettings {
   const deliveredResultMaxChars = normalizeInteger(raw.deliveredResultMaxChars, 1, 1_000_000);
   if (deliveredResultMaxChars !== undefined) settings.deliveredResultMaxChars = deliveredResultMaxChars;
   return settings;
+}
+
+const UNSAFE_ALIAS_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+function normalizeModelAliases(value: unknown): Record<string, string> | undefined {
+  if (!isPlainObject(value)) return undefined;
+  const aliases: Record<string, string> = {};
+  for (const [rawKey, rawValue] of Object.entries(value)) {
+    if (typeof rawValue !== "string") continue;
+    const key = rawKey.trim().toLowerCase();
+    const target = rawValue.trim();
+    if (!key || !target || UNSAFE_ALIAS_KEYS.has(key)) continue;
+    aliases[key] = target;
+  }
+  return aliases;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
 }
 
 function normalizeInteger(value: unknown, min: number, max: number): number | undefined {

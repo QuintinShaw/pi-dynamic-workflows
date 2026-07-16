@@ -268,6 +268,42 @@ test(
 );
 
 test(
+  "runSync correlates duplicate-label histories by invocation",
+  withTempCwd(async (cwd) => {
+    let arrivals = 0;
+    let release!: () => void;
+    const bothStarted = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt: string, options: { onHistory?: (history: unknown[]) => void }) {
+          arrivals++;
+          if (arrivals === 2) release();
+          await bothStarted;
+          options.onHistory?.([{ role: "assistant", kind: "text", text: `history:${prompt}` }]);
+          return `result:${prompt}`;
+        },
+      },
+    });
+    const script = `export const meta = { name: 'duplicate-history', description: 'history correlation' }
+return await parallel([
+  () => agent('first prompt', { label: 'duplicate' }),
+  () => agent('second prompt', { label: 'duplicate' }),
+])`;
+
+    await manager.runSync(script);
+
+    const run = manager.listRuns().find((candidate) => candidate.workflowName === "duplicate-history");
+    assert.equal(run?.agents.length, 2);
+    for (const agent of run?.agents ?? []) {
+      assert.equal(agent.history?.[0]?.text, `history:${agent.prompt}`);
+    }
+  }),
+);
+
+test(
   "startInBackground returns immediately with runId and promise",
   withTempCwd(async (cwd) => {
     const manager = new WorkflowManager({ cwd, agent: fakeAgent() });
@@ -471,6 +507,43 @@ test(
 );
 
 test(
+  "resume acquires the lease before reloading and revalidating persisted state",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent() });
+    const persistence = manager.getPersistence();
+    const runId = "resume-toctou";
+    persistence.save({
+      runId,
+      workflowName: "resume race",
+      script: oneAgentScript,
+      args: { stale: true },
+      status: "paused",
+      phases: [],
+      agents: [],
+      logs: [],
+      startedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+    const acquire = persistence.acquireRunLease.bind(persistence);
+    const load = persistence.load.bind(persistence);
+    persistence.acquireRunLease = (id: string) => {
+      const lease = acquire(id);
+      const stale = load(id);
+      assert.ok(stale);
+      persistence.save({ ...stale, status: "completed", script: "" });
+      return lease;
+    };
+
+    assert.equal(await manager.resume(runId), false, "state changed at lease acquisition is reloaded and rejected");
+    persistence.acquireRunLease = acquire;
+    const lease = persistence.acquireRunLease(runId);
+    assert.ok(lease, "resume releases the lease when reloaded state is no longer resumable");
+    persistence.releaseRunLease(lease);
+    assert.equal(manager.getRun(runId), undefined);
+  }),
+);
+
+test(
   "manager emits complete event with runId",
   withTempCwd(async (cwd) => {
     const manager = new WorkflowManager({ cwd, agent: fakeAgent() });
@@ -502,6 +575,609 @@ test(
     await promise; // wait for completion
     const paused = manager.pause(runId);
     assert.equal(paused, false, "cannot pause completed run");
+  }),
+);
+
+test(
+  "resume fails within the cancellation grace when a paused agent ignores abort and prevents overlap",
+  withTempCwd(async (cwd) => {
+    const da = deferredAgent();
+    let calls = 0;
+    const manager = new WorkflowManager({
+      cwd,
+      cancellationGraceMs: 20,
+      agent: {
+        async run(prompt: string, options?: { onUsage?: (u: AgentUsage) => void }) {
+          calls++;
+          return da.runner.run(prompt, options);
+        },
+      },
+    });
+    manager.on("error", () => {});
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(manager.pause(runId), true);
+
+    const resume = manager.resume(runId);
+    try {
+      await assert.rejects(
+        Promise.race([
+          resume,
+          new Promise<never>((_resolve, reject) =>
+            setTimeout(() => reject(new Error("resume hung past its cancellation grace")), 200),
+          ),
+        ]),
+        /did not settle within 20ms/,
+      );
+      assert.equal(calls, 1, "an unsafe timed-out generation is never overlapped by a resumed generation");
+      assert.equal(manager.getRun(runId)?.status, "aborted");
+      const lease = manager.getPersistence().acquireRunLease(runId);
+      assert.ok(lease, "timed-out cancellation releases its execution lease");
+      manager.getPersistence().releaseRunLease(lease);
+    } finally {
+      da.resolve("late result");
+      await promise.catch(() => {});
+      await resume.catch(() => {});
+    }
+    assert.equal(manager.getPersistence().load(runId)?.status, "aborted", "late settlement cannot overwrite state");
+  }),
+);
+
+test(
+  "settled pause retains its lease until a durable paused marker can be saved",
+  withTempCwd(async (cwd) => {
+    const da = deferredAgent();
+    const manager = new WorkflowManager({ cwd, cancellationGraceMs: 20, agent: da.runner });
+    manager.on("error", () => {});
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const persistence = manager.getPersistence();
+    const save = persistence.save.bind(persistence);
+    const deletePersisted = persistence.delete.bind(persistence);
+    let deleteCalls = 0;
+    persistence.save = () => {
+      throw new Error("injected pause save failure");
+    };
+    persistence.delete = () => {
+      deleteCalls++;
+      return false;
+    };
+
+    let contender: WorkflowManager | undefined;
+    try {
+      assert.equal(manager.pause(runId), true);
+      da.resolve("settled result");
+      await promise.catch(() => {});
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      assert.equal(persistence.load(runId)?.status, "running", "both failed pause writes leave the old marker");
+
+      const contenderCalls: string[] = [];
+      contender = new WorkflowManager({
+        cwd,
+        agent: {
+          async run(prompt: string) {
+            contenderCalls.push(prompt);
+            return "resumed";
+          },
+        },
+      });
+      assert.equal(
+        await contender.resume(runId),
+        false,
+        "another manager cannot recover or resume stale running state",
+      );
+      assert.deepEqual(contenderCalls, [], "the contender must not start while the paused marker is not durable");
+      assert.equal(deleteCalls, 0, "a legitimately paused run is retained rather than deleted as cleanup fallback");
+    } finally {
+      persistence.save = save;
+      persistence.delete = deletePersisted;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    assert.equal(persistence.load(runId)?.status, "paused", "cleanup retry eventually saves the paused marker");
+    const resumed = await contender?.resume(runId);
+    assert.equal(resumed, true, "the durably paused run remains normally resumable");
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(contender?.getRun(runId)?.status, "completed");
+  }),
+);
+
+test(
+  "settled usage-limit pause retains its lease until its paused marker is durable",
+  withTempCwd(async (cwd) => {
+    let failPausedSave = false;
+    const manager = new WorkflowManager({
+      cwd,
+      cancellationGraceMs: 20,
+      agent: {
+        async run() {
+          failPausedSave = true;
+          throw new WorkflowError("usage limit", WorkflowErrorCode.PROVIDER_USAGE_LIMIT, { recoverable: false });
+        },
+      },
+    });
+    const persistence = manager.getPersistence();
+    const save = persistence.save.bind(persistence);
+    const deletePersisted = persistence.delete.bind(persistence);
+    let deleteCalls = 0;
+    persistence.save = (state) => {
+      if (failPausedSave && state.status === "paused") throw new Error("injected quota pause save failure");
+      save(state);
+    };
+    persistence.delete = () => {
+      deleteCalls++;
+      return false;
+    };
+
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    await promise.catch(() => {});
+    assert.equal(persistence.load(runId)?.status, "running", "the failed final pause write leaves the old marker");
+
+    const contender = new WorkflowManager({ cwd, agent: fakeAgent() });
+    assert.equal(await contender.resume(runId), false, "another manager cannot recover a failed quota pause write");
+    assert.equal(deleteCalls, 0, "quota-paused runs are not deleted as a marker-save fallback");
+
+    failPausedSave = false;
+    persistence.save = save;
+    persistence.delete = deletePersisted;
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    assert.equal(persistence.load(runId)?.status, "paused", "retry saves the quota pause marker");
+    assert.equal(await contender.resume(runId), true, "the quota-paused run remains resumable after cleanup");
+  }),
+);
+
+test(
+  "stop on a settled paused run handles lease acquisition failure without mutation",
+  withTempCwd(async (cwd) => {
+    const da = deferredAgent();
+    const manager = new WorkflowManager({ cwd, cancellationGraceMs: 20, agent: da.runner });
+    manager.on("error", () => {});
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(manager.pause(runId), true);
+    da.resolve("settled result");
+    await promise.catch(() => {});
+
+    const persistence = manager.getPersistence();
+    const blocker = persistence.acquireRunLease(runId);
+    assert.ok(blocker, "the settled pause should have released its execution lease");
+    try {
+      assert.equal(manager.stop(runId), false, "stop reports cross-process lease contention cleanly");
+      assert.equal(manager.getRun(runId)?.status, "paused", "failed acquisition does not mutate memory");
+      assert.equal(persistence.load(runId)?.status, "paused", "failed acquisition does not mutate persistence");
+    } finally {
+      persistence.releaseRunLease(blocker);
+    }
+
+    assert.equal(manager.stop(runId), true, "stop succeeds after the competing lease is released");
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(persistence.load(runId)?.status, "aborted");
+  }),
+);
+
+test(
+  "settled paused stop retains its acquired lease while abort persistence fails",
+  withTempCwd(async (cwd) => {
+    const da = deferredAgent();
+    const manager = new WorkflowManager({ cwd, cancellationGraceMs: 20, agent: da.runner });
+    manager.on("error", () => {});
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(manager.pause(runId), true);
+    da.resolve("settled result");
+    await promise.catch(() => {});
+
+    const persistence = manager.getPersistence();
+    const save = persistence.save.bind(persistence);
+    const deletePersisted = persistence.delete.bind(persistence);
+    persistence.save = () => {
+      throw new Error("injected abort save failure");
+    };
+    persistence.delete = () => false;
+
+    try {
+      assert.equal(manager.stop(runId), true);
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      const contenderCalls: string[] = [];
+      const contender = new WorkflowManager({
+        cwd,
+        agent: {
+          async run(prompt: string) {
+            contenderCalls.push(prompt);
+            return "unsafe resume";
+          },
+        },
+      });
+      assert.equal(
+        await contender.resume(runId),
+        false,
+        "failed abort cleanup remains protected by the acquired lease",
+      );
+      assert.deepEqual(contenderCalls, []);
+      assert.equal(persistence.load(runId)?.status, "paused", "the old durable pause marker remains until retry");
+    } finally {
+      persistence.save = save;
+      persistence.delete = deletePersisted;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    assert.equal(persistence.load(runId)?.status, "aborted", "retry durably marks the stopped run aborted");
+    const releasedLease = persistence.acquireRunLease(runId);
+    assert.ok(releasedLease, "successful retry releases the fail-safe lease");
+    persistence.releaseRunLease(releasedLease);
+  }),
+);
+
+test(
+  "deleteRun on a settled paused run handles lease acquisition failure without mutation",
+  withTempCwd(async (cwd) => {
+    const da = deferredAgent();
+    const manager = new WorkflowManager({ cwd, cancellationGraceMs: 20, agent: da.runner });
+    manager.on("error", () => {});
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(manager.pause(runId), true);
+    da.resolve("settled result");
+    await promise.catch(() => {});
+
+    const persistence = manager.getPersistence();
+    const blocker = persistence.acquireRunLease(runId);
+    assert.ok(blocker, "the settled pause should have released its execution lease");
+    try {
+      assert.equal(manager.deleteRun(runId), false, "delete reports cross-process lease contention cleanly");
+      assert.equal(manager.getRun(runId)?.status, "paused", "failed acquisition keeps the run in memory");
+      assert.equal(persistence.load(runId)?.status, "paused", "failed acquisition keeps the durable paused run");
+    } finally {
+      persistence.releaseRunLease(blocker);
+    }
+
+    assert.equal(manager.deleteRun(runId), true, "delete succeeds after the competing lease is released");
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(persistence.load(runId), null);
+  }),
+);
+
+test(
+  "settled paused deleteRun retains its acquired lease while deletion fails",
+  withTempCwd(async (cwd) => {
+    const da = deferredAgent();
+    const manager = new WorkflowManager({ cwd, cancellationGraceMs: 20, agent: da.runner });
+    manager.on("error", () => {});
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(manager.pause(runId), true);
+    da.resolve("settled result");
+    await promise.catch(() => {});
+
+    const persistence = manager.getPersistence();
+    const deletePersisted = persistence.delete.bind(persistence);
+    persistence.delete = () => false;
+
+    try {
+      assert.equal(manager.deleteRun(runId), false, "the injected deletion failure is reported");
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      const contenderCalls: string[] = [];
+      const contender = new WorkflowManager({
+        cwd,
+        agent: {
+          async run(prompt: string) {
+            contenderCalls.push(prompt);
+            return "unsafe resume";
+          },
+        },
+      });
+      assert.equal(await contender.resume(runId), false, "failed deletion remains protected by the acquired lease");
+      assert.deepEqual(contenderCalls, []);
+      assert.equal(
+        persistence.load(runId)?.status,
+        "paused",
+        "the paused state remains protected until deletion retry",
+      );
+    } finally {
+      persistence.delete = deletePersisted;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    assert.equal(persistence.load(runId), null, "retry eventually deletes the paused run");
+    const releasedLease = persistence.acquireRunLease(runId);
+    assert.ok(releasedLease, "successful deletion retry releases the fail-safe lease");
+    persistence.releaseRunLease(releasedLease);
+  }),
+);
+
+test(
+  "settled stop retains the lease when abort-marker save and deletion both fail",
+  withTempCwd(async (cwd) => {
+    const da = deferredAgent();
+    const manager = new WorkflowManager({ cwd, cancellationGraceMs: 50, agent: da.runner });
+    manager.on("error", () => {});
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const persistence = manager.getPersistence();
+    const save = persistence.save.bind(persistence);
+    const deletePersisted = persistence.delete.bind(persistence);
+    persistence.save = () => {
+      throw new Error("injected save failure");
+    };
+    persistence.delete = () => false;
+
+    assert.equal(manager.stop(runId), true);
+    da.resolve("settled result");
+    await promise.catch(() => {});
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const contenderCalls: string[] = [];
+    const contender = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt: string) {
+          contenderCalls.push(prompt);
+          return "unsafe-overlap";
+        },
+      },
+    });
+    const staleStatus = persistence.load(runId)?.status;
+    const resumed = await contender.resume(runId);
+
+    persistence.save = save;
+    persistence.delete = deletePersisted;
+    await new Promise((resolve) => setTimeout(resolve, 70));
+
+    const releasedLease = persistence.acquireRunLease(runId);
+    try {
+      assert.equal(staleStatus, "running", "failed cleanup leaves stale running state protected by the lease");
+      assert.equal(resumed, false, "a second manager cannot resume after the old generation settles unsafely");
+      assert.deepEqual(contenderCalls, [], "the contender must not start a replacement generation");
+      assert.equal(persistence.load(runId)?.status, "aborted");
+      assert.ok(releasedLease, "cleanup retry releases the lease after persisting the aborted marker");
+    } finally {
+      if (releasedLease) persistence.releaseRunLease(releasedLease);
+    }
+  }),
+);
+
+test(
+  "failed abort marker and deletion retain the lease until durable cleanup can retry",
+  withTempCwd(async (cwd) => {
+    const da = deferredAgent();
+    const manager = new WorkflowManager({ cwd, cancellationGraceMs: 20, agent: da.runner });
+    manager.on("error", () => {});
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const persistence = manager.getPersistence();
+    const save = persistence.save.bind(persistence);
+    const deletePersisted = persistence.delete.bind(persistence);
+    persistence.save = () => {
+      throw new Error("injected save failure");
+    };
+    persistence.delete = () => false;
+
+    assert.equal(manager.stop(runId), true);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const contenderCalls: string[] = [];
+    const contender = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt: string) {
+          contenderCalls.push(prompt);
+          return "unsafe-overlap";
+        },
+      },
+    });
+    const staleStatus = persistence.load(runId)?.status;
+    const resumed = await contender.resume(runId);
+
+    persistence.save = save;
+    persistence.delete = deletePersisted;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const releasedLease = persistence.acquireRunLease(runId);
+    try {
+      assert.equal(staleStatus, "running", "failed cleanup must leave the stale marker protected by the lease");
+      assert.equal(resumed, false, "a second manager cannot resume the stale state while cleanup is unsafe");
+      assert.deepEqual(contenderCalls, [], "the contender must not start a concurrent generation");
+      assert.ok(releasedLease, "cleanup retry releases the lease after persisting the aborted marker");
+      assert.equal(persistence.load(runId)?.status, "aborted");
+    } finally {
+      if (releasedLease) persistence.releaseRunLease(releasedLease);
+      da.resolve("late result");
+      await promise.catch(() => {});
+    }
+  }),
+);
+
+test(
+  "unresponsive pause retains the lease when abort-marker save and deletion both fail",
+  withTempCwd(async (cwd) => {
+    const da = deferredAgent();
+    const manager = new WorkflowManager({ cwd, cancellationGraceMs: 20, agent: da.runner });
+    manager.on("error", () => {});
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const persistence = manager.getPersistence();
+    const save = persistence.save.bind(persistence);
+    const deletePersisted = persistence.delete.bind(persistence);
+    persistence.save = () => {
+      throw new Error("injected save failure");
+    };
+    persistence.delete = () => false;
+
+    assert.equal(manager.pause(runId), true);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const contenderCalls: string[] = [];
+    const contender = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt: string) {
+          contenderCalls.push(prompt);
+          return "unsafe-overlap";
+        },
+      },
+    });
+    const staleStatus = persistence.load(runId)?.status;
+    const resumed = await contender.resume(runId);
+
+    persistence.save = save;
+    persistence.delete = deletePersisted;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const releasedLease = persistence.acquireRunLease(runId);
+    try {
+      assert.equal(staleStatus, "running", "failed cleanup must leave stale state protected by the lease");
+      assert.equal(resumed, false, "a second manager cannot resume an unresponsive paused generation");
+      assert.deepEqual(contenderCalls, [], "the contender must not start a concurrent generation");
+      assert.equal(persistence.load(runId)?.status, "aborted");
+      assert.ok(releasedLease, "cleanup retry releases the lease after persisting the aborted marker");
+    } finally {
+      if (releasedLease) persistence.releaseRunLease(releasedLease);
+      da.resolve("late result");
+      await promise.catch(() => {});
+    }
+    assert.equal(persistence.load(runId)?.status, "aborted", "late pause settlement cannot overwrite cleanup");
+  }),
+);
+
+test(
+  "settled deleteRun retains the lease until failed deletion can retry",
+  withTempCwd(async (cwd) => {
+    const da = deferredAgent();
+    const manager = new WorkflowManager({ cwd, cancellationGraceMs: 50, agent: da.runner });
+    manager.on("error", () => {});
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const persistence = manager.getPersistence();
+    const deletePersisted = persistence.delete.bind(persistence);
+    persistence.delete = () => false;
+
+    assert.equal(manager.deleteRun(runId), false, "the injected delete failure is reported");
+    da.resolve("settled result");
+    await promise.catch(() => {});
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const contenderCalls: string[] = [];
+    const contender = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt: string) {
+          contenderCalls.push(prompt);
+          return "unsafe-overlap";
+        },
+      },
+    });
+    const staleStatus = persistence.load(runId)?.status;
+    const resumed = await contender.resume(runId);
+
+    persistence.delete = deletePersisted;
+    await new Promise((resolve) => setTimeout(resolve, 70));
+
+    const releasedLease = persistence.acquireRunLease(runId);
+    try {
+      assert.equal(staleStatus, "running", "failed deletion leaves stale running state protected by the lease");
+      assert.equal(resumed, false, "a second manager cannot recover a deleted run while cleanup is pending");
+      assert.deepEqual(contenderCalls, [], "the contender must not start a replacement generation");
+      assert.equal(persistence.load(runId), null, "cleanup retry eventually deletes the stale state");
+      assert.ok(releasedLease, "successful deletion retry releases the lease");
+    } finally {
+      if (releasedLease) persistence.releaseRunLease(releasedLease);
+    }
+  }),
+);
+
+test(
+  "failed deleteRun cleanup retains the lease until deletion can retry",
+  withTempCwd(async (cwd) => {
+    const da = deferredAgent();
+    const manager = new WorkflowManager({ cwd, cancellationGraceMs: 20, agent: da.runner });
+    manager.on("error", () => {});
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const persistence = manager.getPersistence();
+    const deletePersisted = persistence.delete.bind(persistence);
+    persistence.delete = () => false;
+
+    assert.equal(manager.deleteRun(runId), false, "the injected delete failure is reported");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const contenderCalls: string[] = [];
+    const contender = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt: string) {
+          contenderCalls.push(prompt);
+          return "unsafe-overlap";
+        },
+      },
+    });
+    const staleStatus = persistence.load(runId)?.status;
+    const resumed = await contender.resume(runId);
+
+    persistence.delete = deletePersisted;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const releasedLease = persistence.acquireRunLease(runId);
+    try {
+      assert.equal(staleStatus, "running", "failed deletion must leave stale state protected by the lease");
+      assert.equal(resumed, false, "a second manager cannot resume while deletion is pending");
+      assert.deepEqual(contenderCalls, [], "the contender must not start a concurrent generation");
+      assert.equal(persistence.load(runId), null, "cleanup retry eventually deletes the stale state");
+      assert.ok(releasedLease, "successful deletion retry releases the lease");
+    } finally {
+      if (releasedLease) persistence.releaseRunLease(releasedLease);
+      da.resolve("late result");
+      await promise.catch(() => {});
+    }
+  }),
+);
+
+test(
+  "stop releases the lease after cancellation grace when an agent ignores abort",
+  withTempCwd(async (cwd) => {
+    const da = deferredAgent();
+    const manager = new WorkflowManager({ cwd, cancellationGraceMs: 20, agent: da.runner });
+    manager.on("error", () => {});
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(manager.stop(runId), true);
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    const lease = manager.getPersistence().acquireRunLease(runId);
+    try {
+      assert.ok(lease, "stopped run must not retain a permanent lease");
+    } finally {
+      if (lease) manager.getPersistence().releaseRunLease(lease);
+      da.resolve("late result");
+      await promise.catch(() => {});
+    }
+    assert.equal(manager.getPersistence().load(runId)?.status, "aborted");
+  }),
+);
+
+test(
+  "delete releases the lease after cancellation grace without allowing stale persistence",
+  withTempCwd(async (cwd) => {
+    const da = deferredAgent();
+    const manager = new WorkflowManager({ cwd, cancellationGraceMs: 20, agent: da.runner });
+    manager.on("error", () => {});
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(manager.deleteRun(runId), true);
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    const lease = manager.getPersistence().acquireRunLease(runId);
+    try {
+      assert.ok(lease, "deleted run must not retain a permanent lease");
+    } finally {
+      if (lease) manager.getPersistence().releaseRunLease(lease);
+      da.resolve("late result");
+      await promise.catch(() => {});
+    }
+    assert.equal(manager.getPersistence().load(runId), null, "late settlement must not resurrect a deleted run");
   }),
 );
 
@@ -790,19 +1466,12 @@ test(
     assert.equal(paused, true);
     assert.equal(manager.getRun(runId)?.status, "paused");
 
-    // Resume — replays journal (empty for single-agent that never completed) and
-    // re-runs the live agent with a fresh (non-aborted) controller.
-    const resumed = await manager.resume(runId);
-    assert.equal(resumed, true, "resume should succeed");
-
-    // The resumed run should be running
-    assert.equal(manager.getRun(runId)?.status, "running", "resumed run should be running");
-
-    // Resolve the deferred agent so the resumed run's agent completes
+    // Resume waits for the paused generation's final write and lease release.
+    const resumePromise = manager.resume(runId);
     da.resolve("resumed-done");
-
-    // The original promise will reject (its controller was aborted). Suppress it.
     await origPromise.catch(() => {});
+    const resumed = await resumePromise;
+    assert.equal(resumed, true, "resume should succeed");
 
     // Wait for the resumed run to complete
     await new Promise((r) => setTimeout(r, 50));
@@ -1156,6 +1825,25 @@ test(
 // ─── getRun tests ──────────────────────────────────────────────────────────────
 
 test(
+  "manager classifies schema-valid null output as done unless error metadata is present",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run() {
+          return null;
+        },
+      },
+    });
+    const script = `export const meta = { name: 'null-schema', description: 'null schema' }
+return await agent('nullable', { label: 'nullable', schema: {} })`;
+    await manager.runSync(script);
+    const run = manager.listRuns().find((candidate) => candidate.workflowName === "null-schema");
+    assert.equal(run?.agents[0]?.status, "done");
+  }),
+);
+
+test(
   "getRun returns ManagedRun with correct fields for active background run",
   withTempCwd(async (cwd) => {
     const da = deferredAgent();
@@ -1382,14 +2070,14 @@ test(
     await new Promise((resolve) => setTimeout(resolve, 20));
     manager.pause(runId);
 
-    const resumed = await manager.resume(runId);
+    const resumePromise = manager.resume(runId);
+    da.resolve("done");
+    await promise.catch(() => {});
+    const resumed = await resumePromise;
     const persisted = manager.listRuns().find((run) => run.runId === runId);
 
     assert.equal(resumed, true);
     assert.equal(persisted?.status, "running", "listRuns should show running status after resume");
-
-    da.resolve("done");
-    await promise.catch(() => {});
   }),
 );
 
@@ -1408,13 +2096,13 @@ test(
     const { runId, promise } = manager.startInBackground(oneAgentScript);
     await new Promise((r) => setTimeout(r, 20));
     manager.pause(runId);
-    await manager.resume(runId);
+    const resumePromise = manager.resume(runId);
+    da.resolve("done");
+    await promise.catch(() => {});
+    await resumePromise;
 
     assert.ok(resumedEvent, "resumed event should fire");
     assert.equal(resumedEvent?.runId, runId);
-
-    da.resolve("done");
-    await promise.catch(() => {});
   }),
 );
 
@@ -1466,13 +2154,11 @@ test(
     assert.equal(manager.pause(runId), true);
     assert.equal(manager.getRun(runId)?.status, "paused", "should be paused after pause");
 
-    const resumed = await manager.resume(runId);
-    assert.equal(resumed, true);
-    assert.equal(manager.getRun(runId)?.status, "running", "should be running after resume");
-
-    // Complete the resumed run
+    const resumePromise = manager.resume(runId);
     da.resolve("resumed-done");
     await origPromise.catch(() => {});
+    const resumed = await resumePromise;
+    assert.equal(resumed, true);
     await new Promise((r) => setTimeout(r, 30));
 
     assert.equal(manager.getRun(runId)?.status, "completed", "should complete after resume finishes");
@@ -1597,16 +2283,15 @@ test(
     assert.equal(manager.pause(runId), true);
     assert.equal(manager.getRun(runId)?.status, "paused");
 
-    // First resume should succeed
-    const firstResume = await manager.resume(runId);
-    assert.equal(firstResume, true, "first resume should succeed");
-
-    // The resumed run is now running; second resume should return false
-    const secondResume = await manager.resume(runId);
-    assert.equal(secondResume, false, "second resume should return false when the resumed run is already running");
-
+    // First resume waits for the old generation to settle.
+    const firstResumePromise = manager.resume(runId);
     da.resolve("done");
     await origPromise.catch(() => {});
+    const firstResume = await firstResumePromise;
+    assert.equal(firstResume, true, "first resume should succeed");
+
+    const secondResume = await manager.resume(runId);
+    assert.equal(secondResume, false, "second resume should return false once a new generation starts");
   }),
 );
 
@@ -1660,8 +2345,11 @@ test(
     });
 
     try {
-      // Resume — executeRun calls runWorkflow which calls the mocked runner
-      const resumed = await manager.resume(runId);
+      // Resume starts only after the paused generation has settled.
+      const resumePromise = manager.resume(runId);
+      da.resolve("done");
+      await origPromise.catch(() => {});
+      const resumed = await resumePromise;
       assert.equal(resumed, true, "resume should schedule the run");
 
       // Wait for the background executed run to process the agent error
@@ -1732,8 +2420,11 @@ test(
     });
 
     try {
-      // Resume — the run will fail because the mocked agent throws
-      const resumed = await manager.resume(runId);
+      // Resume starts only after the paused generation has settled.
+      const resumePromise = manager.resume(runId);
+      da.resolve("done");
+      await origPromise.catch(() => {});
+      const resumed = await resumePromise;
       assert.equal(resumed, true, "resume should schedule the run");
       await new Promise((r) => setTimeout(r, 100));
 
@@ -1774,8 +2465,11 @@ test(
     });
 
     try {
-      // Resume — the run will fail
-      const resumed = await manager.resume(runId);
+      // Resume starts only after the paused generation has settled.
+      const resumePromise = manager.resume(runId);
+      da.resolve("done");
+      await origPromise.catch(() => {});
+      const resumed = await resumePromise;
       assert.equal(resumed, true, "resume should schedule the run");
       await new Promise((r) => setTimeout(r, 100));
 
@@ -1816,8 +2510,11 @@ test(
     });
 
     try {
-      // Resume — the run will fail
-      await manager.resume(runId);
+      // Resume starts only after the paused generation has settled.
+      const resumePromise = manager.resume(runId);
+      da.resolve("done");
+      await origPromise.catch(() => {});
+      await resumePromise;
       await new Promise((r) => setTimeout(r, 100));
 
       // Verify the run is now in failed state

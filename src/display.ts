@@ -1,5 +1,5 @@
 import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
-import type { AgentUsage } from "./agent.js";
+import type { AgentTelemetry, AgentUsage } from "./agent.js";
 import type { AgentHistoryEntry } from "./agent-history.js";
 import type { WorkflowErrorCode } from "./errors.js";
 import type { WorkflowMeta } from "./workflow.js";
@@ -8,6 +8,8 @@ export type WorkflowAgentStatus = "queued" | "running" | "done" | "error" | "ski
 
 export interface WorkflowAgentSnapshot {
   id: number;
+  /** Internal deterministic invocation identity for duplicate-label correlation. */
+  callId?: string;
   label: string;
   phase?: string;
   prompt: string;
@@ -23,6 +25,8 @@ export interface WorkflowAgentSnapshot {
   tokenUsage?: AgentUsage;
   /** The model this agent ran on (provider/id), when known. */
   model?: string;
+  /** Exact live telemetry, or persisted telemetry explicitly marked as replayed. */
+  telemetry?: AgentTelemetry;
 }
 
 export interface WorkflowSnapshot {

@@ -5,20 +5,23 @@ import type { AssistantMessage, Model, TextContent } from "@earendil-works/pi-ai
 import {
   AuthStorage,
   type CreateAgentSessionOptions,
+  type CreateAgentSessionResult,
   createAgentSession,
   createCodingTools,
+  DefaultResourceLoader,
   getAgentDir,
   ModelRegistry,
+  type ResourceLoader,
   SessionManager,
   SettingsManager,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import type { Static, TSchema } from "typebox";
+import type { TSchema } from "typebox";
 import { Check, Convert } from "typebox/value";
 import { type AgentHistoryEntry, compactAgentHistory } from "./agent-history.js";
 import { applyToolPolicy } from "./agent-registry.js";
 import { classifyProviderLimit, WorkflowError, WorkflowErrorCode } from "./errors.js";
-import { canonicalModelSpec, resolveModelSpecWithThinking } from "./model-spec.js";
+import { canonicalModelSpec, type ModelThinkingLevel, resolveModelSpecWithThinking } from "./model-spec.js";
 import {
   formatTierFallbackNotice,
   loadModelTierConfig,
@@ -26,7 +29,12 @@ import {
   type RankableModel,
   resolveTierModel,
 } from "./model-tier-config.js";
-import { createStructuredOutputTool, type StructuredOutputCapture } from "./structured-output.js";
+import {
+  createStructuredOutputTool,
+  type SchemaOutput,
+  type StructuredOutputCapture,
+  type WorkflowSchema,
+} from "./structured-output.js";
 
 /**
  * Find a JSON object/array in free-form text: a fenced ```json block if present,
@@ -53,7 +61,7 @@ function findJsonBlock(text: string): string | undefined {
  * it toward the schema, and accept it only if it then validates. Never fabricates
  * — returns undefined unless the parsed value genuinely satisfies the schema.
  */
-export function extractValidated<T>(text: string, schema: TSchema): T | undefined {
+export function extractValidated<T>(text: string, schema: WorkflowSchema): T | undefined {
   const json = findJsonBlock(text);
   if (json === undefined) return undefined;
   let parsed: unknown;
@@ -63,8 +71,8 @@ export function extractValidated<T>(text: string, schema: TSchema): T | undefine
     return undefined;
   }
   try {
-    const converted = Convert(schema, parsed);
-    if (Check(schema, converted)) return converted as T;
+    const converted = Convert(schema as TSchema, parsed);
+    if (Check(schema as TSchema, converted)) return converted as T;
   } catch {
     // typebox can throw on exotic schemas; treat as no match.
   }
@@ -122,7 +130,7 @@ export interface StructuredSession {
 export async function resolveStructuredOutput<T>(
   session: StructuredSession,
   capture: StructuredOutputCapture<T>,
-  schema: TSchema,
+  schema: WorkflowSchema,
   options: { maxSchemaRetries?: number; signal?: AbortSignal; label?: string },
   lastText: (messages: unknown[]) => string,
 ): Promise<T> {
@@ -201,6 +209,18 @@ export function resolveAgentModelSpec(
   return undefined;
 }
 
+export function resolveAgentThinkingLevel(
+  effort: ModelThinkingLevel | undefined,
+  modelThinking: ModelThinkingLevel | undefined,
+  inheritedThinking: CreateAgentSessionOptions["thinkingLevel"] | undefined,
+): CreateAgentSessionOptions["thinkingLevel"] | undefined {
+  return effort ?? modelThinking ?? inheritedThinking;
+}
+
+export type WorkflowSessionFactory = (options?: CreateAgentSessionOptions) => Promise<CreateAgentSessionResult>;
+export type WorkflowResourceLoaderOptions = ConstructorParameters<typeof DefaultResourceLoader>[0];
+export type WorkflowResourceLoaderFactory = (options: WorkflowResourceLoaderOptions) => ResourceLoader;
+
 export interface WorkflowAgentOptions {
   cwd?: string;
   /** Extra tools available to the subagent in addition to the structured output tool. */
@@ -231,6 +251,14 @@ export interface WorkflowAgentOptions {
    * Default: false (current behavior).
    */
   persistAgentSessions?: boolean;
+  /** Exact, case-insensitive symbolic model aliases supplied by workflow settings. */
+  modelAliases?: Record<string, string>;
+  /** Reject unresolved requested model specs instead of using the session default. */
+  strictModelResolution?: boolean;
+  /** Test/embedder seam for session creation. */
+  sessionFactory?: WorkflowSessionFactory;
+  /** Test/embedder seam for resource-loader construction. */
+  resourceLoaderFactory?: WorkflowResourceLoaderFactory;
 }
 
 /**
@@ -268,12 +296,17 @@ export function listAvailableModelSpecs(registry?: ModelRegistry): string[] {
   return listAvailableModels(registry).map((model) => model.spec);
 }
 
-/**
- * Emitted at most once per process: when an agent asks for a tier but no
- * model-tiers.json exists, the tier silently falls back to the session model.
- * Surface that once (with the mapping the user would get by configuring) so the
- * no-op is discoverable. Diagnostics only — never lets a failure break a run.
- */
+/** Resolve only an exact symbolic alias (case-insensitive); all other specs are unchanged. */
+export function resolveModelAlias(spec: string, aliases: Record<string, string> | undefined): string {
+  const key = spec.trim().toLowerCase();
+  if (!key || !aliases) return spec.trim();
+  for (const [alias, target] of Object.entries(aliases)) {
+    if (alias.trim().toLowerCase() === key && target.trim()) return target.trim();
+  }
+  return spec.trim();
+}
+
+/** Emit the unconfigured tier fallback diagnostic at most once per process. */
 let warnedTierUnconfigured = false;
 function warnTierUnconfiguredOnce(mainModel: string | undefined, registry: ModelRegistry): void {
   if (warnedTierUnconfigured) return;
@@ -285,12 +318,7 @@ function warnTierUnconfiguredOnce(mainModel: string | undefined, registry: Model
   }
 }
 
-/**
- * Emitted at most once per process when persistAgentSessions is enabled and a
- * session is actually persisted: full subagent transcripts (which may include
- * secrets or other sensitive context) are being written to disk. Surface the
- * privacy trade-off at run time, not only in the docs.
- */
+/** Warn once when persisted subagent sessions may contain sensitive context. */
 let warnedPersistSecrets = false;
 function warnPersistSecretsOnce(sessionDir: string): void {
   if (warnedPersistSecrets) return;
@@ -310,12 +338,7 @@ export interface AgentUsage {
   cost: number;
 }
 
-/**
- * Map session stats to an AgentUsage, or undefined when the provider reported
- * no usage at all (all-zero stats). Returning undefined — instead of a zero
- * breakdown — lets displays fall back to their scalar token count, so setups
- * on non-reporting providers render the same as before the split existed.
- */
+/** Map non-zero session stats to the normalized usage shared by callbacks and telemetry. */
 export function usageFromStats(stats: {
   tokens: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
   cost: number;
@@ -332,7 +355,26 @@ export function usageFromStats(stats: {
   };
 }
 
-export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefined> {
+export interface AgentTelemetry {
+  execution: "live" | "replay";
+  requestedModelSpec?: string;
+  resolvedModel?: string;
+  effectiveThinkingLevel?: string;
+  skillsEnabled?: boolean;
+  loadedSkillCount?: number;
+  activeToolNames?: string[];
+  activeToolCount?: number;
+  systemPromptChars?: number;
+  projectContextFileCount?: number;
+  projectContextChars?: number;
+  usage?: AgentUsage;
+  /** Whether all retry attempts settled and their captured usage can be accounted without races. */
+  accountingStatus?: "exact" | "incomplete";
+  /** Attempts that exceeded the bounded post-abort cleanup grace. */
+  accountingIncompleteAttempts?: number;
+}
+
+export interface AgentRunOptions<TSchemaDef extends WorkflowSchema | undefined = undefined> {
   label?: string;
   /**
    * Display name recorded on the persisted session (session_info entry) when
@@ -352,6 +394,8 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
    * (all-zero stats), so consumers keep their scalar fallback.
    */
   onUsage?: (usage: AgentUsage) => void;
+  /** Called once with exact live session/resource telemetry before disposal. */
+  onTelemetry?: (telemetry: AgentTelemetry) => void;
   /**
    * Model spec for this subagent: either `provider/modelId` (unambiguous) or a
    * bare `modelId`. When it can't be resolved, the session default is used and
@@ -367,6 +411,11 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
    * caring which concrete model backs that tier.
    */
   tier?: string;
+  /**
+   * Explicit Pi thinking level for this agent. Wins over a model `:thinking`
+   * suffix and over the inherited session thinking level.
+   */
+  effort?: ModelThinkingLevel;
   /** Called with the resolved model id once known (for display/telemetry). */
   onModelResolved?: (modelId: string) => void;
   /** Called when `model`/`tier`/phase resolved to a spec that wasn't found (fell back to session default). */
@@ -405,10 +454,18 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
    * omitted.
    */
   modelRegistry?: ModelRegistry;
+  /** Boolean skill policy bound from an agent definition. */
+  skills?: boolean;
+  /** Tier config snapshotted by the workflow runtime; null means no configured tiers. */
+  modelTierConfig?: ModelTierConfig | null;
+  /** Per-run aliases override constructor aliases. */
+  modelAliases?: Record<string, string>;
+  /** Per-run strictness overrides constructor strictness. */
+  strictModelResolution?: boolean;
 }
 
-export type AgentRunResult<TSchemaDef extends TSchema | undefined> = TSchemaDef extends TSchema
-  ? Static<TSchemaDef>
+export type AgentRunResult<TSchemaDef extends WorkflowSchema | undefined> = TSchemaDef extends WorkflowSchema
+  ? SchemaOutput<TSchemaDef>
   : string;
 
 export class WorkflowAgent {
@@ -420,6 +477,10 @@ export class WorkflowAgent {
   private readonly mainModel?: string;
   /** Shared registry from the host session, when provided. */
   private readonly sharedRegistry?: ModelRegistry;
+  private readonly modelAliases?: Record<string, string>;
+  private readonly strictModelResolution: boolean;
+  private readonly sessionFactory: WorkflowSessionFactory;
+  private readonly resourceLoaderFactory: WorkflowResourceLoaderFactory;
   /** Lazily built once; shares the SDK's agentDir/auth so resolved models are authed. */
   private registry?: ModelRegistry;
 
@@ -431,6 +492,11 @@ export class WorkflowAgent {
     this.instructions = options.instructions;
     this.mainModel = options.mainModel;
     this.sharedRegistry = options.modelRegistry;
+    this.modelAliases = options.modelAliases;
+    this.strictModelResolution = options.strictModelResolution ?? false;
+    this.sessionFactory = options.sessionFactory ?? createAgentSession;
+    this.resourceLoaderFactory =
+      options.resourceLoaderFactory ?? ((loaderOptions) => new DefaultResourceLoader(loaderOptions));
   }
 
   /**
@@ -453,6 +519,11 @@ export class WorkflowAgent {
       this.registry = ModelRegistry.create(auth, join(dir, "models.json"));
     }
     return this.registry;
+  }
+
+  /** Resolve the exact registry this runner will use, for deterministic replay hashing. */
+  getModelRegistry(perRunRegistry?: ModelRegistry): ModelRegistry {
+    return this.getRegistry(perRunRegistry);
   }
 
   /**
@@ -492,7 +563,7 @@ export class WorkflowAgent {
     unlinkSync(probePath);
   }
 
-  async run<TSchemaDef extends TSchema | undefined = undefined>(
+  async run<TSchemaDef extends WorkflowSchema | undefined = undefined>(
     prompt: string,
     options: AgentRunOptions<TSchemaDef> = {},
   ): Promise<AgentRunResult<TSchemaDef>> {
@@ -521,19 +592,31 @@ export class WorkflowAgent {
     // Resolve the model spec (explicit model > tier > session default). This
     // composes with phase-based routing in workflow.ts, which only supplies
     // options.model when a phase pattern matches — so an explicit model wins.
-    const modelSpec = resolveAgentModelSpec(options, this.mainModel, loadModelTierConfig, () =>
-      warnTierUnconfiguredOnce(this.mainModel, this.getRegistry(options.modelRegistry)),
+    const modelSpec = resolveAgentModelSpec(
+      options,
+      this.mainModel,
+      () => (options.modelTierConfig === undefined ? loadModelTierConfig() : options.modelTierConfig),
+      () => warnTierUnconfiguredOnce(this.mainModel, this.getRegistry(options.modelRegistry)),
     );
 
-    // Resolve a requested model spec to a Model object. Specs use Pi CLI-style
-    // parsing, including an optional :thinking suffix such as gpt-5.5:xhigh.
-    // A given-but-unresolved spec falls back to the session default (with a
-    // warning) rather than failing.
+    // Resolve an exact symbolic alias before the existing CLI-style parsing and
+    // fuzzy matching. The original requested spec remains untouched for telemetry.
+    const aliases = options.modelAliases ?? this.modelAliases;
+    const effectiveModelSpec = modelSpec ? resolveModelAlias(modelSpec, aliases) : undefined;
+    const strictModelResolution = options.strictModelResolution ?? this.strictModelResolution;
     const modelRegistry = this.getRegistry(options.modelRegistry);
     let resolvedModel: Model<any> | undefined;
     let resolvedThinkingLevel: CreateAgentSessionOptions["thinkingLevel"] | undefined;
-    if (modelSpec) {
-      const resolved = resolveModelSpecWithThinking(modelSpec, modelRegistry);
+    if (effectiveModelSpec) {
+      const resolved = resolveModelSpecWithThinking(effectiveModelSpec, modelRegistry);
+      const syntheticCustomModel = resolved.warning?.includes("Using custom model id") ?? false;
+      if (strictModelResolution && (!resolved.model || syntheticCustomModel)) {
+        throw new WorkflowError(
+          `Model "${modelSpec}" resolved to "${effectiveModelSpec}" but was not found`,
+          WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+          { recoverable: false, agentLabel: options.label },
+        );
+      }
       if (resolved.warning) console.warn(`[workflow] ${resolved.warning}`);
       if (resolved.model) {
         resolvedModel = resolved.model;
@@ -541,25 +624,49 @@ export class WorkflowAgent {
         options.onModelResolved?.(resolved.resolvedSpec ?? canonicalModelSpec(resolved.model));
       } else {
         console.warn(`[workflow] model "${modelSpec}" not found; using session default`);
-        options.onModelFallback?.(modelSpec);
+        options.onModelFallback?.(modelSpec ?? effectiveModelSpec);
       }
     }
+    const thinkingLevel = resolveAgentThinkingLevel(
+      options.effort,
+      resolvedThinkingLevel,
+      this.sessionOptions.thinkingLevel,
+    );
 
     const agentDir = getAgentDir();
+    const injectedResourceLoader = this.sessionOptions.resourceLoader;
+    if (options.skills === false && injectedResourceLoader) {
+      throw new WorkflowError(
+        "skills:false cannot be enforced with an explicitly injected session.resourceLoader",
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        { recoverable: false, agentLabel: options.label },
+      );
+    }
+    // Use one real SettingsManager for both loader and session so extensions,
+    // prompts, themes, project context, model settings, and custom tools retain
+    // the SDK's default discovery behavior. Only skills are suppressed.
+    const settingsManager = this.sessionOptions.settingsManager ?? SettingsManager.create(this.cwd, agentDir);
+    const resourceLoader =
+      injectedResourceLoader ??
+      this.resourceLoaderFactory({
+        cwd: runCwd,
+        agentDir,
+        settingsManager,
+        ...(options.skills === false ? { noSkills: true } : {}),
+      });
+    if (!injectedResourceLoader) await resourceLoader.reload();
+
     // Key persisted sessions by the runner's project cwd (this.cwd), NOT the
     // per-call runCwd: agents working in short-lived git worktrees should still
     // group under the project's session dir instead of scattering across
     // temporary worktree paths.
     const sessionManager = this.createSessionManager();
-    const { session } = await createAgentSession({
+    const { session } = await this.sessionFactory({
       cwd: runCwd,
       agentDir,
       sessionManager,
-      // Use real SettingsManager to inherit user's default provider/model settings.
-      // SettingsManager.inMemory() doesn't load ~/.pi/settings.json, so subagents
-      // would fall back to the first available model (e.g. openai-codex) which may
-      // not have valid auth, causing silent empty responses.
-      settingsManager: SettingsManager.create(this.cwd, agentDir),
+      settingsManager,
+      resourceLoader,
       customTools,
       // Per-run modelRegistry wins over the constructor's shared registry
       // (see getRegistry() precedence above).
@@ -569,7 +676,7 @@ export class WorkflowAgent {
       ...this.sessionOptions,
       // Per-call model/thinking wins over any sessionOptions defaults.
       ...(resolvedModel ? { model: resolvedModel } : {}),
-      ...(resolvedThinkingLevel ? { thinkingLevel: resolvedThinkingLevel } : {}),
+      ...(thinkingLevel !== undefined ? { thinkingLevel } : {}),
     });
 
     // Name the persisted session so it's identifiable in session pickers.
@@ -636,13 +743,35 @@ export class WorkflowAgent {
       } catch {
         // History is diagnostic only; never let it mask the real result/error.
       }
-      // Read real usage before disposing — dispose tears down the session state.
-      if (options.onUsage) {
+      // Read stats exactly once, then feed the same normalized value to both
+      // callbacks so accounting and telemetry can never diverge.
+      let usage: AgentUsage | undefined;
+      try {
+        usage = usageFromStats(session.getSessionStats());
+        if (usage) options.onUsage?.(usage);
+      } catch {
+        // Diagnostics are best-effort; never mask the real result/error.
+      }
+      if (options.onTelemetry) {
         try {
-          const usage = usageFromStats(session.getSessionStats());
-          if (usage) options.onUsage(usage);
+          const contextFiles = resourceLoader.getAgentsFiles().agentsFiles;
+          const activeToolNames = session.getActiveToolNames();
+          options.onTelemetry({
+            execution: "live",
+            requestedModelSpec: modelSpec,
+            resolvedModel: session.model ? canonicalModelSpec(session.model) : undefined,
+            effectiveThinkingLevel: session.thinkingLevel,
+            skillsEnabled: options.skills !== false,
+            loadedSkillCount: resourceLoader.getSkills().skills.length,
+            activeToolNames,
+            activeToolCount: activeToolNames.length,
+            systemPromptChars: session.systemPrompt.length,
+            projectContextFileCount: contextFiles.length,
+            projectContextChars: contextFiles.reduce((total, file) => total + file.content.length, 0),
+            usage,
+          });
         } catch {
-          // Usage is best-effort; never let stats failure mask the real result/error.
+          // Telemetry is diagnostic only; never mask the real result/error.
         }
       }
       session.dispose();

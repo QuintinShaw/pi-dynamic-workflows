@@ -4,15 +4,35 @@
 
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { AgentUsage } from "./agent.js";
+import type { AgentTelemetry, AgentUsage } from "./agent.js";
 import type { AgentHistoryEntry } from "./agent-history.js";
 import type { WorkflowErrorCode } from "./errors.js";
 import { workflowProjectPaths } from "./workflow-paths.js";
 
 export type RunStatus = "pending" | "running" | "paused" | "completed" | "failed" | "aborted";
 
+export const RUN_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
+export function assertValidRunId(runId: string): void {
+  if (!RUN_ID_PATTERN.test(runId)) {
+    throw new Error("Invalid workflow run ID");
+  }
+}
+
+export interface PersistedExecutionPolicy {
+  cwd: string;
+  maxAgents: number;
+  agentTimeoutMs: number | null;
+  tokenBudget: number | null;
+  concurrency: number;
+  agentRetries: number;
+  agentTypePolicy: "fallback" | "error";
+}
+
 export interface PersistedAgentState {
   id: number;
+  /** Internal deterministic invocation identity for duplicate-label correlation. */
+  callId?: string;
   label: string;
   phase?: string;
   prompt: string;
@@ -30,6 +50,7 @@ export interface PersistedAgentState {
   tokenUsage?: AgentUsage;
   /** The model this agent ran on (provider/id), when known. */
   model?: string;
+  telemetry?: AgentTelemetry;
 }
 
 export interface PersistedRunState {
@@ -37,6 +58,12 @@ export interface PersistedRunState {
   workflowName: string;
   script: string;
   args?: unknown;
+  /** Working directory used by this run. Optional only for legacy records. */
+  cwd?: string;
+  /** Effective limits and policy used by this run. Optional only for legacy records. */
+  executionPolicy?: PersistedExecutionPolicy;
+  /** Effective unknown-agent policy for this execution, including per-run overrides. */
+  agentTypePolicy?: "fallback" | "error";
   /** The pi session this run belongs to. Runs persist on disk across sessions but
    * the navigator shows only the current session's runs (undefined = legacy/global). */
   sessionId?: string;
@@ -62,19 +89,35 @@ export interface PersistedRunState {
     cacheRead?: number;
     cacheWrite?: number;
   };
-  /** Cached agent results for resume, keyed by deterministic call index. */
-  journal?: Array<{ index: number; hash: string; result: unknown }>;
-  /**
-   * Opt-out of auto-resume for this run (default true, i.e. eligible unless
-   * explicitly set to false via ExecOptions.autoResume). Set once at run start
-   * and carried through resumes; see UsageLimitScheduler.
-   */
+  /** Cached agent/atomic-child results for resume, keyed by deterministic call index. */
+  journal?: Array<{
+    index: number;
+    hash: string;
+    result: unknown;
+    storeDelta?: Record<string, unknown>;
+    storeVersions?: Record<string, number>;
+    telemetry?: AgentTelemetry;
+    agentCount?: number;
+    resultKind?: "void";
+    childAgents?: Array<{
+      /** Internal deterministic invocation identity for duplicate-label correlation. */
+      callId?: string;
+      label: string;
+      phase?: string;
+      prompt: string;
+      result: unknown;
+      tokens?: number;
+      tokenUsage?: AgentUsage;
+      model?: string;
+      error?: string;
+      errorCode?: WorkflowErrorCode;
+      recoverable?: boolean;
+      telemetry?: AgentTelemetry;
+    }>;
+  }>;
+  /** Whether usage-limit auto-resume is enabled for this run. */
   autoResume?: boolean;
-  /**
-   * Auto-resume attempt counter for the current usage_limit pause-cycle, owned
-   * and persisted by UsageLimitScheduler (best-effort). Absent/0 means no
-   * auto-resume attempt has been recorded yet.
-   */
+  /** Auto-resume attempts for the current usage-limit pause cycle. */
   autoResumeAttempts?: number;
 }
 
@@ -85,8 +128,8 @@ export interface RunPersistence {
   load(runId: string): PersistedRunState | null;
   /** List all persisted runs. */
   list(): PersistedRunState[];
-  /** Delete a persisted run. */
-  delete(runId: string): boolean;
+  /** Delete a persisted run, optionally retaining its active execution lease. */
+  delete(runId: string, options?: { preserveLock?: boolean }): boolean;
   /**
    * Acquire an exclusive cross-process lease for a run. Returns null when another
    * live process owns the run; stale/corrupt lock files are removed and retried.
@@ -187,6 +230,7 @@ export function createRunPersistence(cwd: string, fsOverride?: Partial<FsLayer>)
 
   return {
     save(state: PersistedRunState) {
+      assertValidRunId(state.runId);
       ensureDir();
       state.updatedAt = new Date().toISOString();
       const path = primaryRunPath(state.runId);
@@ -204,6 +248,7 @@ export function createRunPersistence(cwd: string, fsOverride?: Partial<FsLayer>)
     },
 
     load(runId: string): PersistedRunState | null {
+      assertValidRunId(runId);
       // Try the primary, then the .bak — so a corrupt primary doesn't lose the run.
       for (const path of candidateRunPaths(runId)) {
         for (const candidate of [path, `${path}.bak`]) {
@@ -239,13 +284,17 @@ export function createRunPersistence(cwd: string, fsOverride?: Partial<FsLayer>)
       return [...byRunId.values()].sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
     },
 
-    delete(runId: string): boolean {
+    delete(runId: string, options: { preserveLock?: boolean } = {}): boolean {
+      assertValidRunId(runId);
       let deleted = false;
       try {
         for (const path of candidateRunPaths(runId)) {
           const dir = path === primaryRunPath(runId) ? runsDir : legacyRunsDir;
-          // Best-effort cleanup of the sidecar files alongside the primary.
-          for (const sidecar of [`${path}.bak`, `${path}.tmp`, lockPath(dir, runId)]) {
+          // Best-effort cleanup of sidecars. An active deletion retains the
+          // token-owned lock until the cancelled execution settles and releases it.
+          const sidecars = [`${path}.bak`, `${path}.tmp`];
+          if (!options.preserveLock) sidecars.push(lockPath(dir, runId));
+          for (const sidecar of sidecars) {
             try {
               if (_existsSync(sidecar)) _unlinkSync(sidecar);
             } catch {
@@ -268,6 +317,7 @@ export function createRunPersistence(cwd: string, fsOverride?: Partial<FsLayer>)
     },
 
     acquireRunLease(runId: string): RunLease | null {
+      assertValidRunId(runId);
       ensureDir();
       const path = primaryRunPath(runId);
       const lock = primaryLockPath(runId);
@@ -302,6 +352,7 @@ export function createRunPersistence(cwd: string, fsOverride?: Partial<FsLayer>)
     },
 
     releaseRunLease(lease: RunLease): void {
+      assertValidRunId(lease.runId);
       try {
         const existing = readLock(lease.runId);
         if (existing?.token === lease.token) _unlinkSync(primaryLockPath(lease.runId));

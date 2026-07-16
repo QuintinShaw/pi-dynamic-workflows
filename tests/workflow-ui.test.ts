@@ -24,6 +24,20 @@ function fakeManager(): Pick<WorkflowManager, "listRuns" | "getRun"> {
         resultPreview: "found 2",
         tokens: 100,
         model: "fast-llm/model",
+        telemetry: {
+          execution: "live",
+          requestedModelSpec: "haiku",
+          resolvedModel: "fast-llm/model",
+          effectiveThinkingLevel: "high",
+          skillsEnabled: false,
+          loadedSkillCount: 0,
+          activeToolNames: ["read", "context_search"],
+          activeToolCount: 2,
+          systemPromptChars: 1234,
+          projectContextFileCount: 2,
+          projectContextChars: 456,
+          usage: { input: 50, output: 20, cacheRead: 30, cacheWrite: 0, total: 100, cost: 0.01 },
+        },
       },
       {
         id: 2,
@@ -464,6 +478,14 @@ test("renderNavigator shows agent detail view", () => {
   assert.match(text, /Status:/);
   assert.match(text, /Model:/);
   assert.match(text, /model/); // shortModel strips provider prefix
+  assert.match(text, /Routing:.*haiku -> fast-llm\/model/);
+  assert.match(text, /Thinking:.*high/);
+  assert.match(text, /Skills:.*off \(0 loaded\)/);
+  assert.match(text, /Tools:.*2/);
+  assert.match(text, /Prompt chars:.*1,234/);
+  assert.match(text, /Context:.*2 files.*456 chars/);
+  assert.match(text, /Usage:.*input 50.*cache read 30.*\$0\.0100/);
+  assert.match(text, /Tool names:.*read, context_search/);
   assert.match(text, /j\/k scroll/); // detail view footer
 });
 

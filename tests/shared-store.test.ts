@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { AgentDefinition, AgentRegistry } from "../src/agent-registry.js";
 import { SharedStore } from "../src/shared-store.js";
-import { runWorkflow } from "../src/workflow.js";
+import { type JournalEntry, runWorkflow } from "../src/workflow.js";
 
 // ─── SharedStore unit tests ───────────────────────────────────────────────────
 
@@ -13,6 +13,18 @@ test("SharedStore.put / get / has basics", () => {
   store.put("x", 42);
   assert.equal(store.has("x"), true);
   assert.equal(store.get("x"), 42);
+});
+
+test("SharedStore rejects prototype-pollution keys without mutating object prototypes", () => {
+  const store = new SharedStore();
+  for (const key of ["__proto__", "prototype", "constructor"]) {
+    assert.throws(() => store.put(key, { polluted: true }), /unsafe shared-store key/);
+    assert.throws(() => store.trackPut(key, { polluted: true }, `scope:${key}`), /unsafe shared-store key/);
+    assert.throws(() => store.get(key), /unsafe shared-store key/);
+    assert.throws(() => store.has(key), /unsafe shared-store key/);
+  }
+  assert.equal(({} as { polluted?: boolean }).polluted, undefined);
+  assert.deepEqual(store.snapshot(), {});
 });
 
 test("SharedStore.snapshot returns deep copy", () => {
@@ -48,6 +60,18 @@ test("SharedStore.applyDelta adds keys without clearing", () => {
   assert.equal(store.get("newKey"), "added");
 });
 
+test("SharedStore.applyDelta validates the full delta before mutating", () => {
+  const store = new SharedStore();
+  store.put("existing", "keep");
+
+  assert.throws(
+    () => store.applyDelta({ valid: "must-not-apply", invalid: "rejected" }, { valid: 10, invalid: -1 }),
+    /invalid shared-store write version/,
+  );
+  assert.equal(store.has("valid"), false);
+  assert.equal(store.get("existing"), "keep");
+});
+
 test("SharedStore.applyDelta: replaying parallel-agent deltas in callSeq order is correct", () => {
   // Scenario: agents 2 and 3 run in parallel.
   // Agent 3 finishes first and writes {y: 2}; agent 2 writes {x: 1}.
@@ -67,13 +91,37 @@ test("SharedStore.applyDelta: replaying parallel-agent deltas in callSeq order i
   assert.equal(store.get("y"), 2, "agent 3 write must be present");
 });
 
-test("SharedStore.dispose clears map and agent deltas", () => {
-  const store = new SharedStore();
-  store.put("k", "v");
-  store.trackPut("k2", "v2", "run-1:1");
-  store.dispose();
-  assert.equal(store.get("k"), undefined);
-  assert.deepEqual(store.commitDelta("run-1:1"), {});
+test("disposed child stores are permanently closed and cannot read parents or accept writes", () => {
+  const parent = new SharedStore();
+  parent.put("parent-secret", "visible-only-while-active");
+  const child = parent.createChildScope();
+
+  assert.equal(child.get("parent-secret"), "visible-only-while-active");
+  child.put("local", "active-write");
+  assert.equal(child.get("local"), "active-write");
+
+  child.dispose();
+
+  const operations = [
+    () => child.get("parent-secret"),
+    () => child.has("parent-secret"),
+    () => child.put("orphan", "rejected"),
+    () => child.trackPut("orphan", "rejected", "late-attempt"),
+    () => child.snapshot(),
+    () => child.prepareDelta("late-attempt"),
+    () => child.commitDelta("late-attempt"),
+    () => child.discardDelta("late-attempt"),
+    () => child.createChildScope(),
+    () => child.prepareChildScope(),
+    () => child.commitChildScope(),
+    () => child.applyDelta({ orphan: "rejected" }),
+    () => child.restore({ orphan: "rejected" }),
+  ];
+  for (const operation of operations) assert.throws(operation, /shared store is disposed/);
+
+  assert.equal(parent.has("orphan"), false);
+  assert.equal(parent.get("parent-secret"), "visible-only-while-active");
+  assert.doesNotThrow(() => child.dispose(), "dispose remains idempotent");
 });
 
 // ─── Delta-key collision regression (defect: nested workflow() shares a store
@@ -148,6 +196,61 @@ test("each runWorkflow call gets an isolated SharedStore: run 2 does not see run
   await runWorkflow(getScript, { agent, cwd: process.cwd() });
 
   assert.equal(readsByRun.get, false, "a second, independent runWorkflow call must not see run 1's store writes");
+});
+
+test("parallel attempts cannot observe another attempt's uncommitted writes", async () => {
+  let writerHasPut!: () => void;
+  const writerPut = new Promise<void>((resolve) => {
+    writerHasPut = resolve;
+  });
+  let readerHasRead!: () => void;
+  const readerRead = new Promise<void>((resolve) => {
+    readerHasRead = resolve;
+  });
+  const script = `export const meta = { name: 'pending-isolation', description: 'pending isolation' }
+return await parallel([
+  () => agent('reader'),
+  () => agent('writer'),
+])`;
+
+  const journal: JournalEntry[] = [];
+  const runner = {
+    async run(
+      prompt: string,
+      options: {
+        systemTools?: Array<{
+          name: string;
+          execute: (id: string, params: unknown) => Promise<{ details?: Record<string, unknown> }>;
+        }>;
+      },
+    ) {
+      const putTool = options.systemTools?.find((tool) => tool.name === "store_put");
+      const getTool = options.systemTools?.find((tool) => tool.name === "store_get");
+      if (prompt === "writer") {
+        await putTool?.execute("", { key: "pending", value: "must-stay-private" });
+        writerHasPut();
+        await readerRead;
+        throw new Error("writer failed");
+      }
+      await writerPut;
+      const observed = await getTool?.execute("", { key: "pending" });
+      readerHasRead();
+      return observed?.details;
+    },
+  };
+  const result = await runWorkflow<Array<{ found: boolean; value: unknown } | null>>(script, {
+    persistLogs: false,
+    agent: runner,
+    onAgentJournal: (entry) => journal.push(entry),
+  });
+
+  assert.deepEqual(result.result, [{ key: "pending", found: false, value: null }, null]);
+  const replay = await runWorkflow<Array<{ found: boolean; value: unknown } | null>>(script, {
+    persistLogs: false,
+    agent: runner,
+    resumeJournal: new Map(journal.map((entry) => [entry.index, entry])),
+  });
+  assert.deepEqual(replay.result, result.result, "replay must expose the same committed-only state as live execution");
 });
 
 test("store_put/store_get are injected as systemTools even under a restrictive agentType tools allowlist", async () => {

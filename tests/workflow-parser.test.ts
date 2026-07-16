@@ -169,6 +169,15 @@ test("parseWorkflowScript still parses a removed/unknown meta field (e.g. whenTo
   assert.equal(parsed.meta.name, "demo");
 });
 
+test("parseWorkflowScript ignores nondeterministic API names in comments and strings", () => {
+  const parsed = parseWorkflowScript(
+    "export const meta = { name: 'demo', description: 'desc' }\n" +
+      "// Date.now() Math.random() new Date()\n" +
+      "return `Date.now() Math.random() new Date()`",
+  );
+  assert.match(parsed.body, /Date\.now\(\)/);
+});
+
 test("parseWorkflowScript rejects nondeterministic APIs", () => {
   assert.throws(
     () => parseWorkflowScript("export const meta = { name: 'demo', description: 'desc' }\nreturn Date.now()"),

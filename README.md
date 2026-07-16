@@ -114,6 +114,7 @@ For an always-on exhaustive mode, use `/ultracode`; `/effort high` is the lighte
 | `/workflows` | Open the interactive run navigator |
 | `/workflows run <prompt>` | Force a workflow even when keyword triggering is off |
 | `/workflows status <id>` | Watch a run and print its result when complete |
+| `/workflows report <id>` | Print persisted per-agent routing, context, tool, telemetry, and usage details |
 | `/workflows pause\|resume\|stop\|rm <id>` | Control a run |
 | `/workflows save <name>` | Save the latest script as a reusable command |
 | `/workflows-trigger off\|on\|status` | Control automatic keyword triggering |
@@ -136,7 +137,7 @@ In the navigator: `↑/↓` select · `enter/→` open · `esc/←` back · `p` 
 | `phase(title, { budget? })` | Group work in the live view and optionally set a phase budget |
 | `verify` / `judgePanel` | Cross-check a result or choose the best candidate |
 | `loopUntilDry` / `completenessCheck` | Repeat discovery until no new findings remain |
-| `workflow(name, args)` | Run a saved workflow inline |
+| `workflow(nameOrSourceOrDescriptor, args)` | Run a saved name, raw source, or cwd-contained `{ scriptPath }` inline |
 | `checkpoint(prompt, opts)` | Add a journaled human-approval gate |
 | `budget` | Inspect real tokens spent and remaining |
 
@@ -144,9 +145,10 @@ In the navigator: `↑/↓` select · `enter/→` open · `esc/←` back · `p` 
 | --- | --- |
 | `tier` | `small`, `medium`, or `big` model routing |
 | `model` | Exact `provider/modelId` or `provider/modelId:thinking`; overrides `tier` |
-| `agentType` | Named role, tool, and model definition |
+| `effort` | Explicit Pi thinking level; overrides model suffix and inherited thinking |
+| `agentType` | Named role, tool, skill policy, and model definition |
 | `isolation` | Use `"worktree"` for conflict-free parallel edits |
-| `schema` | JSON Schema for a validated structured result |
+| `schema` | TypeBox or literal JSON Schema for a validated structured result |
 | `label` / `phase` | Display label and phase override |
 | `timeoutMs` / `retries` | Optional per-agent timeout and recoverable-failure retries |
 
@@ -169,6 +171,17 @@ Model tiers live at `~/.pi/workflows/model-tiers.json` and accept Pi CLI-style t
 
 Use `/workflows-models` to edit them interactively. Without a config, the extension ranks authenticated models by capability hints and assigns distinct models when possible.
 
+Exact, case-insensitive symbolic aliases and strict resolution can be configured globally or per project:
+
+```json
+{
+  "modelAliases": { "haiku": "openai-codex/gpt-5.4-mini" },
+  "strictModelResolution": true
+}
+```
+
+Alias targets, configured tiers, the implicit medium tier, phase/default routes, and effective thinking participate in resume identity. Changing an effective route reruns affected work; unrelated alias edits do not invalidate direct `agent()` calls.
+
 Runs have no default token budget or per-agent hard timeout. Add `tokenBudget`, `agentTimeoutMs`, phase budgets, or agent `timeoutMs` when you need explicit gates. `concurrency` is clamped to 16; `agentRetries` retries only recoverable failures. Defaults can be set in `~/.pi/workflows/settings.json`.
 
 </details>
@@ -184,7 +197,13 @@ Extension state lives outside the repository under `~/.pi/workflows`:
 
 Subagents are in-memory by default. Set `persistAgentSessions: true` to retain full transcripts in Pi's standard session directory. This creates one file per agent and may store sensitive material that an agent read, so enable it deliberately.
 
-Completed background runs persist their full result in the project run JSON. The conversation delivery includes a pointer to that file when the visible summary is shortened.
+Completed background runs persist their full result in the project run JSON. The conversation delivery includes a pointer to that file when the visible summary is shortened. Execution cwd and limits are also persisted, so cold resume keeps the original policy and consumed token-budget semantics.
+
+The top-level tool supports `run`, `resume`, and `status` actions. `run` accepts exactly one of raw `script` or a `scriptPath` contained by the realpath of `ctx.cwd`; files are read fresh, and traversal, symlink escapes, missing paths, and directories are rejected. `resume` accepts a run ID plus an optional safe shallow args patch. The edit-and-resume compatibility form uses `resumeFromRunId` with a revised `script` or `scriptPath`.
+
+Nested workflow calls are atomic journal entries. Their deterministic result, shared-store delta, logical agent count, and child telemetry are replayed without rerunning or double-counting agents. Nesting is limited to one level; child args must be deterministic JSON-serializable values, and `{ scriptPath }` resolves from the workflow cwd.
+
+`WorkflowManager.resume(runId, { argsPatch })` performs the same safe shallow patch used by the tool. Set `agentTypePolicy: "error"` to reject unknown named agent definitions instead of using the compatibility fallback. Structured output accepts TypeBox or plain JSON Schema.
 
 </details>
 
@@ -222,6 +241,10 @@ The default `workflow` also matches `workflows`; a custom word matches exactly. 
 ## Determinism and limits
 
 Workflow scripts run in a Node `vm` sandbox. `Date.now()`, `Math.random()`, `new Date()`, `require`, `import`, filesystem access, and network access are unavailable inside the orchestration script. Subagents use their assigned tools; keeping the orchestrator deterministic is what makes journal replay reliable.
+
+Named agent definitions are loaded from project `.pi/agents`, primary user `~/.pi/agent/agents`, and the deprecated `~/.pi/agents` fallback. Literal boolean `skills: false` disables skill loading for that subagent while preserving normal extensions, context, prompts, themes, settings, model registration, and tools.
+
+`/workflows report <runId>` shows live/replay/legacy execution markers, requested and resolved models, effective thinking, skills, tools, system/context sizes, and exact provider usage when available. Missing legacy telemetry remains explicitly unavailable rather than being fabricated.
 
 Journal replay — including edit-and-resume via `resumeFromRunId` — matches cached agent results by **positional call index** (the order in which `agent()` calls execute), the same contract Claude Code uses. Editing an `agent()` prompt in place reuses the cache up to that call and re-runs it and everything after. Inserting, removing, or reordering an `agent()` call before others shifts their positions and invalidates the cache from that point on (mismatched calls simply re-run — no crash). To preserve the cached prefix, keep the earlier still-good `agent()` calls unchanged and in the same order.
 

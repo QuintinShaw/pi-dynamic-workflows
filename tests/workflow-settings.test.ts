@@ -242,6 +242,82 @@ describe("workflow settings", () => {
     });
   });
 
+  it("normalizes safe model aliases and strict model resolution", () => {
+    withSettingsPath((settingsPath) => {
+      mkdirSync(dirname(settingsPath), { recursive: true });
+      writeFileSync(
+        settingsPath,
+        JSON.stringify({
+          modelAliases: {
+            " HaIkU ": " openai-codex/gpt-5.6-luna ",
+            blank: "   ",
+            "   ": "vendor/model",
+            numeric: 42,
+          },
+          strictModelResolution: true,
+        }),
+        "utf-8",
+      );
+
+      assert.deepEqual(loadWorkflowSettings(settingsPath), {
+        modelAliases: { haiku: "openai-codex/gpt-5.6-luna" },
+        strictModelResolution: true,
+      });
+    });
+  });
+
+  it("rejects unsafe and malformed model alias objects", () => {
+    withSettingsPath((settingsPath) => {
+      mkdirSync(dirname(settingsPath), { recursive: true });
+      writeFileSync(
+        settingsPath,
+        '{"modelAliases":{"safe":"vendor/model","__proto__":"polluted","constructor":"bad","prototype":"bad"}}',
+        "utf-8",
+      );
+      assert.deepEqual(loadWorkflowSettings(settingsPath), { modelAliases: { safe: "vendor/model" } });
+      assert.equal(({} as { polluted?: string }).polluted, undefined);
+
+      for (const modelAliases of [null, [], "haiku", 42]) {
+        writeFileSync(settingsPath, JSON.stringify({ modelAliases }), "utf-8");
+        assert.deepEqual(loadWorkflowSettings(settingsPath), {});
+      }
+    });
+  });
+
+  it("project model aliases replace global aliases using the existing shallow merge", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-alias-settings-"));
+    const cwd = join(dir, "project");
+    const globalPath = join(dir, "global.json");
+    const projectPath = join(dir, "project.json");
+    try {
+      saveWorkflowSettings(
+        { modelAliases: { haiku: "global/haiku", sonnet: "global/sonnet" }, strictModelResolution: false },
+        globalPath,
+      );
+      saveWorkflowSettings(
+        { modelAliases: { haiku: "project/haiku" }, strictModelResolution: true },
+        { cwd, settingsPath: globalPath, projectSettingsPath: projectPath, scope: "project" },
+      );
+
+      assert.deepEqual(loadWorkflowSettings({ cwd, settingsPath: globalPath, projectSettingsPath: projectPath }), {
+        modelAliases: { haiku: "project/haiku" },
+        strictModelResolution: true,
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("ignores non-boolean strictModelResolution values", () => {
+    withSettingsPath((settingsPath) => {
+      mkdirSync(dirname(settingsPath), { recursive: true });
+      for (const strictModelResolution of ["true", 1, null]) {
+        writeFileSync(settingsPath, JSON.stringify({ strictModelResolution }), "utf-8");
+        assert.deepEqual(loadWorkflowSettings(settingsPath), {});
+      }
+    });
+  });
+
   it("project persistAgentSessions overrides the global setting", () => {
     const dir = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-persist-settings-"));
     const cwd = join(dir, "project");

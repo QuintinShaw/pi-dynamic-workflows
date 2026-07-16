@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { closeSync, mkdirSync, mkdtempSync, openSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import test from "node:test";
 import type { AgentUsage } from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
+import { resolveWorkflowScriptPath } from "../src/workflow.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { backgroundStartedText, createWorkflowTool, modelRoutingGuideline } from "../src/workflow-tool.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
@@ -31,6 +32,169 @@ test("backgroundStartedText tells the user it auto-continues and they can wait",
 });
 
 // ─── createWorkflowTool ────────────────────────────────────────────────────────
+
+test("workflow tool accepts exactly one fresh, cwd-contained scriptPath source", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-dw-tool-"));
+  const outside = mkdtempSync(join(tmpdir(), "pi-dw-tool-outside-"));
+  try {
+    const script = "export const meta = { name: 'path-workflow', description: 'path workflow' }\nreturn args";
+    const scriptPath = join(root, "workflow.js");
+    writeFileSync(scriptPath, script);
+    const captured: Array<{ script: string; args: unknown; cwd?: string }> = [];
+    const manager = {
+      getModelRegistry: () => undefined,
+      startInBackground(source: string, args: unknown, options?: { cwd?: string }) {
+        captured.push({ script: source, args, cwd: options?.cwd });
+        return { runId: "run-path", promise: Promise.resolve({}) };
+      },
+    } as any;
+    const tool = createWorkflowTool({ cwd: root, manager });
+    const execute = tool.execute as any;
+
+    await execute("call", { scriptPath: "workflow.js", args: { fresh: true } }, undefined, undefined, { cwd: root });
+    assert.deepEqual(captured, [{ script, args: { fresh: true }, cwd: root }]);
+    writeFileSync(scriptPath, script.replace("path-workflow", "updated-workflow"));
+    await execute("call", { scriptPath: "workflow.js", args: { fresh: false } }, undefined, undefined, { cwd: root });
+    assert.equal(captured[1]?.script, script.replace("path-workflow", "updated-workflow"));
+
+    const outsidePath = join(outside, "outside.js");
+    writeFileSync(outsidePath, script);
+    const invalid = [
+      [{ script: script, scriptPath: "workflow.js" }, /exactly one/],
+      [{}, /exactly one/],
+      [{ scriptPath: "   " }, /non-empty/],
+      [{ scriptPath: "missing.js" }, /does not exist/],
+      [{ scriptPath: relative(root, outsidePath) }, /escapes workflow cwd/],
+    ] as const;
+    for (const [params, message] of invalid) {
+      await assert.rejects(() => execute("call", params, undefined, undefined, { cwd: root }), message);
+    }
+
+    mkdirSync(join(root, "directory"));
+    await assert.rejects(
+      () => execute("call", { scriptPath: "directory" }, undefined, undefined, { cwd: root }),
+      /must reference a file/,
+    );
+    symlinkSync(outsidePath, join(root, "linked.js"));
+    await assert.rejects(
+      () => execute("call", { scriptPath: "linked.js" }, undefined, undefined, { cwd: root }),
+      /escapes workflow cwd/,
+    );
+    symlinkSync(scriptPath, join(root, "internal-link.js"));
+    await assert.rejects(
+      () => execute("call", { scriptPath: "internal-link.js" }, undefined, undefined, { cwd: root }),
+      /symlink/,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test("scriptPath rejects deterministic path replacement between validation and open", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-dw-script-race-"));
+  try {
+    const scriptPath = join(root, "workflow.js");
+    const replacementPath = join(root, "replacement.js");
+    const originalPath = join(root, "original.js");
+    writeFileSync(scriptPath, "original");
+    writeFileSync(replacementPath, "replacement");
+
+    assert.throws(
+      () =>
+        (resolveWorkflowScriptPath as any)("workflow.js", root, {
+          openSync(path: string, flags: number) {
+            renameSync(scriptPath, originalPath);
+            renameSync(replacementPath, scriptPath);
+            return openSync(path, flags);
+          },
+        }),
+      (error: unknown) => {
+        assert.ok(error instanceof WorkflowError);
+        assert.equal(error.code, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR);
+        assert.match(error.message, /changed during secure open/);
+        return true;
+      },
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("scriptPath closes its descriptor after a successful secure read", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-dw-script-close-"));
+  try {
+    writeFileSync(join(root, "workflow.js"), "contents");
+    let closes = 0;
+    const resolved = (resolveWorkflowScriptPath as any)("workflow.js", root, {
+      closeSync(fd: number) {
+        closes++;
+        closeSync(fd);
+      },
+    });
+    assert.equal(resolved.script, "contents");
+    assert.equal(closes, 1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("workflow tool reports SCRIPT_VALIDATION_ERROR when its cwd was deleted", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-dw-tool-deleted-cwd-"));
+  const manager = {
+    getModelRegistry: () => undefined,
+    startInBackground() {
+      assert.fail("manager must not start for an invalid cwd");
+    },
+  } as any;
+  const execute = createWorkflowTool({ cwd: root, manager }).execute as any;
+  rmSync(root, { recursive: true, force: true });
+
+  await assert.rejects(
+    () => execute("call", { scriptPath: "workflow.js" }, undefined, undefined, { cwd: root }),
+    (error: unknown) => {
+      assert.ok(error instanceof WorkflowError);
+      assert.equal(error.code, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR);
+      assert.match(error.message, /workflow cwd does not exist/);
+      return true;
+    },
+  );
+});
+
+test("workflow tool passes exact scriptPath source and args to foreground manager.runSync", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-dw-tool-foreground-"));
+  try {
+    const script =
+      "export const meta = { name: 'foreground-path', description: 'foreground path' }\n" +
+      "await agent('preserve this source')\n  \n";
+    writeFileSync(join(root, "workflow.js"), script);
+    const args = { unchanged: true, nested: { value: "keep" } };
+    const calls: Array<{ script: string; args: unknown; cwd?: string }> = [];
+    const manager = {
+      getModelRegistry: () => undefined,
+      runSync(source: string, receivedArgs: unknown, options?: { cwd?: string }) {
+        calls.push({ script: source, args: receivedArgs, cwd: options?.cwd });
+        return Promise.resolve({
+          meta: { name: "foreground-path", description: "foreground path" },
+          result: { ok: true },
+          logs: [],
+          phases: [],
+          agentCount: 1,
+          durationMs: 1,
+        });
+      },
+    } as any;
+    const tool = createWorkflowTool({ cwd: root, manager });
+
+    await (tool.execute as any)("call", { scriptPath: "workflow.js", args, background: false }, undefined, undefined, {
+      cwd: root,
+    });
+
+    assert.deepEqual(calls, [{ script, args, cwd: root }]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("createWorkflowTool has correct name and label", () => {
   const tool = createWorkflowTool();
@@ -102,6 +266,210 @@ test("createWorkflowTool schema exposes concurrency and agentRetries", () => {
 
   assert.match(parameters.properties?.concurrency?.description ?? "", /Maximum concurrent agents/i);
   assert.match(parameters.properties?.agentRetries?.description ?? "", /Retry attempts/i);
+});
+
+test("createWorkflowTool schema exposes assistant resume and status controls", () => {
+  const tool = createWorkflowTool();
+  const parameters = tool.parameters as { properties?: Record<string, { description?: string }> };
+
+  assert.match(parameters.properties?.action?.description ?? "", /run.*resume.*status/i);
+  assert.match(parameters.properties?.runId?.description ?? "", /resume.*status/i);
+});
+
+test("workflow tool action arguments enforce run, resume, and status shapes", () => {
+  const tool = createWorkflowTool();
+  const prepare = tool.prepareArguments as (args: unknown) => unknown;
+
+  assert.deepEqual(prepare({ action: "resume", runId: "paused-123", args: { riskAccepted: true } }), {
+    action: "resume",
+    runId: "paused-123",
+    args: { riskAccepted: true },
+  });
+  assert.deepEqual(prepare({ action: "status", runId: "paused-123" }), {
+    action: "status",
+    runId: "paused-123",
+  });
+  assert.throws(
+    () => prepare({ action: "resume", runId: "paused-123", script: "return 1" }),
+    /must not include.*script/i,
+  );
+  assert.throws(() => prepare({ action: "status", runId: "paused-123", args: {} }), /must not include.*args/i);
+  assert.throws(() => prepare({ action: "resume" }), /runId/i);
+  assert.throws(() => prepare({ action: "run", runId: "paused-123", script: "return 1" }), /runId/i);
+});
+
+test("workflow tool resumes a persisted run with an optional args patch", async () => {
+  const calls: unknown[][] = [];
+  const manager = {
+    getModelRegistry: () => undefined,
+    async resume(...args: unknown[]) {
+      calls.push(args);
+      return true;
+    },
+    getRunForReport: () => ({ runId: "paused-123", workflowName: "audit", status: "paused" }),
+  } as any;
+  const tool = createWorkflowTool({ manager });
+
+  const result = await (tool.execute as any)(
+    "call",
+    { action: "resume", runId: "paused-123", args: { riskAccepted: true } },
+    undefined,
+    undefined,
+    {},
+  );
+
+  assert.deepEqual(calls, [["paused-123", { argsPatch: { riskAccepted: true } }]]);
+  assert.match(result.content[0].text, /paused-123.*resumed/i);
+  assert.deepEqual(result.details, { runId: "paused-123", background: true, resumed: true });
+});
+
+test("workflow tool reports why a run cannot be resumed", async () => {
+  const manager = {
+    getModelRegistry: () => undefined,
+    resume: async () => false,
+    getRunForReport: () => ({ runId: "done-123", workflowName: "audit", status: "completed" }),
+  } as any;
+  const tool = createWorkflowTool({ manager });
+
+  await assert.rejects(
+    () => (tool.execute as any)("call", { action: "resume", runId: "done-123" }, undefined, undefined, {}),
+    /not resumable.*completed/i,
+  );
+});
+
+test("workflow tool cold-resumes a persisted manager run end to end", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-dw-tool-resume-"));
+  try {
+    const runId = "cold-resume-123";
+    const script = `export const meta = { name: 'cold-resume', description: 'cold resume' }
+return await agent(JSON.stringify(args), { label: 'capture' })`;
+    let prompt = "";
+    const manager = new WorkflowManager({
+      cwd: root,
+      agent: {
+        async run(value: string) {
+          prompt = value;
+          return "ok";
+        },
+      },
+    });
+    const now = new Date().toISOString();
+    manager.getPersistence().save({
+      runId,
+      workflowName: "cold-resume",
+      script,
+      args: { keep: true },
+      status: "paused",
+      phases: [],
+      agents: [],
+      logs: [],
+      startedAt: now,
+      updatedAt: now,
+    });
+    const completed = new Promise<void>((resolve) => {
+      manager.on("complete", (event: { runId: string }) => {
+        if (event.runId === runId) resolve();
+      });
+    });
+    const tool = createWorkflowTool({ cwd: root, manager });
+
+    await (tool.execute as any)("call", { action: "resume", runId, args: { added: 1 } }, undefined, undefined, {
+      cwd: root,
+    });
+    await completed;
+
+    assert.deepEqual(JSON.parse(prompt), { keep: true, added: 1 });
+    const status = await (tool.execute as any)("call", { action: "status", runId }, undefined, undefined, {
+      cwd: root,
+    });
+    assert.equal(status.details.status, "completed");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("workflow tool rejects unsafe resume, status, and edit-resume run IDs before manager access", async () => {
+  let accesses = 0;
+  const manager = {
+    getModelRegistry: () => undefined,
+    getRun: () => {
+      accesses++;
+      return undefined;
+    },
+    getRunForReport: () => {
+      accesses++;
+      return null;
+    },
+    resume: async () => {
+      accesses++;
+      return false;
+    },
+  } as any;
+  const tool = createWorkflowTool({ manager });
+  const execute = tool.execute as any;
+
+  for (const params of [
+    { action: "resume", runId: "../escape" },
+    { action: "status", runId: "a/b" },
+    {
+      script: "export const meta = { name: 'edit', description: 'edit' }\nreturn await agent('x')",
+      resumeFromRunId: "bad\\id",
+    },
+  ]) {
+    await assert.rejects(() => execute("call", params, undefined, undefined, {}), /Invalid workflow run ID/);
+  }
+  assert.equal(accesses, 0);
+});
+
+test("workflow tool status rejects an unknown run ID", async () => {
+  const manager = {
+    getModelRegistry: () => undefined,
+    getRun: () => undefined,
+    getRunForReport: () => null,
+  } as any;
+  const tool = createWorkflowTool({ manager });
+
+  await assert.rejects(
+    () => (tool.execute as any)("call", { action: "status", runId: "missing-123" }, undefined, undefined, {}),
+    /missing-123.*not found/i,
+  );
+});
+
+test("workflow tool reports persisted run status without requiring a script", async () => {
+  const manager = {
+    getModelRegistry: () => undefined,
+    getRunForReport: () => ({
+      runId: "paused-123",
+      workflowName: "audit",
+      status: "paused",
+      currentPhase: "Review",
+      phases: ["Plan", "Review"],
+      agents: [{ status: "done" }, { status: "running" }],
+      startedAt: "2026-07-16T00:00:00.000Z",
+      updatedAt: "2026-07-16T00:01:00.000Z",
+    }),
+  } as any;
+  const tool = createWorkflowTool({ manager });
+
+  const result = await (tool.execute as any)(
+    "call",
+    { action: "status", runId: "paused-123" },
+    undefined,
+    undefined,
+    {},
+  );
+
+  assert.match(result.content[0].text, /audit.*paused/i);
+  assert.deepEqual(result.details, {
+    runId: "paused-123",
+    workflowName: "audit",
+    status: "paused",
+    currentPhase: "Review",
+    phases: ["Plan", "Review"],
+    agentCount: 2,
+    startedAt: "2026-07-16T00:00:00.000Z",
+    updatedAt: "2026-07-16T00:01:00.000Z",
+  });
 });
 
 test("createWorkflowTool promptGuidelines mention retry and concurrency controls", () => {
@@ -271,11 +639,11 @@ function withToolTempCwd(fn: (cwd: string) => Promise<void>) {
   };
 }
 
-test("workflowToolSchema exposes resumeFromRunId as optional; script stays required", () => {
+test("workflowToolSchema exposes resumeFromRunId while action controls keep source fields optional", () => {
   const tool = createWorkflowTool();
   const schema = tool.parameters as { properties: Record<string, unknown>; required?: string[] };
   assert.ok(schema.properties.resumeFromRunId, "resumeFromRunId should be a schema property");
-  assert.ok((schema.required ?? []).includes("script"), "script stays required");
+  assert.ok(!(schema.required ?? []).includes("script"), "resume and status actions do not require a script");
   assert.ok(!(schema.required ?? []).includes("resumeFromRunId"), "resumeFromRunId is optional");
 });
 

@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import type { AgentUsage } from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
@@ -48,6 +51,159 @@ function createDeferred<T = void>(): { promise: Promise<T>; resolve: (value: T |
   });
   return { promise, resolve };
 }
+
+test("a parent-aborted settled attempt persists finalized usage exactly once before cancellation", async () => {
+  const controller = new AbortController();
+  const started = createDeferred<void>();
+  const progress: AgentUsage[] = [];
+  let finalUsageEvents = 0;
+  const run = runWorkflow(
+    `export const meta = { name: 'abort-usage', description: 'abort usage' }
+return await agent('work')`,
+    {
+      persistLogs: false,
+      signal: controller.signal,
+      onTokenUsageProgress: (usage) => progress.push(usage as AgentUsage),
+      onTokenUsage: () => finalUsageEvents++,
+      agent: {
+        async run(_prompt: string, options: { signal?: AbortSignal; onUsage?: (usage: AgentUsage) => void }) {
+          started.resolve();
+          await new Promise<void>((resolve) =>
+            options.signal?.addEventListener("abort", () => resolve(), { once: true }),
+          );
+          options.onUsage?.({ input: 7, output: 4, cacheRead: 0, cacheWrite: 0, total: 11, cost: 0.01 });
+          return "settled-after-abort";
+        },
+      },
+    },
+  );
+
+  await started.promise;
+  controller.abort();
+  await assert.rejects(run, (error: unknown) => {
+    assert.ok(error instanceof WorkflowError);
+    assert.equal(error.code, WorkflowErrorCode.WORKFLOW_ABORTED);
+    return true;
+  });
+  assert.deepEqual(
+    progress.map((usage) => usage.total),
+    [11],
+  );
+  assert.equal(finalUsageEvents, 0, "public usage remains final-success-only");
+});
+
+test("parallel cancellation is operation-scoped, awaits siblings, and permits later workflow work", async () => {
+  let siblingSettled = false;
+  const started = createDeferred<void>();
+  const script = `export const meta = { name: 'parallel-cancel', description: 'parallel cancellation' }
+let caught = ''
+try {
+  await parallel([
+    () => agent('fatal'),
+    () => agent('sibling'),
+  ])
+} catch (error) {
+  caught = error.message
+}
+const after = await agent('after')
+return { caught, after }`;
+
+  const result = await runWorkflow(script, {
+    persistLogs: false,
+    agent: {
+      async run(prompt: string, options: { signal?: AbortSignal }) {
+        if (prompt === "fatal") {
+          await started.promise;
+          throw new WorkflowError("fatal", WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, { recoverable: false });
+        }
+        if (prompt === "after") {
+          assert.equal(siblingSettled, true, "parallel must await sibling cleanup before returning");
+          return "continued";
+        }
+        started.resolve();
+        await new Promise<void>((resolve) =>
+          options.signal?.addEventListener("abort", () => resolve(), { once: true }),
+        );
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        siblingSettled = true;
+        throw new Error("cancelled sibling");
+      },
+    },
+  });
+
+  assert.equal(JSON.stringify(result.result), JSON.stringify({ caught: "fatal", after: "continued" }));
+  assert.equal(siblingSettled, true);
+});
+
+test("pipeline cancellation is operation-scoped, awaits siblings, and permits later workflow work", async () => {
+  let siblingSettled = false;
+  const started = createDeferred<void>();
+  const script = `export const meta = { name: 'pipeline-cancel', description: 'pipeline cancellation' }
+let caught = ''
+try {
+  await pipeline(['fatal', 'sibling'], item => agent(item))
+} catch (error) {
+  caught = error.message
+}
+const after = await agent('after')
+return { caught, after }`;
+
+  const result = await runWorkflow(script, {
+    persistLogs: false,
+    agent: {
+      async run(prompt: string, options: { signal?: AbortSignal }) {
+        if (prompt === "fatal") {
+          await started.promise;
+          throw new WorkflowError("fatal", WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, { recoverable: false });
+        }
+        if (prompt === "after") {
+          assert.equal(siblingSettled, true, "pipeline must await sibling cleanup before returning");
+          return "continued";
+        }
+        started.resolve();
+        await new Promise<void>((resolve) =>
+          options.signal?.addEventListener("abort", () => resolve(), { once: true }),
+        );
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        siblingSettled = true;
+        throw new Error("cancelled sibling");
+      },
+    },
+  });
+
+  assert.equal(JSON.stringify(result.result), JSON.stringify({ caught: "fatal", after: "continued" }));
+  assert.equal(siblingSettled, true);
+});
+
+test("nested workflow scriptPath rejects symlinks with SCRIPT_VALIDATION_ERROR", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-dw-nested-script-path-"));
+  try {
+    const childPath = join(root, "child.js");
+    writeFileSync(
+      childPath,
+      "export const meta = { name: 'child', description: 'child' }\nreturn await agent('child')",
+    );
+    symlinkSync(childPath, join(root, "child-link.js"));
+    const parent = `export const meta = { name: 'parent', description: 'parent' }
+return await workflow({ scriptPath: 'child-link.js' })`;
+
+    await assert.rejects(
+      runWorkflow(parent, {
+        cwd: root,
+        persistLogs: false,
+        agent: countingAgent().runner,
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof WorkflowError);
+        assert.equal(error.code, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR);
+        assert.match(error.message, /symlink/);
+        return true;
+      },
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("runWorkflow concurrency caps parallel agents", async () => {
   let active = 0;

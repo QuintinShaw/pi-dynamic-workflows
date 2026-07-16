@@ -30,6 +30,8 @@ export default function extension(pi: ExtensionAPI) {
     concurrency: settings.defaultConcurrency,
     defaultAgentRetries: settings.defaultAgentRetries,
     persistAgentSessions: settings.persistAgentSessions,
+    modelAliases: settings.modelAliases,
+    strictModelResolution: settings.strictModelResolution,
   });
 
   const workflowTool = createWorkflowTool({ cwd, manager, storage });

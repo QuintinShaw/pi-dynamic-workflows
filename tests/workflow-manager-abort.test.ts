@@ -350,19 +350,13 @@ test(
     assert.equal(paused, true);
     assert.equal(manager.getRun(runId)?.status, "paused");
 
-    // Resume — replays journal (empty for single-agent that never completed) and
-    // re-runs the live agent with a fresh (non-aborted) controller.
-    const resumed = await manager.resume(runId);
-    assert.equal(resumed, true, "resume should succeed");
-
-    // The resumed run should be running
-    assert.equal(manager.getRun(runId)?.status, "running", "resumed run should be running");
-
-    // Resolve the deferred agent so the resumed run's agent completes
+    // Resume waits for the aborted execution to settle before starting a fresh
+    // generation, so release the old in-flight runner before awaiting it.
+    const resumePromise = manager.resume(runId);
     da.resolve("resumed-done");
-
-    // The original promise will reject (its controller was aborted). Suppress it.
     await origPromise.catch(() => {});
+    const resumed = await resumePromise;
+    assert.equal(resumed, true, "resume should succeed");
 
     // Wait for the resumed run to complete
     await new Promise((r) => setTimeout(r, 50));
@@ -438,6 +432,50 @@ test(
       const resumed = await manager.resume(runId);
       assert.equal(resumed, false, "cannot resume a completed run");
     }
+  }),
+);
+
+test(
+  "immediate resume waits for the paused generation to settle before starting a new generation",
+  withTempCwd(async (cwd) => {
+    let calls = 0;
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run() {
+          calls++;
+          if (calls === 1) await firstGate;
+          return `result-${calls}`;
+        },
+      },
+    });
+    manager.on("error", () => {});
+    const started = new Promise<void>((resolve) => manager.once("agentStart", () => resolve()));
+    const { runId, promise: firstExecution } = manager.startInBackground(oneAgentScript);
+    await started;
+
+    assert.equal(manager.pause(runId), true);
+    const resumePromise = manager.resume(runId);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(calls, 1, "the new generation must not overlap the aborted runner");
+    assert.equal(manager.getRun(runId)?.status, "paused");
+
+    releaseFirst();
+    await firstExecution.catch(() => {});
+    assert.equal(await resumePromise, true);
+    await new Promise<void>((resolve) => {
+      const run = manager.getRun(runId);
+      if (run?.status === "completed") resolve();
+      else manager.on("complete", (event: { runId: string }) => event.runId === runId && resolve());
+    });
+
+    assert.equal(calls, 2);
+    assert.equal(manager.getPersistence().load(runId)?.status, "completed");
+    assert.equal(manager.getRun(runId)?.result?.result?.a, "result-2");
   }),
 );
 
@@ -534,9 +572,23 @@ test(
       runs.find((r) => r.runId === runId),
       undefined,
     );
+    assert.equal(
+      manager.getPersistence().acquireRunLease(runId),
+      null,
+      "the deleted execution retains its lease until cancellation settles",
+    );
 
     da.resolve("done");
     await promise.catch(() => {});
+
+    assert.equal(
+      manager.getPersistence().load(runId),
+      null,
+      "the deleted generation must not recreate persisted state",
+    );
+    const lease = manager.getPersistence().acquireRunLease(runId);
+    assert.ok(lease, "the deleted execution releases its lease after settling");
+    manager.getPersistence().releaseRunLease(lease);
   }),
 );
 
@@ -663,6 +715,7 @@ test(
     const _ac = new AbortController();
     const da = deferredAgent();
     const manager = new WorkflowManager({ cwd, agent: da.runner });
+    manager.on("error", () => {});
 
     // Track resumed event
     let resumedEvent: { runId: string } | null = null;
@@ -673,14 +726,14 @@ test(
     // Track resumed event on the pause→resume cycle
     const { runId, promise: origPromise } = manager.startInBackground(oneAgentScript);
     await new Promise((r) => setTimeout(r, 20));
-    manager.pause(runId);
-    await manager.resume(runId);
+    assert.equal(manager.pause(runId), true);
+    const resumePromise = manager.resume(runId);
+    da.resolve("done");
+    await origPromise.catch(() => {});
+    assert.equal(await resumePromise, true);
 
     assert.ok(resumedEvent, "resumed event should fire on resume");
     assert.equal(resumedEvent?.runId, runId);
-
-    da.resolve("done");
-    await origPromise.catch(() => {});
 
     // Now test error event on abort
     let capturedError: { runId: string; error: WorkflowError } | null = null;

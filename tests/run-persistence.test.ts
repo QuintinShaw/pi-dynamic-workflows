@@ -359,6 +359,37 @@ test(
   }),
 );
 
+test(
+  "run persistence rejects unsafe run IDs before save, load, delete, or lease paths are constructed",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd);
+    const invalidIds = ["", "../escape", "a/b", "a\\b", ".hidden", "line\nbreak", `a${"x".repeat(128)}`];
+    const base: PersistedRunState = {
+      runId: "valid",
+      workflowName: "wf",
+      script: "export const meta = { name: 'w', description: 'w' }",
+      status: "paused",
+      phases: [],
+      agents: [],
+      logs: [],
+      startedAt: "2024-01-01T00:00:00.000Z",
+      updatedAt: "2024-01-01T00:00:00.000Z",
+    };
+
+    for (const runId of invalidIds) {
+      assert.throws(() => rp.save({ ...base, runId }), /Invalid workflow run ID/);
+      assert.throws(() => rp.load(runId), /Invalid workflow run ID/);
+      assert.throws(() => rp.delete(runId), /Invalid workflow run ID/);
+      assert.throws(() => rp.acquireRunLease(runId), /Invalid workflow run ID/);
+      assert.throws(() => rp.releaseRunLease({ runId, token: "token" }), /Invalid workflow run ID/);
+    }
+
+    const longestValid = `a${"x".repeat(127)}`;
+    rp.save({ ...base, runId: longestValid });
+    assert.equal(rp.load(longestValid)?.runId, longestValid);
+  }),
+);
+
 test("generateRunId returns a string with timestamp and random parts", () => {
   const id = generateRunId();
   assert.equal(typeof id, "string");

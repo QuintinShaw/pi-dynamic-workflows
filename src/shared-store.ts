@@ -7,104 +7,221 @@
  * intermediate state without coordinating through the script itself.
  *
  * Journal integration: callers capture `store.commitDelta(deltaKey)` alongside
- * each agent result in the journal. On resume, `store.applyDelta(delta)` rebuilds
- * the store state additively in callSeq order, so parallel-agent writes are
- * replayed correctly without the last-complete-wins ordering bug that a
- * whole-Map restore() would cause.
+ * each successful agent result. Failed attempts call `discardDelta(deltaKey)` so
+ * unjournaled writes do not remain observable. Atomic child workflows use a
+ * child scope: they can read parent state, but their execution-ordered final
+ * delta is applied to the parent only after the whole child succeeds.
  *
- * `deltaKey` must be unique across every run that shares this store instance,
- * not just within one run's callSeq. A nested `workflow()` call restarts its own
- * callSeq at 0 while inheriting the parent's store (so parent and nested-run
- * agents can share state), so a bare callIndex would collide between a parent
- * agent and a concurrently-running nested-run agent that both got index 0 —
- * whichever commits its delta last would clobber the other's entry in
- * `agentDeltas`. Callers compose `deltaKey` as `${runId}:${callIndex}`, and
- * since every run (including each nested run) gets its own distinct `runId`,
- * the composite key is unique across the whole store's lifetime.
+ * `deltaKey` must be unique across every invocation sharing a store scope, not
+ * just within one run's callSeq. Callers compose it from the run ID and call
+ * index; nested children additionally receive a call-index-based invocation ID.
  */
 
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
-export class SharedStore {
-  private readonly map = new Map<string, unknown>();
-  // Per-agent write deltas for delta-journaling; keyed by a run-unique
-  // `${runId}:${callIndex}` string (see class doc) so nested workflow() runs
-  // sharing this store can't collide on a bare callIndex.
-  private readonly agentDeltas = new Map<string, Record<string, unknown>>();
+interface StoreWrite {
+  key: string;
+  value: unknown;
+  version: number;
+  deltaKey?: string;
+  committed: boolean;
+}
 
-  /** Store a value under `key`. Overwrites any existing value. */
+interface StoreClock {
+  nextVersion: number;
+}
+
+export interface StoreDelta {
+  values: Record<string, unknown>;
+  versions: Record<string, number>;
+}
+
+const UNSAFE_STORE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+function validateStoreKey(key: string): void {
+  if (UNSAFE_STORE_KEYS.has(key)) throw new TypeError(`unsafe shared-store key: ${key}`);
+}
+
+export class SharedStore {
+  /** Writes use a scope-wide monotonic version assigned at store_put execution time. */
+  private writes: StoreWrite[] = [];
+  private readonly agentDeltas = new Map<string, StoreWrite[]>();
+  private readonly closedDeltas = new Set<string>();
+  private readonly clock: StoreClock;
+  private disposed = false;
+
+  constructor(private readonly parent?: SharedStore) {
+    this.clock = parent?.clock ?? { nextVersion: 0 };
+  }
+
+  /** Store a committed value under `key`. Overwrites any older write. */
   put(key: string, value: unknown): void {
-    this.map.set(key, value);
+    this.assertOpen();
+    validateStoreKey(key);
+    this.appendCommitted(key, value, ++this.clock.nextVersion);
   }
 
   /**
-   * Store a value and record the write in the per-agent delta for `deltaKey`
-   * (a run-unique `${runId}:${callIndex}` string — see class doc). Used by
-   * per-agent tools created via `createAgentStoreTools` so that each agent's
-   * writes can be journaled and replayed independently.
+   * Store a value and record the write in the per-attempt delta for `deltaKey`.
+   * Closed attempt scopes reject late writes, including work that outlives a timeout.
    */
   trackPut(key: string, value: unknown, deltaKey: string): void {
-    this.map.set(key, value);
-    let delta = this.agentDeltas.get(deltaKey);
-    if (!delta) {
-      delta = {};
-      this.agentDeltas.set(deltaKey, delta);
-    }
-    delta[key] = value;
+    this.assertOpen();
+    validateStoreKey(key);
+    if (this.closedDeltas.has(deltaKey)) throw new Error(`shared-store delta scope is closed: ${deltaKey}`);
+    const write = { key, value, version: ++this.clock.nextVersion, deltaKey, committed: false };
+    this.writes.push(write);
+    const delta = this.agentDeltas.get(deltaKey) ?? [];
+    delta.push(write);
+    this.agentDeltas.set(deltaKey, delta);
   }
 
-  /** Retrieve the value for `key`, or `undefined` when absent. */
-  get(key: string): unknown {
-    return this.map.get(key);
+  /** Retrieve committed state plus the calling attempt's own pending writes. */
+  get(key: string, deltaKey?: string): unknown {
+    this.assertOpen();
+    validateStoreKey(key);
+    return this.latestWrite(key, deltaKey)?.value;
   }
 
-  /** Whether `key` is present in the store. */
-  has(key: string): boolean {
-    return this.map.has(key);
+  /** Whether committed state or the calling attempt's own pending state contains `key`. */
+  has(key: string, deltaKey?: string): boolean {
+    this.assertOpen();
+    validateStoreKey(key);
+    return this.latestWrite(key, deltaKey) !== undefined;
   }
 
-  /** Return a deep-copied plain-object snapshot of all entries. */
+  /** Return a deep-copied plain-object snapshot of all observable entries. */
   snapshot(): Record<string, unknown> {
-    return structuredClone(Object.fromEntries(this.map));
+    this.assertOpen();
+    const snapshot: Record<string, unknown> = {};
+    for (const write of this.allWrites().sort((left, right) => left.version - right.version)) {
+      snapshot[write.key] = write.value;
+    }
+    return structuredClone(snapshot);
   }
 
-  /**
-   * Extract and clear the write delta accumulated for `deltaKey`.
-   * Called after an agent completes to get the set of keys it wrote.
-   */
+  /** Inspect an attempt's final per-key values without making it irrevocable. */
+  prepareDelta(deltaKey: string): StoreDelta {
+    this.assertOpen();
+    return this.deltaFromWrites(this.agentDeltas.get(deltaKey) ?? []);
+  }
+
+  /** Confirm an agent's writes and return its per-key final delta. */
   commitDelta(deltaKey: string): Record<string, unknown> {
-    const delta = this.agentDeltas.get(deltaKey) ?? {};
+    this.assertOpen();
+    const delta = this.prepareDelta(deltaKey);
+    for (const write of this.agentDeltas.get(deltaKey) ?? []) write.committed = true;
     this.agentDeltas.delete(deltaKey);
-    return delta;
+    this.closedDeltas.add(deltaKey);
+    return delta.values;
   }
 
-  /**
-   * Apply a write delta additively — sets each key without clearing others.
-   * Used during resume replay so parallel-agent deltas applied in callSeq
-   * order accumulate correctly regardless of original completion order.
-   */
-  applyDelta(delta: Record<string, unknown>): void {
-    for (const [k, v] of Object.entries(delta)) {
-      this.map.set(k, v);
+  /** Remove every still-uncommitted write made by a failed agent attempt. */
+  discardDelta(deltaKey: string): void {
+    this.assertOpen();
+    const discarded = this.agentDeltas.get(deltaKey) ?? [];
+    const discardedSet = new Set(discarded.filter((write) => !write.committed));
+    if (discardedSet.size > 0) this.writes = this.writes.filter((write) => !discardedSet.has(write));
+    this.agentDeltas.delete(deltaKey);
+    this.closedDeltas.add(deltaKey);
+  }
+
+  /** Create a child-scoped overlay whose writes are atomic at workflow success. */
+  createChildScope(): SharedStore {
+    this.assertOpen();
+    return new SharedStore(this);
+  }
+
+  /** Inspect this child's committed writes without exposing them to its parent. */
+  prepareChildScope(): StoreDelta {
+    this.assertOpen();
+    if (!this.parent) throw new Error("Only child-scoped stores can be committed");
+    return this.deltaFromWrites(this.writes.filter((write) => write.committed));
+  }
+
+  /** Commit a previously prepared child delta to its parent. */
+  commitChildScope(delta = this.prepareChildScope()): Record<string, unknown> {
+    this.assertOpen();
+    if (!this.parent) throw new Error("Only child-scoped stores can be committed");
+    this.parent.applyDelta(delta.values, delta.versions);
+    return delta.values;
+  }
+
+  /** Apply a committed replay delta additively, retaining captured write versions. */
+  applyDelta(delta: Record<string, unknown>, versions?: Record<string, number>): void {
+    this.assertOpen();
+    const entries = Object.entries(delta);
+    for (const [key] of entries) {
+      validateStoreKey(key);
+      const version = versions?.[key];
+      if (version !== undefined && (!Number.isSafeInteger(version) || version < 0)) {
+        throw new TypeError(`invalid shared-store write version for key: ${key}`);
+      }
+    }
+    for (const [key, value] of entries) {
+      const version = versions?.[key];
+      this.appendCommitted(key, value, version ?? ++this.clock.nextVersion);
     }
   }
 
-  /**
-   * Replace all entries with a snapshot (for full resets).
-   * Prefer `applyDelta` for resume replay — see journal integration above.
-   */
+  /** Replace all local entries with a committed snapshot. */
   restore(snap: Record<string, unknown>): void {
-    this.map.clear();
-    for (const [k, v] of Object.entries(snap)) {
-      this.map.set(k, v);
-    }
+    this.assertOpen();
+    this.writes = [];
+    this.agentDeltas.clear();
+    this.closedDeltas.clear();
+    this.applyDelta(snap);
   }
 
-  /** Clear all entries (called when the run ends). */
+  /** Permanently close this scope and clear all local entries and attempt tracking. */
   dispose(): void {
-    this.map.clear();
+    if (this.disposed) return;
+    this.disposed = true;
+    this.writes = [];
     this.agentDeltas.clear();
+    this.closedDeltas.clear();
+  }
+
+  private assertOpen(): void {
+    if (this.disposed) throw new Error("shared store is disposed");
+  }
+
+  private appendCommitted(key: string, value: unknown, version: number): void {
+    this.assertOpen();
+    this.clock.nextVersion = Math.max(this.clock.nextVersion, version);
+    this.writes.push({ key, value, version, committed: true });
+  }
+
+  private latestWrite(key: string, deltaKey?: string): StoreWrite | undefined {
+    this.assertOpen();
+    let latest = this.parent?.latestWrite(key);
+    for (const write of this.writes) {
+      if (!write.committed && write.deltaKey !== deltaKey) continue;
+      if (write.key === key && (!latest || write.version > latest.version)) latest = write;
+    }
+    return latest;
+  }
+
+  private allWrites(): StoreWrite[] {
+    this.assertOpen();
+    return [...(this.parent?.allWrites() ?? []), ...this.writes.filter((write) => write.committed)];
+  }
+
+  private deltaFromWrites(writes: StoreWrite[]): StoreDelta {
+    this.assertOpen();
+    const latestByKey = new Map<string, StoreWrite>();
+    for (const write of writes) {
+      const current = latestByKey.get(write.key);
+      if (!current || write.version > current.version) latestByKey.set(write.key, write);
+    }
+    const values: Record<string, unknown> = {};
+    const versions: Record<string, number> = {};
+    for (const write of [...latestByKey.values()].sort((left, right) => left.version - right.version)) {
+      values[write.key] = write.value;
+      versions[write.key] = write.version;
+    }
+    return { values, versions };
   }
 }
 
@@ -177,7 +294,7 @@ export function createAgentStoreTools(store: SharedStore, deltaKey: string): Too
     name: "store_put",
     label: "Store Put",
     description:
-      "Write a value to the shared run store. Any other agent in this workflow run can read it with store_get. Overwrites any existing value for the key. Note: when two parallel agents write the same key, the last write wins — no merge is performed.",
+      "Write a value to this agent attempt's shared-store scope. The value becomes visible to other agents only after this attempt commits.",
     promptSnippet: "Write a value to the shared store",
     parameters: Type.Object({
       key: Type.String({ description: "The key to store the value under." }),
@@ -196,14 +313,14 @@ export function createAgentStoreTools(store: SharedStore, deltaKey: string): Too
     name: "store_get",
     label: "Store Get",
     description:
-      "Read a value from the shared run store previously written by store_put. Returns the stored value, or null when the key does not exist.",
+      "Read committed shared-store state plus values written by this agent attempt. Returns null when the key does not exist.",
     promptSnippet: "Read a value from the shared store",
     parameters: Type.Object({
       key: Type.String({ description: "The key to read." }),
     }),
     async execute(_id: string, params: { key: string }) {
-      const found = store.has(params.key);
-      const value = store.get(params.key);
+      const found = store.has(params.key, deltaKey);
+      const value = store.get(params.key, deltaKey);
       const text = found
         ? `Value for key "${params.key}": ${JSON.stringify(value)}`
         : `Key "${params.key}" not found in store.`;

@@ -75,6 +75,13 @@ describe("parseAgentDefinition", () => {
     assert.ok(def);
     assert.equal(def.isolation, undefined);
   });
+
+  it("binds only literal boolean skills frontmatter", () => {
+    assert.equal(parseAgentDefinition("---\nskills: false\n---\nBody.", "project", "off.md")?.skills, false);
+    assert.equal(parseAgentDefinition("---\nskills: true\n---\nBody.", "project", "on.md")?.skills, true);
+    assert.equal(parseAgentDefinition("---\nskills: 'false'\n---\nBody.", "project", "quoted.md")?.skills, undefined);
+    assert.equal(parseAgentDefinition("---\n---\nBody.", "project", "absent.md")?.skills, undefined);
+  });
 });
 
 // ── loadAgentRegistry (dir injection) ──────────────────────────────────────
@@ -327,6 +334,12 @@ describe("agentDefinitionKey", () => {
     const base: AgentDefinition = { name: "x", prompt: "p", source: "project" };
     assert.notEqual(agentDefinitionKey(base), agentDefinitionKey({ ...base, isolation: "worktree" }));
   });
+
+  it("changes when skills changes", () => {
+    const base: AgentDefinition = { name: "x", prompt: "p", source: "project" };
+    assert.notEqual(agentDefinitionKey(base), agentDefinitionKey({ ...base, skills: false }));
+    assert.notEqual(agentDefinitionKey({ ...base, skills: false }), agentDefinitionKey({ ...base, skills: true }));
+  });
 });
 
 // ── runtime integration: agentType binds tools/model/prompt via runWorkflow ──
@@ -340,6 +353,7 @@ function capturingAgent() {
     instructions?: string;
     cwd?: string;
     cwdExists?: boolean;
+    skills?: boolean;
   }> = [];
   const runner = {
     async run(_prompt: string, options: Record<string, unknown>) {
@@ -351,6 +365,7 @@ function capturingAgent() {
         instructions: options.instructions as string | undefined,
         cwd: options.cwd as string | undefined,
         cwdExists: typeof options.cwd === "string" ? existsSync(options.cwd) : undefined,
+        skills: options.skills as boolean | undefined,
       });
       return "ok";
     },
@@ -386,6 +401,19 @@ return r`;
     assert.deepEqual(seen[0].toolNames, ["read", "grep"], "allowlist forwarded");
     assert.deepEqual(seen[0].disallowedToolNames, ["write", "bash"], "denylist forwarded");
     assert.ok(seen[0].instructions?.includes("You are a security auditor."), "body prompt injected");
+  });
+
+  it("forwards skills:false from the resolved agent definition", async () => {
+    const { seen, runner } = capturingAgent();
+    const skillsRegistry: AgentRegistry = new Map([
+      ["no-skills", { name: "no-skills", prompt: "No skills.", skills: false, source: "project" } as AgentDefinition],
+    ]);
+    const script = `export const meta = { name: 'at', description: 'agentType' }
+await agent('audit', { label: 'a', agentType: 'no-skills' })
+return {}`;
+    await runWorkflow(script, { agent: runner, persistLogs: false, agentRegistry: skillsRegistry });
+
+    assert.equal(seen[0].skills, false);
   });
 
   it("explicit opts.model beats the agentType model", async () => {

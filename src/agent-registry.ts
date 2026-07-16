@@ -17,7 +17,7 @@
  * tools+model+system-prompt, not a prose hint.
  *
  * Bound today: `tools` (allowlist), `disallowedTools` (denylist), `model`,
- * and the markdown body (`prompt`). Parsed-but-ignored for now (documented): `mcp`, `skills`, `background`.
+ * boolean `skills`, and the markdown body (`prompt`). Parsed-but-ignored for now (documented): `mcp`, `background`.
  * Wired: `isolation` ("worktree") → createWorktree() in workflow.ts.
  */
 
@@ -38,6 +38,8 @@ export interface AgentDefinition {
   disallowedTools?: string[];
   /** Model spec (`provider/modelId` or bare id) for this subagent. */
   model?: string;
+  /** Whether SDK skills are enabled for this subagent. Only literal booleans bind. */
+  skills?: boolean;
   /** Isolation mode. When "worktree", agents using this type run in a git worktree. */
   isolation?: "worktree";
   /** Markdown body, prepended to the subagent's task as role guidance. */
@@ -95,6 +97,7 @@ export function parseAgentDefinition(
     tools: toStringArray(fm.tools),
     disallowedTools: toStringArray(fm.disallowedTools),
     model: typeof fm.model === "string" ? fm.model.trim() || undefined : undefined,
+    skills: typeof fm.skills === "boolean" ? fm.skills : undefined,
     isolation:
       typeof fm.isolation === "string" && fm.isolation.toLowerCase().trim() === "worktree" ? "worktree" : undefined,
     prompt,
@@ -210,6 +213,7 @@ export function agentDefinitionKey(def: AgentDefinition | undefined): string | n
     tools: def.tools ?? null,
     disallowedTools: def.disallowedTools ?? null,
     model: def.model ?? null,
+    skills: def.skills ?? null,
     isolation: def.isolation ?? null,
     prompt: def.prompt,
   });

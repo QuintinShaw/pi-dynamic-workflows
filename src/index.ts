@@ -1,7 +1,24 @@
 export type { AdversarialReviewConfig } from "./adversarial-review.js";
 export { generateAdversarialReviewWorkflow, generateMultiPerspectiveWorkflow } from "./adversarial-review.js";
-export type { AgentRunOptions, AgentRunResult, WorkflowAgentOptions } from "./agent.js";
-export { listAvailableModelSpecs, listAvailableModels, WorkflowAgent } from "./agent.js";
+export type {
+  AgentRunOptions,
+  AgentRunResult,
+  AgentTelemetry,
+  AgentUsage,
+  WorkflowAgentOptions,
+  WorkflowResourceLoaderFactory,
+  WorkflowResourceLoaderOptions,
+  WorkflowSessionFactory,
+} from "./agent.js";
+export {
+  listAvailableModelSpecs,
+  listAvailableModels,
+  resolveAgentModelSpec,
+  resolveAgentThinkingLevel,
+  resolveModelAlias,
+  usageFromStats,
+  WorkflowAgent,
+} from "./agent.js";
 export type { AgentHistoryEntry, AgentHistoryKind, AgentHistoryRole } from "./agent-history.js";
 export { compactAgentHistory } from "./agent-history.js";
 export type { AgentDefinition, AgentRegistry } from "./agent-registry.js";
@@ -66,15 +83,28 @@ export {
   saveModelTierConfig,
   sortedTierNames,
 } from "./model-tier-config.js";
-export type { PersistedRunState, RunPersistence, RunStatus } from "./run-persistence.js";
-export { createRunPersistence, generateRunId } from "./run-persistence.js";
+export type {
+  PersistedExecutionPolicy,
+  PersistedRunState,
+  RunPersistence,
+  RunStatus,
+} from "./run-persistence.js";
+export { assertValidRunId, createRunPersistence, generateRunId, RUN_ID_PATTERN } from "./run-persistence.js";
 export {
   parseCommandArgs,
   registerAllSavedWorkflows,
   registerSavedWorkflow,
 } from "./saved-commands.js";
 export { createSharedStoreTools, SharedStore } from "./shared-store.js";
-export type { StructuredOutputCapture, StructuredOutputToolOptions } from "./structured-output.js";
+export type {
+  LiteralJsonSchema,
+  LiteralSchemaOutput,
+  LiteralStructuredOutputToolOptions,
+  SchemaOutput,
+  StructuredOutputCapture,
+  StructuredOutputToolOptions,
+  WorkflowSchema,
+} from "./structured-output.js";
 export { createStructuredOutputTool } from "./structured-output.js";
 export { deliverText, installResultDelivery, installTaskPanel, type TaskPanelOptions } from "./task-panel.js";
 export type {
@@ -87,12 +117,14 @@ export { computeAutoResumeDelayMs, parseResetHintMs, UsageLimitScheduler } from 
 export { createWebFetchTool, createWebSearchTool, createWebTools } from "./web-tools.js";
 export type {
   AgentOptions,
+  AgentTypePolicy,
   JournalEntry,
   SharedRuntime,
   WorkflowMeta,
   WorkflowMetaPhase,
   WorkflowRunOptions,
   WorkflowRunResult,
+  WorkflowScriptDescriptor,
 } from "./workflow.js";
 export { parseWorkflowScript, runWorkflow } from "./workflow.js";
 export { registerWorkflowCommands } from "./workflow-commands.js";
@@ -110,7 +142,7 @@ export {
   WorkflowEditor,
   type WorkflowModeState,
 } from "./workflow-editor.js";
-export type { ManagedRun, WorkflowManagerOptions } from "./workflow-manager.js";
+export type { ManagedRun, ResumeOptions, WorkflowManagerOptions } from "./workflow-manager.js";
 export { WorkflowManager } from "./workflow-manager.js";
 export type { WorkflowProjectPaths } from "./workflow-paths.js";
 export {
@@ -121,6 +153,7 @@ export {
   workflowProjectPaths,
   workflowUserSavedDir,
 } from "./workflow-paths.js";
+export { formatWorkflowReport } from "./workflow-report.js";
 export type { SavedWorkflow, WorkflowStorage } from "./workflow-saved.js";
 export { assertSafeSavedWorkflowName, createWorkflowStorage, isSafeSavedWorkflowName } from "./workflow-saved.js";
 export type { WorkflowSettings, WorkflowSettingsOptions, WorkflowSettingsStore } from "./workflow-settings.js";

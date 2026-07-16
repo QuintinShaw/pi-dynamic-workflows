@@ -228,6 +228,7 @@ function persistedToSnapshot(p: PersistedRunState): WorkflowSnapshot {
       tokens: a.tokens,
       tokenUsage: a.tokenUsage,
       model: a.model,
+      telemetry: a.telemetry,
     })),
     agentCount: p.agents.length,
     runningCount: p.agents.filter((a) => a.status === "running").length,
@@ -513,7 +514,7 @@ function rightAgentRow(
   const statsStyled = theme.fg("dim", stats);
 
   // Assemble with explicit cell padding (visibleWidth-driven gaps).
-  let out = marker + dot + " " + nameStyled;
+  let out = `${marker + dot} ${nameStyled}`;
   const afterName = nameStart + visibleWidth(nameOut);
   if (modelOut) {
     out += " ".repeat(Math.max(0, modelStart - afterName)) + modelStyled;
@@ -826,6 +827,44 @@ export function renderNavigator(
       const body: string[] = [];
       body.push(dim("Status: ") + (a.status ?? ""));
       if (a.model) body.push(dim("Model: ") + (shortModel(a.model) ?? ""));
+      if (a.telemetry) {
+        const telemetry = a.telemetry;
+        body.push(dim("Execution: ") + telemetry.execution);
+        body.push(
+          dim("Routing: ") +
+            `${telemetry.requestedModelSpec ?? "(default)"} -> ${telemetry.resolvedModel ?? "unknown"}`,
+        );
+        body.push(dim("Thinking: ") + (telemetry.effectiveThinkingLevel ?? "unknown"));
+        body.push(
+          dim("Skills: ") +
+            (telemetry.skillsEnabled === undefined
+              ? "unknown"
+              : `${telemetry.skillsEnabled ? "on" : "off"} (${telemetry.loadedSkillCount ?? "?"} loaded)`),
+        );
+        body.push(dim("Tools: ") + String(telemetry.activeToolCount ?? telemetry.activeToolNames?.length ?? "?"));
+        body.push(
+          dim("Prompt chars: ") +
+            (telemetry.systemPromptChars === undefined ? "unknown" : telemetry.systemPromptChars.toLocaleString()),
+        );
+        body.push(
+          dim("Context: ") +
+            `${telemetry.projectContextFileCount ?? "?"} files · ${
+              telemetry.projectContextChars === undefined ? "unknown" : telemetry.projectContextChars.toLocaleString()
+            } chars`,
+        );
+        if (telemetry.usage) {
+          const usage = telemetry.usage;
+          body.push(
+            dim("Usage: ") +
+              `input ${usage.input.toLocaleString()} · output ${usage.output.toLocaleString()} · ` +
+              `cache read ${usage.cacheRead.toLocaleString()} · cache write ${usage.cacheWrite.toLocaleString()} · ` +
+              `total ${usage.total.toLocaleString()} · $${usage.cost.toFixed(4)}`,
+          );
+        }
+        if (telemetry.activeToolNames?.length) {
+          body.push(dim("Tool names: ") + telemetry.activeToolNames.join(", "));
+        }
+      }
       if (a.error) body.push(dim("Error: ") + a.error);
       if (a.errorCode) body.push(`${dim("Error code: ")}${a.errorCode}${a.recoverable ? " (recoverable)" : ""}`);
       body.push("", dim("Prompt:"));

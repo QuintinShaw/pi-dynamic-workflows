@@ -1,11 +1,16 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createEffortState, effortDirective } from "../src/effort-command.js";
+import { createRunPersistence } from "../src/run-persistence.js";
 import { registerWorkflowCommands } from "../src/workflow-commands.js";
 import { buildForcedWorkflowPrompt, WORKFLOW_TOOL_NAME } from "../src/workflow-editor.js";
-import type { WorkflowManager } from "../src/workflow-manager.js";
+import { WorkflowManager } from "../src/workflow-manager.js";
+import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
 type Handler = (args: string, ctx: any) => Promise<void>;
 
@@ -49,6 +54,10 @@ function harness(
 
   const manager: Partial<WorkflowManager> = {
     listRuns: () => [],
+    getRunForReport: (id: string) => {
+      const runs = typeof managerOverrides.listRuns === "function" ? managerOverrides.listRuns() : [];
+      return runs.find((run: { runId: string }) => run.runId === id) ?? null;
+    },
     getSnapshot: () => null,
     getRun: () => undefined,
     stop: (id: string) => {
@@ -164,6 +173,88 @@ test("/workflows status <id> renders a persisted run", async () => {
   await h.run("status run-7");
   assert.match(h.printed[0], /audit \(run-7\)/);
   assert.match(h.printed[0], /scan files/);
+});
+
+test("/workflows report <id> prints the persistent telemetry report", async () => {
+  const h = harness({
+    listRuns: () => [
+      {
+        runId: "run-report",
+        workflowName: "audit",
+        status: "completed",
+        script: "",
+        phases: [],
+        agents: [{ id: 1, label: "legacy", status: "done", prompt: "x" }],
+        logs: [],
+        startedAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:01.000Z",
+      },
+    ],
+  });
+  await h.run("report run-report");
+  assert.match(h.printed[0], /Workflow report: audit \(run-report\)/);
+  assert.match(h.printed[0], /legacy .* telemetry unavailable/);
+});
+
+test("/workflows report resolves an explicit legacy run outside the bound session", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-report-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-report-home-"));
+  try {
+    await withFakeHomeAsync(home, async () => {
+      createRunPersistence(cwd).save({
+        runId: "legacy-run",
+        workflowName: "legacy audit",
+        script: "",
+        status: "completed",
+        phases: [],
+        agents: [],
+        logs: [],
+        startedAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:01.000Z",
+      });
+      const manager = new WorkflowManager({ cwd, sessionId: "current-session" });
+      assert.equal(manager.listRuns().length, 0, "the legacy run is intentionally hidden from session navigation");
+
+      const printed: string[] = [];
+      let handler: Handler | undefined;
+      const pi: Partial<ExtensionAPI> = {
+        getCommands: () => [],
+        registerCommand: (_name: string, options: { handler: Handler }) => {
+          handler = options.handler;
+        },
+        sendMessage: async (message) => {
+          if (typeof message.content === "string") printed.push(message.content);
+        },
+      };
+      registerWorkflowCommands(pi as ExtensionAPI, manager);
+      assert.ok(handler);
+      await handler("report legacy-run", { ui: { notify: () => {} } });
+      assert.match(printed[0], /Workflow report: legacy audit \(legacy-run\)/);
+    });
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("/workflows report without id warns usage", async () => {
+  const h = harness();
+  await h.run("report");
+  assert.equal(h.notified[0].type, "warning");
+  assert.match(h.notified[0].message, /report <id>/);
+});
+
+test("/workflows report catches invalid run IDs and notifies a stable error", async () => {
+  const h = harness({
+    getRunForReport() {
+      throw new Error("Invalid workflow run ID");
+    },
+  });
+
+  await h.run("report ../escape");
+
+  assert.deepEqual(h.notified, [{ message: "Invalid workflow run ID", type: "error" }]);
+  assert.equal(h.printed.length, 0);
 });
 
 test("/workflows status without id warns", async () => {
