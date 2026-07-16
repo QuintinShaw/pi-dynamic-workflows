@@ -14,9 +14,13 @@
  */
 
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it, mock } from "node:test";
 import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { buildForcedWorkflowPrompt, WORKFLOW_TOOL_NAME, type WorkflowModeState } from "../src/workflow-editor.js";
+import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
 // ---------------------------------------------------------------------------
 // Default Pi tools that every Pi install provides (plugin-independent)
@@ -33,6 +37,7 @@ const DEFAULT_PI_TOOLS = [
   "advisor",
   "subagent",
   "workflow",
+  "workflow_control",
 ];
 
 // Additional tools from context-mode plugin (common but not guaranteed)
@@ -141,7 +146,7 @@ describe("installWorkflowEditor - tool availability", () => {
     const { installWorkflowEditor } = await import("../src/workflow-editor.js");
 
     // Add a bonus tool to simulate a plugin adding a tool
-    const originalTools = ["bash", "read", "edit", "write", "custom-plugin-tool", "workflow"];
+    const originalTools = ["bash", "read", "edit", "write", "custom-plugin-tool", "workflow", "workflow_control"];
     const mockPi = createMockPi(originalTools);
 
     const ui = {
@@ -448,5 +453,57 @@ describe("installWorkflowEditor - tool availability", () => {
 
     assert.equal(typeof state.active, "boolean");
     assert.equal(state.active, false);
+  });
+});
+
+describe("workflow extension - control tool availability", () => {
+  it("registers and activates workflow and workflow_control together", async () => {
+    const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-control-extension-"));
+    try {
+      await withFakeHomeAsync(fakeHome, async () => {
+        const registeredTools: string[] = [];
+        const activeTools = ["bash", "read"];
+        const handlers: Record<string, Array<(...args: any[]) => any>> = {};
+        const pi = {
+          registerTool: (tool: { name: string }) => registeredTools.push(tool.name),
+          registerCommand: () => {},
+          getCommands: () => [],
+          on: (event: string, handler: (...args: any[]) => any) => {
+            if (!handlers[event]) handlers[event] = [];
+            handlers[event].push(handler);
+          },
+          getActiveTools: () => [...activeTools],
+          setActiveTools: (tools: string[]) => {
+            activeTools.splice(0, activeTools.length, ...tools);
+          },
+          sendMessage: () => {},
+        } as unknown as ExtensionAPI;
+        const { default: installExtension } = await import("../extensions/workflow.js");
+
+        installExtension(pi);
+
+        assert.deepEqual(registeredTools.slice(0, 2), ["workflow", "workflow_control"]);
+        assert.equal(handlers.session_start.length, 1);
+        handlers.session_start[0](
+          {},
+          {
+            model: undefined,
+            modelRegistry: {},
+            sessionManager: { getSessionId: () => "session-1" },
+            ui: {
+              setWidget: () => {},
+              getEditorComponent: () => undefined,
+              setEditorComponent: () => {},
+            },
+          },
+        );
+
+        assert.ok(activeTools.includes("workflow"));
+        assert.ok(activeTools.includes("workflow_control"));
+        handlers.session_shutdown?.[0]?.();
+      });
+    } finally {
+      rmSync(fakeHome, { recursive: true, force: true });
+    }
   });
 });

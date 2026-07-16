@@ -96,6 +96,12 @@ export type {
 } from "./workflow.js";
 export { parseWorkflowScript, runWorkflow } from "./workflow.js";
 export { registerWorkflowCommands } from "./workflow-commands.js";
+export type {
+  WorkflowControlInput,
+  WorkflowControlRunDetails,
+  WorkflowControlToolOptions,
+} from "./workflow-control-tool.js";
+export { createWorkflowControlTool } from "./workflow-control-tool.js";
 export {
   buildForcedWorkflowPrompt,
   colorizeWorkflow,

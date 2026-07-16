@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { join } from "node:path";
 import { before, describe, it } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
@@ -242,7 +243,7 @@ describe("installResultDelivery", () => {
 
     const content = (pi as unknown as { _calls: { content: string }[] })._calls[0].content;
     assert.ok(content.includes("Full result:"), "should include the pointer label");
-    assert.ok(content.includes("/runs/test-run-1.json"), "should point at <runsDir>/<runId>.json");
+    assert.ok(content.includes(join("/runs", "test-run-1.json")), "should point at <runsDir>/<runId>.json");
     // The verdict summary itself is unchanged apart from the appended pointer.
     assert.ok(content.includes("All tests passed"), "verdict text preserved");
   });
@@ -275,7 +276,7 @@ describe("installResultDelivery", () => {
     const content = (pi as unknown as { _calls: { content: string }[] })._calls[0].content;
     assert.ok(/…\(truncated [\d.]+ (B|KB|MB)\)/.test(content), "the 50-char setting truncates a sub-400 dump");
     assert.ok(!content.includes("z".repeat(200)), "the body is cut at the configured threshold");
-    assert.ok(content.includes("/runs/test-run-1.json"), "pointer still appended");
+    assert.ok(content.includes(join("/runs", "test-run-1.json")), "pointer still appended");
   });
 
   // ── installResultDelivery: guard / stale ctx ──
