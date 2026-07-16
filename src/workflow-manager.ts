@@ -39,6 +39,12 @@ export interface ManagedRun {
    * result, so re-delivering would duplicate it.
    */
   background: boolean;
+  /**
+   * Auto-resume eligibility for this run (see ExecOptions.autoResume). Set once
+   * at creation and carried through resume() so it survives pause/resume cycles.
+   * Undefined means eligible (default-on); false opts out.
+   */
+  autoResume?: boolean;
 }
 
 /** Per-execution options shared by sync, background, and resume runs. */
@@ -61,6 +67,13 @@ export interface ExecOptions {
   agentRetries?: number;
   /** Resolve a checkpoint() question with a human reply (only for UI-bearing runs). */
   confirm?: (promptText: string, options: unknown) => Promise<unknown>;
+  /**
+   * Whether this run is eligible for auto-resume when it pauses on a provider
+   * usage limit. Default-on: omit or pass true to stay eligible, pass false to
+   * opt out. Persisted on the run so a cold-start UsageLimitScheduler respects
+   * it too. See usage-limit-scheduler.ts.
+   */
+  autoResume?: boolean;
 }
 
 export interface WorkflowManagerOptions {
@@ -215,6 +228,7 @@ export class WorkflowManager extends EventEmitter {
       journal: [],
       background: true,
       lease,
+      autoResume: exec.autoResume,
     };
 
     this.runs.set(runId, managed);
@@ -233,6 +247,7 @@ export class WorkflowManager extends EventEmitter {
         logs: [],
         startedAt: managed.startedAt.toISOString(),
         updatedAt: managed.startedAt.toISOString(),
+        autoResume: managed.autoResume,
       });
     } catch (err) {
       this.releaseRunLease(managed);
@@ -262,6 +277,7 @@ export class WorkflowManager extends EventEmitter {
     const lease = this.persistence.acquireRunLease(managed.runId);
     if (!lease) throw new Error(`Could not acquire workflow run lease for ${managed.runId}`);
     managed.lease = lease;
+    managed.autoResume = exec.autoResume;
     this.runs.set(managed.runId, managed);
     // Persist the initial state immediately so listRuns()/the task panel can see
     // the run the moment it starts, not only after the first agent journals.
@@ -484,6 +500,10 @@ export class WorkflowManager extends EventEmitter {
         sessionId: this.sessionId,
         journal: managed.journal,
         status: managed.status,
+        // Persisted every write (not just at pause) so a stale read during the
+        // "paused" event race (see UsageLimitScheduler) is still correct — this
+        // is fixed at run-start and doesn't change over the run's lifetime.
+        autoResume: managed.autoResume,
         // Why a usage-limit pause happened, so the navigator / a future cold start
         // can show it and (eventually) re-arm resume after the budget refills.
         pauseReason:
@@ -578,6 +598,9 @@ export class WorkflowManager extends EventEmitter {
       journal: persisted.journal ?? [],
       background: true,
       lease,
+      // Carry the original opt-out forward across resumes; it's fixed at
+      // run-start and persistRun() re-persists it on every subsequent write.
+      autoResume: persisted.autoResume,
     };
     this.runs.set(runId, managed);
     // Persist before notifying renderers: listRuns() is their source of truth for

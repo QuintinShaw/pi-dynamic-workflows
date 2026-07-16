@@ -13,6 +13,7 @@ import {
   registerWorkflowCommands,
   registerWorkflowModelsCommand,
   saveWorkflowSettingsForCwd,
+  UsageLimitScheduler,
   WorkflowManager,
 } from "../src/index.js";
 
@@ -33,6 +34,15 @@ export default function extension(pi: ExtensionAPI) {
 
   const workflowTool = createWorkflowTool({ cwd, manager, storage });
   pi.registerTool(workflowTool);
+  // Auto-resume runs that paused on a provider usage limit once the quota is
+  // likely refilled. Standalone: only consumes the manager's public surface, so
+  // it stays decoupled from manager/persistence internals. Its constructor also
+  // re-arms any run that was already paused-on-usage_limit before this process
+  // started (cold start), so restarting pi doesn't strand a paused run.
+  const usageLimitScheduler = new UsageLimitScheduler(manager);
+  pi.on("session_shutdown", () => {
+    usageLimitScheduler.dispose();
+  });
   // Standing /effort opt-in (off|high|ultra): auto-arms a workflow for substantive
   // messages, like CC's ultracode. Shared with the editor's input hook below and
   // with the explicit /workflows run <prompt> manual trigger.

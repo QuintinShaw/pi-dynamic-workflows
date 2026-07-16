@@ -64,6 +64,18 @@ export interface PersistedRunState {
   };
   /** Cached agent results for resume, keyed by deterministic call index. */
   journal?: Array<{ index: number; hash: string; result: unknown }>;
+  /**
+   * Opt-out of auto-resume for this run (default true, i.e. eligible unless
+   * explicitly set to false via ExecOptions.autoResume). Set once at run start
+   * and carried through resumes; see UsageLimitScheduler.
+   */
+  autoResume?: boolean;
+  /**
+   * Auto-resume attempt counter for the current usage_limit pause-cycle, owned
+   * and persisted by UsageLimitScheduler (best-effort). Absent/0 means no
+   * auto-resume attempt has been recorded yet.
+   */
+  autoResumeAttempts?: number;
 }
 
 export interface RunPersistence {
