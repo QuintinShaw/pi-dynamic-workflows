@@ -9,6 +9,8 @@ const runActionSchema = Type.Union([
   Type.Literal("pause"),
   Type.Literal("resume"),
   Type.Literal("stop"),
+  Type.Literal("restart"),
+  Type.Literal("remove"),
 ]);
 
 const workflowControlSchema = Type.Union([
@@ -40,6 +42,7 @@ export interface WorkflowControlRunDetails {
     total: number;
     done: number;
     running: number;
+    paused: number;
     queued: number;
     error: number;
     skipped: number;
@@ -61,7 +64,7 @@ export function createWorkflowControlTool(
     name: "workflow_control",
     label: "Workflow Control",
     description:
-      "List and inspect workflow runs, or pause, resume, and stop them without asking the user to run slash commands.",
+      "List and inspect workflow runs, or pause, resume, stop, restart, and remove them without asking the user to run slash commands.",
     promptSnippet: "Inspect and manage workflow runs directly by canonical run ID.",
     promptGuidelines: [
       "Use workflow_control for workflow lifecycle management; do not ask the user to type /workflows when this tool can perform the action.",
@@ -102,6 +105,43 @@ export function createWorkflowControlTool(
         case "stop":
           if (!manager.stop(run.runId)) return invalidTransition("stop", run);
           return actionSuccess("stop", "stopped", currentSummary(manager, run));
+        case "restart": {
+          if (run.status === "running") {
+            return controlError("restart", run.runId, "cannot restart a running run", allowedActions(run.status));
+          }
+          if (!run.script) {
+            return controlError("restart", run.runId, "run has no saved script", allowedActions(run.status));
+          }
+          const restarted = manager.restart(run.runId);
+          if (!restarted) {
+            return controlError("restart", run.runId, "run could not be restarted", allowedActions(run.status));
+          }
+          const next = findRun(manager, restarted.runId);
+          const suffix = next
+            ? formatRun(summarizeRun(next, manager.getSnapshot(next.runId)))
+            : `runId=${restarted.runId} status=running`;
+          return result(`action=restart result=restarted sourceRunId=${run.runId} ${suffix}`, {
+            action: "restart",
+            result: "restarted",
+            sourceRunId: run.runId,
+            runId: restarted.runId,
+          });
+        }
+        case "remove":
+          if (run.status === "running" || run.status === "paused") {
+            return controlError("remove", run.runId, `cannot remove a ${run.status} run; stop it first`, [
+              "status",
+              "stop",
+            ]);
+          }
+          if (!manager.deleteRun(run.runId)) {
+            return controlError("remove", run.runId, "run could not be removed", ["list"]);
+          }
+          return result(`action=remove result=removed runId=${run.runId}`, {
+            action: "remove",
+            result: "removed",
+            runId: run.runId,
+          });
       }
     },
   });
@@ -112,9 +152,9 @@ function normalizeInput(value: unknown): WorkflowControlInput {
     throw new Error("workflow_control requires an object argument");
   }
   const input = value as Record<string, unknown>;
-  const actions = new Set(["list", "status", "pause", "resume", "stop"]);
+  const actions = new Set(["list", "status", "pause", "resume", "stop", "restart", "remove"]);
   if (typeof input.action !== "string" || !actions.has(input.action)) {
-    throw new Error("workflow_control requires action: list|status|pause|resume|stop");
+    throw new Error("workflow_control requires action: list|status|pause|resume|stop|restart|remove");
   }
 
   const allowedKeys = input.action === "list" ? new Set(["action"]) : new Set(["action", "runId"]);
@@ -164,13 +204,13 @@ function allowedActions(status: RunStatus): string[] {
     case "running":
       return ["status", "pause", "stop"];
     case "paused":
-      return ["status", "resume", "stop"];
+      return ["status", "resume", "stop", "restart"];
     case "failed":
     case "pending":
-      return ["status", "resume"];
+      return ["status", "resume", "restart", "remove"];
     case "completed":
     case "aborted":
-      return ["status"];
+      return ["status", "restart", "remove"];
   }
 }
 
@@ -200,6 +240,7 @@ function countAgents(agents: Array<Pick<WorkflowAgentSnapshot, "status">>): Work
     total: agents.length,
     done: agents.filter((agent) => agent.status === "done").length,
     running: agents.filter((agent) => agent.status === "running").length,
+    paused: agents.filter((agent) => agent.status === "paused").length,
     queued: agents.filter((agent) => agent.status === "queued").length,
     error: agents.filter((agent) => agent.status === "error").length,
     skipped: agents.filter((agent) => agent.status === "skipped").length,
@@ -208,7 +249,7 @@ function countAgents(agents: Array<Pick<WorkflowAgentSnapshot, "status">>): Work
 
 function formatRun(run: WorkflowControlRunDetails): string {
   const active = run.activeLabels.join(",") || "-";
-  return `runId=${run.runId} name=${quote(run.workflowName)} status=${run.status} phase=${quote(run.phase ?? "-")} total=${run.counts.total} done=${run.counts.done} running=${run.counts.running} queued=${run.counts.queued} error=${run.counts.error} skipped=${run.counts.skipped} active=${quote(active)} tokens=${run.tokenTotal}`;
+  return `runId=${run.runId} name=${quote(run.workflowName)} status=${run.status} phase=${quote(run.phase ?? "-")} total=${run.counts.total} done=${run.counts.done} running=${run.counts.running} paused=${run.counts.paused} queued=${run.counts.queued} error=${run.counts.error} skipped=${run.counts.skipped} active=${quote(active)} tokens=${run.tokenTotal}`;
 }
 
 function quote(value: string): string {

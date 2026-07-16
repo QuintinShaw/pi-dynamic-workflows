@@ -4,7 +4,13 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import type { AgentRunOptions, AgentUsage } from "../src/agent.js";
-import { listAvailableModelSpecs, resolveAgentModelSpec, usageFromStats, WorkflowAgent } from "../src/agent.js";
+import {
+  createAgentUsageEventHandler,
+  listAvailableModelSpecs,
+  resolveAgentModelSpec,
+  usageFromStats,
+  WorkflowAgent,
+} from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { resolveModelSpecWithThinking } from "../src/model-spec.js";
 import type { ModelTierConfig } from "../src/model-tier-config.js";
@@ -388,6 +394,104 @@ test("lastAssistantText picks the last assistant message, not first", () => {
   assert.equal(text, "final");
 });
 
+test("usage events emit throttled estimates then exact cumulative message usage", () => {
+  const events: AgentUsage[] = [];
+  let timestamp = 0;
+  const handle = createAgentUsageEventHandler(
+    (usage) => events.push(usage),
+    () => timestamp,
+  );
+  const updatingMessage = {
+    role: "assistant",
+    content: [{ type: "text", text: "12345678" }],
+  };
+
+  handle({ type: "message_update", message: updatingMessage, assistantMessageEvent: {} } as never);
+  timestamp = 100;
+  updatingMessage.content[0].text = "123456789012";
+  handle({ type: "message_update", message: updatingMessage, assistantMessageEvent: {} } as never);
+  timestamp = 250;
+  handle({ type: "message_update", message: updatingMessage, assistantMessageEvent: {} } as never);
+
+  const endedMessage = {
+    role: "assistant",
+    content: [{ type: "text", text: "done" }],
+    usage: {
+      input: 7,
+      output: 3,
+      cacheRead: 2,
+      cacheWrite: 1,
+      totalTokens: 13,
+      cost: { input: 0.01, output: 0.02, cacheRead: 0, cacheWrite: 0, total: 0.03 },
+    },
+  };
+  handle({ type: "message_end", message: endedMessage } as never);
+  handle({ type: "message_end", message: endedMessage } as never);
+
+  assert.deepEqual(
+    events.map((usage) => ({ total: usage.total, output: usage.output, estimated: usage.estimated })),
+    [
+      { total: 2, output: 2, estimated: true },
+      { total: 3, output: 3, estimated: true },
+      { total: 13, output: 3, estimated: false },
+    ],
+  );
+  assert.equal(events[2].input, 7);
+  assert.equal(events[2].cacheRead, 2);
+  assert.equal(events[2].cost, 0.03);
+});
+
+test("all-zero message usage keeps the streaming estimate fallback", () => {
+  const events: AgentUsage[] = [];
+  const handle = createAgentUsageEventHandler((usage) => events.push(usage));
+  const message = {
+    role: "assistant",
+    content: [{ type: "text", text: "12345678" }],
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+  };
+
+  handle({ type: "message_update", message, assistantMessageEvent: {} } as never);
+  handle({ type: "message_end", message } as never);
+
+  assert.deepEqual(
+    events.map((usage) => usage.estimated),
+    [true],
+  );
+  assert.ok(events[0].total > 0);
+});
+
+test("usage message_end events accumulate across assistant turns", () => {
+  const events: AgentUsage[] = [];
+  const handle = createAgentUsageEventHandler((usage) => events.push(usage));
+  const message = (input: number, output: number) => ({
+    role: "assistant",
+    content: [{ type: "text", text: "done" }],
+    usage: {
+      input,
+      output,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: input + output,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.001 },
+    },
+  });
+
+  handle({ type: "message_end", message: message(10, 4) } as never);
+  handle({ type: "message_end", message: message(6, 2) } as never);
+
+  assert.equal(events.at(-1)?.input, 16);
+  assert.equal(events.at(-1)?.output, 6);
+  assert.equal(events.at(-1)?.total, 22);
+  assert.equal(events.at(-1)?.cost, 0.002);
+});
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Full agent() pipeline inside runWorkflow — verifies the agent() function
 // in workflow.ts correctly invokes the runner with all options.
@@ -638,8 +742,8 @@ test("agent() in workflow fires onTokenUsage after run", async () => {
       onTokenUsage: (u) => usageEvents.push({ input: u.input, output: u.output, total: u.total }),
     },
   );
-  assert.equal(usageEvents.length, 1, "should fire onTokenUsage once");
-  assert.equal(usageEvents[0].total, 30, "should accumulate from agent usage");
+  assert.ok(usageEvents.length >= 1, "should fire onTokenUsage during the run");
+  assert.equal(usageEvents.at(-1)?.total, 30, "should finish with accumulated agent usage");
 });
 
 test("agent() passes onModelResolved callback for display model updates", async () => {
@@ -673,8 +777,8 @@ test("agent() accumulates usage across multiple agents", async () => {
       onTokenUsage: (u) => usageEvents.push({ total: u.total }),
     },
   );
-  assert.equal(usageEvents.length, 1, "one final usage event");
-  assert.equal(usageEvents[0].total, 60, "two agents × 30 tokens each");
+  assert.ok(usageEvents.length >= 2, "usage should update as each agent reports");
+  assert.equal(usageEvents.at(-1)?.total, 60, "two agents × 30 tokens each");
 });
 
 test("agent() with timeout should handle gracefully (timeout returns null)", async () => {

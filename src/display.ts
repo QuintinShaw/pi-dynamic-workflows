@@ -4,10 +4,13 @@ import type { AgentHistoryEntry } from "./agent-history.js";
 import type { WorkflowErrorCode } from "./errors.js";
 import type { WorkflowMeta } from "./workflow.js";
 
-export type WorkflowAgentStatus = "queued" | "running" | "done" | "error" | "skipped";
+export type WorkflowAgentStatus = "queued" | "running" | "paused" | "done" | "error" | "skipped";
 
 export interface WorkflowAgentSnapshot {
   id: number;
+  /** Stable invocation identity (`runId:callIndex`). */
+  executionId?: string;
+  callIndex?: number;
   label: string;
   phase?: string;
   prompt: string;
@@ -19,6 +22,10 @@ export interface WorkflowAgentSnapshot {
   history?: AgentHistoryEntry[];
   /** Tokens used by this agent (a scalar estimate when the provider reports no usage). */
   tokens?: number;
+  /** Whether tokens is a live streaming estimate. */
+  tokensEstimated?: boolean;
+  /** Exact or provisional cumulative usage for this invocation. */
+  usage?: AgentUsage;
   /** Per-agent token usage breakdown (fresh input+output vs cached), when known. */
   tokenUsage?: AgentUsage;
   /** The model this agent ran on (provider/id), when known. */
@@ -247,7 +254,7 @@ const NO_THEME: ThemeLike = { fg: (_c, t) => t, bold: (t) => t };
 /** The bracketed per-agent token cell (" [89 tok · 3,000 cached]"), or "" when nothing is known yet. */
 function agentTokenCell(agent: WorkflowAgentSnapshot, theme: ThemeLike): string {
   const segment = fmtTokenSegment(tokenFigures(agent.tokenUsage, agent.tokens), fmtFull);
-  return segment ? theme.fg("dim", ` [${segment}]`) : "";
+  return segment ? theme.fg("dim", ` [${agent.tokensEstimated ? "~" : ""}${segment}]`) : "";
 }
 
 export function renderWorkflowLines(
@@ -338,6 +345,8 @@ export function statusIcon(status: WorkflowAgentStatus): string {
       return "○";
     case "running":
       return "●";
+    case "paused":
+      return "⏸";
     case "done":
       return "✓";
     case "error":

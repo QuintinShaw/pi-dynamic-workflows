@@ -3,6 +3,7 @@ import { unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { AssistantMessage, Model, TextContent } from "@earendil-works/pi-ai";
 import {
+  type AgentSessionEvent,
   AuthStorage,
   type CreateAgentSessionOptions,
   createAgentSession,
@@ -300,7 +301,7 @@ function warnPersistSecretsOnce(sessionDir: string): void {
   );
 }
 
-/** Real token/cost usage for a single subagent run, read from the SDK session. */
+/** Token/cost usage for a single subagent run. */
 export interface AgentUsage {
   input: number;
   output: number;
@@ -308,6 +309,64 @@ export interface AgentUsage {
   cacheWrite: number;
   total: number;
   cost: number;
+  /** True only for an in-progress output-token estimate. */
+  estimated?: boolean;
+}
+
+/**
+ * Convert session events into absolute cumulative usage. Exact message usage is
+ * emitted at message_end; throttled message_update events add only a temporary
+ * output estimate, which the next exact event replaces.
+ */
+export function createAgentUsageEventHandler(
+  onUsage: (usage: AgentUsage) => void,
+  now: () => number = Date.now,
+): (event: AgentSessionEvent) => void {
+  const exact: AgentUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 };
+  const endedMessages = new WeakSet<object>();
+  let lastEstimateEmit = Number.NEGATIVE_INFINITY;
+  const emit = (usage: AgentUsage) => {
+    try {
+      onUsage(usage);
+    } catch {
+      // Telemetry is best-effort; never interrupt the child session.
+    }
+  };
+
+  return (event) => {
+    if (event.type === "message_end" && event.message.role === "assistant") {
+      if (endedMessages.has(event.message)) return;
+      endedMessages.add(event.message);
+      const usage = event.message.usage;
+      exact.input += usage.input;
+      exact.output += usage.output;
+      exact.cacheRead += usage.cacheRead;
+      exact.cacheWrite += usage.cacheWrite;
+      exact.total += usage.totalTokens;
+      exact.cost += usage.cost.total;
+      lastEstimateEmit = Number.NEGATIVE_INFINITY;
+      if (exact.total > 0 || exact.cost > 0) emit({ ...exact, estimated: false });
+      return;
+    }
+
+    if (event.type !== "message_update" || event.message.role !== "assistant") return;
+    const timestamp = now();
+    if (timestamp - lastEstimateEmit < 250) return;
+    lastEstimateEmit = timestamp;
+    const textLength = event.message.content.reduce(
+      (total, part) =>
+        total + (part.type === "text" ? part.text.length : part.type === "thinking" ? part.thinking.length : 0),
+      0,
+    );
+    const estimatedOutput = Math.ceil(textLength / 4);
+    if (estimatedOutput <= 0) return;
+    emit({
+      ...exact,
+      output: exact.output + estimatedOutput,
+      total: exact.total + estimatedOutput,
+      estimated: true,
+    });
+  };
 }
 
 /**
@@ -346,10 +405,9 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
   instructions?: string;
   signal?: AbortSignal;
   /**
-   * Called once with this subagent's real usage, read from the session right
-   * before disposal. Fires on both the success and error paths so partial
-   * usage is never lost — but NOT when the provider reported no usage at all
-   * (all-zero stats), so consumers keep their scalar fallback.
+   * Called with absolute cumulative usage during the run and once more with
+   * authoritative session totals before disposal. Streaming estimates have
+   * `estimated: true`; message-boundary and terminal updates are exact.
    */
   onUsage?: (usage: AgentUsage) => void;
   /**
@@ -583,7 +641,7 @@ export class WorkflowAgent {
     }
 
     let removeAbortListener: (() => void) | undefined;
-    let removeHistoryListener: (() => void) | undefined;
+    let removeSessionListener: (() => void) | undefined;
     let lastHistoryEmit = 0;
     const emitHistory = () => options.onHistory?.(compactAgentHistory(session.messages));
     const maybeEmitHistory = () => {
@@ -593,6 +651,7 @@ export class WorkflowAgent {
       lastHistoryEmit = now;
       emitHistory();
     };
+    const handleUsageEvent = options.onUsage ? createAgentUsageEventHandler(options.onUsage) : undefined;
     try {
       if (options.signal?.aborted) throw new Error("Subagent was aborted");
       if (options.signal) {
@@ -600,8 +659,11 @@ export class WorkflowAgent {
         options.signal.addEventListener("abort", onAbort, { once: true });
         removeAbortListener = () => options.signal?.removeEventListener("abort", onAbort);
       }
-      if (options.onHistory) {
-        removeHistoryListener = session.subscribe(() => maybeEmitHistory());
+      if (options.onHistory || handleUsageEvent) {
+        removeSessionListener = session.subscribe((event) => {
+          maybeEmitHistory();
+          handleUsageEvent?.(event);
+        });
       }
 
       await session.prompt(this.buildPrompt(prompt, options as AgentRunOptions<any>, Boolean(options.schema)));
@@ -630,17 +692,17 @@ export class WorkflowAgent {
       return text as AgentRunResult<TSchemaDef>;
     } finally {
       removeAbortListener?.();
-      removeHistoryListener?.();
+      removeSessionListener?.();
       try {
         emitHistory();
       } catch {
         // History is diagnostic only; never let it mask the real result/error.
       }
-      // Read real usage before disposing — dispose tears down the session state.
+      // Emit authoritative terminal usage before disposing the session state.
       if (options.onUsage) {
         try {
           const usage = usageFromStats(session.getSessionStats());
-          if (usage) options.onUsage(usage);
+          if (usage) options.onUsage({ ...usage, estimated: false });
         } catch {
           // Usage is best-effort; never let stats failure mask the real result/error.
         }

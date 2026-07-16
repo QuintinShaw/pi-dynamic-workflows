@@ -28,7 +28,10 @@ import { shortModel } from "./workflow-ui.js";
 // as tokens accrue (not only on agent start/end). It is harmless in compact mode —
 // it redraws identical content.
 const RUN_EVENTS = [
+  "agentQueued",
   "agentStart",
+  "agentUsage",
+  "agentHistory",
   "agentEnd",
   "phase",
   "log",
@@ -335,7 +338,7 @@ function renderRunBody(
     const visible = phaseAgents.slice(-maxAgents);
     for (const a of visible) {
       const segment = fmtTokenSegment(tokenFigures(a.tokenUsage, a.tokens), fmtTokensShort);
-      const tok = segment ? dim(` ${segment}`) : "";
+      const tok = segment ? dim(` ${a.tokensEstimated ? "~" : ""}${segment}`) : "";
       const mdl = shortModel(a.model);
       const model = mdl ? dim(` · ${mdl}`) : "";
       lines.push(`    [${a.id}] ${statusIcon(a.status)} ${shorten(a.label, 40)}${tok}${model}`);

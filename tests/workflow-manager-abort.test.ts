@@ -350,21 +350,20 @@ test(
     assert.equal(paused, true);
     assert.equal(manager.getRun(runId)?.status, "paused");
 
-    // Resume — replays journal (empty for single-agent that never completed) and
-    // re-runs the live agent with a fresh (non-aborted) controller.
-    const resumed = await manager.resume(runId);
-    assert.equal(resumed, true, "resume should succeed");
+    // Resume serializes behind the interrupted execution before it starts a
+    // replacement, so an invocation can never overlap with its prior attempt.
+    const resumePromise = manager.resume(runId);
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(manager.getRun(runId)?.status, "paused");
 
-    // The resumed run should be running
-    assert.equal(manager.getRun(runId)?.status, "running", "resumed run should be running");
-
-    // Resolve the deferred agent so the resumed run's agent completes
+    // Let the interrupted runner settle; the replacement then starts with a
+    // fresh controller. This test runner reuses an already-resolved promise, so
+    // the replacement completes immediately with the same terminal result.
     da.resolve("resumed-done");
-
-    // The original promise will reject (its controller was aborted). Suppress it.
     await origPromise.catch(() => {});
+    assert.equal(await resumePromise, true, "resume should succeed");
 
-    // Wait for the resumed run to complete
+    // Wait for the resumed run to complete.
     await new Promise((r) => setTimeout(r, 50));
 
     const finalRun = manager.getRun(runId);
@@ -513,7 +512,7 @@ test(
 // ─── deleteRun tests (2 tests) ─────────────────────────────────────────────────
 
 test(
-  "deleteRun can delete a running run (removes from memory and persistence)",
+  "deleteRun refuses active work until it is stopped",
   withTempCwd(async (cwd) => {
     const da = deferredAgent();
     const manager = new WorkflowManager({ cwd, agent: da.runner });
@@ -521,18 +520,16 @@ test(
     const { runId, promise } = manager.startInBackground(oneAgentScript);
     await new Promise((r) => setTimeout(r, 20));
 
-    // Delete while running — should succeed (removes from tracking)
-    const deleted = manager.deleteRun(runId);
-    assert.equal(deleted, true);
+    assert.equal(manager.deleteRun(runId), false, "running artifacts must remain owned by the execution");
+    assert.ok(manager.getRun(runId));
+    assert.ok(manager.listRuns().some((run) => run.runId === runId));
 
-    // Should not be in memory
+    assert.equal(manager.stop(runId), true);
+    assert.equal(manager.deleteRun(runId), true);
     assert.equal(manager.getRun(runId), undefined);
-
-    // Should not be in persistence
-    const runs = manager.listRuns();
     assert.equal(
-      runs.find((r) => r.runId === runId),
-      undefined,
+      manager.listRuns().some((run) => run.runId === runId),
+      false,
     );
 
     da.resolve("done");
@@ -674,13 +671,13 @@ test(
     const { runId, promise: origPromise } = manager.startInBackground(oneAgentScript);
     await new Promise((r) => setTimeout(r, 20));
     manager.pause(runId);
-    await manager.resume(runId);
+    const resumePromise = manager.resume(runId);
+    da.resolve("done");
+    await origPromise.catch(() => {});
+    assert.equal(await resumePromise, true);
 
     assert.ok(resumedEvent, "resumed event should fire on resume");
     assert.equal(resumedEvent?.runId, runId);
-
-    da.resolve("done");
-    await origPromise.catch(() => {});
 
     // Now test error event on abort
     let capturedError: { runId: string; error: WorkflowError } | null = null;

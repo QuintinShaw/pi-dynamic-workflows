@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { Check } from "typebox/value";
 import type { WorkflowSnapshot } from "../src/display.js";
 import type { PersistedRunState, RunStatus } from "../src/run-persistence.js";
 import { createWorkflowControlTool } from "../src/workflow-control-tool.js";
-import type { WorkflowManager } from "../src/workflow-manager.js";
+import { WorkflowManager } from "../src/workflow-manager.js";
+import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
 function run(status: RunStatus = "running", runId = "audit-abc123"): PersistedRunState {
   return {
@@ -54,6 +58,20 @@ function fakeManager(initial: PersistedRunState[], liveSnapshots: Record<string,
       item.status = "aborted";
       return true;
     },
+    restart(runId: string) {
+      calls.push({ action: "restart", runId });
+      const item = runs.get(runId);
+      if (!item || item.status === "running") return null;
+      const restarted = run("running", "audit-new456");
+      runs.set(restarted.runId, restarted);
+      return { runId: restarted.runId, promise: Promise.resolve({}) };
+    },
+    deleteRun(runId: string) {
+      calls.push({ action: "remove", runId });
+      const item = runs.get(runId);
+      if (!item || item.status === "running" || item.status === "paused") return false;
+      return runs.delete(runId);
+    },
   } as unknown as WorkflowManager;
   return { manager, calls };
 }
@@ -67,7 +85,7 @@ function text(result: Awaited<ReturnType<typeof execute>>): string {
   return result.content[0].text;
 }
 
-test("workflow_control exposes only list, status, pause, resume, and stop in a strict schema", () => {
+test("workflow_control exposes durable lifecycle actions in a strict schema", () => {
   const { manager } = fakeManager([]);
   const tool = createWorkflowControlTool({ manager });
 
@@ -77,8 +95,8 @@ test("workflow_control exposes only list, status, pause, resume, and stop in a s
   assert.equal(Check(tool.parameters, { action: "pause", runId: "abc" }), true);
   assert.equal(Check(tool.parameters, { action: "resume", runId: "abc" }), true);
   assert.equal(Check(tool.parameters, { action: "stop", runId: "abc" }), true);
-  assert.equal(Check(tool.parameters, { action: "restart", runId: "abc" }), false);
-  assert.equal(Check(tool.parameters, { action: "remove", runId: "abc" }), false);
+  assert.equal(Check(tool.parameters, { action: "restart", runId: "abc" }), true);
+  assert.equal(Check(tool.parameters, { action: "remove", runId: "abc" }), true);
   assert.equal(Check(tool.parameters, { action: "set_concurrency", runId: "abc", concurrency: 2 }), false);
   assert.equal(Check(tool.parameters, { action: "status" }), false);
   assert.equal(Check(tool.parameters, { action: "list", runId: "abc" }), false);
@@ -87,7 +105,7 @@ test("workflow_control exposes only list, status, pause, resume, and stop in a s
   const prepare = tool.prepareArguments as (value: unknown) => unknown;
   assert.throws(() => prepare({ action: "pause" }), /requires runId/);
   assert.throws(() => prepare({ action: "status", runId: "abc", extra: true }), /does not accept extra/);
-  assert.throws(() => prepare({ action: "restart", runId: "abc" }), /requires action/);
+  assert.throws(() => prepare({ action: "restart" }), /requires runId/);
 });
 
 test("list and status return stable lifecycle and observability fields", async () => {
@@ -96,7 +114,7 @@ test("list and status return stable lifecycle and observability fields", async (
   const listed = await execute(manager, { action: "list" });
   assert.match(text(listed), /^action=list result=ok runs=1\n/);
   assert.match(text(listed), /runId=audit-abc123 name="audit" status=running phase="Inspect"/);
-  assert.match(text(listed), /total=4 done=0 running=1 queued=1 error=1 skipped=1/);
+  assert.match(text(listed), /total=4 done=0 running=1 paused=0 queued=1 error=1 skipped=1/);
   assert.match(text(listed), /active="active scan" tokens=30/);
   assert.deepEqual(listed.details, {
     action: "list",
@@ -107,7 +125,7 @@ test("list and status return stable lifecycle and observability fields", async (
         workflowName: "audit",
         status: "running",
         phase: "Inspect",
-        counts: { total: 4, done: 0, running: 1, queued: 1, error: 1, skipped: 1 },
+        counts: { total: 4, done: 0, running: 1, paused: 0, queued: 1, error: 1, skipped: 1 },
         activeLabels: ["active scan"],
         tokenTotal: 30,
       },
@@ -171,6 +189,53 @@ test("pause, resume, and stop call the shared manager lifecycle methods", async 
   );
 });
 
+test("restart creates a new run and remove deletes terminal history", async () => {
+  const fixture = fakeManager([run("completed")]);
+
+  const restarted = await execute(fixture.manager, { action: "restart", runId: "audit-abc123" });
+  assert.match(text(restarted), /action=restart result=restarted sourceRunId=audit-abc123/);
+  assert.equal(restarted.details.runId, "audit-new456");
+
+  const removed = await execute(fixture.manager, { action: "remove", runId: "audit-abc123" });
+  assert.match(text(removed), /action=remove result=removed runId=audit-abc123/);
+  assert.deepEqual(
+    fixture.calls.map((call) => call.action),
+    ["restart", "remove"],
+  );
+});
+
+test("cold paused run can be stopped and then removed", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-control-cold-"));
+  const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-control-home-"));
+  try {
+    await withFakeHomeAsync(fakeHome, async () => {
+      const bootstrap = new WorkflowManager({ cwd });
+      const runId = "cold-paused-control";
+      bootstrap.getPersistence().save({
+        runId,
+        workflowName: "cold_control",
+        script: "export const meta = { name: 'cold_control', description: 'cold' }; return true",
+        status: "paused",
+        phases: [],
+        agents: [],
+        logs: [],
+        startedAt: "2026-07-14T00:00:00.000Z",
+        updatedAt: "2026-07-14T00:00:01.000Z",
+      });
+
+      const manager = new WorkflowManager({ cwd });
+      assert.equal(manager.getRun(runId), undefined);
+      assert.match(text(await execute(manager, { action: "stop", runId })), /result=stopped/);
+      assert.equal(manager.getPersistence().load(runId)?.status, "aborted");
+      assert.match(text(await execute(manager, { action: "remove", runId })), /result=removed/);
+      assert.equal(manager.getPersistence().load(runId), null);
+    });
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(fakeHome, { recursive: true, force: true });
+  }
+});
+
 test("unknown IDs and illegal transitions return explicit errors with allowed actions", async () => {
   const fixture = fakeManager([run("completed"), run("running", "live-123")]);
 
@@ -179,10 +244,13 @@ test("unknown IDs and illegal transitions return explicit errors with allowed ac
 
   const pauseCompleted = text(await execute(fixture.manager, { action: "pause", runId: "audit-abc123" }));
   assert.match(pauseCompleted, /cannot pause run with status completed/);
-  assert.match(pauseCompleted, /allowed=status/);
+  assert.match(pauseCompleted, /allowed=status,restart,remove/);
+
+  const removeRunning = text(await execute(fixture.manager, { action: "remove", runId: "live-123" }));
+  assert.match(removeRunning, /cannot remove a running run; stop it first/);
 
   await execute(fixture.manager, { action: "stop", runId: "live-123" });
   const stopAborted = text(await execute(fixture.manager, { action: "stop", runId: "live-123" }));
   assert.match(stopAborted, /cannot stop run with status aborted/);
-  assert.match(stopAborted, /allowed=status/);
+  assert.match(stopAborted, /allowed=status,restart,remove/);
 });

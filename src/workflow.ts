@@ -20,6 +20,9 @@ import { parseModelRoutingFromMeta, resolveModelForPhase } from "./model-routing
 import { createAgentStoreTools, SharedStore } from "./shared-store.js";
 import { createWorktree, removeWorktree, type Worktree } from "./worktree.js";
 
+/** AbortSignal reason used for a resumable workflow pause (distinct from stop/Esc). */
+export const WORKFLOW_PAUSE_ABORT_REASON = "workflow-paused";
+
 export interface WorkflowMetaPhase {
   title: string;
   detail?: string;
@@ -37,9 +40,15 @@ export interface WorkflowMeta {
 /** One cached agent() result, keyed by its deterministic call index. */
 export interface JournalEntry {
   index: number;
+  /** Stable invocation identity (`runId:index`). */
+  executionId?: string;
+  /** Runtime-only origin; checkpoints have no following agent-end persistence callback. */
+  source?: "agent" | "checkpoint";
   /** sha256 of the call's identity (prompt + model + phase + agentType + schema). */
   hash: string;
   result: unknown;
+  /** Exact cumulative usage for the completed invocation, when available. */
+  usage?: AgentUsage;
   /**
    * Per-agent write delta (keys set by this agent) for additive replay on resume.
    * Replaces the former full-map snapshot to fix parallel-agent ordering: applying
@@ -50,9 +59,8 @@ export interface JournalEntry {
 }
 
 /**
- * Global resources shared across a run and any workflow() nested inside it, so
- * the 16-concurrent / 1000-total caps and the token budget hold across nesting
- * instead of each level getting its own limiter and counters.
+ * Global resources shared across a run and any nested workflow() call, so
+ * concurrency, maxAgents, and token budgets apply to the whole tree.
  */
 export interface SharedRuntime {
   limiter: <T>(fn: () => Promise<T>) => Promise<T>;
@@ -60,6 +68,10 @@ export interface SharedRuntime {
   spent: number;
   tokenUsage: { input: number; output: number; total: number; cost: number; cacheRead: number; cacheWrite: number };
   depth: number;
+  /** Scoped execution IDs replayed before the first cache miss. */
+  replayedExecutionIds?: Set<string>;
+  /** Shared resume boundary: after any parent/child miss, all later scoped calls run live. */
+  resumeMissed?: boolean;
 }
 
 export interface WorkflowRunOptions extends WorkflowAgentOptions {
@@ -87,12 +99,16 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   persistLogs?: boolean;
   /** Run ID for persistence. Auto-generated if not provided. */
   runId?: string;
-  /** Resume: cached agent results keyed by deterministic call index. */
-  resumeJournal?: Map<number, JournalEntry>;
+  /** Resume: cached results keyed by scoped execution ID (numeric keys remain supported for legacy callers). */
+  resumeJournal?: ReadonlyMap<string | number, JournalEntry>;
   /** Resume: the run being resumed (informational; enables resume mode). */
   resumeFromRunId?: string;
   /** Called after each live agent completes so the caller can persist the journal. */
   onAgentJournal?: (entry: JournalEntry) => void;
+  /** Called once at the first replay miss with the execution IDs safe to retain. */
+  onResumeMiss?: (replayedExecutionIds: ReadonlySet<string>) => void;
+  /** Exact historical usage by phase, used to restore phase sub-budget gates. */
+  resumePhaseUsage?: ReadonlyMap<string, number>;
   /** Internal: shared runtime inherited by a nested workflow() call. */
   sharedRuntime?: SharedRuntime;
   /**
@@ -111,20 +127,58 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   confirm?: (promptText: string, options: CheckpointOptions) => Promise<unknown>;
   onLog?: (message: string) => void;
   onPhase?: (title: string) => void;
-  onAgentStart?: (event: { label: string; phase?: string; prompt: string; model?: string }) => void;
+  onAgentQueued?: (event: {
+    executionId: string;
+    callIndex: number;
+    label: string;
+    phase?: string;
+    prompt: string;
+    model?: string;
+    /** True only when this callback represents a journal cache hit. */
+    replayed?: boolean;
+  }) => void;
+  onAgentStart?: (event: {
+    executionId: string;
+    callIndex: number;
+    label: string;
+    phase?: string;
+    prompt: string;
+    model?: string;
+    /** True only when this callback represents a journal cache hit. */
+    replayed?: boolean;
+  }) => void;
   onAgentEnd?: (event: {
+    executionId: string;
+    callIndex: number;
     label: string;
     phase?: string;
     result: unknown;
+    status: "done" | "error" | "skipped" | "paused";
     tokens?: number;
-    tokenUsage?: AgentUsage;
-    worktree?: string;
+    usage?: AgentUsage;
     model?: string;
     error?: string;
     errorCode?: WorkflowErrorCode;
     recoverable?: boolean;
+    /** True only when this callback represents a journal cache hit. */
+    replayed?: boolean;
   }) => void;
-  onAgentHistory?: (event: { label: string; phase?: string; history: AgentHistoryEntry[] }) => void;
+  onAgentHistory?: (event: {
+    executionId: string;
+    callIndex: number;
+    label: string;
+    phase?: string;
+    history: AgentHistoryEntry[];
+  }) => void;
+  onAgentUsage?: (event: {
+    executionId: string;
+    callIndex: number;
+    label: string;
+    phase?: string;
+    usage: AgentUsage;
+    /** True only when this callback represents a journal cache hit. */
+    replayed?: boolean;
+  }) => void;
   onTokenUsage?: (usage: {
     input: number;
     output: number;
@@ -220,6 +274,8 @@ interface RuntimeState {
    * callIndex < firstMiss; once a call misses, it AND everything after run live.
    */
   firstMiss: number;
+  /** Deterministic nested workflow invocation sequence within this script. */
+  nestedSeq: number;
 }
 
 type AnyNode = Node & { [key: string]: any; start: number; end: number };
@@ -294,21 +350,31 @@ export async function runWorkflow<T = unknown>(
     phaseBudgets: new Map(),
     callSeq: 0,
     firstMiss: Number.POSITIVE_INFINITY,
+    nestedSeq: 0,
   };
 
   const agentRunner = options.agent ?? new WorkflowAgent(options);
   const concurrency = normalizeConcurrency(
     options.concurrency ?? Math.max(1, (globalThis.navigator?.hardwareConcurrency ?? 8) - 2),
   );
-  // Global caps + budget are shared with any nested workflow() so they hold across nesting.
+  // Global controls are shared with any nested workflow() so they hold across nesting.
   const shared: SharedRuntime = options.sharedRuntime ?? {
     limiter: createLimiter(concurrency),
     agentCount: 0,
     spent: 0,
     tokenUsage: { input: 0, output: 0, total: 0, cost: 0, cacheRead: 0, cacheWrite: 0 },
     depth: 0,
+    replayedExecutionIds: new Set(),
+    resumeMissed: false,
   };
   const limiter = shared.limiter;
+  if (!shared.replayedExecutionIds) shared.replayedExecutionIds = new Set();
+  const replayedExecutionIds = shared.replayedExecutionIds;
+  const markResumeMiss = () => {
+    if (shared.resumeMissed) return;
+    shared.resumeMissed = true;
+    options.onResumeMiss?.(new Set(replayedExecutionIds));
+  };
 
   // One store instance per run; nested workflow() calls inherit the parent's store
   // so all agents across nesting levels share the same key-value space.
@@ -327,7 +393,12 @@ export async function runWorkflow<T = unknown>(
     // Re-declaring re-bases from the current spent (idempotent across resume: the
     // script re-runs phase() and the ceiling is recomputed from live spent).
     if (typeof phaseOptions?.budget === "number" && phaseOptions.budget > 0) {
-      state.phaseBudgets.set(title, { budget: phaseOptions.budget, startSpent: shared.spent, warned: false });
+      const historicalUsage = options.resumePhaseUsage?.get(title) ?? 0;
+      state.phaseBudgets.set(title, {
+        budget: phaseOptions.budget,
+        startSpent: shared.spent - historicalUsage,
+        warned: false,
+      });
     }
     options.onPhase?.(title);
   };
@@ -344,6 +415,14 @@ export async function runWorkflow<T = unknown>(
     }
   };
 
+  const cachedJournalEntry = (executionId: string, callIndex: number): JournalEntry | undefined => {
+    const scoped = options.resumeJournal?.get(executionId);
+    if (scoped) return scoped;
+    // Numeric journals predate scoped nested execution IDs. Only the root may
+    // consume them; otherwise child index 0 can replay the root's index 0 entry.
+    return options.sharedRuntime ? undefined : options.resumeJournal?.get(callIndex);
+  };
+
   const agent = async (prompt: string, agentOptions: AgentOptions = {}) => {
     throwIfAborted();
 
@@ -356,35 +435,7 @@ export async function runWorkflow<T = unknown>(
       );
     }
 
-    if (budget.total !== null && budget.remaining() <= 0) {
-      throw new WorkflowError("workflow token budget exhausted", WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED, {
-        recoverable: false,
-      });
-    }
-
     const assignedPhase = agentOptions.phase ?? state.currentPhase;
-
-    // Per-phase soft sub-budget gate: a noisy phase can exhaust its own ceiling
-    // without touching the run's overall budget. Soft (spent accrues post-agent),
-    // warns once at ~80%, throws at 100%. Scripts can try/catch around a phase's
-    // work so later phases still proceed.
-    if (assignedPhase) {
-      const pb = state.phaseBudgets.get(assignedPhase);
-      if (pb) {
-        const phaseSpent = shared.spent - pb.startSpent;
-        if (phaseSpent >= pb.budget) {
-          throw new WorkflowError(
-            `phase "${assignedPhase}" token sub-budget exhausted (${pb.budget})`,
-            WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED,
-            { recoverable: false },
-          );
-        }
-        if (!pb.warned && phaseSpent >= pb.budget * 0.8) {
-          pb.warned = true;
-          log(`phase "${assignedPhase}" at ${Math.round((phaseSpent / pb.budget) * 100)}% of its token sub-budget`);
-        }
-      }
-    }
 
     const requestedLabel = agentOptions.label?.trim();
 
@@ -416,45 +467,86 @@ export async function runWorkflow<T = unknown>(
     // running nested-run agent can both get callIndex 0 and collide in
     // SharedStore.agentDeltas — whichever commits last steals/overwrites the
     // other's journaled delta. Composing the run's own runId (unique per
-    // top-level run AND per nested run, see `${runId}-nested${shared.depth}`
-    // below) with callIndex makes the key unique across the whole store.
-    const deltaKey = `${runId}:${callIndex}`;
+    // top-level and deterministic nested invocation) with callIndex makes the
+    // key unique across the whole store.
+    const executionId = `${runId}:${callIndex}`;
+    const deltaKey = executionId;
 
-    // Reserve the agent slot synchronously — atomic with the limit/budget gate
-    // above (no await in between) — so a parallel() fan-out can't all observe the
-    // same agentCount and overshoot maxAgents. (Token budget stays a soft gate:
-    // spent accrues after each agent, matching Claude Code; in-flight agents may
-    // push slightly past total, then further agent() calls throw.)
-    shared.agentCount++;
-    const label = requestedLabel || defaultAgentLabel(assignedPhase, shared.agentCount);
+    const label = requestedLabel || defaultAgentLabel(assignedPhase, shared.agentCount + 1);
+    const invocation = { executionId, callIndex, label, phase: assignedPhase };
 
-    // Longest-unchanged-prefix resume: replay a cached result only while the
-    // prefix is still intact — this call's index is before the first changed/new
-    // call. Once any call misses, it AND everything after it run live (matching
-    // Claude Code's contract), so an edited upstream call never leaves stale
-    // downstream results served from the journal.
-    const cached = options.resumeJournal?.get(callIndex);
+    // Longest-unchanged-prefix resume: replay a cached result before live-work
+    // budget gates. Historical work is free even when the remaining budget is 0.
+    const cached = cachedJournalEntry(executionId, callIndex);
     const hashMatches = cached != null && cached.hash === callHash;
     const cachedEmptyOutput = hashMatches && isEmptyTextAgentResult(cached.result, agentOptions.schema);
-    if (hashMatches && !cachedEmptyOutput && callIndex < state.firstMiss) {
-      options.onAgentStart?.({ label, phase: assignedPhase, prompt, model: displayModel });
-      options.onAgentEnd?.({ label, phase: assignedPhase, result: cached.result, tokens: 0, model: displayModel });
-      // Apply this agent's write delta so live agents later in the run see a
-      // consistent store. Additive apply preserves parallel-agent writes that
-      // came from higher-callIndex agents finishing before this one.
+    if (hashMatches && !cachedEmptyOutput && !shared.resumeMissed && callIndex < state.firstMiss) {
+      shared.agentCount++;
+      replayedExecutionIds.add(executionId);
+      options.onAgentQueued?.({ ...invocation, prompt, model: displayModel, replayed: true });
+      options.onAgentStart?.({ ...invocation, prompt, model: displayModel, replayed: true });
+      if (cached.usage)
+        options.onAgentUsage?.({ ...invocation, usage: { ...cached.usage, estimated: false }, replayed: true });
+      options.onAgentEnd?.({
+        ...invocation,
+        result: cached.result,
+        status: "done",
+        tokens: cached.usage?.total ?? 0,
+        usage: cached.usage,
+        model: displayModel,
+        replayed: true,
+      });
       if (cached.storeDelta) store.applyDelta(cached.storeDelta);
       return cached.result;
     }
-    // A genuine miss (no journal entry, or the hash changed) marks where the
-    // unchanged prefix ends; this call and every later one then run live.
-    if (!hashMatches || cachedEmptyOutput) state.firstMiss = Math.min(state.firstMiss, callIndex);
+    if (!hashMatches || cachedEmptyOutput) {
+      state.firstMiss = Math.min(state.firstMiss, callIndex);
+      markResumeMiss();
+    }
+
+    if (budget.total !== null && budget.remaining() <= 0) {
+      throw new WorkflowError("workflow token budget exhausted", WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED, {
+        recoverable: false,
+      });
+    }
+    if (assignedPhase) {
+      const pb = state.phaseBudgets.get(assignedPhase);
+      if (pb) {
+        const phaseSpent = shared.spent - pb.startSpent;
+        if (phaseSpent >= pb.budget) {
+          throw new WorkflowError(
+            `phase "${assignedPhase}" token sub-budget exhausted (${pb.budget})`,
+            WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED,
+            { recoverable: false },
+          );
+        }
+        if (!pb.warned && phaseSpent >= pb.budget * 0.8) {
+          pb.warned = true;
+          log(`phase "${assignedPhase}" at ${Math.round((phaseSpent / pb.budget) * 100)}% of its token sub-budget`);
+        }
+      }
+    }
+
+    // Reserve synchronously before the limiter so parallel fan-out cannot exceed maxAgents.
+    shared.agentCount++;
+    options.onAgentQueued?.({
+      ...invocation,
+      prompt,
+      model: displayModel,
+    });
 
     return limiter(async () => {
+      // Calls that never entered the limiter before pause remain visibly queued.
+      throwIfAborted();
       const timeout = agentOptions.timeoutMs !== undefined ? agentOptions.timeoutMs : agentTimeoutMs;
       const retryAttempts = normalizeAgentRetries(agentOptions.retries ?? options.agentRetries ?? 0);
       const maxAttempts = retryAttempts + 1;
 
-      options.onAgentStart?.({ label, phase: assignedPhase, prompt, model: displayModel });
+      options.onAgentStart?.({
+        ...invocation,
+        prompt,
+        model: displayModel,
+      });
 
       // Optional per-agent worktree isolation (deterministic name -> stable resume keys).
       // Precedence: explicit call-site isolation > agentDef isolation.
@@ -469,27 +561,81 @@ export async function runWorkflow<T = unknown>(
       }
       const runCwd = worktree?.isolated ? worktree.cwd : undefined;
 
-      // Captured from the subagent's real session usage; falls back to an
-      // estimate when the provider reports no usage (total === 0). Usage is reset
-      // per retry attempt so a failed attempt does not double-count the next one.
-      let usage: AgentUsage | undefined;
-      const recordTokens = (result: unknown): number => {
-        const tokens = usage && usage.total > 0 ? usage.total : estimateTokens(result) + estimateTokens(prompt);
-        if (usage) {
-          shared.tokenUsage.input += usage.input;
-          shared.tokenUsage.output += usage.output;
-          shared.tokenUsage.cost += usage.cost;
-          shared.tokenUsage.cacheRead += usage.cacheRead;
-          shared.tokenUsage.cacheWrite += usage.cacheWrite;
+      // Provider callbacks are absolute within an attempt. Only exact callbacks
+      // enter durable/run accounting; estimates are provisional display values.
+      const zeroUsage = (): AgentUsage => ({
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        total: 0,
+        cost: 0,
+        estimated: false,
+      });
+      const addUsage = (left: AgentUsage, right: AgentUsage): AgentUsage => ({
+        input: left.input + right.input,
+        output: left.output + right.output,
+        cacheRead: left.cacheRead + right.cacheRead,
+        cacheWrite: left.cacheWrite + right.cacheWrite,
+        total: left.total + right.total,
+        cost: left.cost + right.cost,
+        estimated: left.estimated === true || right.estimated === true,
+      });
+      let completedExactUsage = zeroUsage();
+      let attemptExactUsage: AgentUsage | undefined;
+      let accountedUsage = zeroUsage();
+      const emitUsage = (usage: AgentUsage) => options.onAgentUsage?.({ ...invocation, usage });
+      const applyExactUsage = (usage: AgentUsage) => {
+        const input = usage.input - accountedUsage.input;
+        const output = usage.output - accountedUsage.output;
+        const cacheRead = usage.cacheRead - accountedUsage.cacheRead;
+        const cacheWrite = usage.cacheWrite - accountedUsage.cacheWrite;
+        const total = usage.total - accountedUsage.total;
+        const cost = usage.cost - accountedUsage.cost;
+        shared.tokenUsage.input += input;
+        shared.tokenUsage.output += output;
+        shared.tokenUsage.cacheRead += cacheRead;
+        shared.tokenUsage.cacheWrite += cacheWrite;
+        shared.tokenUsage.total += total;
+        shared.tokenUsage.cost += cost;
+        shared.spent += total;
+        accountedUsage = { ...usage, estimated: false };
+        if (input || output || cacheRead || cacheWrite || total || cost) options.onTokenUsage?.(shared.tokenUsage);
+      };
+      const receiveUsage = (usage: AgentUsage) => {
+        if (usage.estimated) {
+          emitUsage(addUsage(completedExactUsage, { ...usage, estimated: true }));
+          return;
         }
-        shared.tokenUsage.total += tokens;
-        shared.spent += tokens;
-        return tokens;
+        attemptExactUsage = { ...usage, estimated: false };
+        const cumulative = addUsage(completedExactUsage, attemptExactUsage);
+        emitUsage(cumulative);
+        applyExactUsage(cumulative);
+      };
+      const finishAttempt = (result: unknown, allowEstimate = true): { display?: AgentUsage; exact?: AgentUsage } => {
+        if (attemptExactUsage) {
+          completedExactUsage = addUsage(completedExactUsage, attemptExactUsage);
+          completedExactUsage.estimated = false;
+          emitUsage(completedExactUsage);
+          applyExactUsage(completedExactUsage);
+          attemptExactUsage = undefined;
+          return { display: completedExactUsage, exact: completedExactUsage };
+        }
+        if (!allowEstimate) return { exact: completedExactUsage.total > 0 ? completedExactUsage : undefined };
+        const display = addUsage(completedExactUsage, {
+          ...zeroUsage(),
+          total: estimateTokens(result) + estimateTokens(prompt),
+          estimated: true,
+        });
+        emitUsage(display);
+        return { display, exact: completedExactUsage.total > 0 ? completedExactUsage : undefined };
       };
 
+      let activeAttempt = 0;
       try {
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-          usage = undefined;
+          activeAttempt = attempt;
+          attemptExactUsage = undefined;
           try {
             throwIfAborted();
 
@@ -520,11 +666,11 @@ export async function runWorkflow<T = unknown>(
                   // Make the silent degrade visible in /workflows, not just console.
                   log(`${label}: model "${spec}" unavailable — using the session default`);
                 },
-                onUsage: (u: AgentUsage) => {
-                  usage = u;
+                onUsage: (usage: AgentUsage) => {
+                  if (activeAttempt === attempt) receiveUsage(usage);
                 },
                 onHistory: (history: AgentHistoryEntry[]) => {
-                  options.onAgentHistory?.({ label, phase: assignedPhase, history });
+                  options.onAgentHistory?.({ ...invocation, history });
                 },
               }),
               timeout,
@@ -539,29 +685,49 @@ export async function runWorkflow<T = unknown>(
               });
             }
 
-            const tokens = recordTokens(result);
+            const usage = finishAttempt(result);
+            activeAttempt = 0;
             options.onAgentJournal?.({
               index: callIndex,
+              executionId,
+              source: "agent",
               hash: callHash,
               result,
+              usage: usage.exact,
               storeDelta: store.commitDelta(deltaKey),
             });
             options.onAgentEnd?.({
-              label,
-              phase: assignedPhase,
+              ...invocation,
               result,
-              tokens,
-              tokenUsage: usage,
-              worktree: runCwd,
+              status: "done",
+              tokens: usage.display?.total ?? 0,
+              usage: usage.display,
               model: displayModel,
             });
             return result;
           } catch (error) {
-            if (options.signal?.aborted) throw error;
+            if (options.signal?.aborted) {
+              const usage = finishAttempt(null, false);
+              activeAttempt = 0;
+              const paused = options.signal.reason === WORKFLOW_PAUSE_ABORT_REASON;
+              options.onAgentEnd?.({
+                ...invocation,
+                result: null,
+                status: paused ? "paused" : "skipped",
+                tokens: usage.display?.total ?? usage.exact?.total ?? 0,
+                usage: usage.display ?? usage.exact,
+                model: displayModel,
+                error: paused ? "Subagent paused; incomplete work will restart on resume" : "Subagent was aborted",
+                errorCode: WorkflowErrorCode.WORKFLOW_ABORTED,
+                recoverable: true,
+              });
+              throw error;
+            }
 
             const workflowError = wrapError(error, { agentLabel: label });
             logger.error(`agent ${label} attempt ${attempt}/${maxAttempts} failed: ${workflowError.message}`);
-            const tokens = recordTokens(null);
+            const usage = finishAttempt(null);
+            activeAttempt = 0;
 
             if (workflowError.recoverable && attempt < maxAttempts) {
               log(
@@ -570,19 +736,20 @@ export async function runWorkflow<T = unknown>(
               continue;
             }
 
+            const providerPaused = workflowError.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT;
             options.onAgentEnd?.({
-              label,
-              phase: assignedPhase,
+              ...invocation,
               result: null,
-              tokens,
-              tokenUsage: usage,
-              worktree: runCwd,
+              status: providerPaused ? "paused" : "error",
+              tokens: usage.display?.total ?? usage.exact?.total ?? 0,
+              usage: usage.display ?? usage.exact,
               model: displayModel,
               error: workflowError.message,
               errorCode: workflowError.code,
               recoverable: workflowError.recoverable,
             });
 
+            if (providerPaused) throw workflowError;
             if (workflowError.recoverable) {
               log(
                 `agent "${label}" exhausted ${maxAttempts} attempt${maxAttempts === 1 ? "" : "s"}: ${workflowError.code} ${workflowError.message}`,
@@ -594,7 +761,6 @@ export async function runWorkflow<T = unknown>(
         }
         return null;
       } finally {
-        // Always tear down the worktree, even on timeout/abort.
         if (worktree?.isolated) await removeWorktree(worktree);
       }
     });
@@ -666,6 +832,7 @@ export async function runWorkflow<T = unknown>(
     }
     const resolved = options.loadSavedWorkflow?.(String(nameOrScript));
     const childScript = resolved ?? String(nameOrScript);
+    const childRunId = `${runId}-nested${state.nestedSeq++}`;
     shared.depth++;
     try {
       const child = await runWorkflow(childScript, {
@@ -674,10 +841,10 @@ export async function runWorkflow<T = unknown>(
         sharedRuntime: shared,
         // Propagate the parent's store so nested agents share the same key-value space.
         sharedStore: store,
-        // A nested run is its own script; never reuse the parent's resume journal.
-        resumeJournal: undefined,
-        resumeFromRunId: undefined,
-        runId: `${runId}-nested${shared.depth}`,
+        // Scoped execution IDs let parent and child replay from one durable journal.
+        resumeJournal: options.resumeJournal,
+        resumeFromRunId: options.resumeFromRunId,
+        runId: childRunId,
         persistLogs: false,
       });
       return child.result;
@@ -856,13 +1023,18 @@ export async function runWorkflow<T = unknown>(
       );
     }
     const callIndex = state.callSeq++;
+    const executionId = `${runId}:${callIndex}`;
     const callHash = hashCheckpoint(promptText, checkpointOptions);
-    const cached = options.resumeJournal?.get(callIndex);
-    if (cached != null && cached.hash === callHash && callIndex < state.firstMiss) {
+    const cached = cachedJournalEntry(executionId, callIndex);
+    if (cached != null && cached.hash === callHash && !shared.resumeMissed && callIndex < state.firstMiss) {
       shared.agentCount++;
+      replayedExecutionIds.add(executionId);
       return cached.result; // replay the journaled human reply
     }
-    if (cached == null || cached.hash !== callHash) state.firstMiss = Math.min(state.firstMiss, callIndex);
+    if (cached == null || cached.hash !== callHash) {
+      state.firstMiss = Math.min(state.firstMiss, callIndex);
+      markResumeMiss();
+    }
     shared.agentCount++;
 
     let reply: unknown;
@@ -878,7 +1050,13 @@ export async function runWorkflow<T = unknown>(
       reply = checkpointOptions.default ?? true;
     }
     throwIfAborted();
-    options.onAgentJournal?.({ index: callIndex, hash: callHash, result: reply });
+    options.onAgentJournal?.({
+      index: callIndex,
+      executionId,
+      source: "checkpoint",
+      hash: callHash,
+      result: reply,
+    });
     return reply;
   };
 
@@ -1146,7 +1324,7 @@ function estimateTokens(value: unknown): number {
   return Math.ceil(JSON.stringify(value ?? "").length / 4);
 }
 
-function normalizeConcurrency(value: unknown): number {
+export function normalizeConcurrency(value: unknown): number {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 1) return 1;
   return Math.min(MAX_CONCURRENCY, Math.floor(value));
 }

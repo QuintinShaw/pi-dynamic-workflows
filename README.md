@@ -109,7 +109,7 @@ For an always-on exhaustive mode, use `/ultracode`; `/effort high` is the lighte
 
 ## Commands and run control
 
-Pi can manage background runs directly with the `workflow_control` tool instead of asking you to type a command. It supports `list`, `status`, `pause`, `resume`, and `stop`; run-specific actions use the canonical run ID returned when the workflow starts. Status output includes the run state, current phase, agent counts, active labels, and recorded token total.
+Pi can manage background runs directly with the `workflow_control` tool instead of asking you to type a command. It supports `list`, `status`, `pause`, `resume`, `stop`, `restart`, and `remove`; run-specific actions use the canonical run ID returned when the workflow starts. Status output includes the run state, current phase, agent counts, active labels, and recorded token total. `remove` accepts only terminal runs, so stop running or paused work first.
 
 | Command | Purpose |
 | --- | --- |
@@ -185,6 +185,8 @@ Extension state lives outside the repository under `~/.pi/workflows`:
 - older project-local `.pi/workflows/runs` and `.pi/workflows/saved` remain readable as fallbacks
 
 Subagents are in-memory by default. Set `persistAgentSessions: true` to retain full transcripts in Pi's standard session directory. This creates one file per agent and may store sensitive material that an agent read, so enable it deliberately.
+
+Run files use a versioned, backward-compatible state model with stable execution IDs, exact terminal usage, and crash-safe temp/rename writes plus backup recovery. After a crash, orphaned running work is recovered as paused and waits for an explicit resume. Resume replays the longest unchanged completed prefix—including nested workflows—then starts incomplete work fresh, without reopening child transcripts or double-charging completed usage.
 
 Completed background runs persist their full result in the project run JSON. The conversation delivery includes a pointer to that file when the visible summary is shortened.
 

@@ -4,7 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { WORKFLOW_RUNS_DIR } from "../src/config.js";
-import { createRunPersistence, generateRunId, type PersistedRunState } from "../src/run-persistence.js";
+import {
+  createRunPersistence,
+  generateRunId,
+  type PersistedRunState,
+  RUN_STATE_VERSION,
+  type RunPersistence,
+} from "../src/run-persistence.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { workflowProjectPaths } from "../src/workflow-paths.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
@@ -359,6 +365,157 @@ test(
   }),
 );
 
+test(
+  "save accepts legacy agent rows without identity and load returns normalized identity",
+  withTempCwd(async (cwd) => {
+    const persistence = createRunPersistence(cwd);
+    persistence.save({
+      runId: "legacy-save-shape",
+      workflowName: "legacy",
+      script: "return 1",
+      status: "paused",
+      phases: [],
+      agents: [{ id: 1, label: "old", prompt: "work", status: "done", tokens: 4 }],
+      logs: [],
+      startedAt: "2024-01-01T00:00:00.000Z",
+      updatedAt: "2024-01-01T00:00:00.000Z",
+    });
+
+    const loaded = persistence.load("legacy-save-shape");
+    assert.equal(loaded?.agents[0].executionId, "legacy-save-shape:0");
+    assert.equal(loaded?.agents[0].callIndex, 0);
+  }),
+);
+
+test("RunPersistence remains compatible with legacy PersistedRunState return types", () => {
+  const state = {
+    runId: "legacy-implementation",
+    workflowName: "legacy",
+    script: "return 1",
+    status: "completed",
+    phases: [],
+    agents: [],
+    logs: [],
+    startedAt: "2024-01-01T00:00:00.000Z",
+    updatedAt: "2024-01-01T00:00:00.000Z",
+  } satisfies PersistedRunState;
+  const legacyImplementation: RunPersistence = {
+    save() {},
+    load: () => state,
+    list: () => [state],
+    delete: () => false,
+    acquireRunLease: () => null,
+    releaseRunLease() {},
+    getRunsDir: () => ".",
+  };
+
+  assert.equal(legacyImplementation.load(state.runId)?.runId, state.runId);
+});
+
+test(
+  "legacy run migration fills stable identity and ignores malformed optional fields",
+  withTempCwd(async (cwd) => {
+    const runsDir = workflowProjectPaths(cwd).runsDir;
+    mkdirSync(runsDir, { recursive: true });
+    writeFileSync(
+      join(runsDir, "legacy-v1.json"),
+      JSON.stringify({
+        runId: "legacy-v1",
+        workflowName: "legacy",
+        script: "return 1",
+        status: "paused",
+        phases: ["Work", 7],
+        agents: [
+          {
+            id: 1,
+            label: "old agent",
+            prompt: "work",
+            status: "done",
+            tokens: 12,
+            usage: { input: 8, output: 4, total: 12, cost: 0.01 },
+          },
+        ],
+        logs: ["ok", null],
+        tokenBudget: "bad",
+        journal: [{ index: 0, hash: "hash", result: "done", usage: { input: 8, output: 4, total: 12 } }],
+        startedAt: "2024-01-01T00:00:00.000Z",
+        updatedAt: "2024-01-01T00:01:00.000Z",
+      }),
+    );
+
+    const loaded = createRunPersistence(cwd).load("legacy-v1");
+    assert.equal(loaded?.version, RUN_STATE_VERSION);
+    assert.deepEqual(loaded?.phases, ["Work"]);
+    assert.deepEqual(loaded?.logs, ["ok"]);
+    assert.equal(loaded?.agents[0].executionId, "legacy-v1:0");
+    assert.equal(loaded?.agents[0].callIndex, 0);
+    assert.equal(loaded?.agents[0].usage?.total, 12);
+    assert.equal(loaded?.journal?.[0].executionId, "legacy-v1:0");
+    assert.equal(loaded?.journal?.[0].usage?.total, 12);
+    assert.equal(loaded?.tokenBudget, undefined);
+  }),
+);
+
+test(
+  "current loader warns when malformed nested usage and journal fields are normalized or dropped",
+  withTempCwd(async (cwd) => {
+    const runsDir = workflowProjectPaths(cwd).runsDir;
+    mkdirSync(runsDir, { recursive: true });
+    writeFileSync(
+      join(runsDir, "malformed-nested.json"),
+      JSON.stringify({
+        version: RUN_STATE_VERSION,
+        runId: "malformed-nested",
+        workflowName: "malformed",
+        script: "return 1",
+        status: "paused",
+        phases: [],
+        agents: [
+          {
+            id: 1,
+            executionId: "malformed-nested:0",
+            callIndex: 0,
+            label: "agent",
+            prompt: "work",
+            status: "done",
+            usage: { input: "bad", output: 2, total: 2 },
+          },
+        ],
+        logs: [],
+        journal: [
+          null,
+          {
+            index: 0,
+            executionId: 42,
+            hash: "hash",
+            result: "done",
+            usage: { total: "bad" },
+            storeDelta: [],
+          },
+        ],
+        startedAt: "2024-01-01T00:00:00.000Z",
+        updatedAt: "2024-01-01T00:01:00.000Z",
+      }),
+    );
+
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (...args: unknown[]) => warnings.push(args.map(String).join(" "));
+    try {
+      const loaded = createRunPersistence(cwd).load("malformed-nested");
+      assert.equal(loaded?.agents[0].usage?.input, 0);
+      assert.equal(loaded?.journal?.length, 1);
+      assert.equal(loaded?.journal?.[0].executionId, "malformed-nested:0");
+      assert.equal(loaded?.journal?.[0].usage?.total, 0);
+      assert.equal(loaded?.journal?.[0].storeDelta, undefined);
+      assert.equal(warnings.length, 1);
+      assert.match(warnings[0], /Ignored malformed fields.*malformed-nested/);
+    } finally {
+      console.warn = originalWarn;
+    }
+  }),
+);
+
 test("generateRunId returns a string with timestamp and random parts", () => {
   const id = generateRunId();
   assert.equal(typeof id, "string");
@@ -483,7 +640,16 @@ test(
     assert.equal(loaded.agents[1].status, "running");
     assert.deepEqual(loaded.logs, ["started", "phase: Scan", "phase: Analyze"]);
     assert.deepEqual(loaded.tokenUsage, { input: 500, output: 200, total: 700 });
-    assert.deepEqual(loaded.journal, [{ index: 0, hash: "abc", result: { ok: true } }]);
+    assert.deepEqual(loaded.journal, [
+      {
+        index: 0,
+        executionId: "concurrent-test:0",
+        hash: "abc",
+        result: { ok: true },
+        usage: undefined,
+        storeDelta: undefined,
+      },
+    ]);
   }),
 );
 
@@ -524,6 +690,31 @@ test(
     writeFileSync(join(workflowProjectPaths(cwd).runsDir, "r1.json"), "{ truncated", "utf-8");
     const loaded = rp.load("r1");
     assert.equal(loaded?.runId, "r1", "load falls back to the intact .bak");
+    assert.deepEqual(
+      rp.list().map((run) => run.runId),
+      ["r1"],
+      "list discovers the backup so startup recovery can reconcile the run",
+    );
+  }),
+);
+
+test(
+  "delete reports success for a backup-only run",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd);
+    rp.save({
+      runId: "backup-only",
+      workflowName: "w",
+      status: "completed",
+      phases: [],
+      agents: [],
+      logs: [],
+    } as PersistedRunState);
+    const runsDir = workflowProjectPaths(cwd).runsDir;
+    rmSync(join(runsDir, "backup-only.json"));
+
+    assert.equal(rp.delete("backup-only"), true);
+    assert.equal(rp.load("backup-only"), null);
   }),
 );
 
@@ -674,7 +865,43 @@ test(
 );
 
 test(
-  "delete removes the lock sidecar too",
+  "a live takeover claim blocks contenders and a dead claim is recoverable",
+  withTempCwd(async (cwd) => {
+    const runsDir = workflowProjectPaths(cwd).runsDir;
+    const rp = createRunPersistence(cwd);
+    rp.save({
+      runId: "takeover-race",
+      workflowName: "w",
+      status: "paused",
+      phases: [],
+      agents: [],
+      logs: [],
+    } as PersistedRunState);
+    const lockPath = join(runsDir, "takeover-race.lock");
+    const takeoverPath = `${lockPath}.takeover`;
+    const claim = (pid: number, token: string) => ({
+      runId: "takeover-race",
+      runPath: join(runsDir, "takeover-race.json"),
+      pid,
+      startedAt: "2024-01-01T00:00:00.000Z",
+      token,
+    });
+    writeFileSync(lockPath, JSON.stringify(claim(2147483647, "stale")), "utf-8");
+    writeFileSync(takeoverPath, JSON.stringify(claim(process.pid, "live-claim")), "utf-8");
+
+    assert.equal(rp.acquireRunLease("takeover-race"), null);
+    assert.equal(JSON.parse(readFileSync(takeoverPath, "utf-8")).token, "live-claim");
+
+    writeFileSync(takeoverPath, JSON.stringify(claim(2147483647, "dead-claim")), "utf-8");
+    const lease = rp.acquireRunLease("takeover-race");
+    assert.ok(lease);
+    assert.equal(existsSync(takeoverPath), false);
+    rp.releaseRunLease(lease);
+  }),
+);
+
+test(
+  "artifact deletion leaves the lease for its owner to release",
   withTempCwd(async (cwd) => {
     const rp = createRunPersistence(cwd);
     rp.save({
@@ -688,7 +915,10 @@ test(
     const lease = rp.acquireRunLease("delete-lock");
     assert.ok(lease, "lease exists before delete");
     rp.delete("delete-lock");
-    assert.equal(existsSync(join(workflowProjectPaths(cwd).runsDir, "delete-lock.lock")), false, "lock cleaned up");
+    const lockPath = join(workflowProjectPaths(cwd).runsDir, "delete-lock.lock");
+    assert.equal(existsSync(lockPath), true, "artifact deletion must not remove an ownership record");
+    rp.releaseRunLease(lease);
+    assert.equal(existsSync(lockPath), false, "the owner explicitly releases its lease");
   }),
 );
 
@@ -702,12 +932,23 @@ test(
       status: "running",
       script: "export const meta = { name: 'w', description: 'd' }\nawait agent('x',{label:'x'})\nreturn 1",
       phases: [],
-      agents: [],
+      agents: [
+        {
+          id: 1,
+          executionId: "stale:0",
+          callIndex: 0,
+          label: "orphan",
+          prompt: "x",
+          status: "running",
+        },
+      ],
       logs: [],
     } as PersistedRunState);
     // A fresh manager (the previous process died) should recover the orphan.
     new WorkflowManager({ cwd });
-    assert.equal(rp.load("stale")?.status, "paused", "stale running -> paused (journal preserved for resume)");
+    const recovered = rp.load("stale");
+    assert.equal(recovered?.status, "paused", "stale running -> paused (journal preserved for resume)");
+    assert.equal(recovered?.agents[0].status, "paused", "orphaned running invocation is visibly paused mid-run");
   }),
 );
 

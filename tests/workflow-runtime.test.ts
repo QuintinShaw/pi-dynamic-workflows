@@ -79,6 +79,171 @@ return xs`;
   assert.equal(result.agentCount, 4);
 });
 
+test("queued and running callbacks keep duplicate labels separated by executionId", async () => {
+  const release = createDeferred<void>();
+  let runnerStarts = 0;
+  const queued: Array<{ executionId: string; callIndex: number; label: string }> = [];
+  const started: Array<{ executionId: string; callIndex: number; label: string }> = [];
+  const histories: Array<{ executionId: string; history: unknown[] }> = [];
+  const usages: Array<{ executionId: string; usage: AgentUsage }> = [];
+  const ended: Array<{ executionId: string; result: unknown }> = [];
+  const runner = {
+    async run(
+      prompt: string,
+      options: { onHistory?: (history: unknown[]) => void; onUsage?: (usage: AgentUsage) => void },
+    ) {
+      runnerStarts++;
+      options.onHistory?.([{ role: "assistant", kind: "text", text: prompt }]);
+      await release.promise;
+      const total = prompt.charCodeAt(0) - 96;
+      options.onUsage?.({ input: total, output: 0, cacheRead: 0, cacheWrite: 0, total, cost: 0 });
+      return `done:${prompt}`;
+    },
+  };
+  const script = `export const meta = { name: 'identities', description: 'duplicate labels' }
+const xs = await parallel(['a','b','c','d'].map((p) => () => agent(p, { label: 'worker' })))
+return xs`;
+
+  const run = runWorkflow(script, {
+    runId: "identity-run",
+    agent: runner,
+    concurrency: 2,
+    persistLogs: false,
+    onAgentQueued: (event) => queued.push(event),
+    onAgentStart: (event) => started.push(event),
+    onAgentHistory: (event) => histories.push(event),
+    onAgentUsage: (event) => usages.push(event),
+    onAgentEnd: (event) => ended.push(event),
+  });
+  while (runnerStarts < 2) await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(queued.length, 4, "all logical invocations should be visible before limiter admission");
+  assert.equal(started.length, 2, "only admitted invocations should be running");
+  assert.deepEqual(
+    queued.map((event) => event.executionId),
+    ["identity-run:0", "identity-run:1", "identity-run:2", "identity-run:3"],
+  );
+  assert.deepEqual(
+    started.map((event) => event.executionId),
+    ["identity-run:0", "identity-run:1"],
+  );
+
+  release.resolve();
+  await run;
+  assert.equal(started.length, 4);
+  assert.equal(new Set(histories.map((event) => event.executionId)).size, 4);
+  assert.equal(new Set(usages.map((event) => event.executionId)).size, 4);
+  assert.equal(new Set(ended.map((event) => event.executionId)).size, 4);
+});
+
+test("aborted queued agents without exact usage finish skipped at zero tokens", async () => {
+  const release = createDeferred<void>();
+  const controller = new AbortController();
+  let starts = 0;
+  const queued: string[] = [];
+  const ended: Array<{ status: string; tokens?: number; usage?: AgentUsage }> = [];
+  const run = runWorkflow(
+    `export const meta = { name: 'abort_queue', description: 'abort queue' }
+return await parallel(['a','b','c'].map((p) => () => agent(p, { label: p })))`,
+    {
+      agent: {
+        async run() {
+          starts++;
+          await release.promise;
+          return "done";
+        },
+      },
+      concurrency: 1,
+      signal: controller.signal,
+      persistLogs: false,
+      onAgentQueued: (event) => queued.push(event.executionId),
+      onAgentEnd: (event) => ended.push(event),
+    },
+  );
+  while (starts < 1) await new Promise((resolve) => setTimeout(resolve, 0));
+  controller.abort();
+  release.resolve();
+  await assert.rejects(run, /aborted/i);
+
+  assert.equal(starts, 1, "queued work never reaches the runner");
+  assert.equal(queued.length, 3, "all logical invocations remain visible");
+  assert.equal(ended.length, 1, "only the invocation that actually started can be aborted");
+  assert.ok(ended.every((event) => event.status === "skipped" && event.tokens === 0 && event.usage === undefined));
+});
+
+test("incremental estimates are display-only and exact usage replaces them before completion", async () => {
+  const reported = createDeferred<void>();
+  const release = createDeferred<void>();
+  const agentUsage: AgentUsage[] = [];
+  const runUsage: number[] = [];
+  const runner = {
+    async run(_prompt: string, options: { onUsage?: (usage: AgentUsage) => void }) {
+      options.onUsage?.({
+        input: 0,
+        output: 20,
+        cacheRead: 0,
+        cacheWrite: 0,
+        total: 20,
+        cost: 0,
+        estimated: true,
+      });
+      options.onUsage?.({ input: 8, output: 4, cacheRead: 0, cacheWrite: 0, total: 12, cost: 0.01 });
+      reported.resolve();
+      await release.promise;
+      return "done";
+    },
+  };
+
+  const run = runWorkflow(
+    `export const meta = { name: 'live_usage', description: 'usage before completion' }
+return await agent('work', { label: 'worker' })`,
+    {
+      runId: "usage-run",
+      agent: runner,
+      persistLogs: false,
+      onAgentUsage: (event) => agentUsage.push(event.usage),
+      onTokenUsage: (usage) => runUsage.push(usage.total),
+    },
+  );
+  await reported.promise;
+
+  assert.deepEqual(
+    agentUsage.slice(0, 2).map((usage) => ({ total: usage.total, estimated: usage.estimated })),
+    [
+      { total: 20, estimated: true },
+      { total: 12, estimated: false },
+    ],
+  );
+  assert.deepEqual(runUsage, [12], "the streaming estimate must not enter budget/run accounting");
+
+  release.resolve();
+  const result = await run;
+  assert.equal(result.tokenUsage?.total, 12);
+  assert.equal(agentUsage.at(-1)?.total, 12, "terminal reconciliation replaces rather than adds usage");
+});
+
+test("repeated absolute usage updates are idempotent", async () => {
+  const result = await runWorkflow(
+    `export const meta = { name: 'idempotent_usage', description: 'usage' }
+return await agent('work', { label: 'worker' })`,
+    {
+      agent: {
+        async run(_prompt: string, options: { onUsage?: (usage: AgentUsage) => void }) {
+          const usage = { input: 6, output: 4, cacheRead: 0, cacheWrite: 0, total: 10, cost: 0.01 };
+          options.onUsage?.(usage);
+          options.onUsage?.(usage);
+          return "done";
+        },
+      },
+      persistLogs: false,
+    },
+  );
+
+  assert.equal(result.tokenUsage?.total, 10);
+  assert.equal(result.tokenUsage?.input, 6);
+  assert.equal(result.tokenUsage?.cost, 0.01);
+});
+
 test("runWorkflow retries recoverable empty output then succeeds", async () => {
   let calls = 0;
   const journal: JournalEntry[] = [];
@@ -216,7 +381,7 @@ return 1`;
   assert.equal(seenModel, "meta/default-model", "an agent with no model/tier/phase route uses meta.model");
 });
 
-test("runWorkflow falls back to an estimate when provider reports total === 0", async () => {
+test("an exact provider total of zero is not replaced by an estimate", async () => {
   const result = await runWorkflow(twoAgentScript, {
     agent: fakeAgent({ total: 0 }, "a result string"),
     persistLogs: false,
@@ -224,8 +389,32 @@ test("runWorkflow falls back to an estimate when provider reports total === 0", 
 
   assert.equal(result.tokenUsage?.input, 0);
   assert.equal(result.tokenUsage?.output, 0);
-  assert.ok((result.tokenUsage?.total ?? 0) > 0, "estimate should be positive");
+  assert.equal(result.tokenUsage?.total, 0);
   assert.equal(result.tokenUsage?.cost, 0);
+});
+
+test("missing provider usage emits an estimate without charging or journaling it", async () => {
+  const journal: JournalEntry[] = [];
+  const displayUsage: AgentUsage[] = [];
+  const result = await runWorkflow(
+    `export const meta = { name: 'estimated', description: 'missing usage' }
+return await agent('work', { label: 'worker' })`,
+    {
+      agent: {
+        async run() {
+          return "a result string";
+        },
+      },
+      persistLogs: false,
+      onAgentUsage: (event) => displayUsage.push(event.usage),
+      onAgentJournal: (entry) => journal.push(entry),
+    },
+  );
+
+  assert.equal(displayUsage.at(-1)?.estimated, true);
+  assert.ok((displayUsage.at(-1)?.total ?? 0) > 0);
+  assert.equal(result.tokenUsage?.total, 0);
+  assert.equal(journal[0]?.usage, undefined);
 });
 
 test("agents default to the first declared phase when the script omits phase()", async () => {
@@ -475,6 +664,76 @@ return { a, nested }`;
   assert.equal(result.result.nested.child, "ran:child task");
 });
 
+test("a changed child invalidates later parent resume results", async () => {
+  const childV1 = `export const meta = { name: 'child', description: 'c' }
+return await agent('child original', { label: 'child' })`;
+  const childV2 = `export const meta = { name: 'child', description: 'c' }
+return await agent('child changed', { label: 'child' })`;
+  const parent = `export const meta = { name: 'parent', description: 'p' }
+const before = await agent('parent before', { label: 'before' })
+const child = await workflow('child')
+const after = await agent('parent after', { label: 'after' })
+return { before, child, after }`;
+  const journal: JournalEntry[] = [];
+  await runWorkflow(parent, {
+    runId: "nested-miss",
+    agent: {
+      async run(prompt: string) {
+        return `first:${prompt}`;
+      },
+    },
+    loadSavedWorkflow: () => childV1,
+    persistLogs: false,
+    onAgentJournal: (entry) => journal.push(entry),
+  });
+
+  const livePrompts: string[] = [];
+  const resumed = await runWorkflow<{ before: string; child: string; after: string }>(parent, {
+    runId: "nested-miss",
+    agent: {
+      async run(prompt: string) {
+        livePrompts.push(prompt);
+        return `second:${prompt}`;
+      },
+    },
+    loadSavedWorkflow: () => childV2,
+    persistLogs: false,
+    resumeJournal: new Map(journal.map((entry) => [entry.executionId ?? entry.index, entry] as const)),
+  });
+
+  assert.deepEqual(livePrompts, ["child changed", "parent after"]);
+  assert.equal(resumed.result.before, "first:parent before");
+  assert.equal(resumed.result.child, "second:child changed");
+  assert.equal(resumed.result.after, "second:parent after");
+});
+
+test("legacy numeric journals are never consumed by nested workflows", async () => {
+  const child = `export const meta = { name: 'child', description: 'child' }
+return await agent('same', { label: 'same' })`;
+  const seedJournal: JournalEntry[] = [];
+  await runWorkflow(child, {
+    agent: countingAgent().runner,
+    runId: "seed",
+    persistLogs: false,
+    onAgentJournal: (entry) => seedJournal.push(entry),
+  });
+  const legacyEntry = { ...seedJournal[0], executionId: undefined };
+  const counted = countingAgent();
+  const parent = `export const meta = { name: 'parent', description: 'parent' }
+return await workflow('child')`;
+
+  const result = await runWorkflow(parent, {
+    agent: counted.runner,
+    runId: "root",
+    persistLogs: false,
+    loadSavedWorkflow: (name) => (name === "child" ? child : undefined),
+    resumeJournal: new Map([[0, legacyEntry]]),
+  });
+
+  assert.equal(counted.state.calls, 1);
+  assert.equal(result.result, "ran:same");
+});
+
 test("workflow() nesting is one level deep (second level throws)", async () => {
   const map: Record<string, string> = {
     gc: `export const meta = { name: 'gc', description: 'g' }
@@ -495,6 +754,37 @@ return { err }`;
     loadSavedWorkflow: (name) => map[name],
   });
   assert.match(result.result.err, /one level deep/);
+});
+
+test("cached replay succeeds when the live-work token budget is already exhausted", async () => {
+  const journal: JournalEntry[] = [];
+  const script = `export const meta = { name: 'cached_budget', description: 'cached budget' }
+return await agent('cached', { label: 'cached' })`;
+  await runWorkflow(script, {
+    runId: "cached-budget",
+    agent: fakeAgent({ total: 10 }),
+    persistLogs: false,
+    onAgentJournal: (entry) => journal.push(entry),
+  });
+
+  let liveCalls = 0;
+  const resumed = await runWorkflow(script, {
+    runId: "cached-budget",
+    agent: {
+      async run() {
+        liveCalls++;
+        return "live";
+      },
+    },
+    tokenBudget: 0,
+    persistLogs: false,
+    resumeJournal: new Map(
+      journal.flatMap((entry) => (entry.executionId ? [[entry.executionId, entry] as const] : [])),
+    ),
+  });
+
+  assert.equal(liveCalls, 0);
+  assert.equal(resumed.result, "ok");
 });
 
 test("runWorkflow budget gates on accumulated tokens", async () => {

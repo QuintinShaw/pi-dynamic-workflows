@@ -81,6 +81,7 @@ interface AgentRow {
   status: string;
   phase?: string;
   tokens?: number;
+  tokensEstimated?: boolean;
   tokenUsage?: AgentUsage;
   model?: string;
 }
@@ -188,6 +189,7 @@ export class NavigatorModel {
         status: a.status,
         phase: a.phase,
         tokens: a.tokens,
+        tokensEstimated: a.tokensEstimated,
         tokenUsage: a.tokenUsage,
         model: a.model,
       }));
@@ -215,6 +217,8 @@ function persistedToSnapshot(p: PersistedRunState): WorkflowSnapshot {
     logs: p.logs,
     agents: p.agents.map((a) => ({
       id: a.id,
+      executionId: a.executionId,
+      callIndex: a.callIndex,
       label: a.label,
       phase: a.phase,
       prompt: a.prompt,
@@ -225,8 +229,9 @@ function persistedToSnapshot(p: PersistedRunState): WorkflowSnapshot {
       errorCode: a.errorCode,
       recoverable: a.recoverable,
       history: a.history,
-      tokens: a.tokens,
-      tokenUsage: a.tokenUsage,
+      tokens: a.usage?.total ?? a.tokens,
+      usage: a.usage ?? a.tokenUsage,
+      tokenUsage: a.usage ?? a.tokenUsage,
       model: a.model,
     })),
     agentCount: p.agents.length,
@@ -478,7 +483,8 @@ function rightAgentRow(
   theme: ThemeLike,
 ): string {
   const dotColor = AGENT_DOT_COLOR[a.status] ?? "dim";
-  const stats = fmtTokenSegment(tokenFigures(a.tokenUsage, a.tokens), compactTokens);
+  const tokenSegment = fmtTokenSegment(tokenFigures(a.tokenUsage, a.tokens), compactTokens);
+  const stats = tokenSegment ? `${a.tokensEstimated ? "~" : ""}${tokenSegment}` : "";
   const model = shortModel(a.model) ?? "";
 
   // Stable 2-cell marker so columns never shift on selection: "› " | "  ".
@@ -1028,7 +1034,21 @@ export function openWorkflowNavigator(
   return ui.custom<void>(
     (tui: TUI, theme: Theme, _keybindings, done: (r: undefined) => void) => {
       const rerender = () => tui.requestRender();
-      const events = ["agentStart", "agentEnd", "phase", "log", "complete", "error", "stopped", "paused", "resumed"];
+      const events = [
+        "agentQueued",
+        "agentStart",
+        "agentUsage",
+        "agentHistory",
+        "agentEnd",
+        "tokenUsage",
+        "phase",
+        "log",
+        "complete",
+        "error",
+        "stopped",
+        "paused",
+        "resumed",
+      ];
       const onEvent = () => rerender();
       for (const ev of events) manager.on(ev, onEvent);
       const cleanup = () => {
