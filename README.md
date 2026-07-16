@@ -75,7 +75,7 @@ return await agent(
 
 ## Why use it
 
-- **Real parallel orchestration** — fan out up to 16 concurrent and 1000 total subagents from a sandboxed script.
+- **Real parallel orchestration** — fan out up to 16 concurrent and 1000 total subagents from one orchestration script.
 - **Per-agent model routing** — use `small`, `medium`, or `big` tiers, or choose an exact provider/model and thinking level.
 - **Journaled resume** — replay completed agents after interruption without rerunning them or spending their tokens again.
 - **Git worktree isolation** — let parallel agents edit safely on throwaway branches with `isolation: "worktree"`.
@@ -208,7 +208,7 @@ The default `workflow` also matches `workflows`; a custom word matches exactly. 
 
 | Claude Code dynamic workflows | pi-dynamic-workflows on Pi |
 | --- | --- |
-| Code-mode orchestration | JavaScript `agent()` / `parallel()` / `pipeline()` / `phase()` in a VM sandbox |
+| Code-mode orchestration | JavaScript `agent()` / `parallel()` / `pipeline()` / `phase()` in a VM realm (for determinism, not a security boundary) |
 | Isolated subagent contexts | Fresh in-memory Pi sessions; results remain in variables |
 | Structured outputs | JSON Schema validation with bounded repair |
 | Background runs | Non-blocking run, live panel, and automatic result delivery |
