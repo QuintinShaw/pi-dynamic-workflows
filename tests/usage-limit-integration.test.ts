@@ -15,7 +15,7 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { WorkflowAgent } from "../src/agent.js";
 import { WorkflowErrorCode } from "../src/errors.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
@@ -38,7 +38,7 @@ async function loadFaux(): Promise<typeof import("@earendil-works/pi-ai/compat")
       import.meta.url,
     ),
   );
-  const entry = existsSync(nested) ? nested : "@earendil-works/pi-ai/compat";
+  const entry = existsSync(nested) ? pathToFileURL(nested).href : "@earendil-works/pi-ai/compat";
   return import(entry) as Promise<typeof import("@earendil-works/pi-ai/compat")>;
 }
 
