@@ -104,6 +104,15 @@ const workflowToolSchema = Type.Object({
         "Hard total-token budget for the whole run. Once spent reaches it, further agent() calls fail and the run stops. Omit for no limit. Set it when the user asks to cap spend.",
     }),
   ),
+  resumeFromRunId: Type.Optional(
+    Type.String({
+      description: [
+        "Resume a prior run (this ID) with an edited `script` instead of starting a new run.",
+        "Unchanged agent() calls replay from that run's cache; the first changed/new call onward re-runs.",
+        "Calls match by position: keep earlier good calls identical and in order. Always background.",
+      ].join(" "),
+    }),
+  ),
 });
 
 export type WorkflowToolInput = {
@@ -115,6 +124,7 @@ export type WorkflowToolInput = {
   agentRetries?: number;
   agentTimeoutMs?: number;
   tokenBudget?: number;
+  resumeFromRunId?: string;
 };
 
 export interface WorkflowToolOptions {
@@ -192,6 +202,23 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const script = normalizeWorkflowScript(params.script);
       const parsed = parseWorkflowScript(script);
+
+      // Iteration / cached-prefix reuse: resume a prior run with THIS (edited)
+      // script instead of creating a brand-new run. Unchanged agent() calls
+      // replay from the prior run's journal; the first edited/new call and
+      // everything after it re-run live. Always background (the resumed run is
+      // detached and its result is delivered back into the conversation).
+      if (params.resumeFromRunId) {
+        const runId = params.resumeFromRunId;
+        const resumed = await manager.resume(runId, { script, args: params.args });
+        if (!resumed) {
+          throw new Error(resumeFailureText(manager, runId));
+        }
+        return {
+          content: [{ type: "text", text: resumedText(parsed.meta.name, runId) }],
+          details: { runId, background: true, resumedFrom: runId },
+        };
+      }
 
       // checkpoint() reaches the human only on a UI-bearing foreground run; a
       // background run is detached, so checkpoint() falls back to its headless
@@ -288,7 +315,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
         content: [
           {
             type: "text",
-            text: `Workflow **${result.meta.name}** completed with **${result.agentCount}** agent(s).${tokenInfo}\n\n## Result${formattedResult}`,
+            text: `Workflow **${result.meta.name}** completed with **${result.agentCount}** agent(s).${tokenInfo}\n\n## Result${formattedResult}\n\n${reviseHint(result.runId)}`,
           },
         ],
         details: {
@@ -358,7 +385,60 @@ export function backgroundStartedText(name: string, runId: string): string {
     "resume the conversation by itself), or keep chatting / working on other things",
     "in the meantime; either way the result will come back to this conversation.",
     `They can also track or cancel it with /workflows status ${runId} or /workflows stop ${runId}.`,
+    reviseHint(runId),
   ].join("\n");
+}
+
+/**
+ * One-line hint telling the model it can iterate on a finished/running run by
+ * resuming it with an edited script instead of re-running the whole workflow.
+ * Unchanged agent() calls replay from the journal (cache); only edited/new ones
+ * re-run. Omitted when there is no runId to reference.
+ */
+export function reviseHint(runId: string | undefined): string {
+  if (!runId) return "";
+  return `To revise without re-running everything: re-call workflow with resumeFromRunId="${runId}" and an edited script — unchanged agent() calls replay from cache, only edited/new ones re-run.`;
+}
+
+/**
+ * The tool result returned when the model resumes a run with an edited script.
+ * The resumed run is always background, so its result is delivered back later.
+ */
+export function resumedText(name: string, runId: string): string {
+  return [
+    `Workflow "${name}" resumed from run ${runId} with your edited script.`,
+    "Unchanged agent() calls replay from that run's journal (cache); the first",
+    "edited or newly inserted agent() call — and everything after it — re-runs live.",
+    "It runs in the background; the result is delivered back here when it finishes,",
+    "and the conversation continues automatically. The user can wait or keep working.",
+    `Track or cancel it with /workflows status ${runId} or /workflows stop ${runId}.`,
+  ].join("\n");
+}
+
+/**
+ * Explain why a resumeFromRunId could not be resumed, so the model gets a clear
+ * tool error instead of a silent failure. Inspects live + persisted state to
+ * name the concrete reason (not found / running / completed / stopped).
+ */
+export function resumeFailureText(manager: WorkflowManager, runId: string): string {
+  const active = manager.getRun(runId);
+  if (active?.status === "running") {
+    return `Cannot resume workflow run "${runId}": it is still running. Wait for it to finish (or /workflows stop ${runId}) before resuming with an edited script.`;
+  }
+  const persisted = manager.getPersistence().load(runId);
+  if (!persisted) {
+    return `Cannot resume workflow run "${runId}": no run with that ID was found. Use the runId from a prior workflow result, or omit resumeFromRunId to start a new run.`;
+  }
+  if (persisted.status === "completed") {
+    return `Cannot resume workflow run "${runId}": it already completed. Start a new run instead (omit resumeFromRunId).`;
+  }
+  if (persisted.status === "aborted" || active?.status === "aborted") {
+    return `Cannot resume workflow run "${runId}": it was stopped/aborted and is not resumable. Start a new run instead (omit resumeFromRunId).`;
+  }
+  if (!persisted.script) {
+    return `Cannot resume workflow run "${runId}": it has no persisted script to resume. Start a new run instead (omit resumeFromRunId).`;
+  }
+  return `Cannot resume workflow run "${runId}": it is not currently resumable (it may be busy under another process). Try again shortly, or start a new run.`;
 }
 
 function normalizeWorkflowToolArgs(args: unknown): WorkflowToolInput {

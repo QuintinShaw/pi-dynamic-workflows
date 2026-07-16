@@ -349,6 +349,11 @@ export class WorkflowManager extends EventEmitter {
       const result = await runWorkflow(script, {
         cwd: this.cwd,
         args,
+        // Use the managed run's persisted id as the workflow runId so the value
+        // returned in result.runId matches the id that listRuns()/resume() use.
+        // Otherwise runWorkflow mints an ephemeral `run-<ts>` id and the sync
+        // path would surface a non-resumable id to the model.
+        runId: managed.runId,
         agent: this.agent,
         mainModel: this.mainModel,
         modelRegistry: this.modelRegistry,
@@ -564,8 +569,18 @@ export class WorkflowManager extends EventEmitter {
   /**
    * Resume an interrupted run: replay journaled results for the unchanged prefix
    * and run the rest live. Returns false if there is nothing resumable.
+   *
+   * `opts.script` lets the orchestrating model resume with an EDITED script
+   * (cached-prefix reuse / iteration): unchanged agent() calls whose content
+   * hash still matches the journal entry at their positional callIndex replay
+   * from cache, while the first changed or newly inserted call — and everything
+   * after it — re-runs live. When `opts.script` is omitted, resume behaves
+   * exactly as before and uses the persisted script (auto-resume, TUI resume);
+   * this keeps the existing single-arg `resume(runId)` callers (e.g. the
+   * UsageLimitScheduler) unchanged. `opts.args` overrides the persisted args
+   * only when provided; otherwise the persisted args are kept.
    */
-  async resume(runId: string): Promise<boolean> {
+  async resume(runId: string, opts?: { script?: string; args?: unknown }): Promise<boolean> {
     // Guard: refuse to resume a run that is already running, or one that was
     // intentionally aborted (pause/stop/Esc). Paused and failed runs can restart.
     const active = this.runs.get(runId);
@@ -576,6 +591,10 @@ export class WorkflowManager extends EventEmitter {
     if (!persisted?.script || persisted.status === "completed" || persisted.status === "aborted") return false;
     const lease = this.persistence.acquireRunLease(runId);
     if (!lease) return false;
+
+    // Use the edited script when supplied, else the persisted one (backward-compat).
+    const script = opts?.script ?? persisted.script;
+    const args = opts?.args !== undefined ? opts.args : persisted.args;
 
     const controller = new AbortController();
     const managed: ManagedRun = {
@@ -593,8 +612,10 @@ export class WorkflowManager extends EventEmitter {
       },
       controller,
       startedAt: new Date(),
-      script: persisted.script,
-      args: persisted.args,
+      // The (possibly edited) script + args become the run's own — persistRun()
+      // writes them below, so a later resume of this run sees the edited script.
+      script,
+      args,
       journal: persisted.journal ?? [],
       background: true,
       lease,
@@ -610,7 +631,7 @@ export class WorkflowManager extends EventEmitter {
     const resumeJournal = new Map((persisted.journal ?? []).map((e) => [e.index, e] as const));
     this.emit("resumed", { runId });
     // Run in the background; executeRun records status/errors on the managed run.
-    void this.executeRun(managed, persisted.script, persisted.args, { resumeJournal }).catch(() => {});
+    void this.executeRun(managed, script, args, { resumeJournal }).catch(() => {});
     return true;
   }
 

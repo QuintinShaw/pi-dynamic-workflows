@@ -1930,6 +1930,116 @@ test(
     assert.equal(result.agentCount, 1);
     assert.equal(seen.length, 1);
     assert.equal(seen[0].label, "a");
-    assert.match(seen[0].sessionName ?? "", /^workflow:run-[a-z0-9]+ a$/);
+    // runWorkflow now uses the managed run's persisted id (slug + generateRunId)
+    // so result.runId / session names line up with listRuns()/resume().
+    assert.match(seen[0].sessionName ?? "", /^workflow:tracked-demo-[a-z0-9-]+ a$/);
+  }),
+);
+
+// ─── Edited-script resume (cached-prefix reuse / model iteration) ───────────────
+// resume(runId, { script }) lets the orchestrating model re-run with an EDITED
+// script: the unchanged agent() prefix replays from the journal (cache hit), and
+// the first edited/new call — plus everything after — re-runs live. resume(runId)
+// with NO opts stays backward-compatible (uses the persisted script) so #78's
+// auto-resume (UsageLimitScheduler calls resume(runId)) is unaffected.
+
+const editResumeScriptV1 = `export const meta = { name: 'edit_resume', description: 'two agents' }
+const a = await agent('FIRST', { label: 'first' })
+const b = await agent('SECOND-ORIGINAL', { label: 'second' })
+return { a, b }`;
+
+/** Runner that records prompts and pauses (usage limit) on the original 2nd prompt. */
+function editResumeRunner() {
+  const seen: string[] = [];
+  const state = { failOriginalSecond: true };
+  return {
+    seen,
+    state,
+    runner: {
+      async run(prompt: string) {
+        seen.push(prompt);
+        if (prompt.includes("SECOND-ORIGINAL") && state.failOriginalSecond) {
+          throw new WorkflowError("usage limit reached", WorkflowErrorCode.PROVIDER_USAGE_LIMIT, {
+            recoverable: false,
+            resetHint: "Resets soon",
+          });
+        }
+        return `ran:${prompt}`;
+      },
+    },
+  };
+}
+
+test(
+  "resume with an edited script replays the unchanged prefix and re-runs only the edited call",
+  withTempCwd(async (cwd) => {
+    const { seen, runner } = editResumeRunner();
+    const manager = new WorkflowManager({ cwd, agent: runner });
+    manager.on("paused", () => {});
+    manager.on("error", () => {});
+
+    // First run: agent 1 completes + journals, agent 2 hits a usage limit -> paused.
+    const { runId, promise } = manager.startInBackground(editResumeScriptV1);
+    await promise.catch(() => {});
+    assert.equal(manager.getRun(runId)?.status, "paused", "run pauses on the usage limit");
+    const persisted = manager.listRuns().find((r) => r.runId === runId);
+    assert.ok((persisted?.journal?.length ?? 0) >= 1, "agent 1 should be journaled");
+
+    // Resume with an EDITED script: agent 1 unchanged, agent 2's prompt changed.
+    const editResumeScriptV2 = `export const meta = { name: 'edit_resume', description: 'two agents' }
+const a = await agent('FIRST', { label: 'first' })
+const b = await agent('SECOND-EDITED', { label: 'second' })
+return { a, b }`;
+
+    const seenBeforeResume = seen.length;
+    const resumed = await manager.resume(runId, { script: editResumeScriptV2 });
+    assert.equal(resumed, true, "resume with edited script should succeed");
+    await new Promise((r) => setTimeout(r, 80));
+
+    const finalRun = manager.getRun(runId);
+    assert.equal(finalRun?.status, "completed", "resumed run completes");
+    assert.equal(finalRun?.result?.result?.a, "ran:FIRST", "agent 1 replays its cached journal result");
+    assert.equal(finalRun?.result?.result?.b, "ran:SECOND-EDITED", "edited agent 2 re-runs live");
+
+    // Cache proof: during the resume, the runner was NOT called for the unchanged
+    // agent 1, and WAS called for the edited agent 2.
+    const promptsDuringResume = seen.slice(seenBeforeResume);
+    assert.ok(!promptsDuringResume.includes("FIRST"), "unchanged agent 1 replayed from journal, not re-run");
+    assert.ok(promptsDuringResume.includes("SECOND-EDITED"), "edited agent 2 ran live");
+
+    // The edited script is persisted, so a later resume sees it.
+    const persistedAfter = manager.listRuns().find((r) => r.runId === runId);
+    assert.match(persistedAfter?.script ?? "", /SECOND-EDITED/, "edited script is persisted");
+  }),
+);
+
+test(
+  "resume(runId) with no opts uses the persisted script (auto-resume backward-compat)",
+  withTempCwd(async (cwd) => {
+    const { seen, state, runner } = editResumeRunner();
+    const manager = new WorkflowManager({ cwd, agent: runner });
+    manager.on("paused", () => {});
+    manager.on("error", () => {});
+
+    const { runId, promise } = manager.startInBackground(editResumeScriptV1);
+    await promise.catch(() => {});
+    assert.equal(manager.getRun(runId)?.status, "paused");
+
+    // Let the original second prompt succeed on the second attempt, then resume
+    // with NO opts — exactly how UsageLimitScheduler calls it.
+    state.failOriginalSecond = false;
+    const seenBeforeResume = seen.length;
+    const resumed = await manager.resume(runId);
+    assert.equal(resumed, true);
+    await new Promise((r) => setTimeout(r, 80));
+
+    const finalRun = manager.getRun(runId);
+    assert.equal(finalRun?.status, "completed");
+    assert.equal(finalRun?.result?.result?.a, "ran:FIRST", "agent 1 still replays from journal");
+    assert.equal(finalRun?.result?.result?.b, "ran:SECOND-ORIGINAL", "persisted (unedited) script runs agent 2");
+
+    const promptsDuringResume = seen.slice(seenBeforeResume);
+    assert.ok(!promptsDuringResume.includes("FIRST"), "agent 1 replayed from journal");
+    assert.ok(promptsDuringResume.includes("SECOND-ORIGINAL"), "persisted script's original agent 2 re-ran");
   }),
 );

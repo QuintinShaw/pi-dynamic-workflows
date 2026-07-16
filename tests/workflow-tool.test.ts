@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
+import type { AgentUsage } from "../src/agent.js";
+import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { backgroundStartedText, createWorkflowTool, modelRoutingGuideline } from "../src/workflow-tool.js";
+import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
 /** Minimal fake ModelRegistry, matching the shape the PR's existing tests use. */
 function fakeRegistry(models: Array<{ provider: string; id: string }>) {
@@ -221,3 +227,183 @@ test("createWorkflowTool prepareArguments passes through args", () => {
     assert.equal(result.agentRetries, 1);
   }
 });
+
+// ─── resumeFromRunId (edited-script iteration) ─────────────────────────────────
+
+const resumeToolScript = `export const meta = { name: 'resume_tool', description: 'one agent' }
+const a = await agent('do it', { label: 'a' })
+return { a }`;
+
+function toolFakeAgent(result: unknown = "ok") {
+  return {
+    async run(_prompt: string, options?: { onUsage?: (u: AgentUsage) => void }) {
+      options?.onUsage?.({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 });
+      return result;
+    },
+  };
+}
+
+function deferredToolAgent() {
+  let resolveFn: ((v: unknown) => void) | null = null;
+  const promise = new Promise((resolve) => {
+    resolveFn = resolve;
+  });
+  return {
+    resolve: (v: unknown = "done") => resolveFn?.(v),
+    runner: {
+      async run() {
+        return promise;
+      },
+    },
+  };
+}
+
+function withToolTempCwd(fn: (cwd: string) => Promise<void>) {
+  return async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pi-dw-tool-"));
+    const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-tool-home-"));
+    try {
+      await withFakeHomeAsync(fakeHome, () => fn(cwd));
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(fakeHome, { recursive: true, force: true });
+    }
+  };
+}
+
+test("workflowToolSchema exposes resumeFromRunId as optional; script stays required", () => {
+  const tool = createWorkflowTool();
+  const schema = tool.parameters as { properties: Record<string, unknown>; required?: string[] };
+  assert.ok(schema.properties.resumeFromRunId, "resumeFromRunId should be a schema property");
+  assert.ok((schema.required ?? []).includes("script"), "script stays required");
+  assert.ok(!(schema.required ?? []).includes("resumeFromRunId"), "resumeFromRunId is optional");
+});
+
+test(
+  "workflow tool: resumeFromRunId pointing at a nonexistent run errors and creates no new run",
+  withToolTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: toolFakeAgent() });
+    const tool = createWorkflowTool({ cwd, manager });
+    await assert.rejects(
+      () =>
+        tool.execute(
+          "t1",
+          { script: resumeToolScript, resumeFromRunId: "no-such-run" },
+          undefined,
+          undefined,
+          undefined,
+        ),
+      /no run with that ID|not found/i,
+    );
+    assert.equal(manager.listRuns().length, 0, "no new run should be created on a failed resume");
+  }),
+);
+
+test(
+  "workflow tool: resumeFromRunId pointing at a completed run errors clearly",
+  withToolTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: toolFakeAgent() });
+    const tool = createWorkflowTool({ cwd, manager });
+    // Create + complete a run.
+    const { runId, promise } = manager.startInBackground(resumeToolScript);
+    await promise;
+    assert.equal(manager.getRun(runId)?.status, "completed");
+    await assert.rejects(
+      () => tool.execute("t2", { script: resumeToolScript, resumeFromRunId: runId }, undefined, undefined, undefined),
+      /already completed/i,
+    );
+  }),
+);
+
+test(
+  "workflow tool: resumeFromRunId pointing at a running run errors clearly",
+  withToolTempCwd(async (cwd) => {
+    const da = deferredToolAgent();
+    const manager = new WorkflowManager({ cwd, agent: da.runner });
+    manager.on("error", () => {});
+    const tool = createWorkflowTool({ cwd, manager });
+    const { runId, promise } = manager.startInBackground(resumeToolScript);
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(manager.getRun(runId)?.status, "running");
+    await assert.rejects(
+      () => tool.execute("t3", { script: resumeToolScript, resumeFromRunId: runId }, undefined, undefined, undefined),
+      /still running/i,
+    );
+    da.resolve("ok");
+    await promise.catch(() => {});
+  }),
+);
+
+test(
+  "workflow tool: omitting resumeFromRunId preserves new-run background behavior",
+  withToolTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: toolFakeAgent() });
+    const tool = createWorkflowTool({ cwd, manager });
+    const res = await tool.execute("t4", { script: resumeToolScript }, undefined, undefined, undefined);
+    const details = res.details as { runId?: string; background?: boolean; resumedFrom?: string };
+    assert.ok(details.runId, "a new run id should be returned");
+    assert.equal(details.background, true);
+    assert.equal(details.resumedFrom, undefined, "a fresh run is not a resume");
+    assert.equal(manager.listRuns().length, 1, "exactly one new run created");
+    // The returned text advertises the revise/iterate path.
+    const text = res.content?.[0]?.type === "text" ? res.content[0].text : "";
+    assert.match(text, /resumeFromRunId/, "background text tells the model how to iterate");
+  }),
+);
+
+test(
+  "workflow tool: resumeFromRunId resumes a paused run with the edited script",
+  withToolTempCwd(async (cwd) => {
+    const seen: string[] = [];
+    let failSecond = true;
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt: string) {
+          seen.push(prompt);
+          if (prompt.includes("SECOND-ORIG") && failSecond) {
+            throw new WorkflowError("usage limit", WorkflowErrorCode.PROVIDER_USAGE_LIMIT, {
+              recoverable: false,
+              resetHint: "soon",
+            });
+          }
+          return `ran:${prompt}`;
+        },
+      },
+    });
+    manager.on("paused", () => {});
+    manager.on("error", () => {});
+    const tool = createWorkflowTool({ cwd, manager });
+
+    const v1 = `export const meta = { name: 'iter', description: 'two' }
+const a = await agent('FIRST', { label: 'first' })
+const b = await agent('SECOND-ORIG', { label: 'second' })
+return { a, b }`;
+    const { runId, promise } = manager.startInBackground(v1);
+    await promise.catch(() => {});
+    assert.equal(manager.getRun(runId)?.status, "paused");
+
+    failSecond = false;
+    const v2 = `export const meta = { name: 'iter', description: 'two' }
+const a = await agent('FIRST', { label: 'first' })
+const b = await agent('SECOND-EDITED', { label: 'second' })
+return { a, b }`;
+    const seenBefore = seen.length;
+    const res = await tool.execute("t5", { script: v2, resumeFromRunId: runId }, undefined, undefined, undefined);
+    const details = res.details as { runId?: string; resumedFrom?: string };
+    assert.equal(details.runId, runId, "resumed run keeps the same run id");
+    assert.equal(details.resumedFrom, runId);
+    const text = res.content?.[0]?.type === "text" ? res.content[0].text : "";
+    assert.match(text, new RegExp(`resumed from run ${runId}`), "text names the resumed run");
+
+    await new Promise((r) => setTimeout(r, 80));
+    const finalRun = manager.getRun(runId);
+    assert.equal(finalRun?.status, "completed");
+    assert.equal(finalRun?.result?.result?.b, "ran:SECOND-EDITED");
+    const during = seen.slice(seenBefore);
+    assert.ok(!during.includes("FIRST"), "unchanged agent 1 replays from journal");
+    assert.ok(during.includes("SECOND-EDITED"), "edited agent 2 re-runs live");
+    // No extra run created — resume reuses the same id.
+    assert.equal(manager.listRuns().length, 1, "resume does not create a second run");
+  }),
+);
