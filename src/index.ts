@@ -1,7 +1,7 @@
 export type { AdversarialReviewConfig } from "./adversarial-review.js";
 export { generateAdversarialReviewWorkflow, generateMultiPerspectiveWorkflow } from "./adversarial-review.js";
 export type { AgentRunOptions, AgentRunResult, WorkflowAgentOptions } from "./agent.js";
-export { listAvailableModelSpecs, WorkflowAgent } from "./agent.js";
+export { listAvailableModelSpecs, listAvailableModels, WorkflowAgent } from "./agent.js";
 export type { AgentHistoryEntry, AgentHistoryKind, AgentHistoryRole } from "./agent-history.js";
 export { compactAgentHistory } from "./agent-history.js";
 export type { AgentDefinition, AgentRegistry } from "./agent-registry.js";
@@ -56,9 +56,10 @@ export {
   splitModelSpecThinking,
   THINKING_LEVELS,
 } from "./model-spec.js";
-export type { ModelTierConfig } from "./model-tier-config.js";
+export type { ModelTierConfig, RankableModel } from "./model-tier-config.js";
 export {
   buildDefaultTierConfig,
+  formatTierFallbackNotice,
   getModelTierConfigPath,
   loadModelTierConfig,
   resolveTierModel,

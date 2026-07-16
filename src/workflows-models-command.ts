@@ -23,7 +23,7 @@ import {
   Text,
   type TUI,
 } from "@earendil-works/pi-tui";
-import { listAvailableModelSpecs } from "./agent.js";
+import { listAvailableModelSpecs, listAvailableModels } from "./agent.js";
 import {
   formatModelSpecWithThinking,
   type ModelThinkingLevel,
@@ -50,7 +50,7 @@ export function registerWorkflowModelsCommand(pi: ExtensionAPI): void {
       // available models. If the model registry is empty, fall back to the
       // current Pi model so the tiers are still usable.
       const currentModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
-      let config = loadModelTierConfig() ?? buildDefaultTierConfig(currentModel, listAvailableModelSpecs());
+      let config = loadModelTierConfig() ?? buildDefaultTierConfig(currentModel, listAvailableModels());
       let dirty = false;
 
       const ensureFresh = (cfg: typeof config) => {
@@ -94,7 +94,7 @@ export function registerWorkflowModelsCommand(pi: ExtensionAPI): void {
             "This will reset tiers from your available model list. Continue?",
           );
           if (confirmed) {
-            ensureFresh(buildDefaultTierConfig(currentModel, listAvailableModelSpecs()));
+            ensureFresh(buildDefaultTierConfig(currentModel, listAvailableModels()));
             ctx.ui.notify("Tiers reset to defaults. Use 'Save and exit' to persist.", "info");
           }
         }

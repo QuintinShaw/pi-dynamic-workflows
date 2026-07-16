@@ -16,7 +16,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { listAvailableModelSpecs } from "./agent.js";
+import { listAvailableModels } from "./agent.js";
 import { MODEL_TIERS_FILE } from "./config.js";
 
 // ---------------------------------------------------------------------------
@@ -32,6 +32,22 @@ export interface ModelTierConfig {
   tiers: Record<string, string>;
 }
 
+/**
+ * The minimal projection of a model that tier ranking needs. Deliberately NOT
+ * the SDK's full `Model` type: tier logic depends only on these three fields,
+ * so it stays decoupled from the SDK (no `@earendil-works/pi-ai` import here)
+ * and is trivially unit-testable with plain objects. `agent.ts`'s
+ * `listAvailableModels()` produces these from the live registry.
+ */
+export interface RankableModel {
+  /** Canonical "provider/id" spec string. */
+  spec: string;
+  /** Per-token output price, if the registry reports one. Missing or 0 = unknown. */
+  costOutput?: number;
+  /** Context window size, if the registry reports one. */
+  contextWindow?: number;
+}
+
 // ---------------------------------------------------------------------------
 // Configuration path
 // ---------------------------------------------------------------------------
@@ -42,47 +58,82 @@ export function getModelTierConfigPath(): string {
 }
 
 // ---------------------------------------------------------------------------
-// Capability hints
+// Capability signal
 // ---------------------------------------------------------------------------
 
 /**
- * Substrings that identify small/cheap models (case-insensitive).
- * Used by `rankByCapability` to rank models lowest so a mini/flash/haiku model
- * never lands in a higher tier than a model without this hint.
+ * Substrings that identify small/cheap models (case-insensitive), used only as
+ * a fallback capability hint when price signals are absent or tied.
  */
 export const SMALL_MODEL_HINTS = ["mini", "flash", "haiku", "nano", "small"] as const;
 
 /**
- * Substrings that identify large/capable models (case-insensitive).
- * Used by `rankByCapability` to rank models highest so they are preferred for
- * the big tier over models without this hint.
+ * Substrings that identify large/capable models (case-insensitive), used only
+ * as a fallback capability hint when price signals are absent or tied.
  */
 export const BIG_MODEL_HINTS = ["opus", "pro", "ultra", "large", "plus"] as const;
 
 /**
- * Capability score for a single model spec: +1 if it matches a big-model hint,
- * -1 if it matches a small-model hint, 0 otherwise. If a model happens to
- * match both hint sets (e.g. a name containing both "mini" and "pro"), the
- * small hint wins — we never want a "mini"-labelled model to outrank a
- * neutral or clearly-large one.
+ * Fallback capability hint from a model's name: -1 for a small/cheap name, +1
+ * for a large/capable name, 0 otherwise. If a name matches both sets, the small
+ * hint wins (we never want a "mini"-labelled model to outrank a neutral or
+ * clearly-large one). This is only a FALLBACK: `rankByCapability` prefers the
+ * registry's price signal, which is robust to new vendor names (e.g. "fable",
+ * "mimo") that match no hint and would otherwise all score 0.
  */
-function capabilityScore(model: string): number {
-  const lower = model.toLowerCase();
+export function hintScore(spec: string): number {
+  const lower = spec.toLowerCase();
   if (SMALL_MODEL_HINTS.some((hint) => lower.includes(hint))) return -1;
   if (BIG_MODEL_HINTS.some((hint) => lower.includes(hint))) return 1;
   return 0;
 }
 
 /**
- * Rank `available` models from least to most capable using `capabilityScore`.
- * The sort is stable (ties preserve registry order), so within a score bucket
- * models keep their original relative order.
+ * Rank models from least → most capable.
+ *
+ * PRIMARY signal is output price (higher price ≈ more capable): within a single
+ * registry, price tracks the vendor's capability tier far more robustly than
+ * model-name substrings, and it works for models whose names match no hint.
+ *
+ * Models with an UNKNOWN price (missing or 0 — common for self-hosted
+ * `models.json` entries) are NOT treated as "cheapest = weakest". Instead they
+ * are projected onto the known price range via their substring hint: a
+ * big-hint name lands at the top of the range, a small-hint name at the bottom,
+ * a neutral name at the middle. When NO model has a known price at all, this
+ * degrades to pure hint ordering (the previous behavior).
+ *
+ * The comparison is a single total order (projected cost → hint → contextWindow
+ * → stable registry index), so the sort is transitive and stable.
  */
-function rankByCapability(available: string[]): string[] {
-  return available
-    .map((model, index) => ({ model, index, score: capabilityScore(model) }))
-    .sort((a, b) => a.score - b.score || a.index - b.index)
-    .map((entry) => entry.model);
+export function rankByCapability(models: readonly RankableModel[]): RankableModel[] {
+  const knownCosts = models
+    .map((m) => m.costOutput)
+    .filter((c): c is number => typeof c === "number" && c > 0)
+    .sort((a, b) => a - b);
+  const hasPriceSignal = knownCosts.length > 0;
+  const min = knownCosts[0];
+  const max = knownCosts[knownCosts.length - 1];
+  const median = knownCosts[Math.floor(knownCosts.length / 2)];
+
+  // Project every model onto the price axis. Undefined only when there is no
+  // price signal anywhere (all models unpriced) — then the sort falls through
+  // to the hint comparison below.
+  const costKey = (m: RankableModel): number | undefined => {
+    if (typeof m.costOutput === "number" && m.costOutput > 0) return m.costOutput;
+    if (!hasPriceSignal) return undefined;
+    const hint = hintScore(m.spec);
+    return hint > 0 ? max : hint < 0 ? min : median;
+  };
+
+  return models
+    .map((m, index) => ({ m, index, cost: costKey(m), hint: hintScore(m.spec), ctx: m.contextWindow ?? 0 }))
+    .sort((a, b) => {
+      if (a.cost !== undefined && b.cost !== undefined && a.cost !== b.cost) return a.cost - b.cost;
+      if (a.hint !== b.hint) return a.hint - b.hint;
+      if (a.ctx !== b.ctx) return a.ctx - b.ctx;
+      return a.index - b.index;
+    })
+    .map((entry) => entry.m);
 }
 
 // ---------------------------------------------------------------------------
@@ -95,34 +146,32 @@ function rankByCapability(available: string[]): string[] {
  * box. When the registry is empty or unavailable, fall back to the current Pi
  * model so fresh installs still get usable tier values.
  *
- * Models are first ranked least → most capable via `rankByCapability` (which
- * consults `SMALL_MODEL_HINTS` / `BIG_MODEL_HINTS`, falling back to registry
- * order for models that match neither). Tiers are then assigned from this
- * single ranked pool with exclusion — each model is used for at most one
- * tier — so distinct tiers never collapse onto the same model and a
- * mini/flash/haiku model can never outrank a bigger one (no inversion):
+ * Models are first ranked least → most capable via `rankByCapability` (price
+ * first, name-substring hint as fallback). Tiers are then assigned from this
+ * single ranked pool with exclusion — each model is used for at most one tier —
+ * so distinct tiers never collapse onto the same model and a weaker model can
+ * never outrank a stronger one (no inversion):
  *
  *   - big    = the most capable model (last in the ranking)
  *   - small  = the least capable model (first in the ranking)
  *   - medium = the middle-ranked model
  *
- * When fewer than 3 distinct models are available, this degrades gracefully
- * by reusing the *strongest* available model for the higher tier(s) — it
- * never reuses a weaker model for a higher tier than a stronger one:
+ * When fewer than 3 distinct models are available, this degrades gracefully by
+ * reusing the *strongest* available model for the higher tier(s):
  *
  *   - 2 models: small = weaker, medium = big = stronger
- *   - 1 model / 0 models: small = medium = big = that model (or the current
- *     model / "" fallback)
+ *   - 1 / 0 models: small = medium = big = that model (or the current model /
+ *     "" fallback)
  *
- * `_availableModels` is injectable for testing and for callers that already
- * fetched the registry. When omitted, this reads from the live registry
- * regardless of whether `currentModelSpec` was also provided, so the
- * default-argument path always goes through the same corrected logic instead
- * of silently reproducing the original single-tier collapse.
+ * `availableModels` is injectable for testing and for callers that already
+ * fetched the registry. When omitted, this reads from the live registry.
  */
-export function buildDefaultTierConfig(currentModelSpec?: string, _availableModels?: string[]): ModelTierConfig {
-  const available = _availableModels ?? listAvailableModelSpecs();
-  const ranked = rankByCapability(available);
+export function buildDefaultTierConfig(
+  currentModelSpec?: string,
+  availableModels?: readonly RankableModel[],
+): ModelTierConfig {
+  const models = availableModels ?? listAvailableModels();
+  const ranked = rankByCapability(models).map((m) => m.spec);
 
   if (ranked.length >= 3) {
     const small = ranked[0];
@@ -142,6 +191,30 @@ export function buildDefaultTierConfig(currentModelSpec?: string, _availableMode
       big: fallback,
     },
   };
+}
+
+/**
+ * One-time notice shown when an agent requests `opts.tier` but no
+ * model-tiers.json is configured — in that state tiers silently fall back to
+ * the session model (see `resolveAgentModelSpec` in agent.ts), which is easy to
+ * miss. This surfaces the fallback and the mapping the user *would* get by
+ * configuring, using the same `buildDefaultTierConfig` ranking so the hint is
+ * actionable. Pure/string-only so the caller owns how it's emitted.
+ */
+export function formatTierFallbackNotice(
+  mainModel: string | undefined,
+  availableModels: readonly RankableModel[],
+): string {
+  const fallback = mainModel ?? "the session default model";
+  const suggested = buildDefaultTierConfig(mainModel, availableModels);
+  const mapping = sortedTierNames(suggested)
+    .map((tier) => `${tier}=${suggested.tiers[tier] || "?"}`)
+    .join("  ");
+  return (
+    `[workflow] An agent requested opts.tier but no model-tiers.json is configured, so tiers currently ` +
+    `fall back to ${fallback}. Run /workflows-models to configure them` +
+    (mapping ? `. Suggested mapping from your available models: ${mapping}` : ".")
+  );
 }
 
 // ---------------------------------------------------------------------------

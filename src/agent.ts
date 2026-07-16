@@ -19,7 +19,13 @@ import { type AgentHistoryEntry, compactAgentHistory } from "./agent-history.js"
 import { applyToolPolicy } from "./agent-registry.js";
 import { classifyProviderLimit, WorkflowError, WorkflowErrorCode } from "./errors.js";
 import { canonicalModelSpec, resolveModelSpecWithThinking } from "./model-spec.js";
-import { loadModelTierConfig, type ModelTierConfig, resolveTierModel } from "./model-tier-config.js";
+import {
+  formatTierFallbackNotice,
+  loadModelTierConfig,
+  type ModelTierConfig,
+  type RankableModel,
+  resolveTierModel,
+} from "./model-tier-config.js";
 import { createStructuredOutputTool, type StructuredOutputCapture } from "./structured-output.js";
 
 /**
@@ -177,10 +183,14 @@ export function resolveAgentModelSpec(
   options: { model?: string; tier?: string },
   mainModel: string | undefined,
   loadConfig: () => ModelTierConfig | null = loadModelTierConfig,
+  onTierWithoutConfig?: (tier: string) => void,
 ): string | undefined {
   if (options.model) return options.model;
   const config = loadConfig();
   if (options.tier) {
+    // Tier requested but unconfigured → it silently falls back to mainModel.
+    // Let the caller surface that (once) so the no-op is discoverable.
+    if (!config) onTierWithoutConfig?.(options.tier);
     return (config ? resolveTierModel(options.tier, config) : undefined) ?? mainModel;
   }
   // Untagged agent: default to the configured medium tier when one exists.
@@ -224,11 +234,13 @@ export interface WorkflowAgentOptions {
 }
 
 /**
- * List the user's currently available models (those with auth configured) as
- * `provider/modelId` specs. Used to tell the workflow author which models it may
- * route agents to. Best-effort: returns [] if the registry can't be built.
+ * List the user's currently available models (those with auth configured) with
+ * the minimal fields tier ranking needs: canonical spec, output price, and
+ * context window. This is the single place the SDK `Model` is projected into
+ * the SDK-agnostic `RankableModel`. Best-effort: returns [] if the registry
+ * can't be built.
  */
-export function listAvailableModelSpecs(registry?: ModelRegistry): string[] {
+export function listAvailableModels(registry?: ModelRegistry): RankableModel[] {
   try {
     const modelRegistry =
       registry ??
@@ -237,9 +249,39 @@ export function listAvailableModelSpecs(registry?: ModelRegistry): string[] {
         const auth = AuthStorage.create(join(dir, "auth.json"));
         return ModelRegistry.create(auth, join(dir, "models.json"));
       })();
-    return modelRegistry.getAvailable().map(canonicalModelSpec);
+    return modelRegistry.getAvailable().map((model) => ({
+      spec: canonicalModelSpec(model),
+      costOutput: model.cost?.output,
+      contextWindow: model.contextWindow,
+    }));
   } catch {
     return [];
+  }
+}
+
+/**
+ * List the user's currently available models as `provider/modelId` specs. Used
+ * to tell the workflow author which models it may route agents to. Best-effort:
+ * returns [] if the registry can't be built.
+ */
+export function listAvailableModelSpecs(registry?: ModelRegistry): string[] {
+  return listAvailableModels(registry).map((model) => model.spec);
+}
+
+/**
+ * Emitted at most once per process: when an agent asks for a tier but no
+ * model-tiers.json exists, the tier silently falls back to the session model.
+ * Surface that once (with the mapping the user would get by configuring) so the
+ * no-op is discoverable. Diagnostics only — never lets a failure break a run.
+ */
+let warnedTierUnconfigured = false;
+function warnTierUnconfiguredOnce(mainModel: string | undefined, registry: ModelRegistry): void {
+  if (warnedTierUnconfigured) return;
+  warnedTierUnconfigured = true;
+  try {
+    console.warn(formatTierFallbackNotice(mainModel, listAvailableModels(registry)));
+  } catch {
+    // best-effort diagnostic
   }
 }
 
@@ -463,7 +505,9 @@ export class WorkflowAgent {
     // Resolve the model spec (explicit model > tier > session default). This
     // composes with phase-based routing in workflow.ts, which only supplies
     // options.model when a phase pattern matches — so an explicit model wins.
-    const modelSpec = resolveAgentModelSpec(options, this.mainModel);
+    const modelSpec = resolveAgentModelSpec(options, this.mainModel, loadModelTierConfig, () =>
+      warnTierUnconfiguredOnce(this.mainModel, this.getRegistry(options.modelRegistry)),
+    );
 
     // Resolve a requested model spec to a Model object. Specs use Pi CLI-style
     // parsing, including an optional :thinking suffix such as gpt-5.5:xhigh.

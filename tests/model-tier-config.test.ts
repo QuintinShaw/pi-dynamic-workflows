@@ -2,11 +2,13 @@
  * Tests for model-tier-config.ts
  *
  * Covers:
- * 1. buildDefaultTierConfig — all tiers default to the given model
- * 2. buildDefaultTierConfig — capability-hint ordering (SMALL_MODEL_HINTS / BIG_MODEL_HINTS)
- * 3. resolveTierModel logic
- * 4. save/load round-trip + all validation/error paths (scoped to a temp dir)
- * 5. sortedTierNames helper
+ * 1. rankByCapability — cost-first ranking, hint fallback, cost=0/missing handling, tie-breaks
+ * 2. hintScore — substring capability hints
+ * 3. buildDefaultTierConfig — tier spread + capability ordering (via hint fallback and via cost)
+ * 4. formatTierFallbackNotice — unconfigured-tier notice text
+ * 5. resolveTierModel logic
+ * 6. save/load round-trip + all validation/error paths (scoped to a temp dir)
+ * 7. sortedTierNames helper
  *
  * All tier configs are single-model-per-tier (Record<string, string>).
  */
@@ -21,13 +23,121 @@ async function loadModule() {
   return await import("../src/model-tier-config.js");
 }
 
+/**
+ * Wrap bare spec strings as RankableModel[] with NO cost/context, so ranking
+ * goes through the substring-hint fallback path (the pre-cost behavior). Used
+ * by the hint-ordering tests, which are about names, not prices.
+ */
+function specs(...names: string[]): { spec: string }[] {
+  return names.map((spec) => ({ spec }));
+}
+
 describe("model-tier-config", () => {
+  describe("hintScore", () => {
+    it("scores small-hint names -1, big-hint names +1, neutral 0", async () => {
+      const { hintScore } = await loadModule();
+      assert.equal(hintScore("openai/gpt-4o-mini"), -1);
+      assert.equal(hintScore("x/flash-2"), -1);
+      assert.equal(hintScore("anthropic/claude-3-opus"), 1);
+      assert.equal(hintScore("x/pro-model"), 1);
+      assert.equal(hintScore("vendor/fable-5"), 0);
+      assert.equal(hintScore("vendor/mimo"), 0);
+    });
+
+    it("lets the small hint win when a name matches both sets", async () => {
+      const { hintScore } = await loadModule();
+      assert.equal(hintScore("x/mini-pro"), -1);
+    });
+  });
+
+  describe("rankByCapability (cost-first, hint fallback)", () => {
+    it("ranks by output price when prices are known, ignoring name hints", async () => {
+      const { rankByCapability } = await loadModule();
+      const ranked = rankByCapability([
+        { spec: "v/expensive", costOutput: 10 },
+        { spec: "v/cheap", costOutput: 1 },
+        { spec: "v/mid", costOutput: 5 },
+      ]).map((m) => m.spec);
+      assert.deepEqual(ranked, ["v/cheap", "v/mid", "v/expensive"]);
+    });
+
+    it("lets price beat a misleading name hint", async () => {
+      // A model NAMED like a small one but actually priced high must rank above
+      // a model named like a big one but priced low.
+      const { rankByCapability } = await loadModule();
+      const ranked = rankByCapability([
+        { spec: "x/pro-but-cheap", costOutput: 1 },
+        { spec: "y/mini-but-pricey", costOutput: 9 },
+        { spec: "z/mid", costOutput: 5 },
+      ]).map((m) => m.spec);
+      assert.deepEqual(ranked, ["x/pro-but-cheap", "z/mid", "y/mini-but-pricey"]);
+    });
+
+    it("ranks new vendor names by cost instead of collapsing them to neutral", async () => {
+      // "fable"/"mimo" match no hint; with cost they must still sort correctly.
+      const { rankByCapability } = await loadModule();
+      const ranked = rankByCapability([
+        { spec: "x/fable-5", costOutput: 8 },
+        { spec: "x/mimo", costOutput: 2 },
+        { spec: "x/mid", costOutput: 5 },
+      ]).map((m) => m.spec);
+      assert.deepEqual(ranked, ["x/mimo", "x/mid", "x/fable-5"]);
+    });
+
+    it("projects an unknown-cost model onto the price range via its hint (never treated as cheapest)", async () => {
+      // A self-hosted big model with NO price (cost missing) must not be ranked
+      // as the weakest; its big-hint projects it to the top of the known range.
+      const { rankByCapability } = await loadModule();
+      const ranked = rankByCapability([
+        { spec: "self/opus-local" }, // no cost, big hint → projects to max
+        { spec: "v/a", costOutput: 1 },
+        { spec: "v/b", costOutput: 5 },
+      ]).map((m) => m.spec);
+      // a(1) < b(5) == opus-local(projected 5); tie broken by hint (b:0 before opus:+1).
+      assert.deepEqual(ranked, ["v/a", "v/b", "self/opus-local"]);
+    });
+
+    it("projects an unknown-cost small model to the bottom of the range", async () => {
+      const { rankByCapability } = await loadModule();
+      const ranked = rankByCapability([
+        { spec: "self/mini-local" }, // no cost, small hint → projects to min
+        { spec: "v/a", costOutput: 2 },
+        { spec: "v/b", costOutput: 5 },
+      ]).map((m) => m.spec);
+      // mini-local projected to min(2) == a(2); tie broken by hint (mini:-1 before a:0).
+      assert.deepEqual(ranked, ["self/mini-local", "v/a", "v/b"]);
+    });
+
+    it("falls back to pure hint ordering when no model has a known price (back-compat)", async () => {
+      const { rankByCapability } = await loadModule();
+      const ranked = rankByCapability(specs("a-mini", "b-neutral", "c-opus")).map((m) => m.spec);
+      assert.deepEqual(ranked, ["a-mini", "b-neutral", "c-opus"]);
+    });
+
+    it("breaks cost ties by contextWindow (smaller = less capable)", async () => {
+      const { rankByCapability } = await loadModule();
+      const ranked = rankByCapability([
+        { spec: "x/a", costOutput: 5, contextWindow: 8000 },
+        { spec: "x/b", costOutput: 5, contextWindow: 200000 },
+        { spec: "x/c", costOutput: 1 },
+      ]).map((m) => m.spec);
+      assert.deepEqual(ranked, ["x/c", "x/a", "x/b"]);
+    });
+
+    it("is stable for fully-tied models (registry order preserved)", async () => {
+      const { rankByCapability } = await loadModule();
+      const ranked = rankByCapability([
+        { spec: "x/a", costOutput: 5 },
+        { spec: "x/b", costOutput: 5 },
+        { spec: "x/c", costOutput: 5 },
+      ]).map((m) => m.spec);
+      assert.deepEqual(ranked, ["x/a", "x/b", "x/c"]);
+    });
+  });
+
   describe("buildDefaultTierConfig", () => {
     it("sets every tier to the provided current model when no models are available", async () => {
       const { buildDefaultTierConfig } = await loadModule();
-      // Explicitly inject an empty registry so this exercises the "no models
-      // known" fallback rather than depending on whatever registry happens to
-      // be configured in the environment running the tests.
       const cfg = buildDefaultTierConfig("openai/gpt-4.1", []);
       assert.deepEqual(cfg.tiers, {
         small: "openai/gpt-4.1",
@@ -50,10 +160,7 @@ describe("model-tier-config", () => {
       assert.deepEqual(Object.keys(cfg.tiers).sort(), ["big", "medium", "small"]);
     });
 
-    it("spreads three or more available models across tiers", async () => {
-      // This uses the real listAvailableModelSpecs() which may return [] in test env.
-      // We can only test the code path where currentModelSpec is undefined and
-      // verify the structure is still valid.
+    it("spreads three or more available models across tiers (structure holds with the live registry)", async () => {
       const { buildDefaultTierConfig } = await loadModule();
       const cfg = buildDefaultTierConfig();
       assert.deepEqual(Object.keys(cfg.tiers).sort(), ["big", "medium", "small"]);
@@ -62,20 +169,10 @@ describe("model-tier-config", () => {
       }
     });
 
-    it("the exported default-argument path (no availableModels passed) still spreads distinct tiers when a real registry is available", async () => {
-      // Regression test for the original #38 bug resurfacing through the public
-      // API: buildDefaultTierConfig(currentModelSpec) called WITHOUT its 2nd
-      // argument must still consult the live registry and spread tiers, not
-      // silently collapse to a single model just because currentModelSpec was
-      // also passed. We can't control the real listAvailableModelSpecs() output
-      // here, so we only assert the structural invariant that matters: whatever
-      // it returns, the function must not special-case away the registry lookup
-      // when currentModelSpec is provided (verified functionally in the
-      // 3+/2/1-model tests below via explicit injection, which exercise the
-      // exact same code path).
+    it("the default-argument path (no availableModels passed) still spreads distinct tiers", async () => {
       const { buildDefaultTierConfig } = await loadModule();
-      const withCurrentModel = buildDefaultTierConfig("openai/gpt-4.1", ["a", "b", "c"]);
-      const withoutCurrentModel = buildDefaultTierConfig(undefined, ["a", "b", "c"]);
+      const withCurrentModel = buildDefaultTierConfig("openai/gpt-4.1", specs("a", "b", "c"));
+      const withoutCurrentModel = buildDefaultTierConfig(undefined, specs("a", "b", "c"));
       assert.deepEqual(
         withCurrentModel.tiers,
         withoutCurrentModel.tiers,
@@ -85,25 +182,25 @@ describe("model-tier-config", () => {
 
     it("spreads exactly three available models across small/medium/big (no overlap)", async () => {
       const { buildDefaultTierConfig } = await loadModule();
-      const cfg = buildDefaultTierConfig(undefined, ["model-a", "model-b", "model-c"]);
+      const cfg = buildDefaultTierConfig(undefined, specs("model-a", "model-b", "model-c"));
       assert.equal(cfg.tiers.small, "model-a");
       assert.equal(cfg.tiers.medium, "model-b");
       assert.equal(cfg.tiers.big, "model-c");
     });
 
-    it("spreads available models even when a current model fallback is provided", async () => {
+    it("ranks three priced models across tiers by cost", async () => {
       const { buildDefaultTierConfig } = await loadModule();
-      const cfg = buildDefaultTierConfig("current-model", ["model-a", "model-b", "model-c"]);
-      assert.deepEqual(cfg.tiers, {
-        small: "model-a",
-        medium: "model-b",
-        big: "model-c",
-      });
+      const cfg = buildDefaultTierConfig(undefined, [
+        { spec: "v/big", costOutput: 30 },
+        { spec: "v/small", costOutput: 1 },
+        { spec: "v/mid", costOutput: 8 },
+      ]);
+      assert.deepEqual(cfg.tiers, { small: "v/small", medium: "v/mid", big: "v/big" });
     });
 
     it("spreads two available models: small gets first, medium and big get second", async () => {
       const { buildDefaultTierConfig } = await loadModule();
-      const cfg = buildDefaultTierConfig(undefined, ["model-a", "model-b"]);
+      const cfg = buildDefaultTierConfig(undefined, specs("model-a", "model-b"));
       assert.equal(cfg.tiers.small, "model-a");
       assert.equal(cfg.tiers.medium, "model-b");
       assert.equal(cfg.tiers.big, "model-b");
@@ -111,30 +208,19 @@ describe("model-tier-config", () => {
 
     it("with exactly one available model, all three tiers resolve to it (no crash)", async () => {
       const { buildDefaultTierConfig } = await loadModule();
-      const cfg = buildDefaultTierConfig(undefined, ["only-model"]);
-      assert.deepEqual(cfg.tiers, {
-        small: "only-model",
-        medium: "only-model",
-        big: "only-model",
-      });
+      const cfg = buildDefaultTierConfig(undefined, specs("only-model"));
+      assert.deepEqual(cfg.tiers, { small: "only-model", medium: "only-model", big: "only-model" });
     });
 
     it("with exactly one available model, the current model fallback is ignored in favor of it", async () => {
       const { buildDefaultTierConfig } = await loadModule();
-      const cfg = buildDefaultTierConfig("current-model", ["only-model"]);
-      assert.deepEqual(cfg.tiers, {
-        small: "only-model",
-        medium: "only-model",
-        big: "only-model",
-      });
+      const cfg = buildDefaultTierConfig("current-model", specs("only-model"));
+      assert.deepEqual(cfg.tiers, { small: "only-model", medium: "only-model", big: "only-model" });
     });
 
     it("respects capability hints for the 2-model case: big-hint model always lands in medium/big, never small", async () => {
-      // Registry order is [big-hint model, small-hint model] — a naive positional
-      // split would put the opus model in "small" and the mini model in
-      // "medium"/"big", inverting capability. The fix must rank first.
       const { buildDefaultTierConfig } = await loadModule();
-      const cfg = buildDefaultTierConfig(undefined, ["claude-3-opus", "gpt-4o-mini"]);
+      const cfg = buildDefaultTierConfig(undefined, specs("claude-3-opus", "gpt-4o-mini"));
       assert.equal(cfg.tiers.small, "gpt-4o-mini");
       assert.equal(cfg.tiers.medium, "claude-3-opus");
       assert.equal(cfg.tiers.big, "claude-3-opus");
@@ -142,7 +228,7 @@ describe("model-tier-config", () => {
 
     it("respects capability hints for the 2-model case regardless of registry order", async () => {
       const { buildDefaultTierConfig } = await loadModule();
-      const cfg = buildDefaultTierConfig(undefined, ["gpt-4o-mini", "claude-3-opus"]);
+      const cfg = buildDefaultTierConfig(undefined, specs("gpt-4o-mini", "claude-3-opus"));
       assert.equal(cfg.tiers.small, "gpt-4o-mini");
       assert.equal(cfg.tiers.medium, "claude-3-opus");
       assert.equal(cfg.tiers.big, "claude-3-opus");
@@ -150,8 +236,7 @@ describe("model-tier-config", () => {
 
     it("with four available models, assigns middle index to medium", async () => {
       const { buildDefaultTierConfig } = await loadModule();
-      const cfg = buildDefaultTierConfig(undefined, ["m-a", "m-b", "m-c", "m-d"]);
-      // Math.floor(4 / 2) = 2 → medium = m-c
+      const cfg = buildDefaultTierConfig(undefined, specs("m-a", "m-b", "m-c", "m-d"));
       assert.equal(cfg.tiers.small, "m-a");
       assert.equal(cfg.tiers.medium, "m-c");
       assert.equal(cfg.tiers.big, "m-d");
@@ -169,65 +254,47 @@ describe("model-tier-config", () => {
     it("falls back to the current model when no available models are known", async () => {
       const { buildDefaultTierConfig } = await loadModule();
       const cfg = buildDefaultTierConfig("current-model", []);
-      assert.deepEqual(cfg.tiers, {
-        small: "current-model",
-        medium: "current-model",
-        big: "current-model",
-      });
+      assert.deepEqual(cfg.tiers, { small: "current-model", medium: "current-model", big: "current-model" });
     });
 
-    // -----------------------------------------------------------------------
-    // Capability-hint ordering (SMALL_MODEL_HINTS / BIG_MODEL_HINTS)
-    // -----------------------------------------------------------------------
+    // Capability-hint ordering (SMALL_MODEL_HINTS / BIG_MODEL_HINTS), pure-hint path.
 
     it("assigns small via SMALL_MODEL_HINTS even when mini model is not first in list", async () => {
-      // Simulates a provider-grouped registry: ["gpt-4o", "gpt-4o-mini", "claude-3-5-sonnet"]
-      // Without hint matching, positional would set small="gpt-4o" and big="claude-3-5-sonnet".
-      // With hint matching, "mini" wins for small regardless of position.
       const { buildDefaultTierConfig } = await loadModule();
-      const cfg = buildDefaultTierConfig(undefined, ["gpt-4o-mini", "claude-3-5-sonnet", "gpt-4o"]);
+      const cfg = buildDefaultTierConfig(undefined, specs("gpt-4o-mini", "claude-3-5-sonnet", "gpt-4o"));
       assert.equal(cfg.tiers.small, "gpt-4o-mini");
       assert.equal(cfg.tiers.medium, "claude-3-5-sonnet");
       assert.equal(cfg.tiers.big, "gpt-4o");
     });
 
     it("assigns small and big via hints when both hint sets match, ignoring list position", async () => {
-      // "claude-3-opus" is at index 0 but should be big; "gpt-4o-mini" is at index 2 but should be small.
       const { buildDefaultTierConfig } = await loadModule();
-      const cfg = buildDefaultTierConfig(undefined, ["claude-3-opus", "claude-3-5-sonnet", "gpt-4o-mini"]);
+      const cfg = buildDefaultTierConfig(undefined, specs("claude-3-opus", "claude-3-5-sonnet", "gpt-4o-mini"));
       assert.equal(cfg.tiers.small, "gpt-4o-mini");
       assert.equal(cfg.tiers.medium, "claude-3-5-sonnet");
       assert.equal(cfg.tiers.big, "claude-3-opus");
     });
 
     it("falls back to positional for small/big when no hint matches", async () => {
-      // Generic names have no hint substrings — positional behaviour must be preserved.
       const { buildDefaultTierConfig } = await loadModule();
-      const cfg = buildDefaultTierConfig(undefined, ["model-a", "model-b", "model-c"]);
+      const cfg = buildDefaultTierConfig(undefined, specs("model-a", "model-b", "model-c"));
       assert.equal(cfg.tiers.small, "model-a");
       assert.equal(cfg.tiers.medium, "model-b");
       assert.equal(cfg.tiers.big, "model-c");
     });
 
-    // -----------------------------------------------------------------------
-    // Collapse / inversion regressions (#38, PR #44 review defects)
-    // -----------------------------------------------------------------------
+    // Collapse / inversion regressions (#38, PR #44 review defects).
 
     it("does not collapse tiers when a model matches both small and big hints (small hint wins)", async () => {
-      // "gpt-4o-mini-pro" contains both "mini" (small hint) and "pro" (big hint).
-      // Picking small and big independently via `find()` would assign this same
-      // model to both small AND big, collapsing two tiers together. The fix
-      // must rank each model with a single score (small hint wins ties) and
-      // assign from one pool with exclusion so no model is used twice.
       const { buildDefaultTierConfig } = await loadModule();
-      const cfg = buildDefaultTierConfig(undefined, ["gpt-4o-mini-pro", "gpt-4o", "claude-3-sonnet"]);
+      const cfg = buildDefaultTierConfig(undefined, specs("gpt-4o-mini-pro", "gpt-4o", "claude-3-sonnet"));
       const values = Object.values(cfg.tiers);
       assert.equal(new Set(values).size, values.length, "all three tiers must be distinct models");
       assert.equal(cfg.tiers.small, "gpt-4o-mini-pro");
       assert.notEqual(cfg.tiers.big, cfg.tiers.small);
     });
 
-    it("never inverts capability ranking: big is always at least as capable as medium and small across many model sets", async () => {
+    it("never inverts capability ranking across many model sets (hint path)", async () => {
       const { buildDefaultTierConfig } = await loadModule();
       const scenarios: string[][] = [
         ["claude-3-opus", "gpt-4o-mini", "claude-3-5-sonnet"],
@@ -242,26 +309,17 @@ describe("model-tier-config", () => {
         return 0;
       };
       for (const models of scenarios) {
-        const cfg = buildDefaultTierConfig(undefined, models);
+        const cfg = buildDefaultTierConfig(undefined, specs(...models));
         const values = Object.values(cfg.tiers);
         assert.equal(new Set(values).size, values.length, `tiers must be distinct for ${JSON.stringify(models)}`);
-        assert.ok(
-          rank(cfg.tiers.big) >= rank(cfg.tiers.medium),
-          `big (${cfg.tiers.big}) must not be weaker than medium (${cfg.tiers.medium})`,
-        );
-        assert.ok(
-          rank(cfg.tiers.medium) >= rank(cfg.tiers.small),
-          `medium (${cfg.tiers.medium}) must not be weaker than small (${cfg.tiers.small})`,
-        );
+        assert.ok(rank(cfg.tiers.big) >= rank(cfg.tiers.medium), `big must not be weaker than medium`);
+        assert.ok(rank(cfg.tiers.medium) >= rank(cfg.tiers.small), `medium must not be weaker than small`);
       }
     });
 
-    it("with an odd/limited model set (2 distinct capability tiers), degrades gracefully without inversion", async () => {
-      // Only a "small" model and a "neutral" model are available — big and
-      // medium must both resolve to the stronger (neutral) one, never the
-      // small one, and small must never end up in a higher tier.
+    it("degrades gracefully without inversion for a 2-capability-tier set", async () => {
       const { buildDefaultTierConfig } = await loadModule();
-      const cfg = buildDefaultTierConfig(undefined, ["vendor/neutral-model", "vendor/tiny-mini-model"]);
+      const cfg = buildDefaultTierConfig(undefined, specs("vendor/neutral-model", "vendor/tiny-mini-model"));
       assert.equal(cfg.tiers.small, "vendor/tiny-mini-model");
       assert.equal(cfg.tiers.medium, "vendor/neutral-model");
       assert.equal(cfg.tiers.big, "vendor/neutral-model");
@@ -269,18 +327,39 @@ describe("model-tier-config", () => {
 
     it("with 3+ distinct models, small/medium/big are always pairwise distinct", async () => {
       const { buildDefaultTierConfig } = await loadModule();
-      const cfg = buildDefaultTierConfig(undefined, ["model-a", "model-b", "model-c", "model-d", "model-e"]);
+      const cfg = buildDefaultTierConfig(undefined, specs("model-a", "model-b", "model-c", "model-d", "model-e"));
       const values = Object.values(cfg.tiers);
       assert.equal(new Set(values).size, 3, "small/medium/big must all be distinct with 5 available models");
+    });
+  });
+
+  describe("formatTierFallbackNotice", () => {
+    it("names the fallback model and includes the suggested mapping", async () => {
+      const { formatTierFallbackNotice } = await loadModule();
+      const notice = formatTierFallbackNotice("openai/gpt-4.1", [
+        { spec: "v/small", costOutput: 1 },
+        { spec: "v/mid", costOutput: 5 },
+        { spec: "v/big", costOutput: 20 },
+      ]);
+      assert.match(notice, /no model-tiers\.json/);
+      assert.match(notice, /fall back to openai\/gpt-4\.1/);
+      assert.match(notice, /\/workflows-models/);
+      assert.match(notice, /small=v\/small/);
+      assert.match(notice, /medium=v\/mid/);
+      assert.match(notice, /big=v\/big/);
+    });
+
+    it("uses a generic phrase when no session model is known", async () => {
+      const { formatTierFallbackNotice } = await loadModule();
+      const notice = formatTierFallbackNotice(undefined, specs("only-model"));
+      assert.match(notice, /the session default model/);
     });
   });
 
   describe("resolveTierModel", () => {
     it("returns the model for a valid tier", async () => {
       const { resolveTierModel } = await loadModule();
-      const config = {
-        tiers: { small: "openai/gpt-4.1-mini", medium: "openai/gpt-4.1", big: "openai/gpt-5" },
-      };
+      const config = { tiers: { small: "openai/gpt-4.1-mini", medium: "openai/gpt-4.1", big: "openai/gpt-5" } };
       assert.equal(resolveTierModel("small", config), "openai/gpt-4.1-mini");
       assert.equal(resolveTierModel("medium", config), "openai/gpt-4.1");
       assert.equal(resolveTierModel("big", config), "openai/gpt-5");
@@ -302,9 +381,7 @@ describe("model-tier-config", () => {
       const { loadModelTierConfig, saveModelTierConfig } = await loadModule();
       const tmpDir = mkdtempSync(join(tmpdir(), "mtc-test-"));
       const cfgPath = join(tmpDir, "model-tiers.json");
-      const config = {
-        tiers: { small: "gpt-4.1-mini", medium: "gpt-4.1", big: "gpt-5" },
-      };
+      const config = { tiers: { small: "gpt-4.1-mini", medium: "gpt-4.1", big: "gpt-5" } };
       saveModelTierConfig(config, cfgPath);
       const loaded = loadModelTierConfig(cfgPath);
       assert.deepEqual(loaded, config);
