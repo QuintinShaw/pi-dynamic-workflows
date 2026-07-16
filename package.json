@@ -1,6 +1,6 @@
 {
   "name": "@quintinshaw/pi-dynamic-workflows",
-  "version": "2.13.1",
+  "version": "2.13.2",
   "description": "Claude-Code-style dynamic workflows for Pi — fan a task out across 100s of subagents with real model routing, token/cost accounting, resume, git-worktree isolation, an interactive /workflows TUI, and a real /deep-research.",
   "type": "module",
   "main": "./dist/index.js",

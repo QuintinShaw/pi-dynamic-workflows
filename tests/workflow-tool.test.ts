@@ -66,12 +66,13 @@ test("createWorkflowTool has promptGuidelines array", () => {
   assert.ok(tool.promptGuidelines.length > 5, "should have several guidelines");
 });
 
-test("createWorkflowTool promptGuidelines mention model routing", () => {
+test("createWorkflowTool routes normal work through tiers and reserves exact models for user requests", () => {
   const tool = createWorkflowTool();
   const all = tool.promptGuidelines.join(" ");
-  assert.ok(all.includes("opts.tier"), "should mention opts.tier");
-  assert.ok(all.includes("opts.model"), "should mention opts.model");
-  assert.ok(all.includes("small") || all.includes("medium") || all.includes("big"), "should mention tier names");
+
+  assert.match(all, /opts\.tier/);
+  assert.match(all, /small.+medium.+big/s);
+  assert.match(all, /opts\.model only when the user names/i);
 });
 
 test("createWorkflowTool promptGuidelines keep budget and timeout unbounded by default", () => {
@@ -132,17 +133,6 @@ test("modelRoutingGuideline explains tier vs model priority", () => {
   );
 });
 
-test("modelRoutingGuideline references the model scope (auth-independent)", () => {
-  const text = modelRoutingGuideline();
-  // With auth configured it lists the available models; on a fresh/CI machine
-  // with no models it falls back to a generic line. Accept either so the test
-  // doesn't depend on the runner's authenticated providers.
-  assert.ok(
-    text.includes("route only to these") || text.includes("models the user has configured"),
-    "should explain which models are in scope (listed or fallback)",
-  );
-});
-
 test("modelRoutingGuideline explains when to use each option", () => {
   const text = modelRoutingGuideline();
   assert.ok(/small.*(exploration|search|inventory|agents)/i.test(text), "small tier should mention light workloads");
@@ -164,53 +154,15 @@ test("createWorkflowTool with custom cwd creates tool", () => {
   assert.equal(tool.name, "workflow");
 });
 
-test("modelRoutingGuideline advertises models from an injected registry", () => {
-  const registry = fakeRegistry([{ provider: "router", id: "shared-model" }]);
-  const text = modelRoutingGuideline(registry);
-  assert.match(text, /route only to these/i);
-  assert.match(text, /router\/shared-model/);
-});
-
-test("modelRoutingGuideline accepts a getter and resolves it lazily at call time", () => {
-  // Empty registry (not undefined) so the getter path is exercised end-to-end
-  // rather than falling through to the disk-registry default.
-  let registry: any = fakeRegistry([]);
-  const text = modelRoutingGuideline(() => registry);
-  assert.doesNotMatch(text, /router\/late-model/);
-
-  // Registering after construction (simulating session_start running after the
-  // guideline string was first read) is reflected on the next call.
-  registry = fakeRegistry([{ provider: "router", id: "late-model" }]);
-  const later = modelRoutingGuideline(() => registry);
-  assert.match(later, /router\/late-model/);
-});
-
-test("createWorkflowTool advertises models from the manager's shared registry when set before creation", () => {
+test("createWorkflowTool does not add configured model IDs to promptGuidelines", () => {
   const manager = new WorkflowManager({ cwd: "/tmp" });
-  manager.setModelRegistry(fakeRegistry([{ provider: "router", id: "wired-model" }]));
+  manager.setModelRegistry(fakeRegistry([{ provider: "router", id: "private-model" }]));
   const tool = createWorkflowTool({ cwd: "/tmp", manager });
-  const all = tool.promptGuidelines.join(" ");
-  assert.match(all, /router\/wired-model/);
-});
 
-test("createWorkflowTool promptGuidelines reflect a registry set AFTER tool creation (lazy accessor)", () => {
-  // Mirrors the real ordering: createWorkflowTool() runs at extension load,
-  // setModelRegistry() runs later in session_start. The SDK re-reads
-  // definition.promptGuidelines on every tool-registry refresh, so a fresh
-  // property read must see the late-set registry.
-  const manager = new WorkflowManager({ cwd: "/tmp" });
-  manager.setModelRegistry(fakeRegistry([]));
-  const tool = createWorkflowTool({ cwd: "/tmp", manager });
-  assert.doesNotMatch(tool.promptGuidelines.join(" "), /router\/late-model/);
+  assert.doesNotMatch(tool.promptGuidelines.join(" "), /router\/private-model/);
 
-  manager.setModelRegistry(fakeRegistry([{ provider: "router", id: "late-model" }]));
-  assert.match(tool.promptGuidelines.join(" "), /router\/late-model/);
-
-  // Replacing the registry again is also reflected.
-  manager.setModelRegistry(fakeRegistry([{ provider: "router", id: "replacement-model" }]));
-  const latest = tool.promptGuidelines.join(" ");
-  assert.match(latest, /router\/replacement-model/);
-  assert.doesNotMatch(latest, /router\/late-model/);
+  manager.setModelRegistry(fakeRegistry([{ provider: "router", id: "later-private-model" }]));
+  assert.doesNotMatch(tool.promptGuidelines.join(" "), /router\/later-private-model/);
 });
 
 test("modelRoutingGuideline output is non-empty and well-formed", () => {

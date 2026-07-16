@@ -169,6 +169,52 @@ function isBackspace(data: string): boolean {
   return data === "\x7f" || data === "\b";
 }
 
+/** Emitted at most once per process so a noisy host doesn't spam the log. */
+let warnedUnexpectedArity = false;
+
+/**
+ * Pi's CustomEditor still forwards `(tui, theme, keybindings)` to the legacy
+ * pi-tui Editor constructor. OMP's CustomEditor has no constructor and extends
+ * the newer `Editor(theme)`. Select the argument layout from the base Editor's
+ * required parameter count so one extension can run in either host.
+ *
+ * `baseEditorCtor` defaults to the real `Editor` class (via
+ * `Object.getPrototypeOf(CustomEditor)`) and is only overridable so unit tests
+ * can exercise both branches without depending on which host's `CustomEditor`
+ * happens to be installed (see `tests/workflow-editor.test.ts`).
+ */
+export function customEditorConstructorArgs(
+  tui: TUI,
+  theme: EditorTheme,
+  keybindings: ConstructorParameters<typeof CustomEditor>[2],
+  baseEditorCtor: { readonly length: number } = Object.getPrototypeOf(CustomEditor) as { readonly length: number },
+): ConstructorParameters<typeof CustomEditor> {
+  if (baseEditorCtor.length === 1) {
+    // The installed Pi types describe the legacy signature; OMP provides the
+    // runtime-only `(theme, keybindings)` signature.
+    return [theme, keybindings] as unknown as ConstructorParameters<typeof CustomEditor>;
+  }
+  // INTENTIONAL: any arity other than exactly 1 is treated as the legacy
+  // 3-arg `(tui, theme, keybindings)` layout — this includes the expected
+  // legacy case (2: pi-tui's `Editor(tui, theme, options)`), but also any
+  // *unexpected* arity (0, 3, ...) from a host we haven't seen yet. That's a
+  // deliberate choice: legacy is the layout we've actually verified against
+  // real Pi releases, so it's the safer default. If a third host signature
+  // ever shows up, this heuristic needs a new branch — the warning below is
+  // meant to surface that instead of silently misconstructing the editor
+  // (see https://github.com/QuintinShaw/pi-dynamic-workflows/issues/72).
+  if (baseEditorCtor.length !== 2 && !warnedUnexpectedArity) {
+    warnedUnexpectedArity = true;
+    console.warn(
+      `[pi-dynamic-workflows] WorkflowEditor: base editor constructor takes ${baseEditorCtor.length} required ` +
+        "argument(s), which is neither the known OMP layout (1) nor the known legacy Pi layout (2). Falling back " +
+        "to the legacy (tui, theme, keybindings) call — the editor may fail to render on this host. Please report " +
+        "this at https://github.com/QuintinShaw/pi-dynamic-workflows/issues/72.",
+    );
+  }
+  return [tui, theme, keybindings];
+}
+
 /**
  * Editor that paints the trigger words and owns the on/off toggle. Reads/writes
  * `state.active` so the extension's `input` handler can decide whether to force a
@@ -182,12 +228,12 @@ export class WorkflowEditor extends CustomEditor {
   private wasTriggered = false;
 
   constructor(
-    tui: TUI,
+    private readonly hostTui: TUI,
     theme: EditorTheme,
     keybindings: ConstructorParameters<typeof CustomEditor>[2],
     private readonly modeState: WorkflowModeState,
   ) {
-    super(tui, theme, keybindings);
+    super(...customEditorConstructorArgs(hostTui, theme, keybindings));
   }
 
   /** Highlighted/armed: a trigger is present and the user hasn't toggled it off. */
@@ -205,7 +251,7 @@ export class WorkflowEditor extends CustomEditor {
       this.disabled = true;
       this.modeState.suppressedKeywordText = this.getText().trim();
       this.syncState();
-      this.tui.requestRender();
+      this.hostTui.requestRender();
       return;
     }
     const before = this.getText();
@@ -229,19 +275,85 @@ export class WorkflowEditor extends CustomEditor {
   }
 
   override render(width: number): string[] {
-    const lines = super.render(width);
+    // Defensive layer for issue #72: on some hosts a base-editor/pi-tui
+    // version mismatch can leave the base `Editor`'s internal render state
+    // uninitialized, making `super.render()` throw on every single render —
+    // including the very first one, before the user has typed anything —
+    // which crashes the whole app at launch with no way to recover (short of
+    // disabling the extension). We can't fix a broken host from here, but we
+    // CAN make sure this extension degrades to a plain, unstyled editor
+    // instead of hard-crashing Pi/OMP.
+    let lines: string[];
+    let usingFallback = false;
+    try {
+      lines = super.render(width);
+    } catch (err) {
+      usingFallback = true;
+      if (!WorkflowEditor.warnedRenderFallback) {
+        WorkflowEditor.warnedRenderFallback = true;
+        console.warn(
+          "[pi-dynamic-workflows] WorkflowEditor: base editor render() threw; degrading to a minimal, unstyled " +
+            "rendering so the app doesn't crash. Workflows-mode highlighting will be unavailable this session. " +
+            `Original error: ${err instanceof Error ? (err.stack ?? err.message) : String(err)} ` +
+            "Please report this at https://github.com/QuintinShaw/pi-dynamic-workflows/issues/72.",
+        );
+      }
+      lines = this.safeFallbackLines(width);
+    }
+
     // Keep the shared state current even for non-keystroke changes (history
     // recall, programmatic setText) so the submit hook reads the right value.
-    this.syncState();
-    this.reconcileAnimation();
-    if (!this.isActive() || lines.length === 0) return lines;
-    // First and last lines are the editor's horizontal borders; only the text
-    // lines in between are colorized.
-    return lines.map((ln, i) =>
-      i === 0 || i === lines.length - 1
-        ? ln
-        : colorizeWorkflow(ln, this.tick, RAINBOW, this.modeState.keywordTriggerWord),
-    );
+    // Guarded: this bookkeeping must never itself throw — including against
+    // the fallback lines above — or a broken host would still crash the app.
+    try {
+      this.syncState();
+      this.reconcileAnimation();
+    } catch {
+      // Best-effort; rendering must proceed even if bookkeeping fails.
+    }
+
+    let active = false;
+    try {
+      active = this.isActive();
+    } catch {
+      active = false;
+    }
+    if (usingFallback || !active || lines.length === 0) return lines;
+
+    try {
+      // First and last lines are the editor's horizontal borders; only the text
+      // lines in between are colorized.
+      return lines.map((ln, i) =>
+        i === 0 || i === lines.length - 1
+          ? ln
+          : colorizeWorkflow(ln, this.tick, RAINBOW, this.modeState.keywordTriggerWord),
+      );
+    } catch {
+      // Colorizing is cosmetic; never let it turn a working render into a crash.
+      return lines;
+    }
+  }
+
+  /** Emitted at most once per process so a broken host doesn't spam the log every render. */
+  private static warnedRenderFallback = false;
+
+  /**
+   * Minimal, defensive rendering used only when the base editor's render()
+   * throws (see issue #72). Deliberately avoids calling any other overridden
+   * or state-dependent method that might share the same broken internal
+   * state; falls back to an empty array if even plain text access fails.
+   * Not pretty (no borders, no wrapping beyond a hard slice) — the goal is
+   * "the app still launches", not "the editor still looks nice".
+   */
+  private safeFallbackLines(width: number): string[] {
+    try {
+      const text = this.getText();
+      const raw = text.length > 0 ? text.split("\n") : [""];
+      const safeWidth = Number.isFinite(width) && width > 0 ? Math.floor(width) : 80;
+      return raw.map((line) => (line.length > safeWidth ? line.slice(0, safeWidth) : line));
+    } catch {
+      return [];
+    }
   }
 
   /** Absolute text before the cursor, used to detect "right after the word". */
@@ -261,7 +373,7 @@ export class WorkflowEditor extends CustomEditor {
     if (shouldRun && !this.timer) {
       this.timer = setInterval(() => {
         this.tick = (this.tick + 1) % (RAINBOW.length * 6);
-        this.tui.requestRender();
+        this.hostTui.requestRender();
       }, 90);
       // Don't keep the process alive for the animation.
       (this.timer as { unref?: () => void }).unref?.();

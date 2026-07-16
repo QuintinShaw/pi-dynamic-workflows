@@ -165,10 +165,8 @@ export class WorkflowManager extends EventEmitter {
   }
 
   /**
-   * The host session's model registry, when set. Read lazily (e.g. by the
-   * workflow tool's model routing guideline) since `setModelRegistry` is called
-   * from `session_start`, which runs after the tool is created — a snapshot
-   * taken at tool-creation time would miss it.
+   * Expose the host session's model registry to integrations sharing this
+   * manager. Workflow execution reads the same registry internally.
    */
   getModelRegistry(): ModelRegistry | undefined {
     return this.modelRegistry;

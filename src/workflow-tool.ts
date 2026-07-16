@@ -1,7 +1,6 @@
-import { defineTool, type ModelRegistry, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { listAvailableModelSpecs } from "./agent.js";
 import { listAgentTypes, loadAgentRegistry } from "./agent-registry.js";
 import {
   createToolUpdateWorkflowDisplay,
@@ -27,18 +26,8 @@ import { loadWorkflowSettings } from "./workflow-settings.js";
  *
  * This string is injected into the workflow tool's promptGuidelines and
  * therefore appears in the LLM's system prompt for every workflow execution.
- *
- * `registry` is a live host-session ModelRegistry (or a getter reaching one),
- * e.g. from WorkflowManager.getModelRegistry(). A getter lets each call see
- * the registry as it stands at that moment — the manager's registry is set on
- * session_start, after the tool is created, so an early snapshot would miss it.
  */
-export function modelRoutingGuideline(registry?: ModelRegistry | (() => ModelRegistry | undefined)): string {
-  const resolvedRegistry = typeof registry === "function" ? registry() : registry;
-  const available = listAvailableModelSpecs(resolvedRegistry);
-  const list = available.length
-    ? `The user's currently available models (route only to these) are: ${available.join(", ")}.`
-    : "Use models the user has configured.";
+export function modelRoutingGuideline(): string {
   return [
     "For workflow, the user configures per-tier models (/workflows-models), so TAG EVERY agent with opts.tier by role so those models are actually used.",
     "opts.tier accepts 'small', 'medium', or 'big' and is enforced at runtime.",
@@ -46,9 +35,8 @@ export function modelRoutingGuideline(registry?: ModelRegistry | (() => ModelReg
     "Medium tier: balanced analysis agents.",
     "Big tier: synthesis/judgment/decision agents spanning the full context.",
     "An agent with no opts.tier and no opts.model falls back to the user's medium tier; do not rely on that — tag agents explicitly so small/big are used where they fit.",
-    "If the user named a specific model, use opts.model with that exact provider/id; opts.model always takes precedence over opts.tier.",
+    "Use opts.model only when the user names a specific model; pass that exact provider/id. opts.model always takes precedence over opts.tier.",
     "Exact model specs may include Pi CLI-style thinking suffixes such as openai-codex/gpt-5.5:xhigh or anthropic/claude-fable-5:max when the user requests a specific effort level.",
-    list,
   ].join(" ");
 }
 
@@ -168,10 +156,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
     promptSnippet:
       "Run a deterministic JavaScript workflow. Required script header: export const meta = { name: 'short_snake_case', description: 'non-empty description', phases: [{ title: 'Phase' }] }.",
     // Lazy accessor: the SDK re-reads definition.promptGuidelines on every
-    // tool-registry refresh, so each read sees the manager's registry as it
-    // stands then (setModelRegistry runs on session_start, after tool creation).
-    // Residual caveat: providers registered after the last refresh won't appear
-    // until the next one.
+    // tool-registry refresh, so changes to the agentType registry are reflected.
     get promptGuidelines() {
       return [
         "Use workflow only when the user explicitly asks for a workflow, workflows, fan-out, or multi-agent orchestration.",
@@ -193,7 +178,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
         "For workflow, the default quality shape for fan-out work is finder -> verify -> merge: run one agent per angle or work-unit (in parallel), pass each candidate finding through verify() and drop the unconfirmed, then a single synthesis agent that de-duplicates, ranks by confidence/severity, and caps the output. If nothing survives verification, return an empty result and say so rather than padding.",
         "For workflow, give each subagent a substantive, self-contained task: do not spawn an agent just to read one file or run one command, and do not use one agent only to check on another. Prefer fewer, higher-level agents over many trivial micro-tasks.",
         "For workflow, if agent() needs machine-readable output, pass a plain JSON Schema via opts.schema; agent() will return the validated object. Use JSON Schema syntax, not TypeScript or TypeBox constructors.",
-        modelRoutingGuideline(() => manager.getModelRegistry()),
+        modelRoutingGuideline(),
         agentTypeGuideline(),
         "For workflow, do not assume the parent assistant has repository code context inside subagents; include enough task context and relevant paths in each agent prompt.",
         "For workflow, runs are background by default: the tool returns immediately with a run ID, the turn ends so the user isn't blocked, and the result is delivered back into the conversation when the run finishes. Pass background: false only when you must use the result inline in this same turn (it will block).",

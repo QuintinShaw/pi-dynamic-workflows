@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import { before, describe, it } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import { CustomEditor, type ExtensionAPI, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { type Terminal, TUI } from "@earendil-works/pi-tui";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -38,6 +38,20 @@ function makeMockTerminal(): Terminal {
 /** Create a TUI instance safe for test usage (no real terminal I/O). */
 function createMockTui(): TUI {
   return new TUI(makeMockTerminal(), false);
+}
+
+/**
+ * The base `Editor` class that `WorkflowEditor` actually renders through at
+ * runtime, resolved the same way `customEditorConstructorArgs` resolves it
+ * (`Object.getPrototypeOf(CustomEditor)`). This is NOT necessarily the same
+ * module instance as a direct `import { Editor } from "@earendil-works/pi-tui"`
+ * in this file — `pi-coding-agent` ships its own nested copy of `pi-tui`
+ * (`node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-tui`),
+ * so a top-level import resolves to a *different* `Editor` class object than
+ * the one `CustomEditor` actually extends. Patching the wrong one is a no-op.
+ */
+function getBaseEditorClass(): { prototype: { render: (width: number) => string[] } } {
+  return Object.getPrototypeOf(CustomEditor) as { prototype: { render: (width: number) => string[] } };
 }
 
 /** Editor theme stub. */
@@ -345,6 +359,58 @@ describe("RAINBOW", () => {
   });
 });
 
+// PR #64 / issue #72: the editor must construct the base `CustomEditor` with
+// the argument layout the *actual host's* base `Editor` expects — vanilla Pi
+// forwards `(tui, theme, keybindings)`, while some hosts (e.g. OMP) expose a
+// base `Editor` whose constructor only takes `(theme)`. `baseEditorCtor` is
+// injected here purely for testability (see the function's doc comment).
+describe("customEditorConstructorArgs", () => {
+  it("returns [theme, keybindings] when the base editor takes exactly 1 required arg", async () => {
+    const { customEditorConstructorArgs } = await load();
+    const tui = createMockTui();
+    const theme = makeTheme();
+    const keybindings = {} as unknown as Parameters<typeof customEditorConstructorArgs>[2];
+
+    const result = customEditorConstructorArgs(tui, theme, keybindings, { length: 1 });
+
+    assert.deepEqual(result, [theme, keybindings]);
+  });
+
+  it("returns [tui, theme, keybindings] when the base editor's arity is 2 (the known legacy Pi layout)", async () => {
+    const { customEditorConstructorArgs } = await load();
+    const tui = createMockTui();
+    const theme = makeTheme();
+    const keybindings = {} as unknown as Parameters<typeof customEditorConstructorArgs>[2];
+
+    const result = customEditorConstructorArgs(tui, theme, keybindings, { length: 2 });
+
+    assert.deepEqual(result, [tui, theme, keybindings]);
+  });
+
+  it("falls back to [tui, theme, keybindings] for any arity other than 1 (0, 3, ... unseen hosts too)", async () => {
+    const { customEditorConstructorArgs } = await load();
+    const tui = createMockTui();
+    const theme = makeTheme();
+    const keybindings = {} as unknown as Parameters<typeof customEditorConstructorArgs>[2];
+
+    for (const length of [0, 3, 4]) {
+      assert.deepEqual(customEditorConstructorArgs(tui, theme, keybindings, { length }), [tui, theme, keybindings]);
+    }
+  });
+
+  it("defaults to the real installed CustomEditor's base arity when no override is given", async () => {
+    const { customEditorConstructorArgs } = await load();
+    const tui = createMockTui();
+    const theme = makeTheme();
+    const keybindings = {} as unknown as Parameters<typeof customEditorConstructorArgs>[2];
+
+    // The installed pi-coding-agent/pi-tui devDependencies ship the legacy
+    // `Editor(tui, theme, options)` signature (2 required params), so the
+    // default resolution must produce the legacy 3-arg call layout.
+    assert.deepEqual(customEditorConstructorArgs(tui, theme, keybindings), [tui, theme, keybindings]);
+  });
+});
+
 describe("WorkflowEditor", () => {
   type KBManagerClass = {
     new (
@@ -420,6 +486,72 @@ describe("WorkflowEditor", () => {
     for (const ln of lines) {
       assert.equal(typeof ln, "string", "each line should be a string");
     }
+  });
+
+  // Issue #72: a broken/mismatched host can make the base Editor's render()
+  // throw on every render, including the very first one — crashing the whole
+  // app at launch. WorkflowEditor.render() must degrade instead of crashing.
+  describe("render() defensive fallback (issue #72)", () => {
+    it("degrades to plain text instead of throwing when the base render() throws", () => {
+      const { editor } = createEditor();
+      editor.setText("run a workflow test");
+
+      const BaseEditor = getBaseEditorClass();
+      const original = BaseEditor.prototype.render;
+      BaseEditor.prototype.render = () => {
+        throw new Error("simulated host render() crash");
+      };
+      try {
+        assert.doesNotThrow(() => editor.render(80), "render() must not propagate the base editor's crash");
+        const lines = editor.render(80);
+        assert.deepEqual(lines, ["run a workflow test"], "should fall back to the raw, unstyled text");
+      } finally {
+        BaseEditor.prototype.render = original;
+      }
+    });
+
+    it("does not colorize the fallback lines even when workflows mode is active", () => {
+      const { editor, state } = createEditor();
+      editor.setText("run a workflow test");
+
+      const BaseEditor = getBaseEditorClass();
+      const original = BaseEditor.prototype.render;
+      BaseEditor.prototype.render = () => {
+        throw new Error("simulated host render() crash");
+      };
+      try {
+        const lines = editor.render(80);
+        for (const ln of lines) {
+          assert.equal(ln.includes("\x1b["), false, "fallback lines should contain no ANSI color codes");
+        }
+        // Bookkeeping should still be best-effort attempted (guarded, not skipped).
+        assert.equal(typeof state.active, "boolean");
+      } finally {
+        BaseEditor.prototype.render = original;
+      }
+    });
+
+    it("recovers on the next render once the base editor stops throwing", () => {
+      const { editor } = createEditor();
+      editor.setText("hello");
+
+      const BaseEditor = getBaseEditorClass();
+      const original = BaseEditor.prototype.render;
+      BaseEditor.prototype.render = () => {
+        throw new Error("simulated host render() crash");
+      };
+      let crashedLines: string[] = [];
+      try {
+        crashedLines = editor.render(80);
+      } finally {
+        BaseEditor.prototype.render = original;
+      }
+      assert.deepEqual(crashedLines, ["hello"]);
+
+      const recoveredLines = editor.render(80);
+      assert.ok(Array.isArray(recoveredLines) && recoveredLines.length > 0, "should render normally again");
+      assert.notDeepEqual(recoveredLines, ["hello"], "a real render includes borders, unlike the plain fallback");
+    });
   });
 
   it("isActive() returns true when trigger text is present", () => {
