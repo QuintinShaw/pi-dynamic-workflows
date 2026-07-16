@@ -107,7 +107,9 @@ return await agent(
 
 For an always-on exhaustive mode, use `/ultracode`; `/effort high` is the lighter standing option.
 
-## Commands
+## Commands and run control
+
+Pi can manage background runs directly with the `workflow_control` tool instead of asking you to type a command. It supports `list`, `status`, `pause`, `resume`, and `stop`; run-specific actions use the canonical run ID returned when the workflow starts. Status output includes the run state, current phase, agent counts, active labels, and recorded token total.
 
 | Command | Purpose |
 | --- | --- |

@@ -1,6 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   createEffortState,
+  createWorkflowControlTool,
   createWorkflowStorage,
   createWorkflowTool,
   installResultDelivery,
@@ -33,7 +34,9 @@ export default function extension(pi: ExtensionAPI) {
   });
 
   const workflowTool = createWorkflowTool({ cwd, manager, storage });
+  const workflowControlTool = createWorkflowControlTool({ manager });
   pi.registerTool(workflowTool);
+  pi.registerTool(workflowControlTool);
   // Auto-resume runs that paused on a provider usage limit once the quota is
   // likely refilled. Standalone: only consumes the manager's public surface, so
   // it stays decoupled from manager/persistence internals. Its constructor also
@@ -68,9 +71,9 @@ export default function extension(pi: ExtensionAPI) {
     // advertise the shared registry's models.
     manager.setModelRegistry(ctx.modelRegistry);
     const active = pi.getActiveTools();
-    if (!active.includes(workflowTool.name)) {
-      pi.setActiveTools([...active, workflowTool.name]);
-    }
+    const workflowTools = [workflowTool.name, workflowControlTool.name];
+    const missing = workflowTools.filter((name) => !active.includes(name));
+    if (missing.length) pi.setActiveTools([...active, ...missing]);
     // Scope the /workflows history to this session: runs persist on disk across
     // sessions, but the navigator/task panel show only the current session's runs.
     // Switching back to a previous session re-shows that session's runs.
