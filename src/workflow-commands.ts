@@ -30,7 +30,7 @@ const STATUS_ICON: Record<string, string> = {
 };
 
 const USAGE =
-  "Usage: /workflows [list] | run <prompt> | status <id> | watch <id> | stop <id> | pause <id> | resume <id> | rm <id> | save <name> [runId]";
+  "Usage: /workflows [list] | run <prompt> | status <id> | watch <id> | concurrency <id> <n> | stop <id> | pause <id> | resume <id> | rm <id> | save <name> [runId]";
 
 const RUN_USAGE = "Usage: /workflows run <prompt> — force a dynamic workflow from the prompt";
 
@@ -73,7 +73,7 @@ function watchRun(manager: WorkflowManager, pi: ExtensionAPI, ctx: ExtensionComm
     if (!e || e.runId === id) update();
   };
   let settled = false;
-  const progressEvents = ["agentStart", "agentEnd", "phase", "log"];
+  const progressEvents = ["agentQueued", "agentStart", "agentEnd", "phase", "log", "concurrencyChanged"];
   const finalEvents = ["complete", "error", "stopped", "paused"];
   const finish = (e: { runId?: string }) => {
     if (e && e.runId !== id) return;
@@ -135,7 +135,7 @@ export function registerWorkflowCommands(
 
   pi.registerCommand("workflows", {
     description:
-      "Manage workflow runs — no args (opens navigator) | run <prompt> | status/stop/pause/resume <id> | rm <id> | save <name> [runId]",
+      "Manage workflow runs — no args (opens navigator) | run <prompt> | status/stop/pause/resume <id> | concurrency <id> <n> | rm <id> | save <name> [runId]",
     async handler(args: string, ctx: ExtensionCommandContext) {
       const parts = args.trim().split(/\s+/).filter(Boolean);
       const sub = (parts[0] ?? "list").toLowerCase();
@@ -219,6 +219,21 @@ export function registerWorkflowCommands(
             return;
           }
           await print(renderPersistedStatus(run));
+          return;
+        }
+        case "concurrency": {
+          const concurrency = Number(parts[2]);
+          if (!id || !Number.isInteger(concurrency) || concurrency < 1) {
+            ctx.ui.notify("Usage: /workflows concurrency <id> <positive integer>", "warning");
+            return;
+          }
+          const updated = manager.setConcurrency(id, concurrency);
+          ctx.ui.notify(
+            updated
+              ? `Concurrency for ${id}: ${updated.previousConcurrency} → requested ${updated.requestedConcurrency}, effective ${updated.effectiveConcurrency}`
+              : `Cannot change concurrency for ${id}`,
+            updated ? "info" : "warning",
+          );
           return;
         }
         case "stop": {

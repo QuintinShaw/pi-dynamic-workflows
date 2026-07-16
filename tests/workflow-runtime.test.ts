@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { AgentUsage } from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
-import { type JournalEntry, runWorkflow } from "../src/workflow.js";
+import { createConcurrencyLimiter, type JournalEntry, runWorkflow } from "../src/workflow.js";
 
 /** Agent runner that counts real invocations and echoes a per-call result. */
 function countingAgent() {
@@ -77,6 +77,102 @@ return xs`;
   assert.equal(maxActive, 2);
   assert.deepEqual(result.result, ["ok:a", "ok:b", "ok:c", "ok:d"]);
   assert.equal(result.agentCount, 4);
+});
+
+test("queued agents do not start after the run is aborted", async () => {
+  const controller = new AbortController();
+  const release = createDeferred<void>();
+  const invoked: string[] = [];
+  const started: string[] = [];
+  const runner = {
+    async run(prompt: string) {
+      invoked.push(prompt);
+      await release.promise;
+      return `ok:${prompt}`;
+    },
+  };
+  const script = `export const meta = { name: 'abort_queue', description: 'abort queued work' }
+return await parallel(['a','b','c'].map((p) => () => agent(p, { label: p })))`;
+
+  const run = runWorkflow(script, {
+    agent: runner,
+    concurrency: 1,
+    signal: controller.signal,
+    persistLogs: false,
+    onAgentStart: ({ label }) => started.push(label),
+  });
+  while (invoked.length < 1) await new Promise((resolve) => setTimeout(resolve, 0));
+  controller.abort();
+  release.resolve();
+  await run.catch(() => undefined);
+
+  assert.deepEqual(invoked, ["a"]);
+  assert.deepEqual(started, ["a"]);
+});
+
+test("mutable concurrency limiter releases FIFO and drains after scale-down without aborting", async () => {
+  const limiter = createConcurrencyLimiter(1);
+  const started: string[] = [];
+  const releases = new Map<string, ReturnType<typeof createDeferred<void>>>();
+  const runner = {
+    async run(prompt: string) {
+      started.push(prompt);
+      const release = createDeferred<void>();
+      releases.set(prompt, release);
+      await release.promise;
+      return `ok:${prompt}`;
+    },
+  };
+  const script = `export const meta = { name: 'resize', description: 'resize concurrency' }
+return await parallel(['a','b','c','d'].map((p) => () => agent(p, { label: p })))`;
+
+  const run = runWorkflow(script, { agent: runner, concurrencyLimiter: limiter, persistLogs: false });
+  while (started.length < 1) await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(started, ["a"]);
+
+  limiter.setLimit(3);
+  while (started.length < 3) await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(started, ["a", "b", "c"], "raising the limit should release queued work in FIFO order");
+
+  limiter.setLimit(1);
+  releases.get("b")?.resolve();
+  releases.get("c")?.resolve();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(started, ["a", "b", "c"], "scale-down should wait for active work to drain");
+
+  releases.get("a")?.resolve();
+  while (started.length < 4) await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(started, ["a", "b", "c", "d"]);
+  releases.get("d")?.resolve();
+  assert.deepEqual((await run).result, ["ok:a", "ok:b", "ok:c", "ok:d"]);
+});
+
+test("nested workflows share the mutable concurrency limiter", async () => {
+  const limiter = createConcurrencyLimiter(2);
+  let active = 0;
+  let maxActive = 0;
+  const runner = {
+    async run(prompt: string) {
+      active++;
+      maxActive = Math.max(maxActive, active);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      active--;
+      return `ok:${prompt}`;
+    },
+  };
+  const child = `export const meta = { name: 'child', description: 'nested child' }
+return await parallel(['child-a','child-b'].map((p) => () => agent(p, { label: p })))`;
+  const parent = `export const meta = { name: 'parent', description: 'nested parent' }
+return await parallel([() => workflow('child'), () => agent('parent', { label: 'parent' })])`;
+
+  await runWorkflow(parent, {
+    agent: runner,
+    concurrencyLimiter: limiter,
+    loadSavedWorkflow: (name) => (name === "child" ? child : undefined),
+    persistLogs: false,
+  });
+
+  assert.equal(maxActive, 2);
 });
 
 test("runWorkflow retries recoverable empty output then succeeds", async () => {

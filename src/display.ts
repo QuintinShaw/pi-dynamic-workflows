@@ -46,6 +46,10 @@ export interface WorkflowSnapshot {
     cacheRead?: number;
     cacheWrite?: number;
   };
+  /** Caller-selected concurrency before the runtime cap is applied. */
+  requestedConcurrency?: number;
+  /** Active runtime limit after clamping to the supported range. */
+  effectiveConcurrency?: number;
   runId?: string;
 }
 

@@ -15,7 +15,14 @@ import {
   type RunPersistence,
   type RunStatus,
 } from "./run-persistence.js";
-import { type JournalEntry, parseWorkflowScript, runWorkflow, type WorkflowRunResult } from "./workflow.js";
+import {
+  createConcurrencyLimiter,
+  type JournalEntry,
+  parseWorkflowScript,
+  runWorkflow,
+  type WorkflowConcurrencyLimiter,
+  type WorkflowRunResult,
+} from "./workflow.js";
 
 export interface ManagedRun {
   runId: string;
@@ -32,6 +39,12 @@ export interface ManagedRun {
   journal: JournalEntry[];
   /** Cross-process execution lease for this run, when it is actively executing. */
   lease?: RunLease;
+  /** FIFO gate shared by this run and its nested workflows. */
+  concurrencyLimiter: WorkflowConcurrencyLimiter;
+  /** Caller-selected concurrency before the runtime cap is applied. */
+  requestedConcurrency: number;
+  /** Active runtime limit after clamping to the supported range. */
+  effectiveConcurrency: number;
   /**
    * True when the run was started in the background (or resumed) and the caller is
    * not awaiting its result inline. Only background runs deliver their result back
@@ -74,6 +87,12 @@ export interface ExecOptions {
    * it too. See usage-limit-scheduler.ts.
    */
   autoResume?: boolean;
+}
+
+export interface ConcurrencyUpdate {
+  previousConcurrency: number;
+  requestedConcurrency: number;
+  effectiveConcurrency: number;
 }
 
 export interface WorkflowManagerOptions {
@@ -206,6 +225,9 @@ export class WorkflowManager extends EventEmitter {
     const controller = new AbortController();
     const lease = this.persistence.acquireRunLease(runId);
     if (!lease) throw new Error(`Could not acquire workflow run lease for ${runId}`);
+    const requestedConcurrency = exec.concurrency ?? this.concurrency;
+    const concurrencyLimiter = createConcurrencyLimiter(requestedConcurrency);
+    const effectiveConcurrency = concurrencyLimiter.getLimit();
 
     const managed: ManagedRun = {
       runId,
@@ -220,6 +242,8 @@ export class WorkflowManager extends EventEmitter {
         runningCount: 0,
         doneCount: 0,
         errorCount: 0,
+        requestedConcurrency,
+        effectiveConcurrency,
       },
       controller,
       startedAt: new Date(),
@@ -228,6 +252,9 @@ export class WorkflowManager extends EventEmitter {
       journal: [],
       background: true,
       lease,
+      concurrencyLimiter,
+      requestedConcurrency,
+      effectiveConcurrency,
       autoResume: exec.autoResume,
     };
 
@@ -273,7 +300,7 @@ export class WorkflowManager extends EventEmitter {
    * a caller (e.g. the workflow tool) drive its own inline display.
    */
   async runSync(script: string, args?: unknown, exec: ExecOptions = {}): Promise<WorkflowRunResult> {
-    const managed = this.createManaged(script, args);
+    const managed = this.createManaged(script, args, exec.concurrency);
     const lease = this.persistence.acquireRunLease(managed.runId);
     if (!lease) throw new Error(`Could not acquire workflow run lease for ${managed.runId}`);
     managed.lease = lease;
@@ -286,7 +313,7 @@ export class WorkflowManager extends EventEmitter {
   }
 
   /** Build a fresh managed run with an empty snapshot. */
-  private createManaged(script: string, args?: unknown): ManagedRun {
+  private createManaged(script: string, args: unknown, concurrency: number | undefined): ManagedRun {
     const parsed = parseWorkflowScript(script);
     const slug = parsed.meta.name
       ? parsed.meta.name
@@ -296,6 +323,9 @@ export class WorkflowManager extends EventEmitter {
           .slice(0, 40) || "workflow"
       : "";
     const runId = slug ? `${slug}-${generateRunId()}` : generateRunId();
+    const requestedConcurrency = concurrency ?? this.concurrency;
+    const concurrencyLimiter = createConcurrencyLimiter(requestedConcurrency);
+    const effectiveConcurrency = concurrencyLimiter.getLimit();
     return {
       runId,
       status: "running",
@@ -309,6 +339,8 @@ export class WorkflowManager extends EventEmitter {
         runningCount: 0,
         doneCount: 0,
         errorCount: 0,
+        requestedConcurrency,
+        effectiveConcurrency,
       },
       controller: new AbortController(),
       startedAt: new Date(),
@@ -316,6 +348,9 @@ export class WorkflowManager extends EventEmitter {
       args,
       journal: [],
       background: false,
+      concurrencyLimiter,
+      requestedConcurrency,
+      effectiveConcurrency,
     };
   }
 
@@ -325,19 +360,9 @@ export class WorkflowManager extends EventEmitter {
     args?: unknown,
     exec: ExecOptions = {},
   ): Promise<WorkflowRunResult> {
-    const {
-      resumeJournal,
-      maxAgents,
-      agentTimeoutMs,
-      externalSignal,
-      onProgress,
-      tokenBudget,
-      concurrency,
-      agentRetries,
-      confirm,
-    } = exec;
+    const { resumeJournal, maxAgents, agentTimeoutMs, externalSignal, onProgress, tokenBudget, agentRetries, confirm } =
+      exec;
     const resolvedAgentTimeoutMs = agentTimeoutMs !== undefined ? agentTimeoutMs : this.defaultAgentTimeoutMs;
-    const resolvedConcurrency = concurrency ?? this.concurrency;
     const resolvedAgentRetries = agentRetries ?? this.defaultAgentRetries;
     const progress = () => onProgress?.(managed.snapshot);
     // Let a host abort (e.g. Esc during a blocking tool call) cancel this run.
@@ -359,7 +384,8 @@ export class WorkflowManager extends EventEmitter {
         modelRegistry: this.modelRegistry,
         persistAgentSessions: this.persistAgentSessions,
         signal: managed.controller.signal,
-        concurrency: resolvedConcurrency,
+        concurrency: managed.effectiveConcurrency,
+        concurrencyLimiter: managed.concurrencyLimiter,
         agentRetries: resolvedAgentRetries,
         maxAgents,
         agentTimeoutMs: resolvedAgentTimeoutMs,
@@ -387,15 +413,35 @@ export class WorkflowManager extends EventEmitter {
           this.emit("phase", { runId: managed.runId, title });
           progress();
         },
-        onAgentStart: (event) => {
+        onAgentQueued: (event) => {
           managed.snapshot.agents.push({
             id: managed.snapshot.agents.length + 1,
             label: event.label,
             phase: event.phase,
             prompt: event.prompt,
-            status: "running",
+            status: "queued",
             model: event.model,
           });
+          this.emit("agentQueued", { runId: managed.runId, ...event });
+          progress();
+        },
+        onAgentStart: (event) => {
+          const queued = managed.snapshot.agents.find(
+            (agent) => agent.status === "queued" && agent.label === event.label && agent.prompt === event.prompt,
+          );
+          if (queued) {
+            queued.status = "running";
+            if (event.model) queued.model = event.model;
+          } else {
+            managed.snapshot.agents.push({
+              id: managed.snapshot.agents.length + 1,
+              label: event.label,
+              phase: event.phase,
+              prompt: event.prompt,
+              status: "running",
+              model: event.model,
+            });
+          }
           this.emit("agentStart", { runId: managed.runId, ...event });
           progress();
         },
@@ -597,6 +643,9 @@ export class WorkflowManager extends EventEmitter {
     const args = opts?.args !== undefined ? opts.args : persisted.args;
 
     const controller = new AbortController();
+    const requestedConcurrency = this.concurrency;
+    const concurrencyLimiter = createConcurrencyLimiter(requestedConcurrency);
+    const effectiveConcurrency = concurrencyLimiter.getLimit();
     const managed: ManagedRun = {
       runId,
       status: "running",
@@ -609,6 +658,8 @@ export class WorkflowManager extends EventEmitter {
         runningCount: 0,
         doneCount: 0,
         errorCount: 0,
+        requestedConcurrency,
+        effectiveConcurrency,
       },
       controller,
       startedAt: new Date(),
@@ -619,6 +670,9 @@ export class WorkflowManager extends EventEmitter {
       journal: persisted.journal ?? [],
       background: true,
       lease,
+      concurrencyLimiter,
+      requestedConcurrency,
+      effectiveConcurrency,
       // Carry the original opt-out forward across resumes; it's fixed at
       // run-start and persistRun() re-persists it on every subsequent write.
       autoResume: persisted.autoResume,
@@ -633,6 +687,27 @@ export class WorkflowManager extends EventEmitter {
     // Run in the background; executeRun records status/errors on the managed run.
     void this.executeRun(managed, script, args, { resumeJournal }).catch(() => {});
     return true;
+  }
+
+  /** Resize a live workflow without aborting agents already running. */
+  setConcurrency(runId: string, concurrency: number): ConcurrencyUpdate | null {
+    if (!Number.isFinite(concurrency) || !Number.isInteger(concurrency) || concurrency < 1) return null;
+    const managed = this.runs.get(runId);
+    if (managed?.status !== "running") return null;
+
+    const previousConcurrency = managed.effectiveConcurrency;
+    managed.requestedConcurrency = concurrency;
+    managed.concurrencyLimiter.setLimit(concurrency);
+    managed.effectiveConcurrency = managed.concurrencyLimiter.getLimit();
+    managed.snapshot.requestedConcurrency = concurrency;
+    managed.snapshot.effectiveConcurrency = managed.effectiveConcurrency;
+    const update = {
+      previousConcurrency,
+      requestedConcurrency: concurrency,
+      effectiveConcurrency: managed.effectiveConcurrency,
+    };
+    this.emit("concurrencyChanged", { runId, ...update });
+    return update;
   }
 
   /**

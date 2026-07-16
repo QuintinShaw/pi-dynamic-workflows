@@ -33,6 +33,20 @@ function fakeManager(initial: PersistedRunState[], liveSnapshots: Record<string,
   const manager = {
     listRuns: () => [...runs.values()],
     getSnapshot: (runId: string) => liveSnapshots[runId] ?? null,
+    setConcurrency(runId: string, concurrency: number) {
+      calls.push({ action: "set_concurrency", runId });
+      const item = runs.get(runId);
+      const snapshot = liveSnapshots[runId];
+      if (item?.status !== "running" || !snapshot) return null;
+      const previousConcurrency = snapshot.effectiveConcurrency ?? 1;
+      snapshot.requestedConcurrency = concurrency;
+      snapshot.effectiveConcurrency = Math.min(16, concurrency);
+      return {
+        previousConcurrency,
+        requestedConcurrency: concurrency,
+        effectiveConcurrency: snapshot.effectiveConcurrency,
+      };
+    },
     pause(runId: string) {
       calls.push({ action: "pause", runId });
       const item = runs.get(runId);
@@ -67,7 +81,7 @@ function text(result: Awaited<ReturnType<typeof execute>>): string {
   return result.content[0].text;
 }
 
-test("workflow_control exposes only list, status, pause, resume, and stop in a strict schema", () => {
+test("workflow_control exposes list, status, live concurrency, pause, resume, and stop in a strict schema", () => {
   const { manager } = fakeManager([]);
   const tool = createWorkflowControlTool({ manager });
 
@@ -79,7 +93,8 @@ test("workflow_control exposes only list, status, pause, resume, and stop in a s
   assert.equal(Check(tool.parameters, { action: "stop", runId: "abc" }), true);
   assert.equal(Check(tool.parameters, { action: "restart", runId: "abc" }), false);
   assert.equal(Check(tool.parameters, { action: "remove", runId: "abc" }), false);
-  assert.equal(Check(tool.parameters, { action: "set_concurrency", runId: "abc", concurrency: 2 }), false);
+  assert.equal(Check(tool.parameters, { action: "set_concurrency", runId: "abc", concurrency: 2 }), true);
+  assert.equal(Check(tool.parameters, { action: "set_concurrency", runId: "abc", concurrency: 0 }), false);
   assert.equal(Check(tool.parameters, { action: "status" }), false);
   assert.equal(Check(tool.parameters, { action: "list", runId: "abc" }), false);
   assert.equal(Check(tool.parameters, { action: "status", runId: "abc", extra: true }), false);
@@ -88,6 +103,10 @@ test("workflow_control exposes only list, status, pause, resume, and stop in a s
   assert.throws(() => prepare({ action: "pause" }), /requires runId/);
   assert.throws(() => prepare({ action: "status", runId: "abc", extra: true }), /does not accept extra/);
   assert.throws(() => prepare({ action: "restart", runId: "abc" }), /requires action/);
+  assert.throws(
+    () => prepare({ action: "set_concurrency", runId: "abc", concurrency: 1.5 }),
+    /positive integer concurrency/,
+  );
 });
 
 test("list and status return stable lifecycle and observability fields", async () => {
@@ -97,7 +116,7 @@ test("list and status return stable lifecycle and observability fields", async (
   assert.match(text(listed), /^action=list result=ok runs=1\n/);
   assert.match(text(listed), /runId=audit-abc123 name="audit" status=running phase="Inspect"/);
   assert.match(text(listed), /total=4 done=0 running=1 queued=1 error=1 skipped=1/);
-  assert.match(text(listed), /active="active scan" tokens=30/);
+  assert.match(text(listed), /active="active scan" concurrency=- requestedConcurrency=- tokens=30/);
   assert.deepEqual(listed.details, {
     action: "list",
     result: "ok",
@@ -110,6 +129,8 @@ test("list and status return stable lifecycle and observability fields", async (
         counts: { total: 4, done: 0, running: 1, queued: 1, error: 1, skipped: 1 },
         activeLabels: ["active scan"],
         tokenTotal: 30,
+        requestedConcurrency: null,
+        effectiveConcurrency: null,
       },
     ],
   });
@@ -159,15 +180,36 @@ test("list reports an explicit empty result", async () => {
   assert.deepEqual(response.details, { action: "list", result: "ok", runs: [] });
 });
 
-test("pause, resume, and stop call the shared manager lifecycle methods", async () => {
-  const fixture = fakeManager([run()]);
+test("set_concurrency, pause, resume, and stop call the shared manager lifecycle methods", async () => {
+  const live: WorkflowSnapshot = {
+    name: "audit",
+    phases: ["Inspect"],
+    currentPhase: "Inspect",
+    logs: [],
+    agents: run().agents,
+    agentCount: 4,
+    runningCount: 1,
+    doneCount: 0,
+    errorCount: 1,
+    requestedConcurrency: 4,
+    effectiveConcurrency: 4,
+  };
+  const fixture = fakeManager([run()], { "audit-abc123": live });
+
+  const resized = await execute(fixture.manager, {
+    action: "set_concurrency",
+    runId: "audit-abc123",
+    concurrency: 17,
+  });
+  assert.match(text(resized), /result=updated previous=4/);
+  assert.match(text(resized), /concurrency=16 requestedConcurrency=17/);
 
   assert.match(text(await execute(fixture.manager, { action: "pause", runId: "audit-abc123" })), /result=paused/);
   assert.match(text(await execute(fixture.manager, { action: "resume", runId: "audit-abc123" })), /result=resumed/);
   assert.match(text(await execute(fixture.manager, { action: "stop", runId: "audit-abc123" })), /result=stopped/);
   assert.deepEqual(
     fixture.calls.map((call) => call.action),
-    ["pause", "resume", "stop"],
+    ["set_concurrency", "pause", "resume", "stop"],
   );
 });
 
@@ -180,6 +222,11 @@ test("unknown IDs and illegal transitions return explicit errors with allowed ac
   const pauseCompleted = text(await execute(fixture.manager, { action: "pause", runId: "audit-abc123" }));
   assert.match(pauseCompleted, /cannot pause run with status completed/);
   assert.match(pauseCompleted, /allowed=status/);
+
+  const resizeCompleted = text(
+    await execute(fixture.manager, { action: "set_concurrency", runId: "audit-abc123", concurrency: 2 }),
+  );
+  assert.match(resizeCompleted, /cannot set_concurrency run with status completed/);
 
   await execute(fixture.manager, { action: "stop", runId: "live-123" });
   const stopAborted = text(await execute(fixture.manager, { action: "stop", runId: "live-123" }));

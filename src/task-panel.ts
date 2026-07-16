@@ -28,6 +28,7 @@ import { shortModel } from "./workflow-ui.js";
 // as tokens accrue (not only on agent start/end). It is harmless in compact mode —
 // it redraws identical content.
 const RUN_EVENTS = [
+  "agentQueued",
   "agentStart",
   "agentEnd",
   "phase",
@@ -38,6 +39,7 @@ const RUN_EVENTS = [
   "stopped",
   "paused",
   "resumed",
+  "concurrencyChanged",
 ];
 /** Events after which a run is gone and its token-rate samples can be dropped. */
 const RUN_END_EVENTS = ["complete", "error", "stopped"] as const;
@@ -227,9 +229,14 @@ export function renderPanel(manager: WorkflowManager, theme: Theme, width?: numb
     const live = manager.getRun(r.runId);
     const agents = live?.snapshot.agents ?? r.agents;
     const done = agents.filter((a) => a.status === "done").length;
+    const running = agents.filter((a) => a.status === "running").length;
+    const queued = agents.filter((a) => a.status === "queued").length;
     const icon = r.status === "paused" ? "⏸" : "◆";
     const phase = live?.snapshot.currentPhase ? ` · ${live.snapshot.currentPhase}` : "";
-    return `  ${icon} ${r.workflowName}  ${done}/${agents.length} agents${phase}`;
+    const cap = live?.snapshot.effectiveConcurrency;
+    const activity = running ? ` · ${running}/${cap ?? running} running` : "";
+    const waiting = queued ? ` · ${queued} queued` : "";
+    return `  ${icon} ${r.workflowName}  ${done}/${agents.length} agents${activity}${waiting}${phase}`;
   });
   // Finished runs leave this live panel but are kept in the navigator. Tell the
   // user so a completed run doesn't look like it vanished.
@@ -370,6 +377,8 @@ export function renderPanelDetailed(
     const snap = live?.snapshot;
     const agents = (snap?.agents ?? r.agents) as WorkflowAgentSnapshot[];
     const done = agents.filter((a) => a.status === "done").length;
+    const running = agents.filter((a) => a.status === "running").length;
+    const queued = agents.filter((a) => a.status === "queued").length;
     const icon = r.status === "paused" ? "⏸" : "◆";
     const usage = snap?.tokenUsage ?? r.tokenUsage;
     // The run-level tokenUsage aggregate is only finalized when the run ends, so
@@ -385,6 +394,8 @@ export function renderPanelDetailed(
     const rate = r.status === "running" ? tokensPerSecond(r.runId) : 0;
     const meta = [
       `${done}/${agents.length} agents`,
+      running ? `${running}/${snap?.effectiveConcurrency ?? running} running` : "",
+      queued ? `${queued} queued` : "",
       snap?.currentPhase || "",
       fmtTokenSegment(runUsage, fmtTokensShort),
       // (cost is only known once the run finalizes its usage.)

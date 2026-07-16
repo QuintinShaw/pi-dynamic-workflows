@@ -508,6 +508,22 @@ describe("renderPanel", () => {
     );
   });
 
+  it("shows running agents against the effective cap and separates queued work", async () => {
+    const { renderPanel } = await import("../src/task-panel.js");
+    const snapshot = {
+      currentPhase: "Scan",
+      effectiveConcurrency: 3,
+      agents: [{ status: "running" }, { status: "running" }, { status: "queued" }, { status: "done" }],
+    };
+    const manager = {
+      listRuns: () => [{ runId: "a", workflowName: "live", status: "running", agents: snapshot.agents, logs: [] }],
+      getRun: () => ({ snapshot }),
+    };
+    const text = renderPanel(manager as never, theme as never).join("\n");
+    assert.match(text, /2\/3 running/);
+    assert.match(text, /1 queued/);
+  });
+
   it("renders nothing when no run is active", async () => {
     const { renderPanel } = await import("../src/task-panel.js");
     const manager = {

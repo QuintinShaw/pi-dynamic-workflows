@@ -54,8 +54,16 @@ export interface JournalEntry {
  * the 16-concurrent / 1000-total caps and the token budget hold across nesting
  * instead of each level getting its own limiter and counters.
  */
+export interface WorkflowConcurrencyLimiter {
+  <T>(fn: () => Promise<T>): Promise<T>;
+  setLimit(limit: number): void;
+  getLimit(): number;
+  getActive(): number;
+  getQueued(): number;
+}
+
 export interface SharedRuntime {
-  limiter: <T>(fn: () => Promise<T>) => Promise<T>;
+  limiter: WorkflowConcurrencyLimiter;
   agentCount: number;
   spent: number;
   tokenUsage: { input: number; output: number; total: number; cost: number; cacheRead: number; cacheWrite: number };
@@ -95,6 +103,8 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   onAgentJournal?: (entry: JournalEntry) => void;
   /** Internal: shared runtime inherited by a nested workflow() call. */
   sharedRuntime?: SharedRuntime;
+  /** Internal: manager-owned limiter used for live concurrency changes. */
+  concurrencyLimiter?: WorkflowConcurrencyLimiter;
   /**
    * Shared store for this run. One instance is created per top-level run and
    * propagated into nested workflow() calls. Pass an existing instance to share
@@ -111,6 +121,7 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   confirm?: (promptText: string, options: CheckpointOptions) => Promise<unknown>;
   onLog?: (message: string) => void;
   onPhase?: (title: string) => void;
+  onAgentQueued?: (event: { label: string; phase?: string; prompt: string; model?: string }) => void;
   onAgentStart?: (event: { label: string; phase?: string; prompt: string; model?: string }) => void;
   onAgentEnd?: (event: {
     label: string;
@@ -302,7 +313,7 @@ export async function runWorkflow<T = unknown>(
   );
   // Global caps + budget are shared with any nested workflow() so they hold across nesting.
   const shared: SharedRuntime = options.sharedRuntime ?? {
-    limiter: createLimiter(concurrency),
+    limiter: options.concurrencyLimiter ?? createConcurrencyLimiter(concurrency),
     agentCount: 0,
     spent: 0,
     tokenUsage: { input: 0, output: 0, total: 0, cost: 0, cacheRead: 0, cacheWrite: 0 },
@@ -449,7 +460,9 @@ export async function runWorkflow<T = unknown>(
     // unchanged prefix ends; this call and every later one then run live.
     if (!hashMatches || cachedEmptyOutput) state.firstMiss = Math.min(state.firstMiss, callIndex);
 
+    options.onAgentQueued?.({ label, phase: assignedPhase, prompt, model: displayModel });
     return limiter(async () => {
+      throwIfAborted();
       const timeout = agentOptions.timeoutMs !== undefined ? agentOptions.timeoutMs : agentTimeoutMs;
       const retryAttempts = normalizeAgentRetries(agentOptions.retries ?? options.agentRetries ?? 0);
       const maxAttempts = retryAttempts + 1;
@@ -1066,22 +1079,36 @@ function validateMeta(meta: unknown): asserts meta is WorkflowMeta {
   }
 }
 
-function createLimiter(limit: number) {
+export function createConcurrencyLimiter(initialLimit: number): WorkflowConcurrencyLimiter {
+  let limit = normalizeConcurrency(initialLimit);
   let active = 0;
   const queue: Array<() => void> = [];
-  const next = () => {
-    active--;
-    queue.shift()?.();
+  const drain = () => {
+    while (active < limit && queue.length > 0) {
+      active++;
+      queue.shift()?.();
+    }
   };
-  return async <T>(fn: () => Promise<T>): Promise<T> => {
-    if (active >= limit) await new Promise<void>((resolve) => queue.push(resolve));
-    active++;
+  const limiter = (async <T>(fn: () => Promise<T>): Promise<T> => {
+    await new Promise<void>((resolve) => {
+      queue.push(resolve);
+      drain();
+    });
     try {
       return await fn();
     } finally {
-      next();
+      active--;
+      drain();
     }
+  }) as WorkflowConcurrencyLimiter;
+  limiter.setLimit = (value: number) => {
+    limit = normalizeConcurrency(value);
+    drain();
   };
+  limiter.getLimit = () => limit;
+  limiter.getActive = () => active;
+  limiter.getQueued = () => queue.length;
+  return limiter;
 }
 
 function defaultAgentLabel(phase: string | undefined, index: number): string {

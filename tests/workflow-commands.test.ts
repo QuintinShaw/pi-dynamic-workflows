@@ -63,6 +63,10 @@ function harness(
       calls.push(`resume:${id}`);
       return false;
     },
+    setConcurrency: (id: string, concurrency: number) => {
+      calls.push(`concurrency:${id}:${concurrency}`);
+      return { previousConcurrency: 4, requestedConcurrency: concurrency, effectiveConcurrency: concurrency };
+    },
     deleteRun: (id: string) => {
       calls.push(`rm:${id}`);
       return true;
@@ -145,6 +149,29 @@ test("/workflows stop <id> calls manager.stop", async () => {
   const h = harness();
   await h.run("stop run-9");
   assert.deepEqual(h.calls, ["stop:run-9"]);
+});
+
+test("/workflows concurrency resizes a live run and reports the effective value", async () => {
+  const h = harness({
+    setConcurrency: (id: string, concurrency: number) => {
+      h.calls.push(`concurrency:${id}:${concurrency}`);
+      return { previousConcurrency: 4, requestedConcurrency: concurrency, effectiveConcurrency: 16 };
+    },
+  });
+  await h.run("concurrency run-c1 17");
+  assert.deepEqual(h.calls, ["concurrency:run-c1:17"]);
+  assert.match(h.notified[0].message, /4 → requested 17, effective 16/);
+  assert.equal(h.notified[0].type, "info");
+});
+
+test("/workflows concurrency requires a positive integer", async () => {
+  for (const args of ["concurrency", "concurrency run-c1", "concurrency run-c1 0", "concurrency run-c1 1.5"]) {
+    const h = harness();
+    await h.run(args);
+    assert.equal(h.calls.length, 0);
+    assert.equal(h.notified[0].type, "warning");
+    assert.match(h.notified[0].message, /positive integer/);
+  }
 });
 
 test("/workflows status <id> renders a persisted run", async () => {

@@ -23,6 +23,14 @@ const workflowControlSchema = Type.Union([
     },
     { additionalProperties: false },
   ),
+  Type.Object(
+    {
+      action: Type.Literal("set_concurrency", { description: "Resize a live workflow run." }),
+      runId: Type.String({ minLength: 1, description: "Canonical workflow run ID." }),
+      concurrency: Type.Integer({ minimum: 1, description: "New concurrency limit (capped at 16)." }),
+    },
+    { additionalProperties: false },
+  ),
 ]);
 
 export type WorkflowControlInput = Static<typeof workflowControlSchema>;
@@ -46,6 +54,8 @@ export interface WorkflowControlRunDetails {
   };
   activeLabels: string[];
   tokenTotal: number;
+  requestedConcurrency: number | null;
+  effectiveConcurrency: number | null;
 }
 
 type ControlResult = {
@@ -61,10 +71,11 @@ export function createWorkflowControlTool(
     name: "workflow_control",
     label: "Workflow Control",
     description:
-      "List and inspect workflow runs, or pause, resume, and stop them without asking the user to run slash commands.",
+      "List and inspect workflow runs, resize live concurrency, or pause, resume, and stop them without asking the user to run slash commands.",
     promptSnippet: "Inspect and manage workflow runs directly by canonical run ID.",
     promptGuidelines: [
       "Use workflow_control for workflow lifecycle management; do not ask the user to type /workflows when this tool can perform the action.",
+      "Use set_concurrency to resize a running workflow. Increasing releases queued agents immediately; decreasing does not abort agents already running.",
       "Use stop to terminate or quit a run. Closing the navigator does not stop a run.",
     ],
     parameters: workflowControlSchema,
@@ -93,6 +104,14 @@ export function createWorkflowControlTool(
             run: summary,
           });
         }
+        case "set_concurrency": {
+          const updated = manager.setConcurrency(run.runId, params.concurrency);
+          if (!updated) return invalidTransition("set_concurrency", run);
+          return result(
+            `action=set_concurrency result=updated previous=${updated.previousConcurrency} ${formatRun(currentSummary(manager, run))}`,
+            { action: "set_concurrency", result: "updated", runId: run.runId, ...updated },
+          );
+        }
         case "pause":
           if (!manager.pause(run.runId)) return invalidTransition("pause", run);
           return actionSuccess("pause", "paused", currentSummary(manager, run));
@@ -112,17 +131,28 @@ function normalizeInput(value: unknown): WorkflowControlInput {
     throw new Error("workflow_control requires an object argument");
   }
   const input = value as Record<string, unknown>;
-  const actions = new Set(["list", "status", "pause", "resume", "stop"]);
+  const actions = new Set(["list", "status", "set_concurrency", "pause", "resume", "stop"]);
   if (typeof input.action !== "string" || !actions.has(input.action)) {
-    throw new Error("workflow_control requires action: list|status|pause|resume|stop");
+    throw new Error("workflow_control requires action: list|status|set_concurrency|pause|resume|stop");
   }
 
-  const allowedKeys = input.action === "list" ? new Set(["action"]) : new Set(["action", "runId"]);
+  const allowedKeys =
+    input.action === "list"
+      ? new Set(["action"])
+      : input.action === "set_concurrency"
+        ? new Set(["action", "runId", "concurrency"])
+        : new Set(["action", "runId"]);
   const extraKey = Object.keys(input).find((key) => !allowedKeys.has(key));
   if (extraKey) throw new Error(`workflow_control action "${input.action}" does not accept ${extraKey}`);
 
   if (input.action !== "list" && (typeof input.runId !== "string" || !input.runId.trim())) {
     throw new Error(`workflow_control action "${input.action}" requires runId`);
+  }
+  if (
+    input.action === "set_concurrency" &&
+    (typeof input.concurrency !== "number" || !Number.isInteger(input.concurrency) || input.concurrency < 1)
+  ) {
+    throw new Error('workflow_control action "set_concurrency" requires a positive integer concurrency');
   }
   return input as WorkflowControlInput;
 }
@@ -162,7 +192,7 @@ function controlError(action: string, runId: string, message: string, allowed: s
 function allowedActions(status: RunStatus): string[] {
   switch (status) {
     case "running":
-      return ["status", "pause", "stop"];
+      return ["status", "set_concurrency", "pause", "stop"];
     case "paused":
       return ["status", "resume", "stop"];
     case "failed":
@@ -192,6 +222,8 @@ function summarizeRun(run: PersistedRunState, live?: WorkflowSnapshot | null): W
       persistedUsage.fresh + persistedUsage.cacheRead,
       agentUsage.fresh + agentUsage.cacheRead,
     ),
+    requestedConcurrency: live?.requestedConcurrency ?? null,
+    effectiveConcurrency: live?.effectiveConcurrency ?? null,
   };
 }
 
@@ -208,7 +240,7 @@ function countAgents(agents: Array<Pick<WorkflowAgentSnapshot, "status">>): Work
 
 function formatRun(run: WorkflowControlRunDetails): string {
   const active = run.activeLabels.join(",") || "-";
-  return `runId=${run.runId} name=${quote(run.workflowName)} status=${run.status} phase=${quote(run.phase ?? "-")} total=${run.counts.total} done=${run.counts.done} running=${run.counts.running} queued=${run.counts.queued} error=${run.counts.error} skipped=${run.counts.skipped} active=${quote(active)} tokens=${run.tokenTotal}`;
+  return `runId=${run.runId} name=${quote(run.workflowName)} status=${run.status} phase=${quote(run.phase ?? "-")} total=${run.counts.total} done=${run.counts.done} running=${run.counts.running} queued=${run.counts.queued} error=${run.counts.error} skipped=${run.counts.skipped} active=${quote(active)} concurrency=${run.effectiveConcurrency ?? "-"} requestedConcurrency=${run.requestedConcurrency ?? "-"} tokens=${run.tokenTotal}`;
 }
 
 function quote(value: string): string {

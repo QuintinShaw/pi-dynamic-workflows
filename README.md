@@ -109,13 +109,14 @@ For an always-on exhaustive mode, use `/ultracode`; `/effort high` is the lighte
 
 ## Commands and run control
 
-Pi can manage background runs directly with the `workflow_control` tool instead of asking you to type a command. It supports `list`, `status`, `pause`, `resume`, and `stop`; run-specific actions use the canonical run ID returned when the workflow starts. Status output includes the run state, current phase, agent counts, active labels, and recorded token total.
+Pi can manage background runs directly with the `workflow_control` tool instead of asking you to type a command. It supports `list`, `status`, `set_concurrency`, `pause`, `resume`, and `stop`; run-specific actions use the canonical run ID returned when the workflow starts. Status output includes the run state, current phase, agent counts, active labels, effective concurrency, and recorded token total.
 
 | Command | Purpose |
 | --- | --- |
 | `/workflows` | Open the interactive run navigator |
 | `/workflows run <prompt>` | Force a workflow even when keyword triggering is off |
 | `/workflows status <id>` | Watch a run and print its result when complete |
+| `/workflows concurrency <id> <n>` | Resize a running workflow (clamped to `1..16`) |
 | `/workflows pause\|resume\|stop\|rm <id>` | Control a run |
 | `/workflows save <name>` | Save the latest script as a reusable command |
 | `/workflows-trigger off\|on\|status` | Control automatic keyword triggering |
@@ -171,7 +172,7 @@ Model tiers live at `~/.pi/workflows/model-tiers.json` and accept Pi CLI-style t
 
 Use `/workflows-models` to edit them interactively. Without a config, the extension ranks authenticated models by capability hints and assigns distinct models when possible.
 
-Runs have no default token budget or per-agent hard timeout. Add `tokenBudget`, `agentTimeoutMs`, phase budgets, or agent `timeoutMs` when you need explicit gates. `concurrency` is clamped to 16; `agentRetries` retries only recoverable failures. Defaults can be set in `~/.pi/workflows/settings.json`.
+Runs have no default token budget or per-agent hard timeout. Add `tokenBudget`, `agentTimeoutMs`, phase budgets, or agent `timeoutMs` when you need explicit gates. `concurrency` is clamped to `1..16`; `agentRetries` retries only recoverable failures. Defaults can be set in `~/.pi/workflows/settings.json`. Resize a running workflow with `/workflows concurrency <id> <n>` or `workflow_control set_concurrency`: raising the cap releases queued agents in FIFO order, while lowering it lets active agents finish without starting replacements until activity falls below the new cap.
 
 </details>
 

@@ -171,6 +171,62 @@ return xs`;
 );
 
 test(
+  "setConcurrency resizes a live FIFO run and clamps the effective value to 16",
+  withTempCwd(async (cwd) => {
+    const started: string[] = [];
+    const releases = new Map<string, () => void>();
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt: string) {
+          started.push(prompt);
+          await new Promise<void>((resolve) => releases.set(prompt, resolve));
+          return `ok:${prompt}`;
+        },
+      },
+    });
+    const script = `export const meta = { name: 'live_resize', description: 'live resize' }
+return await parallel(['a','b','c','d'].map((p) => () => agent(p, { label: p })))`;
+    const changes: number[] = [];
+    manager.on("concurrencyChanged", (event: { effectiveConcurrency: number }) =>
+      changes.push(event.effectiveConcurrency),
+    );
+
+    const { runId, promise } = manager.startInBackground(script, undefined, { concurrency: 1 });
+    while (started.length < 1) await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(manager.getSnapshot(runId)?.agents.filter((agent) => agent.status === "queued").length, 3);
+
+    assert.deepEqual(manager.setConcurrency(runId, 3), {
+      previousConcurrency: 1,
+      requestedConcurrency: 3,
+      effectiveConcurrency: 3,
+    });
+    while (started.length < 3) await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.deepEqual(started, ["a", "b", "c"]);
+
+    assert.equal(manager.setConcurrency(runId, 1)?.effectiveConcurrency, 1);
+    releases.get("b")?.();
+    releases.get("c")?.();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.deepEqual(started, ["a", "b", "c"], "lowering must not start queued work above the new limit");
+
+    releases.get("a")?.();
+    while (started.length < 4) await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(manager.getSnapshot(runId)?.agents.find((agent) => agent.label === "d")?.status, "running");
+    assert.deepEqual(manager.setConcurrency(runId, 17), {
+      previousConcurrency: 1,
+      requestedConcurrency: 17,
+      effectiveConcurrency: 16,
+    });
+    assert.equal(manager.getSnapshot(runId)?.effectiveConcurrency, 16);
+    releases.get("d")?.();
+    await promise;
+    assert.deepEqual(changes, [3, 1, 16]);
+    assert.equal(manager.setConcurrency(runId, 2), null, "completed runs are not live-resizable");
+  }),
+);
+
+test(
   "manager defaultAgentRetries applies when run options omit agentRetries",
   withTempCwd(async (cwd) => {
     let calls = 0;
