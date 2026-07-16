@@ -143,6 +143,49 @@ describe("hasTrigger", () => {
     assert.equal(hasTrigger("/workflow"), false);
   });
 
+  it("requires token boundaries for the built-in trigger", async () => {
+    const { hasTrigger } = await load();
+    for (const text of [
+      "myworkflow",
+      "workflows2",
+      "workflow_name",
+      "workflow-based",
+      "src/workflow-editor.ts",
+      "src\\workflow-editor.ts",
+    ]) {
+      assert.equal(hasTrigger(text), false, `${text} should not trigger`);
+    }
+    for (const text of ["workflow, please", "(workflows)", "WORKFLOW!", "Discuss workflows."]) {
+      assert.equal(hasTrigger(text), true, `${text} should trigger`);
+    }
+  });
+
+  it("rejects Unicode identifier and dollar boundaries on either side", async () => {
+    const { hasTrigger } = await load();
+    for (const text of [
+      "$workflow",
+      "workflow$",
+      "caféworkflow",
+      "workflowcafé",
+      "变量workflow变量",
+      "变量workflow",
+      "workflow变量",
+    ]) {
+      assert.equal(hasTrigger(text), false, `${text} should not trigger`);
+    }
+    for (const text of ["¿workflow?", "café, workflow!", "变量：workflow。", "workflow—please"]) {
+      assert.equal(hasTrigger(text), true, `${text} should trigger`);
+    }
+  });
+
+  it("applies path and Unicode identifier boundaries to custom triggers", async () => {
+    const { hasTrigger } = await load();
+    for (const text of ["xpi-workflow", "pi-workflow变量", "src/pi-workflow", "src\\pi-workflow"]) {
+      assert.equal(hasTrigger(text, "pi-workflow"), false, `${text} should not trigger`);
+    }
+    assert.equal(hasTrigger("run pi-workflow, please", "pi-workflow"), true);
+  });
+
   it("returns false for unrelated text", async () => {
     const { hasTrigger } = await load();
     assert.equal(hasTrigger("hello world"), false);
@@ -850,6 +893,34 @@ describe("installWorkflowEditor", () => {
 
     await command.handler("on", {});
     assert.match(sent.at(-1)?.content ?? "", /workflow\/workflows/);
+  });
+
+  it("keeps keyword triggering enabled when the setting is absent or loading fails", async () => {
+    const mod = await load();
+    const stores = [
+      { load: () => ({}), save: () => {} },
+      {
+        load: () => {
+          throw new Error("read failed");
+        },
+        save: () => {},
+      },
+    ];
+
+    for (const settingsStore of stores) {
+      const pi = {
+        on: () => {},
+        registerCommand: () => {},
+        getActiveTools: () => [],
+        setActiveTools: () => {},
+      } as unknown as ExtensionAPI;
+      const ui = { setEditorComponent: () => {} } as unknown as ExtensionUIContext;
+
+      const state = mod.installWorkflowEditor(pi, ui, undefined, { settingsStore });
+
+      assert.equal(state.keywordTriggerEnabled, true);
+      assert.equal(state.keywordTriggerWord, "workflow");
+    }
   });
 
   it("loads the persisted keyword trigger preference on install", async () => {

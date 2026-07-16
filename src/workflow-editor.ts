@@ -1,8 +1,8 @@
 /**
  * "Workflows mode" input affordance, à la a smart input box:
  *
- *  - While the editor text contains the word `workflow`/`workflows`, those letters
- *    render as a flowing rainbow, signalling that submitting will engage a workflow.
+ *  - While the editor text contains the bounded word `workflow`/`workflows`, those
+ *    letters render as a flowing rainbow, signalling that submitting will engage a workflow.
  *  - Pressing Backspace immediately after such a word toggles the highlight OFF
  *    (the word stays, but turns plain white) — a non-destructive "don't run a
  *    workflow after all". Re-typing a fresh trigger word turns it back on.
@@ -32,21 +32,20 @@ import {
   type WorkflowSettingsStore,
 } from "./workflow-settings.js";
 
-// A keyword trigger is a configured literal term. The default `workflow`
-// trigger keeps legacy substring behavior and plural support (`workflows`) while
-// custom trigger words match only that exact term. Slash commands like
-// `/workflows` or `/pi-workflow` are left alone (not colored, not armed).
+// A keyword trigger is a configured literal term. All trigger words use token
+// boundaries so slash commands, paths, and identifier-like text stay untouched.
+// The default `workflow` trigger additionally supports the plural `workflows`.
 function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function triggerSource(triggerWord: string): string {
   const escaped = escapeRegExp(triggerWord);
-  if (triggerWord.toLowerCase() === DEFAULT_KEYWORD_TRIGGER_WORD) return `(?<!\\/)${escaped}s?`;
-  return `(?<![/A-Za-z0-9_-])${escaped}(?![A-Za-z0-9_-])`;
+  const plural = triggerWord.toLowerCase() === DEFAULT_KEYWORD_TRIGGER_WORD ? "s?" : "";
+  return `(?<![/\\p{ID_Continue}$-])(?<!\\\\)${escaped}${plural}(?![/\\p{ID_Continue}$-])(?!\\\\)`;
 }
 
-function triggerRegex(triggerWord = DEFAULT_KEYWORD_TRIGGER_WORD, flags = "i", atEnd = false): RegExp {
+function triggerRegex(triggerWord = DEFAULT_KEYWORD_TRIGGER_WORD, flags = "iu", atEnd = false): RegExp {
   const word = normalizeKeywordTriggerWord(triggerWord) ?? DEFAULT_KEYWORD_TRIGGER_WORD;
   return new RegExp(`${triggerSource(word)}${atEnd ? "$" : ""}`, flags);
 }
@@ -62,7 +61,7 @@ export function hasTrigger(text: string, triggerWord = DEFAULT_KEYWORD_TRIGGER_W
 }
 
 export function endsWithTrigger(textBeforeCursor: string, triggerWord = DEFAULT_KEYWORD_TRIGGER_WORD): boolean {
-  return triggerRegex(triggerWord, "i", true).test(textBeforeCursor);
+  return triggerRegex(triggerWord, "iu", true).test(textBeforeCursor);
 }
 
 /** Shared, mutable view of whether "workflows mode" is currently armed. */
@@ -138,7 +137,7 @@ export function colorizeWorkflow(
   if (!hasTrigger(visible, triggerWord)) return line;
 
   const ranges: Array<[number, number]> = [];
-  const globalTrigger = triggerRegex(triggerWord, "gi");
+  const globalTrigger = triggerRegex(triggerWord, "giu");
   for (let m = globalTrigger.exec(visible); m; m = globalTrigger.exec(visible)) {
     ranges.push([m.index, m.index + m[0].length]);
   }

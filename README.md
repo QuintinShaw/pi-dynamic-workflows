@@ -34,7 +34,7 @@ Run a workflow to audit every route under src/routes/ for missing auth checks.
 
 Pi writes and starts the workflow in the background. A live panel tracks progress while you keep working, and the final result is delivered back into the conversation automatically.
 
-Use the word **workflow** or **workflows** in a message to force workflow mode, or run `/workflows run <prompt>` explicitly. If the default keyword is too broad, change it with `/workflows-trigger set pi-workflow` or disable it with `/workflows-trigger off`.
+Keyword triggering is on by default: use the bounded word **workflow** or **workflows** in a message to force workflow mode, or run `/workflows run <prompt>` explicitly. Identifier-like text and paths such as `myworkflow`, `workflow_name`, and `src/workflow-editor.ts` do not trigger. You can change the keyword with `/workflows-trigger set pi-workflow` or disable it with `/workflows-trigger off`.
 
 ## How it works
 
@@ -199,7 +199,7 @@ Set a literal, case-insensitive custom trigger in `~/.pi/workflows/settings.json
 }
 ```
 
-The default `workflow` also matches `workflows`; a custom word matches exactly. If another extension owns Pi's custom editor, the submit-time trigger still works, but animated keyword highlighting and Backspace one-shot disarm are unavailable. Editor visuals are load-order dependent.
+The default `workflow` also matches `workflows`; a custom word matches exactly. Trigger words are case-insensitive and Unicode identifier-bounded, and do not activate inside paths, slash commands, or identifier-like text. If another extension owns Pi's custom editor, the submit-time trigger still works, but animated keyword highlighting and Backspace one-shot disarm are unavailable. Editor visuals are load-order dependent.
 
 </details>
 
