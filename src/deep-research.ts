@@ -39,7 +39,12 @@ const plan = await agent(
   '\\n\\nProduce ' + angles + ' diverse, specific search queries that together cover the question from different angles.',
   { label: 'plan queries', schema: { type: 'object', properties: { queries: { type: 'array', items: { type: 'string' } } }, required: ['queries'] } }
 )
-const queries = (plan.queries || []).slice(0, angles)
+// The planner agent() can return null (e.g. a subagent that died on a terminal
+// provider error) or omit a usable queries array. Mirror the null-tolerance the
+// Gather phase uses below and fall back to the original question as a single
+// query so research still proceeds (degraded) instead of crashing on plan.queries.
+const planned = plan && Array.isArray(plan.queries) ? plan.queries.filter((q) => typeof q === 'string' && q.trim().length > 0) : []
+const queries = (planned.length > 0 ? planned : [question]).slice(0, angles)
 
 phase('Gather')
 const gathered = await parallel(queries.map((q, i) => () =>
