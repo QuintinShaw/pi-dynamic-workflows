@@ -10,7 +10,11 @@
  */
 
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it, mock } from "node:test";
+import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
 async function loadCommand() {
   const mod = await import("../src/workflows-models-command.js");
@@ -176,6 +180,70 @@ describe("workflows-models-command", () => {
       const result = await editSingleTier(ctx as never, tiers, "small");
       assert.ok(result, "should return updated tiers");
       assert.equal(result.small, "openai/gpt-4.1-mini");
+    });
+  });
+
+  describe("default tier config on first use (pi >= 0.80.8 regression)", () => {
+    it("builds defaults from ctx.modelRegistry, not the empty async disk fallback", async () => {
+      // Since pi 0.80.8 the no-registry fallback inside listAvailableModels()
+      // initializes asynchronously and reports [] on the FIRST call. If the
+      // command handler builds its default tier config without passing the host
+      // session's registry, a first-ever /workflows-models open ranks tiers
+      // from an empty model list (every tier => ""). Drive the real handler
+      // with a stub registry and assert the first menu shows tiers ranked from
+      // that registry.
+      const { registerWorkflowModelsCommand } = await loadCommand();
+      let handler: ((args: unknown, ctx: unknown) => Promise<void>) | undefined;
+      const mockPi = {
+        registerCommand: mock.fn(
+          (_name: string, opts: { handler?: (args: unknown, ctx: unknown) => Promise<void> }) => {
+            handler = opts.handler;
+          },
+        ),
+      };
+      registerWorkflowModelsCommand(mockPi as never);
+      assert.ok(handler, "handler should be registered");
+
+      const cheap = {
+        provider: "mockvendor",
+        id: "cheap-model",
+        cost: { input: 0, output: 1, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 100000,
+      };
+      const registry = { getAvailable: () => [cheap], getAll: () => [cheap], find: () => cheap };
+      const selectCalls: string[][] = [];
+      const ctx = {
+        waitForIdle: async () => {},
+        model: undefined,
+        modelRegistry: registry,
+        ui: {
+          select: mock.fn(async (_title: string, options: string[]) => {
+            selectCalls.push(options);
+            return "Exit"; // leave the menu immediately, nothing saved
+          }),
+          notify: mock.fn(),
+          confirm: mock.fn(async () => false),
+          custom: mock.fn(async () => null),
+        },
+      };
+
+      // Fresh fake home: no saved model-tiers.json, so the handler must build
+      // an in-memory default config.
+      const home = mkdtempSync(join(tmpdir(), "pi-dw-wmc-home-"));
+      try {
+        await withFakeHomeAsync(home, () =>
+          (handler as (args: unknown, ctx: unknown) => Promise<void>)(undefined, ctx),
+        );
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+
+      assert.ok(selectCalls.length >= 1, "the tier menu should have been shown");
+      const menu = selectCalls[0].join("\n");
+      assert.ok(
+        menu.includes("mockvendor/cheap-model"),
+        `default tiers must rank from the host registry's models; menu was:\n${menu}`,
+      );
     });
   });
 });

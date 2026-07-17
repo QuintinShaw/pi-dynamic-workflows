@@ -48,9 +48,13 @@ export function registerWorkflowModelsCommand(pi: ExtensionAPI): void {
 
       // Load the saved config, or build an in-memory default spread across the
       // available models. If the model registry is empty, fall back to the
-      // current Pi model so the tiers are still usable.
+      // current Pi model so the tiers are still usable. Pass the host session's
+      // registry explicitly: since pi 0.80.8 the no-registry fallback inside
+      // listAvailableModels() initializes asynchronously and reports [] on the
+      // first call, which would rank defaults from an empty model list.
       const currentModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
-      let config = loadModelTierConfig() ?? buildDefaultTierConfig(currentModel, listAvailableModels());
+      let config =
+        loadModelTierConfig() ?? buildDefaultTierConfig(currentModel, listAvailableModels(ctx.modelRegistry));
       let dirty = false;
 
       const ensureFresh = (cfg: typeof config) => {
@@ -94,7 +98,7 @@ export function registerWorkflowModelsCommand(pi: ExtensionAPI): void {
             "This will reset tiers from your available model list. Continue?",
           );
           if (confirmed) {
-            ensureFresh(buildDefaultTierConfig(currentModel, listAvailableModels()));
+            ensureFresh(buildDefaultTierConfig(currentModel, listAvailableModels(ctx.modelRegistry)));
             ctx.ui.notify("Tiers reset to defaults. Use 'Save and exit' to persist.", "info");
           }
         }
