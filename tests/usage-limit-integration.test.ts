@@ -3,19 +3,27 @@
  *
  * Every other test injects a fake agent runner; this one drives the REAL
  * `WorkflowAgent.run` → `createAgentSession` path and uses the pi SDK's built-in
- * FAUX provider to end a turn in a "usage limit reached" error (stopReason
+ * faux stream to end a turn in a "usage limit reached" error (stopReason
  * "error" + errorMessage), exactly as a real provider buries a quota exhaustion.
  * It is the contract guard for the load-bearing SDK assumption behind the fix:
  * a usage limit surfaces as an error-status assistant message, not a thrown error.
  * No network call is made and NO provider quota is consumed.
+ *
+ * pi >= 0.80.8: sessions stream through a ModelRuntime, and a builtin provider
+ * with no overlays bypasses the compat api registry entirely — so the old
+ * registerFauxProvider() global-registry hook is invisible to the session.
+ * Instead, register the faux core as an extension provider on an explicit
+ * ModelRuntime (its streamSimple is closure-scripted, no registry involved)
+ * and hand that runtime to the subagent session.
  */
 
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { createFauxCore, fauxAssistantMessage } from "@earendil-works/pi-ai";
+import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { WorkflowAgent } from "../src/agent.js";
 import { WorkflowErrorCode } from "../src/errors.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
@@ -24,69 +32,68 @@ import { withFakeHomeAsync } from "./helpers/fake-home.js";
 const USAGE_LIMIT_MSG = "Codex usage limit reached (plus plan). Resets in ~3h.";
 
 /**
- * Load the faux provider from the SAME pi-ai instance that pi-coding-agent's
- * createAgentSession dispatches through. pi-coding-agent ships its own nested
- * pi-ai copy; registering on a different instance would be invisible to the
- * session ("No API provider registered"). Prefer the nested copy when present,
- * else fall back to the bare specifier — which, when npm has deduped to a single
- * copy, resolves to that same shared instance. Robust to both layouts.
- */
-async function loadFaux(): Promise<typeof import("@earendil-works/pi-ai/compat")> {
-  const nested = fileURLToPath(
-    new URL(
-      "../node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/compat.js",
-      import.meta.url,
-    ),
-  );
-  const entry = existsSync(nested) ? pathToFileURL(nested).href : "@earendil-works/pi-ai/compat";
-  return import(entry) as Promise<typeof import("@earendil-works/pi-ai/compat")>;
-}
-
-/**
- * Run `fn` with an isolated HOME and a dummy provider key so hasConfiguredAuth()
- * passes via env — no real credentials are touched, and the faux api means the
- * key is never actually used. A faux "deepseek" provider is registered/torn down
- * around `fn`; `setResponses` queues the scripted turns.
+ * Run `fn` with an isolated HOME and a scripted faux provider registered on a
+ * test-scoped ModelRuntime — no real credentials are touched and no network
+ * call can happen; `setResponses` queues the scripted turns.
  */
 async function withFauxSession(
   fn: (ctx: {
     cwd: string;
     model: unknown;
+    modelRuntime: ModelRuntime;
     setResponses: (msgs: unknown[]) => void;
     fauxAssistantMessage: typeof import("@earendil-works/pi-ai").fauxAssistantMessage;
   }) => Promise<void>,
 ): Promise<void> {
-  const { registerFauxProvider, fauxAssistantMessage } = await loadFaux();
   const home = mkdtempSync(join(tmpdir(), "pi-dw-i26-home-"));
   const cwd = mkdtempSync(join(tmpdir(), "pi-dw-i26-cwd-"));
-  const prevKey = process.env.DEEPSEEK_API_KEY;
-  process.env.DEEPSEEK_API_KEY = "faux-dummy-key-not-used";
-  const faux = registerFauxProvider({
-    provider: "deepseek",
-    models: [{ id: "faux-deepseek", name: "Faux DeepSeek", contextWindow: 128000, maxTokens: 4096 }],
+  const core = createFauxCore({
+    provider: "fauxtest",
+    models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 4096 }],
   });
   try {
-    await withFakeHomeAsync(home, () =>
-      fn({
+    await withFakeHomeAsync(home, async () => {
+      // Created inside the fake home so every default path stays isolated.
+      const modelRuntime = await ModelRuntime.create({
+        authPath: join(home, "auth.json"),
+        modelsPath: null,
+      });
+      modelRuntime.registerProvider("fauxtest", {
+        name: "Faux Test",
+        // Required by custom-model validation; never dialed — streamSimple intercepts.
+        baseUrl: "http://127.0.0.1:9/faux",
+        apiKey: "faux-dummy-key-not-used",
+        api: core.api,
+        streamSimple: core.streamSimple as never,
+        models: core.models.map((m) => ({
+          id: m.id,
+          name: m.name ?? m.id,
+          reasoning: false,
+          input: ["text"] as ("text" | "image")[],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: m.contextWindow ?? 128000,
+          maxTokens: m.maxTokens ?? 4096,
+        })),
+      });
+      const model = modelRuntime.getModel("fauxtest", "faux-model") ?? core.getModel();
+      await fn({
         cwd,
-        model: faux.getModel(),
-        setResponses: (msgs) => faux.setResponses(msgs as never),
+        model,
+        modelRuntime,
+        setResponses: (msgs) => core.setResponses(msgs as never),
         fauxAssistantMessage,
-      }),
-    );
+      });
+    });
   } finally {
-    faux.unregister();
-    if (prevKey === undefined) delete process.env.DEEPSEEK_API_KEY;
-    else process.env.DEEPSEEK_API_KEY = prevKey;
     rmSync(home, { recursive: true, force: true });
     rmSync(cwd, { recursive: true, force: true });
   }
 }
 
 test("a real subagent session that hits a usage limit surfaces PROVIDER_USAGE_LIMIT (not SCHEMA_NONCOMPLIANCE/EMPTY)", () =>
-  withFauxSession(async ({ cwd, model, setResponses, fauxAssistantMessage }) => {
+  withFauxSession(async ({ cwd, model, modelRuntime, setResponses, fauxAssistantMessage }) => {
     setResponses([fauxAssistantMessage("", { stopReason: "error", errorMessage: USAGE_LIMIT_MSG })]);
-    const agent = new WorkflowAgent({ cwd, session: { model: model as never } });
+    const agent = new WorkflowAgent({ cwd, session: { model: model as never, modelRuntime } });
     await assert.rejects(
       () => agent.run("do the task", { label: "probe" }),
       (err: unknown) => {
@@ -101,16 +108,16 @@ test("a real subagent session that hits a usage limit surfaces PROVIDER_USAGE_LI
   }));
 
 test("a successful real turn whose text merely mentions 'rate limit' is NOT misclassified", () =>
-  withFauxSession(async ({ cwd, model, setResponses, fauxAssistantMessage }) => {
+  withFauxSession(async ({ cwd, model, modelRuntime, setResponses, fauxAssistantMessage }) => {
     setResponses([fauxAssistantMessage("Done. I handled the rate limit gracefully.", { stopReason: "stop" })]);
-    const agent = new WorkflowAgent({ cwd, session: { model: model as never } });
+    const agent = new WorkflowAgent({ cwd, session: { model: model as never, modelRuntime } });
     const text = await agent.run("do the task", { label: "ok" });
     assert.ok(typeof text === "string" && text.includes("Done."), `expected normal text, got ${String(text)}`);
   }));
 
 test("through the manager: a usage limit pauses the run (not fails) and resume replays the journal", () =>
-  withFauxSession(async ({ cwd, model, setResponses, fauxAssistantMessage }) => {
-    const managerAgent = new WorkflowAgent({ cwd, session: { model: model as never } });
+  withFauxSession(async ({ cwd, model, modelRuntime, setResponses, fauxAssistantMessage }) => {
+    const managerAgent = new WorkflowAgent({ cwd, session: { model: model as never, modelRuntime } });
     const manager = new WorkflowManager({ cwd, agent: managerAgent });
     const pausedReasons: Array<string | undefined> = [];
     manager.on("paused", (e: { reason?: string }) => pausedReasons.push(e.reason));

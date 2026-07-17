@@ -3,12 +3,12 @@ import { unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { AssistantMessage, Model, TextContent } from "@earendil-works/pi-ai";
 import {
-  AuthStorage,
   type CreateAgentSessionOptions,
   createAgentSession,
   createCodingTools,
   getAgentDir,
   ModelRegistry,
+  ModelRuntime,
   SessionManager,
   SettingsManager,
   type ToolDefinition,
@@ -205,7 +205,7 @@ export interface WorkflowAgentOptions {
   cwd?: string;
   /** Extra tools available to the subagent in addition to the structured output tool. */
   tools?: ToolDefinition[];
-  /** Override any createAgentSession option (model, authStorage, resourceLoader, etc.). */
+  /** Override any createAgentSession option (model, modelRuntime, resourceLoader, etc.). */
   session?: Partial<CreateAgentSessionOptions>;
   /** Extra system guidance prepended to every subagent task. */
   instructions?: string;
@@ -233,22 +233,79 @@ export interface WorkflowAgentOptions {
   persistAgentSessions?: boolean;
 }
 
+// pi >= 0.80.8: ModelRegistry is a sync facade over an async-created ModelRuntime
+// (AuthStorage/ModelRegistry.create are gone). The disk-backed fallback is built
+// lazily; sync callers see [] until it resolves and real specs on later reads.
+let fallbackRuntimePromise: Promise<ModelRuntime> | undefined;
+let fallbackRegistry: ModelRegistry | undefined;
+
+function ensureFallbackRegistry(): Promise<ModelRegistry> {
+  if (!fallbackRuntimePromise) {
+    const dir = getAgentDir();
+    // Same auth.json/models.json createAgentSession uses by default, so a model
+    // resolved here carries valid credentials.
+    fallbackRuntimePromise = (async () => {
+      const runtime = await ModelRuntime.create({
+        authPath: join(dir, "auth.json"),
+        modelsPath: join(dir, "models.json"),
+      });
+      // Warm the availability snapshot so the facade's sync getAvailable() is
+      // populated immediately after this promise resolves.
+      await runtime.getAvailable().catch(() => {});
+      return runtime;
+    })();
+    // Don't cache a rejection: a transient failure (e.g. auth.json lock) would
+    // otherwise wedge the fallback for the rest of the process.
+    fallbackRuntimePromise.catch(() => {
+      fallbackRuntimePromise = undefined;
+    });
+  }
+  return fallbackRuntimePromise.then((runtime) => {
+    fallbackRegistry ??= new ModelRegistry(runtime);
+    return fallbackRegistry;
+  });
+}
+
+let warnedNoRuntime = false;
+
+/**
+ * The ModelRuntime behind a registry facade. pi's ModelRegistry does not expose
+ * its runtime publicly, so reach into the private field (stable since 0.80.8);
+ * subagent sessions need it to share the host session's exact catalog and auth
+ * (createAgentSession takes modelRuntime, not a registry, since 0.80.8).
+ *
+ * Exported so the test suite can pin this pi-internals contract: the cast means
+ * neither tsc nor mock-based tests would notice pi renaming the field, and the
+ * runtime consequence is silent (subagents fall back to a default runtime and
+ * extension-registered providers vanish from routing).
+ */
+export function runtimeOf(registry: ModelRegistry): ModelRuntime | undefined {
+  const runtime = (registry as unknown as { runtime?: ModelRuntime }).runtime;
+  if (!runtime && !warnedNoRuntime) {
+    warnedNoRuntime = true;
+    console.warn(
+      "[workflow] ModelRegistry no longer carries a private `runtime` field (pi internals changed); subagents fall back to a default-built runtime and may miss extension-registered providers",
+    );
+  }
+  return runtime;
+}
+
 /**
  * List the user's currently available models (those with auth configured) with
  * the minimal fields tier ranking needs: canonical spec, output price, and
  * context window. This is the single place the SDK `Model` is projected into
  * the SDK-agnostic `RankableModel`. Best-effort: returns [] if the registry
- * can't be built.
+ * can't be built (or while the disk-backed fallback is still initializing).
  */
 export function listAvailableModels(registry?: ModelRegistry): RankableModel[] {
   try {
-    const modelRegistry =
-      registry ??
-      (() => {
-        const dir = getAgentDir();
-        const auth = AuthStorage.create(join(dir, "auth.json"));
-        return ModelRegistry.create(auth, join(dir, "models.json"));
-      })();
+    const modelRegistry = registry ?? fallbackRegistry;
+    if (!modelRegistry) {
+      // Kick off the async fallback build; this call reports [] and later
+      // calls (e.g. the tool's lazy promptGuidelines re-reads) see real specs.
+      void ensureFallbackRegistry().catch(() => {});
+      return [];
+    }
     return modelRegistry.getAvailable().map((model) => ({
       spec: canonicalModelSpec(model),
       costOutput: model.cost?.output,
@@ -436,9 +493,10 @@ export class WorkflowAgent {
   /**
    * Resolve the registry for a run: an explicit per-run registry wins, then the
    * constructor's shared registry, then a lazily-built disk registry (shared
-   * across calls once built).
+   * across calls once built). Async because pi >= 0.80.8 builds registries from
+   * an async-created ModelRuntime.
    */
-  private getRegistry(perRunRegistry?: ModelRegistry): ModelRegistry {
+  private async getRegistry(perRunRegistry?: ModelRegistry): Promise<ModelRegistry> {
     if (perRunRegistry) {
       return perRunRegistry;
     }
@@ -446,11 +504,7 @@ export class WorkflowAgent {
       return this.sharedRegistry;
     }
     if (!this.registry) {
-      const dir = getAgentDir();
-      // Same agentDir/auth files createAgentSession uses by default, so a model
-      // resolved here carries valid credentials.
-      const auth = AuthStorage.create(join(dir, "auth.json"));
-      this.registry = ModelRegistry.create(auth, join(dir, "models.json"));
+      this.registry = await ensureFallbackRegistry();
     }
     return this.registry;
   }
@@ -518,18 +572,22 @@ export class WorkflowAgent {
       customTools.push(createStructuredOutputTool({ schema: options.schema, capture }) as unknown as ToolDefinition);
     }
 
+    // Per-run modelRegistry wins over the constructor's shared registry, then
+    // the lazily-built disk fallback. Used for tier diagnostics, model
+    // resolution, and the subagent session's runtime below.
+    const modelRegistry = await this.getRegistry(options.modelRegistry);
+
     // Resolve the model spec (explicit model > tier > session default). This
     // composes with phase-based routing in workflow.ts, which only supplies
     // options.model when a phase pattern matches — so an explicit model wins.
     const modelSpec = resolveAgentModelSpec(options, this.mainModel, loadModelTierConfig, () =>
-      warnTierUnconfiguredOnce(this.mainModel, this.getRegistry(options.modelRegistry)),
+      warnTierUnconfiguredOnce(this.mainModel, modelRegistry),
     );
 
     // Resolve a requested model spec to a Model object. Specs use Pi CLI-style
     // parsing, including an optional :thinking suffix such as gpt-5.5:xhigh.
     // A given-but-unresolved spec falls back to the session default (with a
     // warning) rather than failing.
-    const modelRegistry = this.getRegistry(options.modelRegistry);
     let resolvedModel: Model<any> | undefined;
     let resolvedThinkingLevel: CreateAgentSessionOptions["thinkingLevel"] | undefined;
     if (modelSpec) {
@@ -546,6 +604,9 @@ export class WorkflowAgent {
     }
 
     const agentDir = getAgentDir();
+    // The runtime behind the resolved registry, handed to the subagent session
+    // below so it shares the host session's exact catalog and auth.
+    const modelRuntime = runtimeOf(modelRegistry);
     // Key persisted sessions by the runner's project cwd (this.cwd), NOT the
     // per-call runCwd: agents working in short-lived git worktrees should still
     // group under the project's session dir instead of scattering across
@@ -561,11 +622,10 @@ export class WorkflowAgent {
       // not have valid auth, causing silent empty responses.
       settingsManager: SettingsManager.create(this.cwd, agentDir),
       customTools,
-      // Per-run modelRegistry wins over the constructor's shared registry
-      // (see getRegistry() precedence above).
-      ...(options.modelRegistry || this.sharedRegistry
-        ? { modelRegistry: options.modelRegistry ?? this.sharedRegistry }
-        : {}),
+      // Share the resolved registry's ModelRuntime (catalog + auth, including
+      // extension-registered providers) with the subagent session. pi >= 0.80.8
+      // takes modelRuntime here; the old modelRegistry option is gone.
+      ...(modelRuntime ? { modelRuntime } : {}),
       ...this.sessionOptions,
       // Per-call model/thinking wins over any sessionOptions defaults.
       ...(resolvedModel ? { model: resolvedModel } : {}),
