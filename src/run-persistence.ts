@@ -18,6 +18,8 @@ export interface PersistedAgentState {
   prompt: string;
   status: "queued" | "running" | "done" | "error" | "skipped";
   result?: unknown;
+  /** Compact result written by releases before full agent results were retained. */
+  resultPreview?: string;
   error?: string;
   errorCode?: WorkflowErrorCode;
   recoverable?: boolean;

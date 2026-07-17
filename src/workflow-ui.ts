@@ -13,9 +13,15 @@
  * Component shell (openWorkflowNavigator) wires them to live manager events.
  */
 
-import type { ExtensionAPI, ExtensionUIContext, Theme } from "@earendil-works/pi-coding-agent";
-import type { Component, Focusable, TUI } from "@earendil-works/pi-tui";
-import { parseKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import {
+  type ExtensionAPI,
+  type ExtensionUIContext,
+  getLanguageFromPath,
+  getMarkdownTheme,
+  type Theme,
+} from "@earendil-works/pi-coding-agent";
+import type { Component, Focusable, MarkdownTheme, TUI } from "@earendil-works/pi-tui";
+import { Markdown, parseKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import type { AgentUsage } from "./agent.js";
 import type { ThemeLike, WorkflowAgentSnapshot, WorkflowSnapshot } from "./display.js";
 import { aggregateAgentUsage, fmtCost, fmtTokenSegment, tokenFigures } from "./display.js";
@@ -213,8 +219,9 @@ function persistedToSnapshot(p: PersistedRunState): WorkflowSnapshot {
       phase: a.phase,
       prompt: a.prompt,
       status: a.status,
+      result: a.result,
       resultPreview:
-        a.result == null ? undefined : String(typeof a.result === "string" ? a.result : JSON.stringify(a.result)),
+        a.result == null ? a.resultPreview : String(typeof a.result === "string" ? a.result : JSON.stringify(a.result)),
       error: a.error,
       errorCode: a.errorCode,
       recoverable: a.recoverable,
@@ -236,6 +243,9 @@ function persistedToSnapshot(p: PersistedRunState): WorkflowSnapshot {
 export class NavigatorState {
   private stack: StackFrame[] = [{ kind: "runs", cursor: 0 }];
   scroll = 0;
+  tailing = false;
+  pagerOpen = false;
+  private pageSize = 1;
 
   private top(): StackFrame {
     return this.stack[this.stack.length - 1];
@@ -283,12 +293,62 @@ export class NavigatorState {
 
   move(delta: number, count: number) {
     if (this.kind === "detail" || this.kind === "savedDetail") {
+      if (this.kind === "detail") this.pagerOpen = true;
+      if (delta < 0) this.tailing = false;
       this.scroll = Math.max(0, this.scroll + delta);
       return;
     }
     if (count <= 0) return;
     const t = this.top();
     t.cursor = (t.cursor + delta + count) % count;
+  }
+
+  /** Update the amount moved by page keys to match the rendered viewport. */
+  setPageSize(rows: number) {
+    this.pageSize = Math.max(1, rows);
+  }
+
+  /** Move by almost one viewport, retaining one line of reading context. */
+  movePage(direction: -1 | 1, count: number) {
+    const delta = direction * Math.max(1, this.pageSize - 1);
+    if (this.kind === "detail" || this.kind === "savedDetail") {
+      if (this.kind === "detail") this.pagerOpen = true;
+      if (direction < 0) this.tailing = false;
+      this.scroll = Math.max(0, this.scroll + delta);
+      return;
+    }
+    if (count > 0) this.cursor = Math.max(0, Math.min(count - 1, this.cursor + delta));
+  }
+
+  /** Jump to the beginning or end of the current list/detail. End also enables
+   * follow mode for a live agent detail; start disables it. */
+  jump(edge: "start" | "end", count: number) {
+    if (this.kind === "detail" || this.kind === "savedDetail") {
+      if (this.kind === "detail") this.pagerOpen = true;
+      this.tailing = this.kind === "detail" && edge === "end";
+      // renderNavigator knows the body length and clamps this sentinel.
+      this.scroll = edge === "start" ? 0 : Number.MAX_SAFE_INTEGER;
+      return;
+    }
+    this.cursor = edge === "start" || count <= 0 ? 0 : count - 1;
+  }
+
+  /** Toggle the full pager while retaining the compact agent summary view. */
+  togglePager(): boolean {
+    if (this.kind !== "detail") return false;
+    this.pagerOpen = !this.pagerOpen;
+    this.scroll = 0;
+    if (!this.pagerOpen) this.tailing = false;
+    return this.pagerOpen;
+  }
+
+  /** Toggle live follow mode in an agent detail pager. */
+  toggleTail(): boolean {
+    if (this.kind !== "detail") return false;
+    this.pagerOpen = true;
+    this.tailing = !this.tailing;
+    if (this.tailing) this.scroll = Number.MAX_SAFE_INTEGER;
+    return this.tailing;
   }
 
   /** Drill into the selected item. Returns true if the view changed. */
@@ -308,6 +368,8 @@ export class NavigatorState {
       const item = saved[t.cursor - runs.length];
       if (!item) return false;
       this.scroll = 0;
+      this.tailing = false;
+      this.pagerOpen = false;
       this.stack.push({ kind: "savedDetail", cursor: 0, savedName: item.name });
       return true;
     }
@@ -323,6 +385,8 @@ export class NavigatorState {
       const ag = agents[t.cursor];
       if (!ag) return false;
       this.scroll = 0;
+      this.tailing = false;
+      this.pagerOpen = false;
       this.stack.push({ kind: "detail", cursor: 0, runId: t.runId, phase: t.phase, agentId: ag.id });
       return true;
     }
@@ -331,9 +395,17 @@ export class NavigatorState {
 
   /** Pop one level. Returns false when already at the top (caller should close). */
   back(): boolean {
+    if (this.kind === "detail" && this.pagerOpen) {
+      this.pagerOpen = false;
+      this.scroll = 0;
+      this.tailing = false;
+      return true;
+    }
     if (this.stack.length <= 1) return false;
     this.stack.pop();
     this.scroll = 0;
+    this.tailing = false;
+    this.pagerOpen = false;
     return true;
   }
 
@@ -752,8 +824,10 @@ export function renderNavigator(
   width: number,
   theme: ThemeLike = PLAIN,
   viewportRows = 24,
+  markdownTheme?: MarkdownTheme,
 ): string[] {
   const lines: string[] = [];
+  state.setPageSize(Math.max(1, viewportRows - 5));
   const sel = (i: number, text: string) =>
     i === state.cursor ? theme.fg("accent", theme.bold(`❯ ${text}`)) : `  ${text}`;
   const dim = (t: string) => theme.fg("dim", t);
@@ -762,14 +836,31 @@ export function renderNavigator(
   // stable box (clamping state.scroll) instead of slicing to the end — which
   // shrank the overlay and looked like it was collapsing.
   const pushScrollable = (body: string[]) => {
-    const viewport = Math.max(5, viewportRows - 4); // reserve title + blank + footer + indicator
+    const viewport = Math.max(1, viewportRows - 4); // reserve title + blank + footer + indicator
+    state.setPageSize(viewport);
     const maxScroll = Math.max(0, body.length - viewport);
+    if (state.kind === "detail" && state.tailing) state.scroll = maxScroll;
     state.scroll = Math.min(Math.max(0, state.scroll), maxScroll);
     lines.push(...body.slice(state.scroll, state.scroll + viewport));
     if (body.length > viewport) {
       const end = Math.min(state.scroll + viewport, body.length);
-      lines.push(dim(`  [${state.scroll + 1}-${end} / ${body.length}]`));
+      const up = state.scroll > 0 ? "↑" : " ";
+      const down = end < body.length ? "↓" : " ";
+      const mode = state.kind === "detail" && state.tailing ? " TAIL" : "";
+      lines.push(dim(`  [${state.scroll + 1}-${end} / ${body.length}] ${up}${down}${mode}`));
     }
+  };
+
+  // Compact agent details are deliberately not a pager: they show the useful
+  // current snapshot and reserve scrolling for the explicit full-pager view.
+  const pushCompact = (body: string[]) => {
+    const viewport = Math.max(1, viewportRows - 3); // title + blank + footer
+    if (body.length <= viewport) {
+      lines.push(...body);
+      return;
+    }
+    lines.push(...body.slice(0, Math.max(1, viewport - 1)));
+    lines.push(dim("  … enter to open full pager"));
   };
 
   if (state.kind === "runs") {
@@ -777,26 +868,39 @@ export function renderNavigator(
     const saved = model.saved();
     const total = runs.length + saved.length;
     state.clamp(total);
-    lines.push(theme.bold("Workflows"));
+
+    // Keep the selected run visible when history exceeds the overlay height.
+    const bodyCap = Math.max(1, viewportRows - 3); // title + blank + footer
+    let win = scrollWindow(total, state.cursor, bodyCap);
+    const windowEnd = () => win.start + win.count;
+    const crossesSavedBoundary = () =>
+      runs.length > 0 && saved.length > 0 && win.start < runs.length && windowEnd() > runs.length;
+    if (crossesSavedBoundary() && bodyCap > 1) win = scrollWindow(total, state.cursor, bodyCap - 1);
+    const up = win.start > 0 ? "↑" : " ";
+    const down = windowEnd() < total ? "↓" : " ";
+    const range =
+      win.start > 0 || windowEnd() < total ? dim(`  [${up} ${win.start + 1}-${windowEnd()} / ${total} ${down}]`) : "";
+    lines.push(theme.bold(`Workflows${range}`));
+
     if (total === 0) {
       lines.push(dim("  No runs yet. Start one with a background workflow."));
     }
-    // Render runs
-    runs.forEach((r, i) => {
-      const icon = STATUS_ICON[r.status] ?? "?";
-      const tok = fmtTokenSegment(r, pad);
-      const meta = [`${r.done}/${r.total}`, tok, r.cost > 0 ? fmtCost(r.cost) : ""].filter(Boolean).join(" · ");
-      lines.push(sel(i, `${icon} ${r.name}  ${dim(`${r.runId} · ${r.status} · ${meta}`)}`));
-    });
-    // Render saved workflows after a separator
-    if (saved.length > 0) {
-      const sepOffset = runs.length;
-      if (runs.length > 0) lines.push(dim("  ── saved ──"));
-      saved.forEach((w, i) => {
+    for (let i = win.start; i < windowEnd(); i++) {
+      if (i === runs.length && runs.length > 0 && saved.length > 0) lines.push(dim("  ── saved ──"));
+      if (i < runs.length) {
+        const r = runs[i];
+        if (!r) continue;
+        const icon = STATUS_ICON[r.status] ?? "?";
+        const tok = fmtTokenSegment(r, pad);
+        const meta = [`${r.done}/${r.total}`, tok, r.cost > 0 ? fmtCost(r.cost) : ""].filter(Boolean).join(" · ");
+        lines.push(sel(i, `${icon} ${r.name}  ${dim(`${r.runId} · ${r.status} · ${meta}`)}`));
+      } else {
+        const w = saved[i - runs.length];
+        if (!w) continue;
         const loc = w.location === "user" ? "~" : ".";
         const desc = w.description ? dim(`  ${w.description}`) : "";
-        lines.push(sel(sepOffset + i, `${w.name}${desc}  ${dim(loc)}`));
-      });
+        lines.push(sel(i, `${w.name}${desc}  ${dim(loc)}`));
+      }
     }
   } else if (state.kind === "phases" && state.runId) {
     const phases = model.phases(state.runId);
@@ -818,21 +922,51 @@ export function renderNavigator(
     lines.push(theme.bold(a ? a.label : "agent"));
     if (a) {
       const body: string[] = [];
-      body.push(dim("Status: ") + (a.status ?? ""));
-      if (a.model) body.push(dim("Model: ") + (shortModel(a.model) ?? ""));
-      if (a.error) body.push(dim("Error: ") + a.error);
-      if (a.errorCode) body.push(`${dim("Error code: ")}${a.errorCode}${a.recoverable ? " (recoverable)" : ""}`);
-      body.push("", dim("Prompt:"));
-      body.push(...wrap(a.prompt ?? "", width));
-      body.push("", dim("Result:"));
-      body.push(...wrap(a.resultPreview ?? "(none)", width));
-      if (a.history?.length) {
-        body.push("", dim("History:"));
-        for (const entry of a.history) {
-          body.push(...wrap(`${historyLabel(entry)}: ${entry.text}`, width));
+      if (state.pagerOpen) {
+        body.push(dim("Status: ") + (a.status ?? ""));
+        if (a.model) body.push(dim("Model: ") + (shortModel(a.model) ?? ""));
+        if (a.error) body.push(dim("Error: ") + a.error);
+        if (a.errorCode) body.push(`${dim("Error code: ")}${a.errorCode}${a.recoverable ? " (recoverable)" : ""}`);
+        body.push("", theme.fg("accent", theme.bold("Prompt:")));
+        body.push(...renderMarkdownLines(a.prompt ?? "", width, markdownTheme));
+        body.push("", theme.fg("accent", theme.bold("Result:")));
+        body.push(...renderResultLines(a.result, a.resultPreview, width, markdownTheme));
+        if (a.history?.length) {
+          body.push("", theme.fg("accent", theme.bold("History:")));
+          for (let i = 0; i < a.history.length; i++) {
+            body.push(...renderHistoryEntryLines(a.history, i, width, markdownTheme, dim));
+          }
         }
+        pushScrollable(body);
+      } else if (a.status === "done") {
+        // Completed agents default to their useful final output; prompt/history
+        // remain one keypress away in the full pager.
+        body.push(theme.fg("accent", theme.bold("Result:")));
+        body.push(...renderResultLines(a.result, a.resultPreview, width, markdownTheme));
+        pushCompact(body);
+      } else {
+        // Active/failed agents default to context plus the latest two events.
+        body.push(dim("Status: ") + (a.status ?? ""));
+        if (a.model) body.push(dim("Model: ") + (shortModel(a.model) ?? ""));
+        if (a.error) body.push(dim("Error: ") + a.error);
+        if (a.errorCode) body.push(`${dim("Error code: ")}${a.errorCode}${a.recoverable ? " (recoverable)" : ""}`);
+        body.push("", theme.fg("accent", theme.bold("Prompt:")));
+        const promptLines = renderMarkdownLines(a.prompt ?? "", width, markdownTheme);
+        body.push(...promptLines.slice(0, 5));
+        if (promptLines.length > 5) body.push(dim("  … prompt continues in pager"));
+        body.push("", theme.fg("accent", theme.bold("Recent activity:")));
+        if (a.history?.length) {
+          const start = Math.max(0, a.history.length - 2);
+          for (let i = start; i < a.history.length; i++) {
+            const eventLines = renderHistoryEntryLines(a.history, i, width, markdownTheme, dim);
+            body.push(...eventLines.slice(0, 4));
+            if (eventLines.length > 4) body.push(dim("  … event continues in pager"));
+          }
+        } else {
+          body.push(dim("  Waiting for the first agent event…"));
+        }
+        pushCompact(body);
       }
-      pushScrollable(body);
     }
   } else if (state.kind === "savedDetail" && state.savedName) {
     const saved = model.saved();
@@ -844,8 +978,8 @@ export function renderNavigator(
       body.push(dim("Location: ") + (w.location === "user" ? "user (~/.pi)" : "project (.pi)"));
       body.push(dim("Saved at: ") + w.savedAt);
       if (w.parameters) body.push(dim("Parameters: ") + JSON.stringify(w.parameters));
-      body.push("", dim("Script:"));
-      body.push(...wrap(w.script, width));
+      body.push("", theme.fg("accent", theme.bold("Script:")));
+      body.push(...renderCodeLines(w.script, "javascript", width, markdownTheme));
       pushScrollable(body);
     }
   }
@@ -911,14 +1045,68 @@ function historyLabel(entry: NonNullable<WorkflowAgentSnapshot["history"]>[numbe
   return entry.role;
 }
 
+/** Infer source language for history that pi stores as raw tool text rather than
+ * Markdown. Tool-call arguments are JSON; read results inherit the path from
+ * their nearest preceding read call. */
+function historyEntryLanguage(
+  history: NonNullable<WorkflowAgentSnapshot["history"]>,
+  index: number,
+): string | undefined {
+  const entry = history[index];
+  if (!entry) return undefined;
+  if (entry.kind === "toolCall") return "json";
+  if (entry.kind !== "toolResult" || entry.toolName !== "read") return undefined;
+
+  for (let i = index - 1; i >= 0; i--) {
+    const call = history[i];
+    if (call?.kind !== "toolCall" || call.toolName !== "read") continue;
+    try {
+      const args = JSON.parse(call.text) as { path?: unknown };
+      return typeof args.path === "string" ? getLanguageFromPath(args.path) : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
+function renderHistoryEntryLines(
+  history: NonNullable<WorkflowAgentSnapshot["history"]>,
+  index: number,
+  width: number,
+  markdownTheme: MarkdownTheme | undefined,
+  dim: (text: string) => string,
+): string[] {
+  const entry = history[index];
+  if (!entry) return [];
+  const language = historyEntryLanguage(history, index);
+  return [
+    dim(`${historyLabel(entry)}:`),
+    ...(language
+      ? renderCodeLines(entry.text, language, width, markdownTheme)
+      : renderMarkdownLines(entry.text, width, markdownTheme)),
+  ];
+}
+
 function footerHint(state: NavigatorState, model: NavigatorModel, theme: ThemeLike): string {
   const parts: string[] = [];
   switch (state.kind) {
     case "detail":
-      parts.push("j/k scroll", "esc back");
+      if (state.pagerOpen) {
+        parts.push(
+          "↑/↓ line",
+          "PgUp/PgDn page",
+          "g/G ends",
+          `t tail:${state.tailing ? "on" : "off"}`,
+          "enter summary",
+          "esc summary",
+        );
+      } else {
+        parts.push("enter open pager", "t tail", "esc back");
+      }
       break;
     case "savedDetail":
-      parts.push("j/k scroll", "esc back", "x delete");
+      parts.push("↑/↓ line", "PgUp/PgDn page", "g/G ends", "esc back", "x delete");
       break;
     case "runs": {
       const itemKind = model.saved().length > 0 ? state.itemKindAt(model, state.cursor) : "run";
@@ -938,12 +1126,48 @@ function footerHint(state: NavigatorState, model: NavigatorModel, theme: ThemeLi
 }
 
 function wrap(text: string, width: number): string[] {
-  return wrapTextWithAnsi(text ?? "", Math.max(20, width));
+  return wrapTextWithAnsi(text ?? "", Math.max(1, width));
+}
+
+/** Render prose as Markdown when the host theme is available. Fenced code blocks
+ * are syntax highlighted by pi's Markdown renderer. */
+function renderMarkdownLines(text: string, width: number, markdownTheme?: MarkdownTheme): string[] {
+  if (!markdownTheme) return wrap(text, width);
+  return new Markdown(text, 0, 0, markdownTheme).render(Math.max(1, width));
+}
+
+/** Render a known-language source block without requiring Markdown fences (a
+ * workflow script can itself contain backticks). */
+function renderCodeLines(text: string, language: string, width: number, markdownTheme?: MarkdownTheme): string[] {
+  const sourceLines = markdownTheme?.highlightCode?.(text, language) ?? text.split("\n");
+  return sourceLines.flatMap((line) => wrapTextWithAnsi(`  ${line}`, Math.max(1, width)));
+}
+
+function renderResultLines(
+  result: unknown,
+  preview: string | undefined,
+  width: number,
+  markdownTheme?: MarkdownTheme,
+): string[] {
+  if (result !== undefined && typeof result !== "string") {
+    let json: string;
+    try {
+      json = JSON.stringify(result, null, 2) ?? String(result);
+    } catch {
+      json = String(result);
+    }
+    return renderCodeLines(json, "json", width, markdownTheme);
+  }
+  return renderMarkdownLines(typeof result === "string" ? result : (preview ?? "(none)"), width, markdownTheme);
 }
 
 /** What a key press should do. Pure mapping from a parsed key id to an action. */
 export type NavAction =
   | { type: "move"; delta: number }
+  | { type: "page"; direction: -1 | 1 }
+  | { type: "jump"; edge: "start" | "end" }
+  | { type: "toggleTail" }
+  | { type: "togglePager" }
   | { type: "drill" }
   | { type: "back" }
   | { type: "close" }
@@ -964,10 +1188,30 @@ export function keyToAction(keyId: string | undefined, kind: ViewKind, itemKind?
       return { type: "move", delta: -1 };
     case "j":
       return { type: "move", delta: 1 };
+    case "pageUp":
+    case "ctrl+u":
+    case "ctrl+b":
+      return { type: "page", direction: -1 };
+    case "pageDown":
+    case "ctrl+d":
+    case "ctrl+f":
+      return { type: "page", direction: 1 };
+    case "space":
+      return kind === "detail" || kind === "savedDetail" ? { type: "page", direction: 1 } : { type: "none" };
+    case "home":
+    case "g":
+      return { type: "jump", edge: "start" };
+    case "end":
+    case "G":
+    case "shift+g":
+      return { type: "jump", edge: "end" };
+    case "t":
+      return kind === "detail" ? { type: "toggleTail" } : { type: "none" };
     case "enter":
     case "return":
     case "right":
-      if (kind === "detail" || kind === "savedDetail") return { type: "none" };
+      if (kind === "detail") return { type: "togglePager" };
+      if (kind === "savedDetail") return { type: "none" };
       return { type: "drill" };
     case "escape":
     case "esc":
@@ -1022,7 +1266,18 @@ export function openWorkflowNavigator(
   return ui.custom<void>(
     (tui: TUI, theme: Theme, _keybindings, done: (r: undefined) => void) => {
       const rerender = () => tui.requestRender();
-      const events = ["agentStart", "agentEnd", "phase", "log", "complete", "error", "stopped", "paused", "resumed"];
+      const events = [
+        "agentStart",
+        "agentEnd",
+        "agentHistory",
+        "phase",
+        "log",
+        "complete",
+        "error",
+        "stopped",
+        "paused",
+        "resumed",
+      ];
       const onEvent = () => rerender();
       for (const ev of events) manager.on(ev, onEvent);
       const cleanup = () => {
@@ -1035,6 +1290,18 @@ export function openWorkflowNavigator(
         switch (action.type) {
           case "move":
             state.move(action.delta, currentCount(state, model));
+            break;
+          case "page":
+            state.movePage(action.direction, currentCount(state, model));
+            break;
+          case "jump":
+            state.jump(action.edge, currentCount(state, model));
+            break;
+          case "toggleTail":
+            state.toggleTail();
+            break;
+          case "togglePager":
+            state.togglePager();
             break;
           case "drill":
             state.drill(model);
@@ -1140,7 +1407,13 @@ export function openWorkflowNavigator(
           const titleColor = (s: string) => (_focused ? theme.fg("dim", theme.bold(s)) : theme.fg("muted", s));
           const bgColor = (s: string) => theme.bg("customMessageBg", s);
           const innerWidth = Math.max(10, width - BOX_BORDER_OVERHEAD);
-          const raw = renderNavigator(state, model, innerWidth, theme, tui.terminal?.rows ?? 24);
+          // Match the navigator's own viewport to the overlay's 92% maxHeight;
+          // otherwise the host truncates the footer and bottom border before the
+          // pager gets a chance to scroll them into view.
+          const terminalRows = tui.terminal?.rows ?? 24;
+          const overlayRows = Math.max(8, Math.floor(terminalRows * 0.92));
+          const contentRows = Math.max(6, overlayRows - 2); // top + bottom box borders
+          const raw = renderNavigator(state, model, innerWidth, theme, contentRows, getMarkdownTheme());
           const title = titleColor(" workflows ");
           const topBorder =
             borderColor("╭─") + title + borderColor("─".repeat(Math.max(0, innerWidth - 10))) + borderColor("╮");
@@ -1149,7 +1422,7 @@ export function openWorkflowNavigator(
             const padded = truncateToWidth(line, innerWidth, "", true);
             const fullLine = borderColor(BOX_BORDER_LEFT) + padded + borderColor(BOX_BORDER_RIGHT);
             // Fill trailing whitespace for consistent background across the width
-            const trailingPad = width - fullLine.length;
+            const trailingPad = width - visibleWidth(fullLine);
             return bgColor(fullLine + (trailingPad > 0 ? " ".repeat(trailingPad) : ""));
           };
           return [bgColor(topBorder), ...raw.map(wrapAndBg), bgColor(botBorder)];

@@ -301,6 +301,22 @@ test(
 );
 
 test(
+  "runSync retains the full agent result for live and persisted detail views",
+  withTempCwd(async (cwd) => {
+    const expected = { summary: "complete", findings: [{ path: "src/a.ts", line: 42 }] };
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent({}, expected) });
+
+    const result = await manager.runSync(oneAgentScript);
+    const live = manager.getRun(result.runId)?.snapshot.agents[0];
+    const persisted = manager.listRuns().find((run) => run.runId === result.runId)?.agents[0];
+
+    assert.deepEqual(live?.result, expected);
+    assert.deepEqual(persisted?.result, expected);
+    assert.match(live?.resultPreview ?? "", /complete/);
+  }),
+);
+
+test(
   "startInBackground returns immediately with runId and promise",
   withTempCwd(async (cwd) => {
     const manager = new WorkflowManager({ cwd, agent: fakeAgent() });

@@ -12,6 +12,8 @@ export interface WorkflowAgentSnapshot {
   phase?: string;
   prompt: string;
   status: WorkflowAgentStatus;
+  /** Full agent result, retained for the interactive detail pager. */
+  result?: unknown;
   resultPreview?: string;
   error?: string;
   errorCode?: WorkflowErrorCode;

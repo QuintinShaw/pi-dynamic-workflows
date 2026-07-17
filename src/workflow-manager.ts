@@ -422,6 +422,9 @@ export class WorkflowManager extends EventEmitter {
             .find((a) => a.label === event.label && a.status === "running");
           if (agent) {
             agent.status = event.result === null ? "error" : "done";
+            // Keep the full value for the interactive pager; compact surfaces
+            // continue to use resultPreview.
+            agent.result = event.result;
             agent.resultPreview = preview(event.result);
             agent.error = event.error;
             agent.errorCode = event.errorCode;
