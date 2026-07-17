@@ -14,11 +14,12 @@ import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
 // Exact post-change measurements: ratchet only after reviewing a new accepted form.
 // The prompt baseline intentionally uses an empty agentType registry so user configuration cannot alter it.
-// Ratcheted for the resumeFromRunId (edited-script resume / cached-prefix reuse) tool surface:
-// one new optional schema param on the tool DEFINITION only. The always-on rendered
-// prompt is intentionally unchanged — discoverability comes from the tool-def
-// description plus the per-result revise hint, not an always-on guideline line.
-const RENDERED_PROMPT_BUDGET_BYTES = 6_500;
+// Ratcheted DOWN from 6_500 to 650 by the authorize-keyword-trigger change (#65/#88):
+// the ~20 always-on "For workflow, …" how-to lines were removed from the always-on
+// prompt (measured 6_500 -> 599 bytes) and are now injected only on an ARMED turn
+// (see workflowHowToGuidelines / buildArmedWorkflowPrompt). The always-on surface is
+// now a single opt-in gate line, which cuts self-priming pressure toward the tool.
+const RENDERED_PROMPT_BUDGET_BYTES = 650;
 const TOOL_DEFINITION_BUDGET_BYTES = 2_529;
 
 test("rendered workflow prompt contribution stays within its accepted size", async () => {

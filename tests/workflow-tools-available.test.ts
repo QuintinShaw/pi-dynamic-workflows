@@ -19,7 +19,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it, mock } from "node:test";
 import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
-import { buildForcedWorkflowPrompt, WORKFLOW_TOOL_NAME, type WorkflowModeState } from "../src/workflow-editor.js";
+import { buildArmedWorkflowPrompt, WORKFLOW_TOOL_NAME, type WorkflowModeState } from "../src/workflow-editor.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
 // ---------------------------------------------------------------------------
@@ -112,7 +112,7 @@ describe("installWorkflowEditor - tool availability", () => {
     // Verify transform result
     assert.deepEqual(result, {
       action: "transform",
-      text: buildForcedWorkflowPrompt("przetestuj to workflow zadanie"),
+      text: buildArmedWorkflowPrompt("przetestuj to workflow zadanie"),
     });
 
     // Verify getActiveTools was called

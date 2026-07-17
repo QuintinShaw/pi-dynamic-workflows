@@ -364,23 +364,38 @@ describe("colorizeWorkflow", () => {
   });
 });
 
-describe("buildForcedWorkflowPrompt", () => {
+describe("buildArmedWorkflowPrompt", () => {
   it("includes the original text", async () => {
-    const { buildForcedWorkflowPrompt } = await load();
-    const result = buildForcedWorkflowPrompt("hello world");
+    const { buildArmedWorkflowPrompt } = await load();
+    const result = buildArmedWorkflowPrompt("hello world");
     assert.ok(result.startsWith("hello world"), "should start with hello world");
   });
 
-  it("includes the directive", async () => {
-    const { buildForcedWorkflowPrompt } = await load();
-    const result = buildForcedWorkflowPrompt("test");
-    assert.ok(result.includes("tool named exactly `workflow`"), "should contain tool named exactly `workflow");
-    assert.ok(result.includes("MUST"), "should contain MUST");
+  it("arms (authorizes) rather than forces — no MUST/ONLY/'Do NOT answer' language", async () => {
+    const { buildArmedWorkflowPrompt } = await load();
+    const result = buildArmedWorkflowPrompt("test");
+    assert.ok(result.includes("workflows mode armed"), "should announce armed mode");
+    assert.ok(result.includes("`workflow` tool"), "should still name the workflow tool");
+    assert.ok(!/\bMUST\b/.test(result), "must not force with MUST");
+    assert.ok(!/ONLY acceptable/i.test(result), "must not force with 'ONLY acceptable'");
+    assert.ok(!/Do NOT (instead|answer)/i.test(result), "must not forbid answering directly");
+    assert.ok(
+      result.includes("answer it directly") || result.includes("does not force"),
+      "should permit answering a question directly",
+    );
+  });
+
+  it("carries the how-to guidance for writing a workflow when armed", async () => {
+    const { buildArmedWorkflowPrompt } = await load();
+    const result = buildArmedWorkflowPrompt("test");
+    assert.ok(result.includes("If you do call `workflow`, follow this guidance:"), "should introduce the how-to");
+    assert.ok(result.includes("export const meta = {"), "should carry the meta-header how-to line");
+    assert.ok(result.includes("parallel() takes functions, not promises"), "should carry a mechanics how-to line");
   });
 
   it("is a multi-line string", async () => {
-    const { buildForcedWorkflowPrompt } = await load();
-    const result = buildForcedWorkflowPrompt("test");
+    const { buildArmedWorkflowPrompt } = await load();
+    const result = buildArmedWorkflowPrompt("test");
     assert.ok(result.includes("\n"), "should contain \n");
     assert.ok(result.includes("---"), "should contain ---");
   });
@@ -1194,7 +1209,7 @@ describe("installWorkflowEditor", () => {
 
     assert.deepEqual(result, {
       action: "transform",
-      text: mod.buildForcedWorkflowPrompt(text),
+      text: mod.buildArmedWorkflowPrompt(text),
     });
   });
 
@@ -1232,10 +1247,20 @@ describe("installWorkflowEditor", () => {
     assert.ok(inputHandler, "input handler should be registered");
     const result = inputHandler({ source: "interactive", text });
 
+    // The effort path arms on ANY substantive message, so its directive also
+    // carries the conversational-escape (skip the workflow on trivial turns).
+    const effortExtra = [effortDirective("high"), mod.EFFORT_CONVERSATIONAL_ESCAPE].filter(Boolean).join(" ");
     assert.deepEqual(result, {
       action: "transform",
-      text: mod.buildForcedWorkflowPrompt(text, effortDirective("high")),
+      text: mod.buildArmedWorkflowPrompt(text, effortExtra),
     });
+    const transformed = (result as { text: string }).text;
+    assert.match(
+      transformed,
+      /skip the workflow and just respond directly/,
+      "effort path allows skipping the workflow",
+    );
+    assert.ok(!/\bMUST\b/.test(transformed), "effort path must not force with MUST");
     assert.ok(tools.includes(mod.WORKFLOW_TOOL_NAME), "effort mode should still add the workflow tool");
   });
 

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createEffortState, effortDirective, isSubstantive, registerEffortCommand } from "../src/effort-command.js";
-import { buildForcedWorkflowPrompt } from "../src/workflow-editor.js";
+import { buildArmedWorkflowPrompt } from "../src/workflow-editor.js";
 
 test("effortDirective returns a tier nudge for high/ultra, nothing for off", () => {
   assert.equal(effortDirective("off"), undefined);
@@ -16,11 +16,11 @@ test("isSubstantive accepts real requests, rejects terse text and slash commands
   assert.equal(isSubstantive("    "), false);
 });
 
-test("buildForcedWorkflowPrompt appends the extra directive only when provided", () => {
-  const base = buildForcedWorkflowPrompt("do X");
+test("buildArmedWorkflowPrompt appends the extra directive only when provided", () => {
+  const base = buildArmedWorkflowPrompt("do X");
   assert.ok(!/ULTRA/.test(base), "no directive by default");
   assert.ok(base.startsWith("do X"));
-  const ultra = buildForcedWorkflowPrompt("do X", effortDirective("ultra"));
+  const ultra = buildArmedWorkflowPrompt("do X", effortDirective("ultra"));
   assert.match(ultra, /ULTRA/, "ultra directive appended");
   assert.ok(ultra.startsWith("do X"));
 });
