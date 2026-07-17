@@ -15,11 +15,12 @@ import {
   saveWorkflowSettingsForCwd,
   UsageLimitScheduler,
   WorkflowManager,
+  WorkflowManagerRegistry,
 } from "../src/index.js";
 
 export default function extension(pi: ExtensionAPI) {
-  // Single manager/storage shared by the workflow tool and the /workflows command,
-  // so background runs started by the tool are reachable from the command.
+  // Preserve one default manager/storage for the slash command and TUI. The
+  // registry adds one shared manager per explicit canonical cwd for tool controls.
   const cwd = process.cwd();
   const storage = createWorkflowStorage(cwd);
   const settings = loadWorkflowSettings({ cwd });
@@ -31,17 +32,46 @@ export default function extension(pi: ExtensionAPI) {
     defaultAgentRetries: settings.defaultAgentRetries,
     persistAgentSessions: settings.persistAgentSessions,
   });
+  let deliveryReady = false;
+  const usageLimitSchedulers = new Map<WorkflowManager, UsageLimitScheduler>();
+  const ensureUsageLimitScheduler = (registeredManager: WorkflowManager) => {
+    if (!usageLimitSchedulers.has(registeredManager)) {
+      usageLimitSchedulers.set(registeredManager, new UsageLimitScheduler(registeredManager));
+    }
+  };
+  const managerRegistry = new WorkflowManagerRegistry({
+    defaultCwd: cwd,
+    defaultManager: manager,
+    createManager: (managerCwd) => {
+      const managerStorage = createWorkflowStorage(managerCwd);
+      const managerSettings = loadWorkflowSettings({ cwd: managerCwd });
+      return new WorkflowManager({
+        cwd: managerCwd,
+        loadSavedWorkflow: (name) => managerStorage.load(name)?.script,
+        defaultAgentTimeoutMs: managerSettings.defaultAgentTimeoutMs ?? null,
+        concurrency: managerSettings.defaultConcurrency,
+        defaultAgentRetries: managerSettings.defaultAgentRetries,
+        persistAgentSessions: managerSettings.persistAgentSessions,
+      });
+    },
+    onCreate: (createdManager, managerCwd) => {
+      ensureUsageLimitScheduler(createdManager);
+      if (deliveryReady) {
+        installResultDelivery(pi, createdManager, {
+          loadSettings: () => loadWorkflowSettings({ cwd: managerCwd }),
+          getActiveSessionId: () => createdManager.getSessionId(),
+        });
+      }
+    },
+  });
 
-  const workflowTool = createWorkflowTool({ cwd, manager, storage });
+  const workflowTool = createWorkflowTool({ cwd, managerRegistry, storage });
   pi.registerTool(workflowTool);
-  // Auto-resume runs that paused on a provider usage limit once the quota is
-  // likely refilled. Standalone: only consumes the manager's public surface, so
-  // it stays decoupled from manager/persistence internals. Its constructor also
-  // re-arms any run that was already paused-on-usage_limit before this process
-  // started (cold start), so restarting pi doesn't strand a paused run.
-  const usageLimitScheduler = new UsageLimitScheduler(manager);
+  // Auto-resume runs that pause on provider usage limits in every canonical-cwd
+  // manager. Constructors also re-arm persisted usage_limit pauses after restart.
   pi.on("session_shutdown", () => {
-    usageLimitScheduler.dispose();
+    for (const scheduler of usageLimitSchedulers.values()) scheduler.dispose();
+    usageLimitSchedulers.clear();
   });
   // Standing /effort opt-in (off|high|ultra): auto-arms a workflow for substantive
   // messages, like CC's ultracode. Shared with the editor's input hook below and
@@ -60,13 +90,13 @@ export default function extension(pi: ExtensionAPI) {
   pi.on("session_start", (_event: unknown, ctx: ExtensionContext) => {
     // Tell the manager the session's main model so "explore" agents auto-tier
     // down to a lighter same-family sibling (e.g. Claude → Haiku).
-    manager.setMainModel(ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
+    managerRegistry.setMainModel(ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
     // Share the host session's model registry so tier/phase routing resolves
     // extension-registered providers (e.g. ollama-cloud) consistently. Set it
     // before activating the tool: the tool's promptGuidelines read the
     // manager's registry lazily, so tool-registry refreshes from here on
     // advertise the shared registry's models.
-    manager.setModelRegistry(ctx.modelRegistry);
+    managerRegistry.setModelRegistry(ctx.modelRegistry);
     const active = pi.getActiveTools();
     if (!active.includes(workflowTool.name)) {
       pi.setActiveTools([...active, workflowTool.name]);
@@ -75,14 +105,20 @@ export default function extension(pi: ExtensionAPI) {
     // sessions, but the navigator/task panel show only the current session's runs.
     // Switching back to a previous session re-shows that session's runs.
     try {
-      manager.setSessionId(ctx.sessionManager?.getSessionId());
+      managerRegistry.setSessionId(ctx.sessionManager?.getSessionId());
     } catch {
       // sessionManager may be unavailable in some contexts — fall back to global history.
     }
     // Deliver a background run's result into the conversation when it finishes.
     // The live settings loader lets `deliveredResultMaxChars` take effect without
     // a restart.
-    installResultDelivery(pi, manager, { loadSettings: () => loadWorkflowSettings({ cwd }) });
+    deliveryReady = true;
+    managerRegistry.forEach((registeredManager, managerCwd) => {
+      installResultDelivery(pi, registeredManager, {
+        loadSettings: () => loadWorkflowSettings({ cwd: managerCwd }),
+        getActiveSessionId: () => registeredManager.getSessionId(),
+      });
+    });
     // Live "workflows running" panel below the input (focus + enter to open).
     // Pass a live settings loader so /workflows-progress (compact|detailed) takes
     // effect without a restart.

@@ -8,6 +8,7 @@ import {
   type SchedulableWorkflowManager,
   UsageLimitScheduler,
 } from "../src/usage-limit-scheduler.js";
+import type { AutomaticResumeOptions } from "../src/workflow-manager.js";
 
 // ---- test doubles -----------------------------------------------------------
 
@@ -77,14 +78,14 @@ class FakePersistence {
 
 class FakeManager extends EventEmitter implements SchedulableWorkflowManager {
   readonly persistence = new FakePersistence();
-  resumeImpl: (runId: string) => Promise<boolean> = async () => false;
+  resumeImpl: (runId: string, options: AutomaticResumeOptions) => Promise<boolean> = async () => false;
 
   listAllRuns(): PersistedRunState[] {
     return this.persistence.list();
   }
 
-  resume(runId: string): Promise<boolean> {
-    return this.resumeImpl(runId);
+  resume(runId: string, options: AutomaticResumeOptions): Promise<boolean> {
+    return this.resumeImpl(runId, options);
   }
 
   getPersistence(): RunPersistence {
@@ -178,9 +179,9 @@ test("live pause: arms a timer that calls manager.resume() on fire", async () =>
   const manager = new FakeManager();
   manager.persistence.seed(makeRun({ resetHint: "resets in 10m" }));
   const clock = createFakeClock();
-  const resumedRunIds: string[] = [];
-  manager.resumeImpl = async (runId) => {
-    resumedRunIds.push(runId);
+  const resumeCalls: Array<{ runId: string; options: AutomaticResumeOptions }> = [];
+  manager.resumeImpl = async (runId, options) => {
+    resumeCalls.push({ runId, options });
     return true;
   };
 
@@ -198,7 +199,11 @@ test("live pause: arms a timer that calls manager.resume() on fire", async () =>
   clock.fireAll();
   await flush();
 
-  assert.deepEqual(resumedRunIds, ["run-1"], "resume() was called when the timer fired");
+  assert.deepEqual(
+    resumeCalls,
+    [{ runId: "run-1", options: { intent: "automatic" } }],
+    "scheduler marks resume intent as automatic",
+  );
   scheduler.dispose();
 });
 

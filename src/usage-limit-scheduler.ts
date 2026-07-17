@@ -17,13 +17,14 @@
  */
 
 import type { PersistedRunState, RunPersistence, RunStatus } from "./run-persistence.js";
+import type { AutomaticResumeOptions } from "./workflow-manager.js";
 
 /** Narrow surface this scheduler depends on — satisfied by WorkflowManager. */
 export interface SchedulableWorkflowManager {
   on(event: string, listener: (...args: any[]) => void): unknown;
   off(event: string, listener: (...args: any[]) => void): unknown;
   listAllRuns(): PersistedRunState[];
-  resume(runId: string): Promise<boolean>;
+  resume(runId: string, options: AutomaticResumeOptions): Promise<boolean>;
   getPersistence(): RunPersistence;
 }
 
@@ -298,7 +299,7 @@ export class UsageLimitScheduler {
 
     let resumed = false;
     try {
-      resumed = await this.manager.resume(runId);
+      resumed = await this.manager.resume(runId, { intent: "automatic" });
     } catch (err) {
       this.diagnostic(`[usage-limit-scheduler] ${runId}: resume() threw`, err);
       resumed = false;

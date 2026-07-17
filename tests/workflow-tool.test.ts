@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { AgentUsage } from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
-import { WorkflowManager } from "../src/workflow-manager.js";
+import { WorkflowManager, WorkflowManagerRegistry } from "../src/workflow-manager.js";
 import { backgroundStartedText, createWorkflowTool, modelRoutingGuideline } from "../src/workflow-tool.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
@@ -203,6 +203,185 @@ test("createWorkflowTool prepareArguments strips javascript fences", () => {
   }
 });
 
+test("createWorkflowTool exposes optional action, cwd, and runId without requiring script in the schema", () => {
+  const tool = createWorkflowTool();
+  const parameters = tool.parameters as {
+    properties?: Record<string, { anyOf?: unknown[] }>;
+    required?: string[];
+  };
+
+  assert.ok(parameters.properties?.action);
+  assert.ok(parameters.properties?.cwd);
+  assert.ok(parameters.properties?.runId);
+  assert.equal(parameters.required?.includes("script") ?? false, false);
+});
+
+test("createWorkflowTool prepareArguments keeps omitted action as a legacy run", () => {
+  const tool = createWorkflowTool();
+  const prepare = tool.prepareArguments as (args: unknown) => { action?: string; script: string };
+  const result = prepare({ script: " const x = 1 " });
+
+  assert.equal(result.action, undefined);
+  assert.equal(result.script, "const x = 1");
+});
+
+test("createWorkflowTool prepareArguments validates action-specific field combinations strictly", () => {
+  const tool = createWorkflowTool();
+  const prepare = tool.prepareArguments as (args: unknown) => unknown;
+
+  assert.throws(() => prepare({ action: "run" }), /script.*required/i);
+  assert.throws(() => prepare({ action: "status", script: "return 1" }), /status.*script/i);
+  assert.throws(() => prepare({ action: "status", background: true }), /status.*background/i);
+  assert.throws(() => prepare({ action: "resume" }), /resume.*runId/i);
+  assert.throws(() => prepare({ action: "resume", runId: "r1", args: {} }), /resume.*args/i);
+  assert.throws(() => prepare({ action: "resume", runId: "r1", resumeFromRunId: "r0" }), /resume.*resumeFromRunId/i);
+  assert.throws(() => prepare({ action: "stop" }), /stop.*runId/i);
+  assert.throws(() => prepare({ action: "stop", runId: "r1", tokenBudget: 10 }), /stop.*tokenBudget/i);
+  assert.throws(() => prepare({ action: "invalid", runId: "r1" }), /action/i);
+  assert.throws(() => prepare({ action: "status", runId: "../other-project" }), /path-safe/i);
+  assert.throws(() => prepare({ script: "return 1", runId: "r1" }), /runId/i);
+  assert.throws(() => prepare({ script: "return 1", resumeFromRunId: "../other-project" }), /path-safe/i);
+});
+
+test("createWorkflowTool canonicalizes an explicit cwd during argument preparation", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-tool-cwd-"));
+  const link = `${cwd}-link`;
+  try {
+    symlinkSync(cwd, link, "dir");
+    const tool = createWorkflowTool({ cwd });
+    const prepare = tool.prepareArguments as (args: unknown) => { action: string; cwd: string; runId: string };
+    const result = prepare({ action: "status", cwd: link, runId: "r1" });
+    assert.equal(result.cwd, cwd);
+  } finally {
+    rmSync(link, { force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("createWorkflowTool routes run/status/resume/stop through the canonical cwd manager", async () => {
+  const first = mkdtempSync(join(tmpdir(), "pi-dw-tool-first-"));
+  const second = mkdtempSync(join(tmpdir(), "pi-dw-tool-second-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-tool-home-"));
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const registry = new WorkflowManagerRegistry({
+        createManager(cwd) {
+          return new WorkflowManager({
+            cwd,
+            agent: {
+              async run() {
+                return "ok";
+              },
+            },
+          });
+        },
+      });
+      const tool = createWorkflowTool({ cwd: first, managerRegistry: registry });
+      const execute = tool.execute as (...args: any[]) => Promise<any>;
+      const runResult = await execute(
+        "call-run",
+        {
+          action: "run",
+          cwd: second,
+          script: `export const meta = { name: 'tool_actions', description: 'tool actions' }
+const value = await agent('work', { label: 'worker' })
+return { value, cwd }`,
+          background: false,
+        },
+        undefined,
+        () => {},
+        {},
+      );
+      const runId = runResult.details.runId as string;
+      assert.equal(runResult.details.result.cwd, second);
+      assert.equal(registry.get(first).listAllRuns().length, 0, "default cwd namespace remains untouched");
+
+      const statusResult = await execute(
+        "call-status",
+        { action: "status", cwd: second, runId },
+        undefined,
+        () => {},
+        {},
+      );
+      assert.equal(statusResult.details.run.runId, runId);
+      assert.equal(statusResult.details.run.cwd, second);
+      assert.equal("script" in statusResult.details.run, false);
+      assert.equal("args" in statusResult.details.run, false);
+
+      registry.get(first).getPersistence().save({
+        runId: "foreign-namespace",
+        workflowName: "foreign",
+        script: "secret foreign script",
+        status: "completed",
+        phases: [],
+        agents: [],
+        logs: [],
+        startedAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      });
+      const listResult = await execute("call-status-list", { action: "status", cwd: second }, undefined, () => {}, {});
+      assert.ok(listResult.details.runs.length <= 20);
+      assert.equal(
+        listResult.details.runs.some((run: { runId: string }) => run.runId === "foreign-namespace"),
+        false,
+        "status never scans another cwd namespace",
+      );
+
+      const pausedId = "tool-paused";
+      registry
+        .get(second)
+        .getPersistence()
+        .save({
+          runId: pausedId,
+          workflowName: "tool_actions",
+          script: `export const meta = { name: 'tool_actions', description: 'tool actions' }
+return await agent('work', { label: 'worker' })`,
+          status: "paused",
+          phases: [],
+          agents: [],
+          logs: [],
+          startedAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:00:00.000Z",
+        });
+      const resumeResult = await execute(
+        "call-resume",
+        { action: "resume", cwd: second, runId: pausedId },
+        undefined,
+        () => {},
+        {},
+      );
+      assert.equal(resumeResult.details.resumed, true);
+      await new Promise((resolve) => setTimeout(resolve, 30));
+
+      const stopId = "tool-stop";
+      registry.get(second).getPersistence().save({
+        runId: stopId,
+        workflowName: "tool_actions",
+        script: "",
+        status: "paused",
+        phases: [],
+        agents: [],
+        logs: [],
+        startedAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      });
+      const stopResult = await execute(
+        "call-stop",
+        { action: "stop", cwd: second, runId: stopId },
+        undefined,
+        () => {},
+        {},
+      );
+      assert.equal(stopResult.details.stopped, true);
+      assert.equal(registry.get(second).getPersistence().load(stopId)?.status, "aborted");
+    });
+  } finally {
+    rmSync(first, { recursive: true, force: true });
+    rmSync(second, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("createWorkflowTool prepareArguments passes through args", () => {
   const tool = createWorkflowTool();
   if (tool.prepareArguments) {
@@ -271,11 +450,11 @@ function withToolTempCwd(fn: (cwd: string) => Promise<void>) {
   };
 }
 
-test("workflowToolSchema exposes resumeFromRunId as optional; script stays required", () => {
+test("workflowToolSchema exposes resumeFromRunId while control actions keep script optional", () => {
   const tool = createWorkflowTool();
   const schema = tool.parameters as { properties: Record<string, unknown>; required?: string[] };
   assert.ok(schema.properties.resumeFromRunId, "resumeFromRunId should be a schema property");
-  assert.ok((schema.required ?? []).includes("script"), "script stays required");
+  assert.ok(!(schema.required ?? []).includes("script"), "control actions do not require script at schema level");
   assert.ok(!(schema.required ?? []).includes("resumeFromRunId"), "resumeFromRunId is optional");
 });
 

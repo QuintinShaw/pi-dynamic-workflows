@@ -81,6 +81,18 @@ function withTempCwd(fn: (cwd: string) => Promise<void>) {
   };
 }
 
+async function resumeAfterSettlement(
+  manager: WorkflowManager,
+  runId: string,
+  original: Promise<unknown>,
+  settleOriginal: () => void,
+): Promise<boolean> {
+  const resumed = manager.resume(runId);
+  settleOriginal();
+  await original.catch(() => {});
+  return resumed;
+}
+
 test(
   "runSync registers the run so /workflows (listRuns) can see it",
   withTempCwd(async (cwd) => {
@@ -546,7 +558,7 @@ test(
       assert.ok((err as WorkflowError).recoverable, "abort error should be recoverable");
     }
 
-    assert.equal(errorEmitted, true, "manager should emit 'error' event on abort");
+    assert.equal(errorEmitted, false, "intentional external abort should not emit a failure event");
   }),
 );
 
@@ -790,19 +802,9 @@ test(
     assert.equal(paused, true);
     assert.equal(manager.getRun(runId)?.status, "paused");
 
-    // Resume — replays journal (empty for single-agent that never completed) and
-    // re-runs the live agent with a fresh (non-aborted) controller.
-    const resumed = await manager.resume(runId);
+    // Resume waits for the paused generation to settle before acquiring its lease.
+    const resumed = await resumeAfterSettlement(manager, runId, origPromise, () => da.resolve("resumed-done"));
     assert.equal(resumed, true, "resume should succeed");
-
-    // The resumed run should be running
-    assert.equal(manager.getRun(runId)?.status, "running", "resumed run should be running");
-
-    // Resolve the deferred agent so the resumed run's agent completes
-    da.resolve("resumed-done");
-
-    // The original promise will reject (its controller was aborted). Suppress it.
-    await origPromise.catch(() => {});
 
     // Wait for the resumed run to complete
     await new Promise((r) => setTimeout(r, 50));
@@ -849,8 +851,11 @@ return { a, b }`;
       const persisted = manager.listRuns().find((r) => r.runId === runId);
       assert.ok(persisted?.journal && persisted.journal.length >= 1, "journal should have at least one entry");
 
-      // Resume
-      const resumed = await manager.resume(runId);
+      // The original generation already has a resolved in-flight promise; wait for
+      // that settlement before the replacement acquires the lease.
+      const resumePromise = manager.resume(runId);
+      await origPromise.catch(() => {});
+      const resumed = await resumePromise;
       assert.equal(resumed, true);
 
       // Wait for resumed run to complete (agent 1 replayed from journal, agent 2 live)
@@ -1382,14 +1387,11 @@ test(
     await new Promise((resolve) => setTimeout(resolve, 20));
     manager.pause(runId);
 
-    const resumed = await manager.resume(runId);
+    const resumed = await resumeAfterSettlement(manager, runId, promise, () => da.resolve("done"));
     const persisted = manager.listRuns().find((run) => run.runId === runId);
 
     assert.equal(resumed, true);
     assert.equal(persisted?.status, "running", "listRuns should show running status after resume");
-
-    da.resolve("done");
-    await promise.catch(() => {});
   }),
 );
 
@@ -1408,18 +1410,15 @@ test(
     const { runId, promise } = manager.startInBackground(oneAgentScript);
     await new Promise((r) => setTimeout(r, 20));
     manager.pause(runId);
-    await manager.resume(runId);
+    assert.equal(await resumeAfterSettlement(manager, runId, promise, () => da.resolve("done")), true);
 
     assert.ok(resumedEvent, "resumed event should fire");
     assert.equal(resumedEvent?.runId, runId);
-
-    da.resolve("done");
-    await promise.catch(() => {});
   }),
 );
 
 test(
-  "manager emits 'error' event on abort with WorkflowError",
+  "manager suppresses 'error' events for intentional external abort",
   withTempCwd(async (cwd) => {
     const ac = new AbortController();
     const da = deferredAgent();
@@ -1443,9 +1442,7 @@ test(
       /* expected */
     }
 
-    assert.ok(capturedError, "error event should fire on abort");
-    assert.ok(capturedError?.error instanceof WorkflowError, "error should be instance of WorkflowError");
-    assert.equal(capturedError?.error.code, WorkflowErrorCode.WORKFLOW_ABORTED);
+    assert.equal(capturedError, null, "intentional external abort should not emit a failure event");
   }),
 );
 
@@ -1466,13 +1463,8 @@ test(
     assert.equal(manager.pause(runId), true);
     assert.equal(manager.getRun(runId)?.status, "paused", "should be paused after pause");
 
-    const resumed = await manager.resume(runId);
+    const resumed = await resumeAfterSettlement(manager, runId, origPromise, () => da.resolve("resumed-done"));
     assert.equal(resumed, true);
-    assert.equal(manager.getRun(runId)?.status, "running", "should be running after resume");
-
-    // Complete the resumed run
-    da.resolve("resumed-done");
-    await origPromise.catch(() => {});
     await new Promise((r) => setTimeout(r, 30));
 
     assert.equal(manager.getRun(runId)?.status, "completed", "should complete after resume finishes");
@@ -1597,16 +1589,13 @@ test(
     assert.equal(manager.pause(runId), true);
     assert.equal(manager.getRun(runId)?.status, "paused");
 
-    // First resume should succeed
-    const firstResume = await manager.resume(runId);
+    // First resume waits for the paused generation to settle, then succeeds.
+    const firstResume = await resumeAfterSettlement(manager, runId, origPromise, () => da.resolve("done"));
     assert.equal(firstResume, true, "first resume should succeed");
 
     // The resumed run is now running; second resume should return false
     const secondResume = await manager.resume(runId);
     assert.equal(secondResume, false, "second resume should return false when the resumed run is already running");
-
-    da.resolve("done");
-    await origPromise.catch(() => {});
   }),
 );
 
@@ -1660,8 +1649,8 @@ test(
     });
 
     try {
-      // Resume — executeRun calls runWorkflow which calls the mocked runner
-      const resumed = await manager.resume(runId);
+      // The mocked runner is used only after the paused generation settles.
+      const resumed = await resumeAfterSettlement(manager, runId, origPromise, () => da.resolve("old-done"));
       assert.equal(resumed, true, "resume should schedule the run");
 
       // Wait for the background executed run to process the agent error
@@ -1676,10 +1665,7 @@ test(
         "error code should be AGENT_EXECUTION_ERROR",
       );
     } finally {
-      // Resolve the original deferred promise so the first executeRun settles
       da.runner.run = async (_prompt: string) => "done";
-      da.resolve("done");
-      await origPromise.catch(() => {});
     }
   }),
 );
@@ -1732,8 +1718,8 @@ test(
     });
 
     try {
-      // Resume — the run will fail because the mocked agent throws
-      const resumed = await manager.resume(runId);
+      // Resume after the paused generation settles; the mocked agent then fails.
+      const resumed = await resumeAfterSettlement(manager, runId, origPromise, () => da.resolve("old-done"));
       assert.equal(resumed, true, "resume should schedule the run");
       await new Promise((r) => setTimeout(r, 100));
 
@@ -1748,8 +1734,6 @@ test(
       assert.equal(manager.getRun(runId)?.status, "failed", "status should remain failed after rejected pause");
     } finally {
       da.runner.run = async (_prompt: string) => "done";
-      da.resolve("done");
-      await origPromise.catch(() => {});
     }
   }),
 );
@@ -1774,8 +1758,8 @@ test(
     });
 
     try {
-      // Resume — the run will fail
-      const resumed = await manager.resume(runId);
+      // Resume after the paused generation settles; the mocked agent then fails.
+      const resumed = await resumeAfterSettlement(manager, runId, origPromise, () => da.resolve("old-done"));
       assert.equal(resumed, true, "resume should schedule the run");
       await new Promise((r) => setTimeout(r, 100));
 
@@ -1790,8 +1774,6 @@ test(
       assert.equal(manager.getRun(runId)?.status, "failed", "status should remain failed after rejected stop");
     } finally {
       da.runner.run = async (_prompt: string) => "done";
-      da.resolve("done");
-      await origPromise.catch(() => {});
     }
   }),
 );
@@ -1816,8 +1798,8 @@ test(
     });
 
     try {
-      // Resume — the run will fail
-      await manager.resume(runId);
+      // Resume after the paused generation settles; the mocked agent then fails.
+      await resumeAfterSettlement(manager, runId, origPromise, () => da.resolve("old-done"));
       await new Promise((r) => setTimeout(r, 100));
 
       // Verify the run is now in failed state
@@ -1825,10 +1807,8 @@ test(
       assert.equal(failedRun?.status, "failed", "run should be in failed state");
       assert.ok(failedRun?.error instanceof WorkflowError, "error should be a WorkflowError");
     } finally {
-      // Restore the runner so the resumed run's agent call succeeds
+      // Restore the runner so the next resume succeeds.
       da.runner.run = async (_prompt: string) => "done";
-      da.resolve("done");
-      await origPromise.catch(() => {});
     }
 
     // Resume the failed run — resume() allows failed status

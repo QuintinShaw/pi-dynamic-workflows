@@ -36,6 +36,33 @@ Pi writes and starts the workflow in the background. A live panel tracks progres
 
 Keyword triggering is on by default: use the bounded word **workflow** or **workflows** in a message to force workflow mode, or run `/workflows run <prompt>` explicitly. Identifier-like text and paths such as `myworkflow`, `workflow_name`, and `src/workflow-editor.ts` do not trigger. You can change the keyword with `/workflows-trigger set pi-workflow` or disable it with `/workflows-trigger off`.
 
+## Assistant `workflow` tool API
+
+The original run shape remains valid: omitting `action` is exactly the same as `action: "run"`. Flat control actions let an assistant recover a run without asking the user to type a slash command.
+
+| Action | Required | Optional | Rejected |
+| --- | --- | --- | --- |
+| omitted / `"run"` | `script` | `cwd`, `args`, `background`, `maxAgents`, `concurrency`, `agentRetries`, `agentTimeoutMs`, `tokenBudget` | `runId` |
+| `"status"` | — | `cwd`, `runId` | script and all execution options |
+| `"resume"` | `runId` | `cwd` | script and all execution options |
+| `"stop"` | `runId` | `cwd` | script and all execution options |
+
+```json
+{ "action": "status", "cwd": "/workspace/project", "runId": "audit-abc123" }
+```
+
+`cwd` may be any existing host-accessible directory. The runtime checks that it exists and is a directory, canonicalizes it with `realpath`, and uses that canonical value for both execution and its isolated persistence namespace. It never calls global `process.chdir()`. Host permission callbacks remain responsible for access policy; there is no extension-owned approved-root allowlist.
+
+`status` with a run ID returns one redacted metadata record. Without an ID it returns at most 20 recent records from that cwd namespace, including persisted runs from other sessions for recovery. Status omits scripts, arguments, agent prompts/history, logs, journal values, and workflow results, and never scans another cwd namespace.
+
+`resume` acquires the persisted run lease before reloading state, replays the journaled prefix once, and restores the captured effective limits, concurrency, retries, timeout, and token budget. The original session remains provenance; the requesting live session becomes the delivery target. `stop` requires the active lease owner or atomically acquires the lease for a persisted paused run. It does not call a model.
+
+New run files include canonical `cwd`/`projectKey`, `originSessionId`/`deliverySessionId`, `executionOptions`, and a bounded deterministic `terminalSnapshot` for completed, failed, or explicitly aborted runs. Host-loss recovery is nonterminal (`paused` with `pauseReason: "host_lost"`) and deliberately has no terminal snapshot. Legacy JSON remains readable with canonical namespace identity, legacy `sessionId` provenance, and deterministic historical execution defaults.
+
+Runtime consumers can import `WorkflowToolAction`, `WorkflowToolInput`, `WorkflowRunMetadata`, `PersistedExecutionOptions`, `TerminalSnapshot`, `WorkflowManagerRegistry`, `canonicalWorkflowCwd`, and the related manager/persistence option types from the package root.
+
+If another Pi extension has already installed a custom editor component, pi-dynamic-workflows leaves it in place and keeps the submit-time workflow trigger active. In that compatibility mode, the animated keyword highlight and Backspace one-shot disarm affordance are skipped because the existing editor remains responsible for rendering and input handling; use `/workflows-trigger off` or `/workflows-trigger set <word>` when you need to discuss workflow/workflows without auto-triggering, including in future sessions. Editor composition is load-order dependent: whichever extension installs a visual editor last owns the editor surface, while pi-dynamic-workflows still keeps its submit-time hook registered.
+
 ## How it works
 
 ![A prompt becomes deterministic orchestration, parallel routed agents, verification, and one result](https://raw.githubusercontent.com/QuintinShaw/pi-dynamic-workflows/main/assets/readme/workflow.png)

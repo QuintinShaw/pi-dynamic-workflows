@@ -78,6 +78,10 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   /** Retry attempts after a recoverable agent failure. Default 0. */
   agentRetries?: number;
   tokenBudget?: number | null;
+  /** Persisted cumulative usage from earlier generations of this run. */
+  initialTokenUsage?: Partial<SharedRuntime["tokenUsage"]>;
+  /** Persisted cumulative budget spend; defaults to initialTokenUsage.total. */
+  initialTokenSpend?: number;
   signal?: AbortSignal;
   /** Maximum number of agents allowed in this run. Default: 1000 */
   maxAgents?: number;
@@ -301,11 +305,19 @@ export async function runWorkflow<T = unknown>(
     options.concurrency ?? Math.max(1, (globalThis.navigator?.hardwareConcurrency ?? 8) - 2),
   );
   // Global caps + budget are shared with any nested workflow() so they hold across nesting.
+  const initialUsage = options.initialTokenUsage;
   const shared: SharedRuntime = options.sharedRuntime ?? {
     limiter: createLimiter(concurrency),
     agentCount: 0,
-    spent: 0,
-    tokenUsage: { input: 0, output: 0, total: 0, cost: 0, cacheRead: 0, cacheWrite: 0 },
+    spent: options.initialTokenSpend ?? initialUsage?.total ?? 0,
+    tokenUsage: {
+      input: initialUsage?.input ?? 0,
+      output: initialUsage?.output ?? 0,
+      total: initialUsage?.total ?? 0,
+      cost: initialUsage?.cost ?? 0,
+      cacheRead: initialUsage?.cacheRead ?? 0,
+      cacheWrite: initialUsage?.cacheWrite ?? 0,
+    },
     depth: 0,
   };
   const limiter = shared.limiter;
@@ -356,36 +368,7 @@ export async function runWorkflow<T = unknown>(
       );
     }
 
-    if (budget.total !== null && budget.remaining() <= 0) {
-      throw new WorkflowError("workflow token budget exhausted", WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED, {
-        recoverable: false,
-      });
-    }
-
     const assignedPhase = agentOptions.phase ?? state.currentPhase;
-
-    // Per-phase soft sub-budget gate: a noisy phase can exhaust its own ceiling
-    // without touching the run's overall budget. Soft (spent accrues post-agent),
-    // warns once at ~80%, throws at 100%. Scripts can try/catch around a phase's
-    // work so later phases still proceed.
-    if (assignedPhase) {
-      const pb = state.phaseBudgets.get(assignedPhase);
-      if (pb) {
-        const phaseSpent = shared.spent - pb.startSpent;
-        if (phaseSpent >= pb.budget) {
-          throw new WorkflowError(
-            `phase "${assignedPhase}" token sub-budget exhausted (${pb.budget})`,
-            WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED,
-            { recoverable: false },
-          );
-        }
-        if (!pb.warned && phaseSpent >= pb.budget * 0.8) {
-          pb.warned = true;
-          log(`phase "${assignedPhase}" at ${Math.round((phaseSpent / pb.budget) * 100)}% of its token sub-budget`);
-        }
-      }
-    }
-
     const requestedLabel = agentOptions.label?.trim();
 
     // Resolve a named agentType to its bound definition (tools/model/prompt).
@@ -448,6 +431,36 @@ export async function runWorkflow<T = unknown>(
     // A genuine miss (no journal entry, or the hash changed) marks where the
     // unchanged prefix ends; this call and every later one then run live.
     if (!hashMatches || cachedEmptyOutput) state.firstMiss = Math.min(state.firstMiss, callIndex);
+
+    // Replay is free and must happen before budget gates: a fully cached run can
+    // finish at zero remaining budget, while the first genuinely fresh call is blocked.
+    if (budget.total !== null && budget.remaining() <= 0) {
+      throw new WorkflowError("workflow token budget exhausted", WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED, {
+        recoverable: false,
+      });
+    }
+
+    // Per-phase soft sub-budget gate: a noisy phase can exhaust its own ceiling
+    // without touching the run's overall budget. Soft (spent accrues post-agent),
+    // warns once at ~80%, throws at 100%. Scripts can try/catch around a phase's
+    // work so later phases still proceed.
+    if (assignedPhase) {
+      const pb = state.phaseBudgets.get(assignedPhase);
+      if (pb) {
+        const phaseSpent = shared.spent - pb.startSpent;
+        if (phaseSpent >= pb.budget) {
+          throw new WorkflowError(
+            `phase "${assignedPhase}" token sub-budget exhausted (${pb.budget})`,
+            WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED,
+            { recoverable: false },
+          );
+        }
+        if (!pb.warned && phaseSpent >= pb.budget * 0.8) {
+          pb.warned = true;
+          log(`phase "${assignedPhase}" at ${Math.round((phaseSpent / pb.budget) * 100)}% of its token sub-budget`);
+        }
+      }
+    }
 
     return limiter(async () => {
       const timeout = agentOptions.timeoutMs !== undefined ? agentOptions.timeoutMs : agentTimeoutMs;
@@ -557,13 +570,26 @@ export async function runWorkflow<T = unknown>(
             });
             return result;
           } catch (error) {
-            if (options.signal?.aborted) throw error;
+            if (options.signal?.aborted) {
+              // Providers can report usage before the agent promise settles. A
+              // deliberate pause/abort must checkpoint that spend without
+              // fabricating an agent failure event, or resume can spend it again.
+              if (usage) {
+                recordTokens(null);
+                options.onTokenUsage?.(shared.tokenUsage);
+              }
+              throw error;
+            }
 
             const workflowError = wrapError(error, { agentLabel: label });
             logger.error(`agent ${label} attempt ${attempt}/${maxAttempts} failed: ${workflowError.message}`);
             const tokens = recordTokens(null);
 
             if (workflowError.recoverable && attempt < maxAttempts) {
+              // This attempt consumed provider tokens even though it will retry.
+              // Checkpoint cumulative spend now; otherwise a later pause/resume
+              // can incorrectly reclaim the failed attempt's budget.
+              options.onTokenUsage?.(shared.tokenUsage);
               log(
                 `agent "${label}" attempt ${attempt}/${maxAttempts} failed: ${workflowError.code} ${workflowError.message}; retrying`,
               );

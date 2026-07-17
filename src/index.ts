@@ -66,8 +66,23 @@ export {
   saveModelTierConfig,
   sortedTierNames,
 } from "./model-tier-config.js";
-export type { PersistedRunState, RunPersistence, RunStatus } from "./run-persistence.js";
-export { createRunPersistence, generateRunId } from "./run-persistence.js";
+export type {
+  PersistedExecutionOptions,
+  PersistedRunState,
+  RunLease,
+  RunPersistence,
+  RunStatus,
+  TerminalRunStatus,
+  TerminalSnapshot,
+} from "./run-persistence.js";
+export {
+  assertSafeRunId,
+  createRunPersistence,
+  createTerminalSnapshot,
+  generateRunId,
+  isSafeRunId,
+  LEGACY_EXECUTION_OPTIONS,
+} from "./run-persistence.js";
 export {
   parseCommandArgs,
   registerAllSavedWorkflows,
@@ -110,10 +125,17 @@ export {
   WorkflowEditor,
   type WorkflowModeState,
 } from "./workflow-editor.js";
-export type { ManagedRun, WorkflowManagerOptions } from "./workflow-manager.js";
-export { WorkflowManager } from "./workflow-manager.js";
+export type {
+  ExecOptions,
+  ManagedRun,
+  WorkflowManagerOptions,
+  WorkflowManagerRegistryOptions,
+  WorkflowRunMetadata,
+} from "./workflow-manager.js";
+export { WorkflowManager, WorkflowManagerRegistry } from "./workflow-manager.js";
 export type { WorkflowProjectPaths } from "./workflow-paths.js";
 export {
+  canonicalWorkflowCwd,
   WORKFLOW_HOME_RELATIVE_DIR,
   WORKFLOW_PROJECTS_SUBDIR,
   workflowHomeDir,
@@ -131,7 +153,7 @@ export {
   saveWorkflowSettings,
   saveWorkflowSettingsForCwd,
 } from "./workflow-settings.js";
-export type { WorkflowToolInput, WorkflowToolOptions } from "./workflow-tool.js";
+export type { WorkflowToolAction, WorkflowToolInput, WorkflowToolOptions } from "./workflow-tool.js";
 export { backgroundStartedText, createWorkflowTool } from "./workflow-tool.js";
 export {
   keyToAction,

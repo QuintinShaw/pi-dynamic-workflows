@@ -106,7 +106,7 @@ test(
       assert.ok((err as WorkflowError).recoverable, "abort error should be recoverable");
     }
 
-    assert.equal(errorEmitted, true, "manager should emit 'error' event on abort");
+    assert.equal(errorEmitted, false, "intentional external abort should not emit a failure event");
   }),
 );
 
@@ -338,42 +338,38 @@ test(
 test(
   "resume full cycle: pause then resume then complete",
   withTempCwd(async (cwd) => {
-    const da = deferredAgent();
-    const manager = new WorkflowManager({ cwd, agent: da.runner });
+    const pending: Array<(value: unknown) => void> = [];
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run() {
+          return new Promise((resolve) => pending.push(resolve));
+        },
+      },
+    });
     manager.on("error", () => {});
 
     const { runId, promise: origPromise } = manager.startInBackground(oneAgentScript);
-    await new Promise((r) => setTimeout(r, 20));
+    await new Promise((r) => setImmediate(r));
 
-    // Pause while the deferred agent is in-flight
-    const paused = manager.pause(runId);
-    assert.equal(paused, true);
+    assert.equal(manager.pause(runId), true);
     assert.equal(manager.getRun(runId)?.status, "paused");
 
-    // Resume — replays journal (empty for single-agent that never completed) and
-    // re-runs the live agent with a fresh (non-aborted) controller.
-    const resumed = await manager.resume(runId);
-    assert.equal(resumed, true, "resume should succeed");
-
-    // The resumed run should be running
+    // Resume must wait for the paused generation to settle before acquiring its lease.
+    const resumePromise = manager.resume(runId);
+    pending.shift()?.("paused-generation-done");
+    await origPromise.catch(() => {});
+    assert.equal(await resumePromise, true, "resume should succeed after settlement");
     assert.equal(manager.getRun(runId)?.status, "running", "resumed run should be running");
 
-    // Resolve the deferred agent so the resumed run's agent completes
-    da.resolve("resumed-done");
-
-    // The original promise will reject (its controller was aborted). Suppress it.
-    await origPromise.catch(() => {});
-
-    // Wait for the resumed run to complete
-    await new Promise((r) => setTimeout(r, 50));
+    const completed = new Promise<void>((resolve) => manager.once("complete", () => resolve()));
+    pending.shift()?.("resumed-done");
+    await completed;
 
     const finalRun = manager.getRun(runId);
     assert.equal(finalRun?.status, "completed", "resumed run should complete successfully");
     assert.equal(finalRun?.result?.result?.a, "resumed-done", "resumed run should have the agent result");
-
-    // The run should also appear in listRuns as completed
-    const persisted = manager.listRuns().find((r) => r.runId === runId);
-    assert.equal(persisted?.status, "completed");
+    assert.equal(manager.listRuns().find((r) => r.runId === runId)?.status, "completed");
   }),
 );
 
@@ -658,7 +654,7 @@ test(
 );
 
 test(
-  "manager emits 'resumed' and 'error' events",
+  "manager emits 'resumed' and suppresses failure events for intentional aborts",
   withTempCwd(async (cwd) => {
     const _ac = new AbortController();
     const da = deferredAgent();
@@ -674,13 +670,13 @@ test(
     const { runId, promise: origPromise } = manager.startInBackground(oneAgentScript);
     await new Promise((r) => setTimeout(r, 20));
     manager.pause(runId);
-    await manager.resume(runId);
+    const resumePromise = manager.resume(runId);
+    da.resolve("done");
+    await origPromise.catch(() => {});
+    assert.equal(await resumePromise, true);
 
     assert.ok(resumedEvent, "resumed event should fire on resume");
     assert.equal(resumedEvent?.runId, runId);
-
-    da.resolve("done");
-    await origPromise.catch(() => {});
 
     // Now test error event on abort
     let capturedError: { runId: string; error: WorkflowError } | null = null;
@@ -704,8 +700,6 @@ test(
       /* expected */
     }
 
-    assert.ok(capturedError, "error event should fire on abort");
-    assert.ok(capturedError?.error instanceof WorkflowError, "error should be instance of WorkflowError");
-    assert.equal(capturedError?.error.code, WorkflowErrorCode.WORKFLOW_ABORTED);
+    assert.equal(capturedError, null, "intentional external abort should not emit a failure event");
   }),
 );

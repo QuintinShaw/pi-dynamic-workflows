@@ -151,19 +151,36 @@ function deliveredMaxChars(opts: { loadSettings?: () => WorkflowSettings }): num
 export function installResultDelivery(
   pi: ExtensionAPI,
   manager: WorkflowManager,
-  opts: { loadSettings?: () => WorkflowSettings } = {},
+  opts: { loadSettings?: () => WorkflowSettings; getActiveSessionId?: () => string | undefined } = {},
 ): void {
+  type PendingDelivery = { sessionId: string; content: string };
+  type DeliveryHolder = {
+    pi: ExtensionAPI;
+    getActiveSessionId?: () => string | undefined;
+    pending: PendingDelivery[];
+  };
   // Mutable holder on manager so shared across re-calls (e.g. session_start after /reload).
-  const m = manager as unknown as { __deliveryInstalled?: boolean; __holder?: { pi: ExtensionAPI } };
+  const m = manager as unknown as { __deliveryInstalled?: boolean; __holder?: DeliveryHolder };
+  const flushPending = () => {
+    const holder = m.__holder;
+    const active = holder?.getActiveSessionId?.();
+    if (!holder || !active) return;
+    const ready = holder.pending.filter((item) => item.sessionId === active);
+    holder.pending = holder.pending.filter((item) => item.sessionId !== active);
+    for (const item of ready) deliver(item.content);
+  };
   if (m.__deliveryInstalled) {
-    // Refresh pi reference only — listeners stay registered.
-    if (m.__holder) m.__holder.pi = pi;
+    if (m.__holder) {
+      m.__holder.pi = pi;
+      m.__holder.getActiveSessionId = opts.getActiveSessionId;
+    }
+    flushPending();
     return;
   }
   m.__deliveryInstalled = true;
-  m.__holder = { pi };
+  m.__holder = { pi, getActiveSessionId: opts.getActiveSessionId, pending: [] };
 
-  const deliver = (content: string) => {
+  function deliver(content: string) {
     try {
       const ret = m.__holder?.pi.sendMessage(
         { customType: "workflow-result", content, display: true },
@@ -176,6 +193,17 @@ export function installResultDelivery(
     } catch {
       // Synchronous failure (e.g. stale ctx) — result still visible via /workflows.
     }
+  }
+
+  const deliverToRunSession = (run: ManagedRun, content: string) => {
+    const target = run.deliverySessionId;
+    const getActive = m.__holder?.getActiveSessionId;
+    if (!target || !getActive) {
+      deliver(content);
+      return;
+    }
+    if (getActive() === target) deliver(content);
+    else m.__holder?.pending.push({ sessionId: target, content });
   };
 
   manager.on("complete", ({ runId }: { runId: string }) => {
@@ -183,12 +211,16 @@ export function installResultDelivery(
     // Only background/resumed runs are delivered: a foreground (sync) run already
     // returns its result inline as the tool result, so re-delivering would dup it.
     if (run?.background) {
-      deliver(deliverText(run, { resultPath: persistedResultPath(manager, runId), maxChars: deliveredMaxChars(opts) }));
+      deliverToRunSession(
+        run,
+        deliverText(run, { resultPath: persistedResultPath(manager, runId), maxChars: deliveredMaxChars(opts) }),
+      );
     }
   });
   manager.on("error", ({ runId, error }: { runId: string; error?: { message?: string } }) => {
-    if (!manager.getRun(runId)?.background) return;
-    deliver(`✗ Background workflow ${runId} failed: ${error?.message ?? "unknown error"}`);
+    const run = manager.getRun(runId);
+    if (!run?.background || run.status === "paused" || run.status === "aborted") return;
+    deliverToRunSession(run, `✗ Background workflow ${runId} failed: ${error?.message ?? "unknown error"}`);
   });
   // A provider usage/quota limit checkpoints the run as paused (not failed): tell the
   // user it is resumable once their budget refills, rather than letting it look dead.
@@ -211,7 +243,10 @@ export function installResultDelivery(
       if (!manager.getRun(runId)?.background) return;
       const when = resetHint ? ` (${resetHint})` : "";
       const cause = error?.message ?? "provider usage limit reached";
-      deliver(
+      const run = manager.getRun(runId);
+      if (!run) return;
+      deliverToRunSession(
+        run,
         `⏸ Background workflow ${runId} paused: ${cause}${when}. ` +
           `Completed steps are saved — run /workflows resume ${runId} once your usage limit resets.`,
       );

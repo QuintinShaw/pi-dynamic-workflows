@@ -14,8 +14,10 @@ import {
   type WorkflowSnapshot,
 } from "./display.js";
 import { WorkflowError, WorkflowErrorCode } from "./errors.js";
+import { isSafeRunId } from "./run-persistence.js";
 import { parseWorkflowScript, type WorkflowRunResult } from "./workflow.js";
-import { WorkflowManager } from "./workflow-manager.js";
+import { WorkflowManager, WorkflowManagerRegistry } from "./workflow-manager.js";
+import { canonicalWorkflowCwd } from "./workflow-paths.js";
 import { createWorkflowStorage, type WorkflowStorage } from "./workflow-saved.js";
 import { loadWorkflowSettings } from "./workflow-settings.js";
 
@@ -58,14 +60,28 @@ export function agentTypeGuideline(cwd: string = process.cwd()): string | undefi
 }
 
 const workflowToolSchema = Type.Object({
-  script: Type.String({
-    description: [
-      "Required raw JavaScript workflow script, with no Markdown fences.",
-      "First statement: export const meta = { name: 'short_snake_case', description: 'non-empty description', phases: [{ title: 'Phase' }] }",
-      "Use phase('Name'), agent(prompt, opts), parallel(arrayOfFunctions), pipeline(items, ...stages), log(message), args, and budget. The workflow must call agent() at least once.",
-      "parallel() requires functions, not promises: await parallel(items.map(item => () => agent(...))).",
-    ].join(" "),
-  }),
+  action: Type.Optional(
+    Type.Union([Type.Literal("run"), Type.Literal("status"), Type.Literal("resume"), Type.Literal("stop")], {
+      description: "Control action. Omit for the backward-compatible legacy run behavior.",
+    }),
+  ),
+  cwd: Type.Optional(
+    Type.String({
+      description:
+        "Existing host-accessible directory used for execution and the persistence namespace. Canonicalized with realpath.",
+    }),
+  ),
+  runId: Type.Optional(Type.String({ description: "Run ID for status, resume, or stop. Forbidden for run actions." })),
+  script: Type.Optional(
+    Type.String({
+      description: [
+        "Required for run actions: raw JavaScript workflow script, with no Markdown fences.",
+        "First statement: export const meta = { name: 'short_snake_case', description: 'non-empty description', phases: [{ title: 'Phase' }] }",
+        "Use phase('Name'), agent(prompt, opts), parallel(arrayOfFunctions), pipeline(items, ...stages), log(message), args, and budget. The workflow must call agent() at least once.",
+        "parallel() requires functions, not promises: await parallel(items.map(item => () => agent(...))).",
+      ].join(" "),
+    }),
+  ),
   args: Type.Optional(
     Type.Any({ description: "Optional JSON value exposed to the workflow script as global `args`." }),
   ),
@@ -115,8 +131,13 @@ const workflowToolSchema = Type.Object({
   ),
 });
 
+export type WorkflowToolAction = "run" | "status" | "resume" | "stop";
+
 export type WorkflowToolInput = {
-  script: string;
+  action?: WorkflowToolAction;
+  cwd?: string;
+  runId?: string;
+  script?: string;
   args?: unknown;
   background?: boolean;
   maxAgents?: number;
@@ -130,8 +151,10 @@ export type WorkflowToolInput = {
 export interface WorkflowToolOptions {
   cwd?: string;
   concurrency?: number;
-  /** Shared manager so background runs are reachable from the `/workflows` command. */
+  /** Shared manager so default-cwd background runs are reachable from the `/workflows` command. */
   manager?: WorkflowManager;
+  /** Canonical-cwd manager registry used by extension hosts for multi-project control actions. */
+  managerRegistry?: WorkflowManagerRegistry;
   /** Shared saved-workflow storage. */
   storage?: WorkflowStorage;
   /** Default per-agent timeout for runs created by this tool. null means no hard timeout. */
@@ -143,28 +166,38 @@ export interface WorkflowToolOptions {
 }
 
 export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefinition<typeof workflowToolSchema, any> {
-  const storage = options.storage ?? createWorkflowStorage(options.cwd ?? process.cwd());
-  const cwd = options.cwd ?? process.cwd();
-  const defaults = resolveWorkflowToolDefaults(options, cwd);
-  const manager =
-    options.manager ??
-    new WorkflowManager({
-      cwd: options.cwd,
+  const cwd = canonicalWorkflowCwd(options.cwd ?? process.cwd());
+  const storage = options.storage ?? createWorkflowStorage(cwd);
+  const createManager = (managerCwd: string) => {
+    const managerStorage = managerCwd === cwd ? storage : createWorkflowStorage(managerCwd);
+    const defaults = resolveWorkflowToolDefaults(options, managerCwd);
+    return new WorkflowManager({
+      cwd: managerCwd,
       concurrency: defaults.concurrency,
-      loadSavedWorkflow: (name: string) => storage.load(name)?.script,
+      loadSavedWorkflow: (name: string) => managerStorage.load(name)?.script,
       defaultAgentTimeoutMs: defaults.agentTimeoutMs,
       defaultAgentRetries: defaults.agentRetries,
     });
+  };
+  const managerRegistry =
+    options.managerRegistry ??
+    new WorkflowManagerRegistry({
+      defaultCwd: cwd,
+      defaultManager: options.manager,
+      createManager,
+    });
+  // Ensure the default-cwd manager exists even before the first tool call.
+  managerRegistry.get(cwd);
 
   return defineTool({
     name: "workflow",
     label: "Workflow",
     description: [
-      "Execute a deterministic JavaScript workflow that orchestrates multiple subagents with agent(), parallel(), and pipeline().",
-      "script is required raw JavaScript. It must start with export const meta = { name, description, phases? } and must call agent() at least once.",
+      "Run or control deterministic JavaScript workflows that orchestrate multiple subagents.",
+      "Omit action (or use action='run') with a script to start a run; use status, resume, or stop with the documented control fields.",
     ].join(" "),
     promptSnippet:
-      "Run a deterministic JavaScript workflow. Required script header: export const meta = { name: 'short_snake_case', description: 'non-empty description', phases: [{ title: 'Phase' }] }.",
+      "Run or control a deterministic JavaScript workflow. Run scripts require: export const meta = { name: 'short_snake_case', description: 'non-empty description', phases: [{ title: 'Phase' }] }.",
     // Lazy accessor: the SDK re-reads definition.promptGuidelines on every
     // tool-registry refresh, so changes to the agentType registry are reflected.
     get promptGuidelines() {
@@ -200,7 +233,57 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       return normalizeWorkflowToolArgs(args);
     },
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      const script = normalizeWorkflowScript(params.script);
+      const action = params.action ?? "run";
+      const selectedCwd = canonicalWorkflowCwd(params.cwd ?? cwd);
+      const manager = managerRegistry.get(selectedCwd);
+
+      if (action === "status") {
+        if (params.runId) {
+          const run = manager.getRunMetadata(params.runId);
+          if (!run) throw new Error(`No workflow run "${params.runId}" in cwd namespace ${selectedCwd}`);
+          return {
+            content: [{ type: "text", text: JSON.stringify(run, null, 2) }],
+            details: { action, cwd: selectedCwd, run },
+          };
+        }
+        const runs = manager.listRunMetadata();
+        return {
+          content: [{ type: "text", text: JSON.stringify(runs, null, 2) }],
+          details: { action, cwd: selectedCwd, runs },
+        };
+      }
+
+      if (action === "resume") {
+        const resumed = await manager.resume(params.runId as string);
+        return {
+          content: [
+            {
+              type: "text",
+              text: resumed
+                ? `Workflow ${params.runId} resumed in ${selectedCwd}.`
+                : `Workflow ${params.runId} could not be resumed in ${selectedCwd}.`,
+            },
+          ],
+          details: { action, cwd: selectedCwd, runId: params.runId, resumed },
+        };
+      }
+
+      if (action === "stop") {
+        const stopped = manager.stop(params.runId as string);
+        return {
+          content: [
+            {
+              type: "text",
+              text: stopped
+                ? `Workflow ${params.runId} stopped in ${selectedCwd}.`
+                : `Workflow ${params.runId} could not be stopped in ${selectedCwd}.`,
+            },
+          ],
+          details: { action, cwd: selectedCwd, runId: params.runId, stopped },
+        };
+      }
+
+      const script = normalizeWorkflowScript(params.script as string);
       const parsed = parseWorkflowScript(script);
 
       // Iteration / cached-prefix reuse: resume a prior run with THIS (edited)
@@ -245,7 +328,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
         });
         return {
           content: [{ type: "text", text: backgroundStartedText(parsed.meta.name, runId) }],
-          details: { runId, background: true },
+          details: { action: "run", cwd: selectedCwd, runId, background: true },
         };
       }
 
@@ -326,6 +409,8 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           result: result.result,
           durationMs: result.durationMs,
           tokenUsage: result.tokenUsage,
+          action: "run",
+          cwd: selectedCwd,
           runId: result.runId,
         },
       };
@@ -441,11 +526,85 @@ export function resumeFailureText(manager: WorkflowManager, runId: string): stri
   return `Cannot resume workflow run "${runId}": it is not currently resumable (it may be busy under another process). Try again shortly, or start a new run.`;
 }
 
+const WORKFLOW_TOOL_FIELDS = new Set([
+  "action",
+  "cwd",
+  "runId",
+  "script",
+  "args",
+  "background",
+  "maxAgents",
+  "concurrency",
+  "agentRetries",
+  "agentTimeoutMs",
+  "tokenBudget",
+  "resumeFromRunId",
+]);
+const RUN_ONLY_FIELDS = [
+  "script",
+  "args",
+  "background",
+  "maxAgents",
+  "concurrency",
+  "agentRetries",
+  "agentTimeoutMs",
+  "tokenBudget",
+  "resumeFromRunId",
+] as const;
+
 function normalizeWorkflowToolArgs(args: unknown): WorkflowToolInput {
-  if (!args || typeof args !== "object") throw new Error("workflow requires an object argument with a script string");
+  if (!args || typeof args !== "object" || Array.isArray(args)) {
+    throw new Error("workflow requires an object argument");
+  }
   const value = args as Record<string, unknown>;
-  if (typeof value.script !== "string") throw new Error("workflow requires `script` to be a string");
-  return { ...value, script: normalizeWorkflowScript(value.script) } as WorkflowToolInput;
+  const unknown = Object.keys(value).find((field) => !WORKFLOW_TOOL_FIELDS.has(field));
+  if (unknown) throw new Error(`workflow received unknown field \`${unknown}\``);
+
+  const rawAction = value.action;
+  if (
+    rawAction !== undefined &&
+    rawAction !== "run" &&
+    rawAction !== "status" &&
+    rawAction !== "resume" &&
+    rawAction !== "stop"
+  ) {
+    throw new Error("workflow `action` must be run, status, resume, or stop");
+  }
+  const action = (rawAction ?? "run") as WorkflowToolAction;
+  if (value.cwd !== undefined && typeof value.cwd !== "string") {
+    throw new Error("workflow `cwd` must be a string");
+  }
+  if (value.runId !== undefined && (typeof value.runId !== "string" || !isSafeRunId(value.runId.trim()))) {
+    throw new Error("workflow `runId` must be a non-empty path-safe identifier");
+  }
+  if (
+    value.resumeFromRunId !== undefined &&
+    (typeof value.resumeFromRunId !== "string" || !isSafeRunId(value.resumeFromRunId.trim()))
+  ) {
+    throw new Error("workflow `resumeFromRunId` must be a non-empty path-safe identifier");
+  }
+
+  if (action === "run") {
+    if (typeof value.script !== "string") {
+      throw new Error("workflow run: `script` is required and must be a string");
+    }
+    if (Object.hasOwn(value, "runId")) throw new Error("workflow run does not accept `runId`");
+  } else {
+    const forbidden = RUN_ONLY_FIELDS.find((field) => Object.hasOwn(value, field));
+    if (forbidden) throw new Error(`workflow ${action} does not accept \`${forbidden}\``);
+    if ((action === "resume" || action === "stop") && value.runId === undefined) {
+      throw new Error(`workflow ${action} requires \`runId\``);
+    }
+  }
+
+  return {
+    ...value,
+    ...(value.action === undefined ? {} : { action }),
+    ...(typeof value.cwd === "string" ? { cwd: canonicalWorkflowCwd(value.cwd) } : {}),
+    ...(typeof value.runId === "string" ? { runId: value.runId.trim() } : {}),
+    ...(typeof value.resumeFromRunId === "string" ? { resumeFromRunId: value.resumeFromRunId.trim() } : {}),
+    ...(typeof value.script === "string" ? { script: normalizeWorkflowScript(value.script) } : {}),
+  } as WorkflowToolInput;
 }
 
 function normalizeWorkflowScript(script: string): string {

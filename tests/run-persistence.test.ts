@@ -1,5 +1,14 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -748,6 +757,217 @@ test(
 
     assert.equal(rp.load("legacy-live")?.status, "running");
     assert.equal(existsSync(join(workflowProjectPaths(cwd).runsDir, "legacy-live.json")), false);
+  }),
+);
+
+test(
+  "terminal snapshots remain idempotent across repeated saves",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd);
+    const state: PersistedRunState = {
+      runId: "terminal-idempotent",
+      workflowName: "terminal",
+      script: "export const meta = { name: 'terminal', description: 'terminal' }",
+      status: "completed",
+      phases: [],
+      agents: [],
+      logs: [],
+      result: { ok: true },
+      startedAt: "2024-01-01T00:00:00.000Z",
+      updatedAt: "2024-01-02T00:00:00.000Z",
+    };
+
+    rp.save(state);
+    const first = rp.load(state.runId)?.terminalSnapshot;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    rp.save(state);
+    assert.deepEqual(rp.load(state.runId)?.terminalSnapshot, first);
+  }),
+);
+
+test(
+  "legacy run JSON receives deterministic cwd, provenance, execution-option, and terminal fallbacks",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd);
+    const runsDir = workflowProjectPaths(cwd).runsDir;
+    mkdirSync(runsDir, { recursive: true });
+    writeFileSync(
+      join(runsDir, "legacy-defaults.json"),
+      JSON.stringify({
+        runId: "legacy-defaults",
+        workflowName: "legacy",
+        script: "export const meta = { name: 'legacy', description: 'legacy' }",
+        sessionId: "legacy-session",
+        status: "completed",
+        phases: [],
+        agents: [],
+        logs: [],
+        result: { ok: true },
+        startedAt: "2024-01-01T00:00:00.000Z",
+        updatedAt: "2024-01-02T00:00:00.000Z",
+      }),
+      "utf-8",
+    );
+
+    const loaded = rp.load("legacy-defaults");
+    assert.equal(loaded?.cwd, cwd);
+    assert.equal(loaded?.projectKey, workflowProjectPaths(cwd).key);
+    assert.equal(loaded?.originSessionId, "legacy-session");
+    assert.equal(loaded?.deliverySessionId, "legacy-session");
+    assert.deepEqual(loaded?.executionOptions, {
+      maxAgents: 1000,
+      concurrency: 8,
+      agentRetries: 0,
+      agentTimeoutMs: null,
+      tokenBudget: null,
+    });
+    assert.equal(loaded?.terminalSnapshot?.outcome, "completed");
+    assert.equal(loaded?.terminalSnapshot?.terminalAt, "2024-01-02T00:00:00.000Z");
+  }),
+);
+
+test(
+  "stale-lock takeover cannot unlink a concurrently replaced live lease",
+  withTempCwd(async (cwd) => {
+    const runsDir = workflowProjectPaths(cwd).runsDir;
+    mkdirSync(runsDir, { recursive: true });
+    const lock = join(runsDir, "takeover-race.lock");
+    writeFileSync(
+      lock,
+      JSON.stringify({
+        runId: "takeover-race",
+        runPath: join(runsDir, "takeover-race.json"),
+        pid: 2147483647,
+        startedAt: "2024-01-01T00:00:00.000Z",
+        token: "stale-token",
+      }),
+    );
+
+    let raced = false;
+    const liveToken = "live-contender";
+    const rp = createRunPersistence(cwd, {
+      renameSync(source, destination) {
+        if (!raced && source === lock) {
+          raced = true;
+          renameSync(source, destination);
+          writeFileSync(
+            lock,
+            JSON.stringify({
+              runId: "takeover-race",
+              runPath: join(runsDir, "takeover-race.json"),
+              pid: process.pid,
+              startedAt: "2026-01-01T00:00:00.000Z",
+              token: liveToken,
+            }),
+          );
+          const error = new Error("destination already claimed") as NodeJS.ErrnoException;
+          error.code = "EEXIST";
+          throw error;
+        }
+        renameSync(source, destination);
+      },
+      unlinkSync(path) {
+        if (path === lock) {
+          // Model the old read-stale/unlink race: a live contender replaces the
+          // stale file after it was inspected but before the unlink occurs.
+          writeFileSync(
+            lock,
+            JSON.stringify({
+              runId: "takeover-race",
+              runPath: join(runsDir, "takeover-race.json"),
+              pid: process.pid,
+              startedAt: "2026-01-01T00:00:00.000Z",
+              token: liveToken,
+            }),
+          );
+        }
+        unlinkSync(path);
+      },
+    });
+
+    assert.equal(rp.acquireRunLease("takeover-race"), null, "the live replacement remains the owner");
+    const owner = JSON.parse(readFileSync(lock, "utf-8")) as { token: string };
+    assert.equal(owner.token, liveToken);
+  }),
+);
+
+test(
+  "versioned decoder deeply projects known fields and rejects malformed nested state",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd);
+    const runsDir = workflowProjectPaths(cwd).runsDir;
+    mkdirSync(runsDir, { recursive: true });
+    const base = {
+      version: 2,
+      runId: "decoded",
+      workflowName: "decoded",
+      script: "export const meta = { name: 'decoded', description: 'decoded' }",
+      status: "completed",
+      phases: ["phase"],
+      currentPhase: "phase",
+      agents: [
+        {
+          id: 1,
+          label: "agent",
+          prompt: "prompt",
+          status: "done",
+          tokenUsage: { input: 1, output: 2, total: 3, cost: 4, cacheRead: 5, cacheWrite: 6, secret: "DROP" },
+          history: [{ role: "assistant", kind: "text", text: "safe", secret: "DROP" }],
+          secret: "DROP",
+        },
+      ],
+      logs: ["safe"],
+      journal: [{ index: 0, hash: "hash", result: { kept: true }, secret: "DROP" }],
+      tokenUsage: { input: 1, output: 2, total: 3, secret: "DROP" },
+      startedAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      executionOptions: { maxAgents: 10, concurrency: 2, agentRetries: 1, agentTimeoutMs: null, tokenBudget: 100 },
+      terminalSnapshot: {
+        version: 1,
+        outcome: "completed",
+        terminalAt: "2026-01-01T00:00:00.000Z",
+        runId: "decoded",
+        workflowName: "decoded",
+        agents: { total: 1, done: 1, error: 0, skipped: 0, secret: `DROP${"x".repeat(100_000)}` },
+        journalEntries: 1,
+        error: { message: "safe", secret: "DROP" },
+        secret: "DROP",
+      },
+      TOP_SECRET_EXTRA: "must not survive projection",
+    };
+    writeFileSync(join(runsDir, "decoded.json"), JSON.stringify(base));
+    writeFileSync(join(runsDir, "mismatch.json"), JSON.stringify({ ...base, runId: "different" }));
+    writeFileSync(join(runsDir, "future.json"), JSON.stringify({ ...base, version: 999, runId: "future" }));
+    const malformed = [
+      { agents: ["bad"] },
+      { agents: [{ ...base.agents[0], history: ["bad"] }] },
+      { logs: ["safe", { secret: "bad" }] },
+      { phases: ["safe", ["bad"]] },
+      { journal: [{ index: "0", hash: "hash", result: null }] },
+      { tokenUsage: { input: 1, output: -1, total: 0 } },
+      { executionOptions: { ...base.executionOptions, tokenBudget: -1 } },
+      { executionOptions: { ...base.executionOptions, tokenBudget: "100" } },
+      { executionOptions: { ...base.executionOptions, concurrency: 99 } },
+    ];
+    malformed.forEach((patch, index) => {
+      const runId = `malformed-${index}`;
+      writeFileSync(
+        join(runsDir, `${runId}.json`),
+        JSON.stringify({ ...base, ...patch, runId, terminalSnapshot: undefined }),
+      );
+      assert.equal(rp.load(runId), null);
+    });
+
+    const decoded = rp.load("decoded") as (PersistedRunState & { TOP_SECRET_EXTRA?: string }) | null;
+    assert.equal(decoded?.TOP_SECRET_EXTRA, undefined);
+    assert.equal(JSON.stringify(decoded).includes("DROP"), false);
+    assert.deepEqual(decoded?.executionOptions, base.executionOptions);
+    assert.equal(rp.load("mismatch"), null);
+    assert.equal(rp.load("future"), null);
+    assert.deepEqual(
+      rp.list().map((run) => run.runId),
+      ["decoded"],
+    );
   }),
 );
 

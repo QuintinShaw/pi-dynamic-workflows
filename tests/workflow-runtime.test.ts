@@ -513,6 +513,75 @@ return { a, second }`;
   assert.equal(result.result.second, "blocked");
 });
 
+test("resume accounting is cumulative and cached replay completes at zero remaining budget", async () => {
+  const script = `export const meta = { name: 'resume_budget', description: 'budget' }
+const value = await agent('cached', { label: 'cached' })
+return { value, total: budget.total, spent: budget.spent(), remaining: budget.remaining() }`;
+  const journal: JournalEntry[] = [];
+  const first = await runWorkflow<{
+    value: unknown;
+    total: number;
+    spent: number;
+    remaining: number;
+  }>(script, {
+    agent: fakeAgent({ input: 60, output: 40, total: 100, cost: 0.25 }),
+    tokenBudget: 100,
+    persistLogs: false,
+    onAgentJournal: (entry) => journal.push(entry),
+  });
+  assert.equal(first.result.value, "ok");
+  assert.equal(first.result.total, 100);
+  assert.equal(first.result.spent, 100);
+  assert.equal(first.result.remaining, 0);
+
+  let liveCalls = 0;
+  const resumed = await runWorkflow<typeof first.result>(script, {
+    agent: {
+      async run() {
+        liveCalls++;
+        return "must-not-run";
+      },
+    },
+    tokenBudget: 100,
+    initialTokenUsage: first.tokenUsage,
+    initialTokenSpend: first.tokenUsage?.total,
+    resumeJournal: new Map(journal.map((entry) => [entry.index, entry])),
+    persistLogs: false,
+  });
+
+  assert.equal(liveCalls, 0);
+  assert.equal(resumed.result.value, "ok");
+  assert.equal(resumed.result.total, 100);
+  assert.equal(resumed.result.spent, 100);
+  assert.equal(resumed.result.remaining, 0);
+  assert.deepEqual(resumed.tokenUsage, first.tokenUsage, "replay adds zero and result usage stays cumulative");
+});
+
+test("resume blocks fresh work when cumulative spend has exhausted the original budget", async () => {
+  const script = `export const meta = { name: 'resume_fresh', description: 'budget' }
+await agent('fresh', { label: 'fresh' })
+return true`;
+  let liveCalls = 0;
+  await assert.rejects(
+    () =>
+      runWorkflow(script, {
+        agent: {
+          async run() {
+            liveCalls++;
+            return "must-not-run";
+          },
+        },
+        tokenBudget: 100,
+        initialTokenUsage: { input: 100, output: 0, total: 100, cost: 0 },
+        initialTokenSpend: 100,
+        resumeJournal: new Map(),
+        persistLogs: false,
+      }),
+    /budget exhausted/i,
+  );
+  assert.equal(liveCalls, 0);
+});
+
 test("token budget exhaustion inside parallel() halts (non-recoverable, not swallowed)", async () => {
   // A warm-up agent spends the whole budget (soft gate: spent accrues after it
   // finishes); the agent() inside parallel() then hits the gate and must

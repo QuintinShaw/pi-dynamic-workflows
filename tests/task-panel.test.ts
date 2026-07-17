@@ -417,6 +417,45 @@ describe("installResultDelivery", () => {
     assert.equal(calls1.length, 0, "pi1 should not be used after refresh");
     assert.equal(calls2.length, 1, "pi2 should receive the delivery");
   });
+
+  it("queues pause, completion, and failure delivery until the exact target session becomes active", () => {
+    const pi = createMockPi();
+    let activeSessionId = "session-2";
+    const run = makeRun({ deliverySessionId: "session-1" });
+    const manager = createMockManager(run);
+    const options = { getActiveSessionId: () => activeSessionId };
+
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager, options);
+    manager.emit("paused", { runId: "test-run-1", reason: "usage_limit", error: { message: "usage limit" } });
+    manager.emit("complete", { runId: "test-run-1" });
+    manager.emit("error", { runId: "test-run-1", error: { message: "failure" } });
+    assert.equal(pi._calls.length, 0, "another active session must not receive any run delivery");
+
+    activeSessionId = "session-1";
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager, options);
+    assert.equal(pi._calls.length, 3, "the target session receives every queued lifecycle message on activation");
+    assert.ok(pi._calls[0].content.includes("paused"));
+    assert.ok(pi._calls[1].content.includes("Background workflow"));
+    assert.ok(pi._calls[2].content.includes("failed"));
+
+    activeSessionId = "session-2";
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager, options);
+    assert.equal(pi._calls.length, 3, "delivery is flushed exactly once and never leaks back into session 2");
+  });
+
+  it("does not deliver an error event for intentionally paused or stopped runs", () => {
+    const pi = createMockPi();
+    const paused = makeRun({ status: "paused" });
+    const manager = createMockManager(paused);
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+
+    manager.emit("error", { runId: "test-run-1", error: { message: "workflow aborted" } });
+    assert.equal(pi._calls.length, 0);
+
+    Object.assign(paused, { status: "aborted" });
+    manager.emit("error", { runId: "test-run-1", error: { message: "workflow aborted" } });
+    assert.equal(pi._calls.length, 0);
+  });
 });
 
 // ─── installTaskPanel ─────────────────────────────────────────────────────────

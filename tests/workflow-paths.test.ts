@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join, normalize } from "node:path";
 import { describe, it } from "node:test";
 import {
+  canonicalWorkflowCwd,
   WORKFLOW_HOME_RELATIVE_DIR,
   WORKFLOW_PROJECTS_SUBDIR,
   workflowHomeDir,
@@ -38,6 +39,29 @@ describe("workflow paths", () => {
       assert.equal(key, workflowProjectKey(cwd));
       assert.match(key, /^[a-z0-9._-]+-[a-f0-9]{12}$/);
       assert.ok(key.startsWith(basename(cwd).toLowerCase()));
+    });
+  });
+
+  it("canonicalizes symlinked cwd values before deriving a namespace", () => {
+    withIsolatedHome((_home, cwd) => {
+      const link = `${cwd}-link`;
+      try {
+        symlinkSync(cwd, link, "dir");
+        assert.equal(canonicalWorkflowCwd(link), cwd);
+        assert.equal(workflowProjectKey(link), workflowProjectKey(cwd));
+        assert.equal(workflowProjectPaths(link).rootDir, workflowProjectPaths(cwd).rootDir);
+      } finally {
+        rmSync(link, { force: true });
+      }
+    });
+  });
+
+  it("rejects missing paths and regular files as workflow cwd values", () => {
+    withIsolatedHome((_home, cwd) => {
+      const file = join(cwd, "not-a-directory.txt");
+      writeFileSync(file, "x");
+      assert.throws(() => canonicalWorkflowCwd(join(cwd, "missing")), /does not exist/i);
+      assert.throws(() => canonicalWorkflowCwd(file), /not a directory/i);
     });
   });
 
