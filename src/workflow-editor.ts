@@ -31,7 +31,6 @@ import {
   type WorkflowSettings,
   type WorkflowSettingsStore,
 } from "./workflow-settings.js";
-import { workflowHowToGuidelines } from "./workflow-tool.js";
 
 // A keyword trigger is a configured literal term. All trigger words use token
 // boundaries so slash commands, paths, and identifier-like text stay untouched.
@@ -385,8 +384,41 @@ export class WorkflowEditor extends CustomEditor {
 }
 
 /**
- * The directive appended to a submitted message when workflows mode is ARMED
- * (via the keyword trigger, standing `/effort`, or `/workflows run`).
+ * Why a turn was armed. This is stated truthfully in the banner so the model
+ * isn't told "the trigger word you typed" on a path where no word was typed:
+ *  - "keyword": the user typed the configured workflow trigger word.
+ *  - "effort": standing `/effort` armed this turn (no workflow word was typed).
+ */
+export type ArmReason = "keyword" | "effort";
+
+/**
+ * Appended to the effort-path directive: standing `/effort` arms on every
+ * substantive message, so the model must be told it can decline the workflow on
+ * a conversational or trivial turn (mirrors "solo only on conversational turns").
+ */
+export const EFFORT_CONVERSATIONAL_ESCAPE =
+  "This turn was armed by standing effort mode, not by an explicit workflow request: if it is conversational or trivial, skip the workflow and just respond directly.";
+
+/** The one-line, truthful "why armed" clause for each heuristic arming path. */
+function armReasonClause(reason: ArmReason): string {
+  return reason === "keyword"
+    ? "you typed the workflow trigger word, which counts as an explicit opt-in to multi-agent orchestration"
+    : "standing effort mode armed this turn (you did not explicitly ask for a workflow)";
+}
+
+/**
+ * The #89 reassurance shared by every arming banner: a background run ENDING the
+ * turn is expected, not a stall — the result auto-delivers back — so the model
+ * shouldn't feel it must stay and block, nor avoid the tool to stay interactive.
+ * Names when `background:false` is the right call (user waiting inline).
+ */
+const BACKGROUND_DELIVERY_REASSURANCE =
+  "If you do call `workflow`, it runs in the background by default: this turn will end and the result is delivered back into the conversation automatically when it finishes — that's expected, not a stall, so you do not need to stay and block. Only pass background:false if the user is waiting for the result inline in this same turn.";
+
+/**
+ * The directive appended to a submitted message when workflows mode is ARMED by a
+ * HEURISTIC path — the keyword trigger or standing `/effort`. (The explicit
+ * `/workflows run` command uses {@link buildForcedWorkflowPrompt} instead.)
  *
  * This authorizes — it does not force. Arming is a confirmed opt-in signal that
  * lifts the always-on "do not call the tool" gate for THIS message; the model
@@ -396,37 +428,62 @@ export class WorkflowEditor extends CustomEditor {
  * caused two bugs: it over-triggered on messages that merely mention workflows
  * (#88), and — by commanding the model to emit nothing but one `workflow` call
  * and not talk — it produced a bare background run that ends the turn and leaves
- * the user at an idle prompt (#89). Letting the model handle the request in a
- * normal turn restores the inline/interactive path.
+ * the user at an idle prompt (#89).
  *
- * The how-to mechanics for writing a workflow script are appended here (only on
- * an armed turn) so the model has them at the moment of use without paying for
- * them in the always-on prompt (#65).
+ * The banner therefore (1) LEADS with the decision boundary (question/trivial →
+ * answer directly; a real decomposable request → call `workflow`) rather than
+ * leading with "call the tool"; (2) states the truthful opt-in `reason` for THIS
+ * path (no "the word you typed" on the effort path, where none was); and (3)
+ * carries the #89 background/deliver-back reassurance so an ending turn reads as
+ * expected. The how-to mechanics are NOT here — they live in the tool's static
+ * `description` (see createWorkflowTool), visible whenever the model looks at the
+ * tool, so they aren't re-injected per armed turn (#65).
  *
- * `extraDirective` (e.g. an effort-tier nudge) is appended when present.
+ * `extraDirective` (e.g. an effort-tier nudge + EFFORT_CONVERSATIONAL_ESCAPE) is
+ * appended when present.
  */
-/**
- * Appended to the effort-path directive: standing `/effort` arms on every
- * substantive message, so the model must be told it can decline the workflow on
- * a conversational or trivial turn (mirrors "solo only on conversational turns").
- */
-export const EFFORT_CONVERSATIONAL_ESCAPE =
-  "This turn was armed by standing effort mode, not by an explicit workflow request: if it is conversational or trivial, skip the workflow and just respond directly.";
-
-export function buildArmedWorkflowPrompt(text: string, extraDirective?: string): string {
+export function buildArmedWorkflowPrompt(
+  text: string,
+  opts: { reason?: ArmReason; extraDirective?: string } = {},
+): string {
+  const reason = opts.reason ?? "keyword";
   const lines = [
     text,
     "",
     "---",
-    "[workflows mode armed — the trigger word you typed counts as explicit opt-in to",
-    "multi-agent orchestration. If this message is a request to do work, handle it by",
-    "calling the `workflow` tool: write a script that fans the task out across subagents",
-    "via agent()/parallel()/pipeline(). If it's a question ABOUT workflows, this repo, or",
-    "the tool itself, just answer it directly — the opt-in does not force a workflow, and",
-    "you should stay conversational and interactive rather than emitting a bare tool call.]",
+    "[workflows mode armed. Decide first: if this message is a question, a trivial task, or",
+    "just talk (about workflows, this repo, or the tool itself), answer it directly and stay",
+    "conversational — arming authorizes the tool, it does not force it. If it is a real,",
+    "decomposable request to do work, handle it by calling the `workflow` tool: write a script",
+    "that fans the task out across subagents via agent()/parallel()/pipeline().",
+    `Why this turn is armed: ${armReasonClause(reason)}.`,
+    BACKGROUND_DELIVERY_REASSURANCE + "]",
+  ];
+  if (opts.extraDirective) lines.push("", opts.extraDirective);
+  return lines.join("\n");
+}
+
+/**
+ * The directive for the explicit `/workflows run <prompt>` command. Unlike the
+ * heuristic {@link buildArmedWorkflowPrompt}, `/workflows run` is a maximal-intent
+ * command — the user typed a command whose whole purpose is to execute a workflow
+ * now — so it does NOT get the "if it's a question, just answer" escape. It still
+ * avoids the old MUST/ONLY forcing language (which caused #88/#89) and still
+ * carries the #89 background/deliver-back reassurance so an ending turn reads as
+ * expected. `extraDirective` (e.g. a standing effort-tier nudge) is appended.
+ */
+export function buildForcedWorkflowPrompt(text: string, extraDirective?: string): string {
+  const lines = [
+    text,
+    "",
+    "---",
+    "[/workflows run — you ran an explicit command to execute a workflow for this request.",
+    "Call the `workflow` tool now: write a script that fans this task out across subagents",
+    "via agent()/parallel()/pipeline(). (This is a direct command, not a heuristic guess, so",
+    "do not answer in prose instead of running the workflow.)",
+    BACKGROUND_DELIVERY_REASSURANCE + "]",
   ];
   if (extraDirective) lines.push("", extraDirective);
-  lines.push("", "If you do call `workflow`, follow this guidance:", ...workflowHowToGuidelines().map((g) => `- ${g}`));
   return lines.join("\n");
 }
 
@@ -627,14 +684,19 @@ export function installWorkflowEditor(
       // Tool restriction is best-effort; the armed directive still authorizes the workflow.
     }
     // Effort path: the trigger word was NOT typed — this arms on ANY substantive
-    // message while standing effort is on. So the directive must let the model
+    // message while standing effort is on. So the directive must (a) state the
+    // truthful "effort" reason (not "the word you typed"), and (b) let the model
     // skip the workflow entirely on conversational/trivial turns, not just on
     // questions about workflows.
     const extra =
       byEffort && effort
         ? [effortDirective(effort.level), EFFORT_CONVERSATIONAL_ESCAPE].filter(Boolean).join(" ")
         : undefined;
-    return { action: "transform", text: buildArmedWorkflowPrompt(event.text, extra) } as const;
+    const reason: ArmReason = byEffort ? "effort" : "keyword";
+    return {
+      action: "transform",
+      text: buildArmedWorkflowPrompt(event.text, { reason, extraDirective: extra }),
+    } as const;
   });
 
   // Restore the user's full tool set once the forced turn completes.

@@ -61,18 +61,37 @@ export function agentTypeGuideline(cwd: string = process.cwd()): string | undefi
  * The single ALWAYS-ON guideline rendered into the system prompt every turn.
  * It is a pure gate: it tells the model when the tool is in scope and, crucially,
  * that it should NOT reach for the tool otherwise. The how-to mechanics live in
- * {@link workflowHowToGuidelines}, injected only on an armed turn.
+ * {@link workflowHowToGuidelines} and are folded into the tool's static
+ * `description` (see {@link createWorkflowTool}), not into this always-on line.
+ *
+ * The line is balanced on purpose: a task-shape positive ("this is the kind of
+ * work the tool is for") so the model recognizes a good fit even when the user
+ * phrases it off-keyword, PLUS the explicit-opt-in gate and the "do not call it
+ * otherwise" negative so it doesn't self-trigger (#88). The "offer with a rough
+ * cost" keeps a non-forcing path open for a task that fits but wasn't opted into.
  */
 export const WORKFLOW_GATE_GUIDELINE =
-  "The `workflow` tool runs multi-agent orchestration (fan-out across subagents). ONLY call it when the user explicitly opts in — via the workflow trigger word, `/workflows run`, or their own words (e.g. 'run a workflow', 'fan this out', '并行审一遍'). For any other task — even one that would clearly benefit — do not call it; you may briefly offer it (with a rough cost) as an option instead.";
+  "The `workflow` tool runs multi-agent orchestration — it fans decomposable work out across subagents, and fits tasks shaped like: repo-wide inspection, independent parallel research/checks, multi-perspective review, or fan-out/fan-in synthesis. ONLY call it when the user explicitly opts in — via the workflow trigger word, `/workflows run`, or their own words (e.g. 'run a workflow', 'fan this out', '并行审一遍'). For any other task — even one that would clearly benefit — do not call it; you may briefly offer it (with a rough cost) as an option instead.";
 
 /**
- * The how-to guidance for actually WRITING a workflow script. This is NOT
- * always-on: it is injected into the message only on an armed turn (keyword
- * trigger, `/effort`, or `/workflows run`), where the model may genuinely be
- * about to call the tool. Keeping it off the always-on prompt shrinks the
- * per-turn budget (#65) and removes the self-priming pressure (#88), while still
- * giving the model the full mechanics at the exact moment it needs them.
+ * The how-to guidance for actually WRITING a workflow script. These lines are
+ * folded into the tool's static `description` (see {@link createWorkflowTool}),
+ * NOT into the always-on `promptGuidelines` and NOT re-injected into the armed
+ * turn's message.
+ *
+ * A tool description is the right home for this "manual": it is visible to the
+ * model whenever it considers or calls the tool — regardless of which path armed
+ * the turn, and even on the natural-language opt-ins that the gate line blesses
+ * but that never trip the literal keyword arm — and it is a static, prefix-
+ * cacheable part of the tool definition rather than per-turn behavioral priming.
+ * That fixes both the "armed off-keyword ⇒ no mechanics ⇒ lower-quality script"
+ * gap and the ~1.4KB-per-armed-turn re-injection (worse for `/effort` users).
+ *
+ * Keeping it out of `promptGuidelines` still shrinks the always-on prompt (#88
+ * self-priming) — this array is the how-to only, never the always-on gate. Note
+ * the description now carries this weight in the tool DEFINITION budget; trimming
+ * the how-to text itself is a separate concern (#65 / contract-concision work),
+ * not this change's job.
  */
 export function workflowHowToGuidelines(cwd: string = process.cwd()): string[] {
   return [
@@ -204,10 +223,21 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
   return defineTool({
     name: "workflow",
     label: "Workflow",
+    // The how-to "manual" lives here, in the static tool description, so the
+    // model has the mechanics whenever it considers/calls the tool — on every
+    // arming path AND on off-keyword natural-language opt-ins that never trip the
+    // literal keyword arm. This is a cacheable part of the tool definition, not
+    // per-turn priming (that's why it's here and not appended to the armed
+    // message; see workflowHowToGuidelines / buildArmedWorkflowPrompt). It grows
+    // the tool-DEFINITION budget; trimming the how-to itself is separate work
+    // (#65 / contract-concision), not this change's job.
     description: [
       "Execute a deterministic JavaScript workflow that orchestrates multiple subagents with agent(), parallel(), and pipeline().",
       "script is required raw JavaScript. It must start with export const meta = { name, description, phases? } and must call agent() at least once.",
-    ].join(" "),
+      "",
+      "How to write the script:",
+      ...workflowHowToGuidelines(cwd).map((g) => `- ${g}`),
+    ].join("\n"),
     promptSnippet:
       "Run a deterministic JavaScript workflow. Required script header: export const meta = { name: 'short_snake_case', description: 'non-empty description', phases: [{ title: 'Phase' }] }.",
     // Lazy accessor: the SDK re-reads definition.promptGuidelines on every
@@ -215,9 +245,10 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
     // prompt every turn), so it is deliberately a single gate line — see #65
     // (always-on prompt budget) and #88 (self-priming: a wall of "For workflow, …"
     // how-to text nudges the model toward the tool even when it wasn't asked for).
-    // The ~20 how-to lines that used to live here are injected only on an ARMED
-    // turn (see workflowHowToGuidelines / buildArmedWorkflowPrompt), so the model
-    // still has them at the moment it actually writes a workflow.
+    // The ~20 how-to lines that used to live here now live in the tool's static
+    // `description` (see above / workflowHowToGuidelines), so the model has the
+    // mechanics whenever it looks at the tool — without paying the always-on cost
+    // or the per-armed-turn re-injection.
     get promptGuidelines() {
       return [WORKFLOW_GATE_GUIDELINE];
     },

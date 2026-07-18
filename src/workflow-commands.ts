@@ -15,7 +15,7 @@ import {
 import { type EffortState, effortDirective } from "./effort-command.js";
 import type { PersistedRunState } from "./run-persistence.js";
 import { registerSavedWorkflow } from "./saved-commands.js";
-import { buildArmedWorkflowPrompt, WORKFLOW_TOOL_NAME } from "./workflow-editor.js";
+import { buildForcedWorkflowPrompt, WORKFLOW_TOOL_NAME } from "./workflow-editor.js";
 import type { WorkflowManager } from "./workflow-manager.js";
 import type { WorkflowStorage } from "./workflow-saved.js";
 import { openWorkflowNavigator } from "./workflow-ui.js";
@@ -164,7 +164,10 @@ export function registerWorkflowCommands(
 
           const effort = opts.effort;
           const extra = effort && effort.level !== "off" ? effortDirective(effort.level) : undefined;
-          const armed = buildArmedWorkflowPrompt(prompt, extra);
+          // `/workflows run` is an explicit, maximal-intent command — use the
+          // forcing directive (no "if it's a question just answer" escape),
+          // distinct from the heuristic keyword/effort arming.
+          const armed = buildForcedWorkflowPrompt(prompt, extra);
           ctx.ui.notify(`Running workflow: ${prompt.slice(0, 60)}${prompt.length > 60 ? "…" : ""}`, "info");
           try {
             await pi.sendMessage(

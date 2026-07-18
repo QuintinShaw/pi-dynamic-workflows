@@ -4,7 +4,7 @@ import test from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createEffortState, effortDirective } from "../src/effort-command.js";
 import { registerWorkflowCommands } from "../src/workflow-commands.js";
-import { buildArmedWorkflowPrompt, WORKFLOW_TOOL_NAME } from "../src/workflow-editor.js";
+import { buildForcedWorkflowPrompt, WORKFLOW_TOOL_NAME } from "../src/workflow-editor.js";
 import type { WorkflowManager } from "../src/workflow-manager.js";
 
 type Handler = (args: string, ctx: any) => Promise<void>;
@@ -108,7 +108,10 @@ test("/workflows run <prompt> sends a forced workflow follow-up turn", async () 
   await h.run("run audit auth boundaries");
   assert.equal(h.sent.length, 1);
   assert.equal(h.sent[0].customType, "workflow-run");
-  assert.equal(h.sent[0].content, buildArmedWorkflowPrompt("audit auth boundaries"));
+  // #P5: /workflows run is an explicit command → forcing directive (no question-escape).
+  assert.equal(h.sent[0].content, buildForcedWorkflowPrompt("audit auth boundaries"));
+  assert.doesNotMatch(h.sent[0].content ?? "", /answer it directly and stay/i, "no question-answer escape");
+  assert.match(h.sent[0].content ?? "", /Call the `workflow` tool now/i, "forces the tool call");
   assert.equal(h.sent[0].options?.triggerTurn, true);
   assert.equal(h.sent[0].options?.deliverAs, "followUp");
   assert.deepEqual(h.activeTools, [WORKFLOW_TOOL_NAME], "does not duplicate an already-active workflow tool");
@@ -130,7 +133,7 @@ test("/workflows run adds the workflow tool when absent and does not depend on t
   const h = harness({}, {}, ["bash", "read"]);
   await h.run("run summarize the auth module");
   assert.deepEqual(h.activeTools, ["bash", "read", WORKFLOW_TOOL_NAME]);
-  assert.equal(h.sent[0].content, buildArmedWorkflowPrompt("summarize the auth module"));
+  assert.equal(h.sent[0].content, buildForcedWorkflowPrompt("summarize the auth module"));
 });
 
 test("/workflows run carries standing effort directives", async () => {
@@ -138,7 +141,7 @@ test("/workflows run carries standing effort directives", async () => {
   effort.level = "ultra";
   const h = harness({}, { effort });
   await h.run("run do X");
-  assert.equal(h.sent[0].content, buildArmedWorkflowPrompt("do X", effortDirective("ultra")));
+  assert.equal(h.sent[0].content, buildForcedWorkflowPrompt("do X", effortDirective("ultra")));
 });
 
 test("/workflows stop <id> calls manager.stop", async () => {

@@ -20,7 +20,7 @@ test("buildArmedWorkflowPrompt appends the extra directive only when provided", 
   const base = buildArmedWorkflowPrompt("do X");
   assert.ok(!/ULTRA/.test(base), "no directive by default");
   assert.ok(base.startsWith("do X"));
-  const ultra = buildArmedWorkflowPrompt("do X", effortDirective("ultra"));
+  const ultra = buildArmedWorkflowPrompt("do X", { reason: "effort", extraDirective: effortDirective("ultra") });
   assert.match(ultra, /ULTRA/, "ultra directive appended");
   assert.ok(ultra.startsWith("do X"));
 });
