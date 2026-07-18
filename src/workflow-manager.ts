@@ -45,6 +45,13 @@ export interface ManagedRun {
    * Undefined means eligible (default-on); false opts out.
    */
   autoResume?: boolean;
+  /**
+   * Real per-agent start/end timestamps, captured at onAgentStart/onAgentEnd
+   * (never fabricated), keyed by the agent's snapshot id. A running agent has
+   * an entry with no endedAt; persistRun() reads from here instead of stamping
+   * every agent with the run's startedAt / "now".
+   */
+  agentTimestamps: Map<number, { startedAt: string; endedAt?: string }>;
 }
 
 /** Per-execution options shared by sync, background, and resume runs. */
@@ -229,6 +236,7 @@ export class WorkflowManager extends EventEmitter {
       background: true,
       lease,
       autoResume: exec.autoResume,
+      agentTimestamps: new Map(),
     };
 
     this.runs.set(runId, managed);
@@ -316,6 +324,7 @@ export class WorkflowManager extends EventEmitter {
       args,
       journal: [],
       background: false,
+      agentTimestamps: new Map(),
     };
   }
 
@@ -370,9 +379,13 @@ export class WorkflowManager extends EventEmitter {
         resumeFromRunId: resumeJournal ? managed.runId : undefined,
         onAgentJournal: (entry) => {
           // Append (crash-safe-ish): keep the latest entry per index, then persist.
+          // This is the high-frequency progress persist (fires once per completed
+          // agent, can burst under concurrency) — throttled (trailing edge). Every
+          // lifecycle-critical persist below (status transitions, run end,
+          // pause/resume/stop) still calls persistRun() directly and flushes this.
           managed.journal = managed.journal.filter((e) => e.index !== entry.index);
           managed.journal.push(entry);
-          this.persistRun(managed);
+          this.schedulePersist(managed);
         },
         onLog: (message) => {
           managed.snapshot.logs.push(message);
@@ -388,14 +401,18 @@ export class WorkflowManager extends EventEmitter {
           progress();
         },
         onAgentStart: (event) => {
+          const id = managed.snapshot.agents.length + 1;
           managed.snapshot.agents.push({
-            id: managed.snapshot.agents.length + 1,
+            id,
             label: event.label,
             phase: event.phase,
             prompt: event.prompt,
             status: "running",
             model: event.model,
           });
+          // Real per-agent start time, captured the moment the agent actually
+          // starts (not the run's startedAt) — see agentTimestamps.
+          managed.agentTimestamps.set(id, { startedAt: new Date().toISOString() });
           this.emit("agentStart", { runId: managed.runId, ...event });
           progress();
         },
@@ -412,6 +429,10 @@ export class WorkflowManager extends EventEmitter {
             agent.tokens = event.tokens;
             if (event.tokenUsage) agent.tokenUsage = event.tokenUsage;
             if (event.model) agent.model = event.model;
+            // Real per-agent end time — only terminal agents get one; a still-
+            // running agent's entry keeps endedAt undefined.
+            const ts = managed.agentTimestamps.get(agent.id);
+            if (ts) ts.endedAt = new Date().toISOString();
           }
           this.emit("agentEnd", { runId: managed.runId, ...event });
           progress();
@@ -493,7 +514,52 @@ export class WorkflowManager extends EventEmitter {
     managed.lease = undefined;
   }
 
-  private persistRun(managed: ManagedRun) {
+  /** Trailing-edge throttle window for high-frequency progress persists (see schedulePersist). */
+  private static readonly PERSIST_THROTTLE_MS = 400;
+
+  /** Pending trailing-edge persist timers for high-frequency progress events, keyed by runId. */
+  private persistTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+  /**
+   * Coalesce rapid progress persists (currently: onAgentJournal, which fires
+   * once per completed agent and can burst under concurrency) to at most one
+   * disk write per PERSIST_THROTTLE_MS (trailing edge) instead of one write
+   * per tick — persistRun() does a full JSON.stringify of the run plus up to
+   * 3 sync writes, so firing it once per agent in a long run is O(N^2).
+   *
+   * Lifecycle-critical writes (status transitions, run end, pause/resume/stop)
+   * must NOT use this — call persistRun() directly, which flushes (and cancels)
+   * any pending timer first so a stale trailing write can never fire after, and
+   * resurrect, a terminal state.
+   */
+  private schedulePersist(managed: ManagedRun): void {
+    if (this.persistTimers.has(managed.runId)) return; // already scheduled; the trailing write reads live state
+    const timer = setTimeout(() => {
+      this.persistTimers.delete(managed.runId);
+      this.writeRunToDisk(managed);
+    }, WorkflowManager.PERSIST_THROTTLE_MS);
+    // A pending progress persist should never keep the process alive on its own.
+    timer.unref?.();
+    this.persistTimers.set(managed.runId, timer);
+  }
+
+  /**
+   * Persist immediately and synchronously. Cancels any pending throttled write
+   * for this run first, so the write that lands is always the caller's current
+   * (final) state — never superseded by a stale deferred write. Use this for
+   * every lifecycle-critical persist: run start, status transitions, run end,
+   * pause()/resume()/stop().
+   */
+  private persistRun(managed: ManagedRun): void {
+    const timer = this.persistTimers.get(managed.runId);
+    if (timer) {
+      clearTimeout(timer);
+      this.persistTimers.delete(managed.runId);
+    }
+    this.writeRunToDisk(managed);
+  }
+
+  private writeRunToDisk(managed: ManagedRun) {
     try {
       this.persistence.save({
         runId: managed.runId,
@@ -521,11 +587,17 @@ export class WorkflowManager extends EventEmitter {
             : undefined,
         phases: managed.snapshot.phases,
         currentPhase: managed.snapshot.currentPhase,
-        agents: managed.snapshot.agents.map((a) => ({
-          ...a,
-          startedAt: managed.startedAt.toISOString(),
-          endedAt: new Date().toISOString(),
-        })),
+        // Real per-agent timestamps only (see agentTimestamps) — never the run's
+        // own startedAt or "now" stamped onto every agent on every write. A
+        // still-running agent is persisted with no endedAt.
+        agents: managed.snapshot.agents.map((a) => {
+          const ts = managed.agentTimestamps.get(a.id);
+          return {
+            ...a,
+            startedAt: ts?.startedAt,
+            endedAt: ts?.endedAt,
+          };
+        }),
         logs: managed.snapshot.logs,
         result: managed.result?.result,
         tokenUsage: managed.snapshot.tokenUsage
@@ -622,6 +694,10 @@ export class WorkflowManager extends EventEmitter {
       // Carry the original opt-out forward across resumes; it's fixed at
       // run-start and persistRun() re-persists it on every subsequent write.
       autoResume: persisted.autoResume,
+      // Fresh per-resume: agents (and any prior timing) are rebuilt live as
+      // onAgentStart/onAgentEnd fire again for this attempt (see `agents: []`
+      // above); the journal, not this map, is what makes replayed agents cheap.
+      agentTimestamps: new Map(),
     };
     this.runs.set(runId, managed);
     // Persist before notifying renderers: listRuns() is their source of truth for
@@ -712,6 +788,13 @@ export class WorkflowManager extends EventEmitter {
     const managed = this.runs.get(runId);
     if (managed) this.releaseRunLease(managed);
     this.runs.delete(runId);
+    // Cancel any pending throttled write so a deferred persist can't fire after
+    // deletion and resurrect the run's file on disk.
+    const timer = this.persistTimers.get(runId);
+    if (timer) {
+      clearTimeout(timer);
+      this.persistTimers.delete(runId);
+    }
     return this.persistence.delete(runId);
   }
 

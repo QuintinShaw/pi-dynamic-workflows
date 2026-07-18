@@ -67,6 +67,39 @@ phase('Work')
 const a = await agent('do it', { label: 'a' })
 return { a }`;
 
+/** Two sequential agents: 'a' finishes, then 'b' starts. */
+const twoAgentScript = `export const meta = { name: 'two_agent_demo', description: 'two sequential agents' }
+phase('Work')
+const a = await agent('first', { label: 'a' })
+const b = await agent('second', { label: 'b' })
+return { a, b }`;
+
+/** Six agents fired in parallel, all resolving instantly — used to exercise a burst of persist ticks. */
+const burstAgentScript = `export const meta = { name: 'burst_demo', description: 'six agents in parallel' }
+const xs = await parallel(['a','b','c','d','e','f'].map((label) => () => agent(label, { label })))
+return xs`;
+
+/**
+ * Agent runner for twoAgentScript: 'a' resolves immediately, 'b' hangs forever
+ * (until the run is aborted by pause()/stop()). Lets a test observe a run with
+ * one done agent and one genuinely still-running agent at the same time.
+ */
+function firstThenHangAgent() {
+  return {
+    async run(prompt: string, options?: { onUsage?: (u: AgentUsage) => void }) {
+      options?.onUsage?.({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 });
+      if (prompt === "first") {
+        // A tiny real delay so 'a' and 'b' get distinguishable (not same-millisecond)
+        // start times — proving persisted timestamps are real wall-clock captures,
+        // not both stamped with one fabricated value.
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        return "a-done";
+      }
+      return new Promise(() => {}); // 'second' never resolves on its own
+    },
+  };
+}
+
 /** Run each manager test with isolated cwd and HOME so workflow state is isolated. */
 function withTempCwd(fn: (cwd: string) => Promise<void>) {
   return async () => {
@@ -937,6 +970,132 @@ test(
     assert.equal(manager.getRun(runId)?.status, "failed");
     const persisted = manager.listRuns().find((r) => r.runId === runId);
     assert.equal(persisted?.pauseReason, undefined, "a real failure carries no usage-limit pause reason");
+  }),
+);
+
+// ─── persistRun: honest per-agent timestamps + throttled progress persists ────
+
+test(
+  "persisted per-agent timestamps are real, not fabricated from the run's startedAt/now",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: firstThenHangAgent() });
+    manager.on("error", () => {});
+    const { runId, promise } = manager.startInBackground(twoAgentScript);
+
+    // Wait until 'a' has finished and 'b' has started (and is hanging) so both
+    // a terminal and a still-running agent coexist in the snapshot.
+    await new Promise((resolve) => {
+      manager.on("agentStart", (event) => {
+        if ((event as { label?: string }).label === "b") resolve(undefined);
+      });
+    });
+
+    // pause() forces a synchronous flush (see the "safety net" tests below), so
+    // this reads the true current state without any arbitrary wait.
+    manager.pause(runId);
+
+    const persisted = manager.listRuns().find((r) => r.runId === runId);
+    const agentA = persisted?.agents.find((a) => a.label === "a");
+    const agentB = persisted?.agents.find((a) => a.label === "b");
+
+    assert.equal(agentA?.status, "done");
+    assert.ok(agentA?.startedAt, "finished agent has a real startedAt");
+    assert.ok(agentA?.endedAt, "finished agent has a real endedAt");
+
+    assert.equal(agentB?.status, "running");
+    assert.ok(agentB?.startedAt, "running agent has a real startedAt too");
+    assert.equal(agentB?.endedAt, undefined, "a still-running agent must NOT get a fabricated endedAt");
+
+    assert.notEqual(
+      agentA?.startedAt,
+      agentB?.startedAt,
+      "agents must not all share one fabricated run-start timestamp",
+    );
+
+    // firstThenHangAgent's 'second' call never resolves on its own (only pause()
+    // marks the run as aborted in bookkeeping — the in-flight call has no timeout
+    // to race against), so don't await it; just avoid an unhandled rejection.
+    promise.catch(() => {});
+  }),
+);
+
+test(
+  "a burst of agent completions coalesces to a small, bounded number of disk writes",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent(), concurrency: 8 });
+    const persistence = manager.getPersistence();
+    let saveCount = 0;
+    const originalSave = persistence.save.bind(persistence);
+    persistence.save = ((...args: Parameters<typeof persistence.save>) => {
+      saveCount++;
+      return originalSave(...args);
+    }) as typeof persistence.save;
+
+    const result = await manager.runSync(burstAgentScript);
+
+    assert.equal((result.result as unknown[]).length, 6);
+    // Unthrottled, each of the 6 near-simultaneous agent completions would persist
+    // on its own: 1 (initial) + 6 (one per agent) + 1 (final) = 8 writes. Throttled,
+    // the whole burst coalesces into at most one trailing write, so the total stays
+    // small regardless of agent count.
+    assert.ok(saveCount <= 3, `expected a coalesced write count (<=3), got ${saveCount}`);
+  }),
+);
+
+test(
+  "pause() flushes a pending throttled progress persist synchronously — no stale read",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: firstThenHangAgent() });
+    manager.on("error", () => {});
+    const { runId, promise } = manager.startInBackground(twoAgentScript);
+
+    // 'a' finishing schedules a throttled (trailing-edge) write via onAgentJournal
+    // that would normally not hit disk for hundreds of ms.
+    await new Promise((resolve) => {
+      manager.on("agentStart", (event) => {
+        if ((event as { label?: string }).label === "b") resolve(undefined);
+      });
+    });
+
+    manager.pause(runId);
+
+    // Read persisted state immediately — no sleep/setTimeout. If pause() didn't
+    // flush the pending write first (and write the current, final state), this
+    // would race a stale read or a delayed write clobbering the paused status.
+    const persisted = manager.listRuns().find((r) => r.runId === runId);
+    assert.equal(persisted?.status, "paused", "terminal status must be visible immediately, with no wait");
+    const agentA = persisted?.agents.find((a) => a.label === "a");
+    assert.equal(agentA?.status, "done", "the already-completed agent's state is flushed synchronously too");
+    assert.ok(agentA?.endedAt, "flushed agent state carries its real endedAt, not stale/missing data");
+
+    // 'second' never resolves on its own; don't await it, just avoid an unhandled rejection.
+    promise.catch(() => {});
+  }),
+);
+
+test(
+  "stop() flushes a pending throttled progress persist synchronously — no stale read",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: firstThenHangAgent() });
+    manager.on("error", () => {});
+    const { runId, promise } = manager.startInBackground(twoAgentScript);
+
+    await new Promise((resolve) => {
+      manager.on("agentStart", (event) => {
+        if ((event as { label?: string }).label === "b") resolve(undefined);
+      });
+    });
+
+    manager.stop(runId);
+
+    const persisted = manager.listRuns().find((r) => r.runId === runId);
+    assert.equal(persisted?.status, "aborted", "terminal status must be visible immediately, with no wait");
+    const agentA = persisted?.agents.find((a) => a.label === "a");
+    assert.equal(agentA?.status, "done");
+    assert.ok(agentA?.endedAt, "flushed agent state carries its real endedAt, not stale/missing data");
+
+    // 'second' never resolves on its own; don't await it, just avoid an unhandled rejection.
+    promise.catch(() => {});
   }),
 );
 
