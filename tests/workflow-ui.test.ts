@@ -682,6 +682,33 @@ test("renderNavigator footer hint changes based on item under cursor", () => {
   assert.equal(savedText.indexOf("x stop"), -1, "saved item should NOT show x stop");
 });
 
+test("navigator shares one persisted run read across a render frame", () => {
+  let listCalls = 0;
+  const manager = {
+    listRuns: () => {
+      listCalls++;
+      return [
+        {
+          runId: "frame-cache",
+          workflowName: "cached",
+          status: "completed",
+          phases: ["Build"],
+          agents: [{ id: 1, label: "builder", phase: "Build", prompt: "build", status: "done" }],
+          logs: [],
+        } as unknown as PersistedRunState,
+      ];
+    },
+    getRun: () => undefined,
+  };
+  const model = new NavigatorModel(manager);
+  const state = new NavigatorState();
+  state.drill(model);
+  listCalls = 0;
+
+  renderNavigator(state, model, 100);
+  assert.equal(listCalls, 1, "header, phases, agents, and footer reuse the same persisted snapshot");
+});
+
 // ═══════════════════════════════════════════════════════════════════════════
 // #57 regressions — the split must survive persistence, and mixed or
 // estimate-only runs must never under-report vs the pre-split scalar.

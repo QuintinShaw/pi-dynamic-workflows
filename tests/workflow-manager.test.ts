@@ -308,11 +308,13 @@ test(
 
     const result = await manager.runSync(oneAgentScript);
     const live = manager.getRun(result.runId)?.snapshot.agents[0];
-    const persisted = manager.listRuns().find((run) => run.runId === result.runId)?.agents[0];
+    const persistedRun = manager.listRuns().find((run) => run.runId === result.runId);
+    const persisted = persistedRun?.agents[0];
 
     assert.deepEqual(live?.result, expected);
     assert.deepEqual(persisted?.result, expected);
     assert.match(live?.resultPreview ?? "", /complete/);
+    assert.equal(persistedRun?.journal, undefined, "completed runs do not duplicate full results in the journal");
   }),
 );
 

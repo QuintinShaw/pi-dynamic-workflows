@@ -45,6 +45,53 @@ const STATUS_ICON: Record<string, string> = {
 
 const PLAIN: ThemeLike = { fg: (_c, t) => t, bold: (t) => t };
 
+/** Bounded per-overlay cache for expensive Markdown parsing and highlighting. */
+class NavigatorTextRenderCache {
+  private readonly entries = new Map<string, { lines: string[]; weight: number }>();
+  private readonly resultJson = new WeakMap<object, string>();
+  private weight = 0;
+
+  get(key: string): string[] | undefined {
+    const hit = this.entries.get(key);
+    if (!hit) return undefined;
+    // Refresh insertion order so eviction behaves like a small LRU.
+    this.entries.delete(key);
+    this.entries.set(key, hit);
+    return hit.lines;
+  }
+
+  stringify(result: object): string {
+    const cached = this.resultJson.get(result);
+    if (cached !== undefined) return cached;
+    let json: string;
+    try {
+      json = JSON.stringify(result, null, 2) ?? String(result);
+    } catch {
+      json = String(result);
+    }
+    this.resultJson.set(result, json);
+    return json;
+  }
+
+  set(key: string, lines: string[], weight: number): string[] {
+    const MAX_ENTRIES = 96;
+    const MAX_WEIGHT = 4_000_000;
+    if (weight > MAX_WEIGHT) return lines;
+    const previous = this.entries.get(key);
+    if (previous) this.weight -= previous.weight;
+    this.entries.delete(key);
+    this.entries.set(key, { lines, weight });
+    this.weight += weight;
+    while (this.entries.size > MAX_ENTRIES || this.weight > MAX_WEIGHT) {
+      const oldest = this.entries.entries().next().value as [string, { lines: string[]; weight: number }] | undefined;
+      if (!oldest) break;
+      this.entries.delete(oldest[0]);
+      this.weight -= oldest[1].weight;
+    }
+    return lines;
+  }
+}
+
 // Border characters for the overlay box
 const BOX_BORDER_LEFT = "│ ";
 const BOX_BORDER_RIGHT = " │";
@@ -94,21 +141,51 @@ export function shortModel(model: string | undefined): string | undefined {
 
 /** Reads run/phase/agent data from the manager, preferring live snapshots. */
 export class NavigatorModel {
+  private frameDepth = 0;
+  private frameRuns: PersistedRunState[] | undefined;
+  private readonly frameSnapshots = new Map<string, { snapshot: WorkflowSnapshot; status: string } | undefined>();
+
   constructor(
     private readonly manager: Pick<WorkflowManager, "listRuns" | "getRun">,
     private readonly storage?: { list(): SavedWorkflow[]; delete(name: string, location?: string): boolean },
   ) {}
 
+  /** Share persisted data across all model lookups performed by one render. */
+  withRenderFrame<T>(render: () => T): T {
+    const outermost = this.frameDepth === 0;
+    this.frameDepth++;
+    try {
+      return render();
+    } finally {
+      this.frameDepth--;
+      if (outermost) {
+        this.frameRuns = undefined;
+        this.frameSnapshots.clear();
+      }
+    }
+  }
+
+  private persistedRuns(): PersistedRunState[] {
+    if (this.frameDepth === 0) return this.manager.listRuns();
+    if (!this.frameRuns) this.frameRuns = this.manager.listRuns();
+    return this.frameRuns;
+  }
+
   private snapshot(runId: string): { snapshot: WorkflowSnapshot; status: string } | undefined {
+    if (this.frameDepth > 0 && this.frameSnapshots.has(runId)) return this.frameSnapshots.get(runId);
     const live = this.manager.getRun(runId);
-    if (live) return { snapshot: live.snapshot, status: live.status };
-    const p = this.manager.listRuns().find((r) => r.runId === runId);
-    if (!p) return undefined;
-    return { snapshot: persistedToSnapshot(p), status: p.status };
+    const value = live
+      ? { snapshot: live.snapshot, status: live.status }
+      : (() => {
+          const p = this.persistedRuns().find((r) => r.runId === runId);
+          return p ? { snapshot: persistedToSnapshot(p), status: p.status } : undefined;
+        })();
+    if (this.frameDepth > 0) this.frameSnapshots.set(runId, value);
+    return value;
   }
 
   runs(): RunRow[] {
-    return this.manager.listRuns().map((p) => {
+    return this.persistedRuns().map((p) => {
       const live = this.manager.getRun(p.runId);
       const agents = (live?.snapshot.agents ?? p.agents) as WorkflowAgentSnapshot[];
       const usage = live?.snapshot.tokenUsage ?? p.tokenUsage;
@@ -826,6 +903,20 @@ export function renderNavigator(
   viewportRows = 24,
   markdownTheme?: MarkdownTheme,
 ): string[] {
+  return model.withRenderFrame(() =>
+    renderNavigatorFrame(state, model, width, theme, viewportRows, markdownTheme, undefined),
+  );
+}
+
+function renderNavigatorFrame(
+  state: NavigatorState,
+  model: NavigatorModel,
+  width: number,
+  theme: ThemeLike,
+  viewportRows: number,
+  markdownTheme: MarkdownTheme | undefined,
+  renderCache: NavigatorTextRenderCache | undefined,
+): string[] {
   const lines: string[] = [];
   state.setPageSize(Math.max(1, viewportRows - 5));
   const sel = (i: number, text: string) =>
@@ -928,13 +1019,13 @@ export function renderNavigator(
         if (a.error) body.push(dim("Error: ") + a.error);
         if (a.errorCode) body.push(`${dim("Error code: ")}${a.errorCode}${a.recoverable ? " (recoverable)" : ""}`);
         body.push("", theme.fg("accent", theme.bold("Prompt:")));
-        body.push(...renderMarkdownLines(a.prompt ?? "", width, markdownTheme));
+        body.push(...renderMarkdownLines(a.prompt ?? "", width, markdownTheme, renderCache));
         body.push("", theme.fg("accent", theme.bold("Result:")));
-        body.push(...renderResultLines(a.result, a.resultPreview, width, markdownTheme));
+        body.push(...renderResultLines(a.result, a.resultPreview, width, markdownTheme, renderCache));
         if (a.history?.length) {
           body.push("", theme.fg("accent", theme.bold("History:")));
           for (let i = 0; i < a.history.length; i++) {
-            body.push(...renderHistoryEntryLines(a.history, i, width, markdownTheme, dim));
+            body.push(...renderHistoryEntryLines(a.history, i, width, markdownTheme, dim, renderCache));
           }
         }
         pushScrollable(body);
@@ -942,7 +1033,7 @@ export function renderNavigator(
         // Completed agents default to their useful final output; prompt/history
         // remain one keypress away in the full pager.
         body.push(theme.fg("accent", theme.bold("Result:")));
-        body.push(...renderResultLines(a.result, a.resultPreview, width, markdownTheme));
+        body.push(...renderResultLines(a.result, a.resultPreview, width, markdownTheme, renderCache));
         pushCompact(body);
       } else {
         // Active/failed agents default to context plus the latest two events.
@@ -951,14 +1042,14 @@ export function renderNavigator(
         if (a.error) body.push(dim("Error: ") + a.error);
         if (a.errorCode) body.push(`${dim("Error code: ")}${a.errorCode}${a.recoverable ? " (recoverable)" : ""}`);
         body.push("", theme.fg("accent", theme.bold("Prompt:")));
-        const promptLines = renderMarkdownLines(a.prompt ?? "", width, markdownTheme);
+        const promptLines = renderMarkdownLines(a.prompt ?? "", width, markdownTheme, renderCache);
         body.push(...promptLines.slice(0, 5));
         if (promptLines.length > 5) body.push(dim("  … prompt continues in pager"));
         body.push("", theme.fg("accent", theme.bold("Recent activity:")));
         if (a.history?.length) {
           const start = Math.max(0, a.history.length - 2);
           for (let i = start; i < a.history.length; i++) {
-            const eventLines = renderHistoryEntryLines(a.history, i, width, markdownTheme, dim);
+            const eventLines = renderHistoryEntryLines(a.history, i, width, markdownTheme, dim, renderCache);
             body.push(...eventLines.slice(0, 4));
             if (eventLines.length > 4) body.push(dim("  … event continues in pager"));
           }
@@ -979,7 +1070,7 @@ export function renderNavigator(
       body.push(dim("Saved at: ") + w.savedAt);
       if (w.parameters) body.push(dim("Parameters: ") + JSON.stringify(w.parameters));
       body.push("", theme.fg("accent", theme.bold("Script:")));
-      body.push(...renderCodeLines(w.script, "javascript", width, markdownTheme));
+      body.push(...renderCodeLines(w.script, "javascript", width, markdownTheme, renderCache));
       pushScrollable(body);
     }
   }
@@ -1076,6 +1167,7 @@ function renderHistoryEntryLines(
   width: number,
   markdownTheme: MarkdownTheme | undefined,
   dim: (text: string) => string,
+  renderCache?: NavigatorTextRenderCache,
 ): string[] {
   const entry = history[index];
   if (!entry) return [];
@@ -1083,8 +1175,8 @@ function renderHistoryEntryLines(
   return [
     dim(`${historyLabel(entry)}:`),
     ...(language
-      ? renderCodeLines(entry.text, language, width, markdownTheme)
-      : renderMarkdownLines(entry.text, width, markdownTheme)),
+      ? renderCodeLines(entry.text, language, width, markdownTheme, renderCache)
+      : renderMarkdownLines(entry.text, width, markdownTheme, renderCache)),
   ];
 }
 
@@ -1131,16 +1223,37 @@ function wrap(text: string, width: number): string[] {
 
 /** Render prose as Markdown when the host theme is available. Fenced code blocks
  * are syntax highlighted by pi's Markdown renderer. */
-function renderMarkdownLines(text: string, width: number, markdownTheme?: MarkdownTheme): string[] {
+function renderMarkdownLines(
+  text: string,
+  width: number,
+  markdownTheme?: MarkdownTheme,
+  renderCache?: NavigatorTextRenderCache,
+): string[] {
   if (!markdownTheme) return wrap(text, width);
-  return new Markdown(text, 0, 0, markdownTheme).render(Math.max(1, width));
+  const renderWidth = Math.max(1, width);
+  const key = `md:${renderWidth}:${text}`;
+  const cached = renderCache?.get(key);
+  if (cached) return cached;
+  const lines = new Markdown(text, 0, 0, markdownTheme).render(renderWidth);
+  return renderCache?.set(key, lines, key.length + lines.reduce((sum, line) => sum + line.length, 0)) ?? lines;
 }
 
 /** Render a known-language source block without requiring Markdown fences (a
  * workflow script can itself contain backticks). */
-function renderCodeLines(text: string, language: string, width: number, markdownTheme?: MarkdownTheme): string[] {
+function renderCodeLines(
+  text: string,
+  language: string,
+  width: number,
+  markdownTheme?: MarkdownTheme,
+  renderCache?: NavigatorTextRenderCache,
+): string[] {
+  const renderWidth = Math.max(1, width);
+  const key = `code:${language}:${renderWidth}:${text}`;
+  const cached = renderCache?.get(key);
+  if (cached) return cached;
   const sourceLines = markdownTheme?.highlightCode?.(text, language) ?? text.split("\n");
-  return sourceLines.flatMap((line) => wrapTextWithAnsi(`  ${line}`, Math.max(1, width)));
+  const lines = sourceLines.flatMap((line) => wrapTextWithAnsi(`  ${line}`, renderWidth));
+  return renderCache?.set(key, lines, key.length + lines.reduce((sum, line) => sum + line.length, 0)) ?? lines;
 }
 
 function renderResultLines(
@@ -1148,17 +1261,27 @@ function renderResultLines(
   preview: string | undefined,
   width: number,
   markdownTheme?: MarkdownTheme,
+  renderCache?: NavigatorTextRenderCache,
 ): string[] {
   if (result !== undefined && typeof result !== "string") {
     let json: string;
-    try {
-      json = JSON.stringify(result, null, 2) ?? String(result);
-    } catch {
-      json = String(result);
+    if (renderCache && typeof result === "object" && result !== null) {
+      json = renderCache.stringify(result);
+    } else {
+      try {
+        json = JSON.stringify(result, null, 2) ?? String(result);
+      } catch {
+        json = String(result);
+      }
     }
-    return renderCodeLines(json, "json", width, markdownTheme);
+    return renderCodeLines(json, "json", width, markdownTheme, renderCache);
   }
-  return renderMarkdownLines(typeof result === "string" ? result : (preview ?? "(none)"), width, markdownTheme);
+  return renderMarkdownLines(
+    typeof result === "string" ? result : (preview ?? "(none)"),
+    width,
+    markdownTheme,
+    renderCache,
+  );
 }
 
 /** What a key press should do. Pure mapping from a parsed key id to an action. */
@@ -1266,22 +1389,39 @@ export function openWorkflowNavigator(
   return ui.custom<void>(
     (tui: TUI, theme: Theme, _keybindings, done: (r: undefined) => void) => {
       const rerender = () => tui.requestRender();
-      const events = [
-        "agentStart",
-        "agentEnd",
-        "agentHistory",
-        "phase",
-        "log",
-        "complete",
-        "error",
-        "stopped",
-        "paused",
-        "resumed",
-      ];
+      const markdownTheme = getMarkdownTheme();
+      const renderCache = new NavigatorTextRenderCache();
+      const events = ["agentStart", "agentEnd", "phase", "log", "complete", "error", "stopped", "paused", "resumed"];
       const onEvent = () => rerender();
       for (const ev of events) manager.on(ev, onEvent);
+
+      // Histories can update several times per second for every parallel agent.
+      // Only agent detail consumes those updates, so ignore unrelated agents and
+      // coalesce matching updates into a modest trailing redraw cadence.
+      let historyRenderTimer: ReturnType<typeof setTimeout> | undefined;
+      const onAgentHistory = (event: { runId: string; agentId?: number }) => {
+        if (
+          state.kind !== "detail" ||
+          event.runId !== state.runId ||
+          event.agentId === undefined ||
+          event.agentId !== state.agentId
+        ) {
+          return;
+        }
+        if (historyRenderTimer) return;
+        historyRenderTimer = setTimeout(() => {
+          historyRenderTimer = undefined;
+          if (state.kind === "detail" && event.runId === state.runId && event.agentId === state.agentId) rerender();
+        }, 125);
+        (historyRenderTimer as { unref?: () => void }).unref?.();
+      };
+      manager.on("agentHistory", onAgentHistory);
+
       const cleanup = () => {
         for (const ev of events) manager.off(ev, onEvent);
+        manager.off("agentHistory", onAgentHistory);
+        if (historyRenderTimer) clearTimeout(historyRenderTimer);
+        historyRenderTimer = undefined;
       };
 
       const act = (data: string) => {
@@ -1413,7 +1553,9 @@ export function openWorkflowNavigator(
           const terminalRows = tui.terminal?.rows ?? 24;
           const overlayRows = Math.max(8, Math.floor(terminalRows * 0.92));
           const contentRows = Math.max(6, overlayRows - 2); // top + bottom box borders
-          const raw = renderNavigator(state, model, innerWidth, theme, contentRows, getMarkdownTheme());
+          const raw = model.withRenderFrame(() =>
+            renderNavigatorFrame(state, model, innerWidth, theme, contentRows, markdownTheme, renderCache),
+          );
           const title = titleColor(" workflows ");
           const topBorder =
             borderColor("╭─") + title + borderColor("─".repeat(Math.max(0, innerWidth - 10))) + borderColor("╮");

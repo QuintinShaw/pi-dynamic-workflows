@@ -575,6 +575,40 @@ test(
 );
 
 test(
+  "createRunPersistence reuses a recent list and invalidates it after save",
+  withTempCwd(async (cwd) => {
+    let directoryReads = 0;
+    const rp = createRunPersistence(cwd, {
+      readdirSync: (path) => {
+        directoryReads++;
+        return readdirSync(path);
+      },
+    });
+    const state: PersistedRunState = {
+      runId: "cached-list",
+      workflowName: "first",
+      script: "export const meta = { name: 'cached', description: 'cached' }",
+      status: "completed",
+      phases: [],
+      agents: [],
+      logs: [],
+      startedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    rp.save(state);
+    assert.equal(rp.list()[0]?.workflowName, "first");
+    const readsAfterFirstList = directoryReads;
+    assert.equal(rp.list()[0]?.workflowName, "first");
+    assert.equal(directoryReads, readsAfterFirstList, "same-frame list avoids another directory scan");
+
+    rp.save({ ...state, workflowName: "updated" });
+    assert.equal(rp.list()[0]?.workflowName, "updated");
+    assert.ok(directoryReads > readsAfterFirstList, "save invalidates the cached list");
+  }),
+);
+
+test(
   "createRunPersistence concurrent save and load returns consistent data",
   withTempCwd(async (cwd) => {
     const rp = createRunPersistence(cwd);

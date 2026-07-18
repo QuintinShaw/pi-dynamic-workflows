@@ -447,7 +447,7 @@ export class WorkflowManager extends EventEmitter {
           if (agent) {
             agent.history = event.history;
           }
-          this.emit("agentHistory", { runId: managed.runId, ...event });
+          this.emit("agentHistory", { runId: managed.runId, agentId: agent?.id, ...event });
           progress();
         },
         onTokenUsage: (usage) => {
@@ -563,6 +563,10 @@ export class WorkflowManager extends EventEmitter {
 
   private writeRunToDisk(managed: ManagedRun) {
     try {
+      // Resumable states need their journal; completed/aborted states need rich
+      // agent details. Persist exactly one full copy of each agent result instead
+      // of writing it to both agents[].result and journal[].result.
+      const keepsResumeJournal = managed.status !== "completed" && managed.status !== "aborted";
       this.persistence.save({
         runId: managed.runId,
         workflowName: managed.snapshot.name,
@@ -571,7 +575,7 @@ export class WorkflowManager extends EventEmitter {
         script: managed.script,
         args: managed.args,
         sessionId: this.sessionId,
-        journal: managed.journal,
+        journal: keepsResumeJournal ? managed.journal : undefined,
         status: managed.status,
         // Persisted every write (not just at pause) so a stale read during the
         // "paused" event race (see UsageLimitScheduler) is still correct — this
@@ -588,9 +592,13 @@ export class WorkflowManager extends EventEmitter {
         // own startedAt or "now" stamped onto every agent on every write. A
         // still-running agent is persisted with no endedAt.
         agents: managed.snapshot.agents.map((a) => {
+          const { result, ...summary } = a;
           const ts = managed.agentTimestamps.get(a.id);
           return {
-            ...a,
+            ...summary,
+            // Live runs keep the rich value in memory. Cold resumable runs use
+            // the journal and retain resultPreview until replay reconstructs it.
+            ...(keepsResumeJournal || result === undefined ? {} : { result }),
             startedAt: ts?.startedAt,
             endedAt: ts?.endedAt,
           };
