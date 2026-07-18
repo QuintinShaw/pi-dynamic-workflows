@@ -479,6 +479,12 @@ export class WorkflowAgent {
   private readonly sharedRegistry?: ModelRegistry;
   /** Lazily built once; shares the SDK's agentDir/auth so resolved models are authed. */
   private registry?: ModelRegistry;
+  /**
+   * Memoized model-tiers.json snapshot, boxed so a legitimately-null config
+   * (file absent/invalid) is distinguishable from "not loaded yet". See
+   * loadTierConfig() below for why this is scoped per-instance.
+   */
+  private tierConfigBox?: { value: ModelTierConfig | null };
 
   constructor(options: WorkflowAgentOptions = {}) {
     this.cwd = options.cwd ?? process.cwd();
@@ -507,6 +513,38 @@ export class WorkflowAgent {
       this.registry = await ensureFallbackRegistry();
     }
     return this.registry;
+  }
+
+  /**
+   * Read+parse ~/.pi/workflows/model-tiers.json at most once for this
+   * instance's lifetime, instead of on every run() call. `resolveAgentModelSpec`
+   * previously received `loadModelTierConfig` directly (sync existsSync +
+   * readFileSync + JSON.parse from disk), which it calls unconditionally for
+   * any agent without an explicit options.model — so a large fan-out did N
+   * redundant synchronous disk reads that blocked the event loop and stalled
+   * concurrent agents' I/O.
+   *
+   * `runWorkflow()` constructs a fresh `WorkflowAgent` per run (see
+   * `new WorkflowAgent(options)` in workflow.ts, unless a caller injects its
+   * own `options.agent` runner — a test-only escape hatch per
+   * WorkflowManagerOptions.agent's doc comment), so a WorkflowAgent instance's
+   * lifetime is one run in production. Memoizing on `this` therefore has the
+   * same scope and lifetime as the agentRegistry snapshot workflow.ts already
+   * takes once per run "for determinism" — the config file isn't expected to
+   * change mid-run, and two different runs (= two different WorkflowAgent
+   * instances) each get their own fresh read of whatever is on disk at the
+   * time, so this does not leak stale config across runs or break tests that
+   * construct fresh agents with different configs.
+   *
+   * `loader` is injectable for tests (defaults to the real disk read); it is
+   * only ever consulted once, on the first call, regardless of what is passed
+   * on later calls.
+   */
+  private loadTierConfig(loader: () => ModelTierConfig | null = loadModelTierConfig): ModelTierConfig | null {
+    if (!this.tierConfigBox) {
+      this.tierConfigBox = { value: loader() };
+    }
+    return this.tierConfigBox.value;
   }
 
   /**
@@ -580,8 +618,11 @@ export class WorkflowAgent {
     // Resolve the model spec (explicit model > tier > session default). This
     // composes with phase-based routing in workflow.ts, which only supplies
     // options.model when a phase pattern matches — so an explicit model wins.
-    const modelSpec = resolveAgentModelSpec(options, this.mainModel, loadModelTierConfig, () =>
-      warnTierUnconfiguredOnce(this.mainModel, modelRegistry),
+    const modelSpec = resolveAgentModelSpec(
+      options,
+      this.mainModel,
+      () => this.loadTierConfig(),
+      () => warnTierUnconfiguredOnce(this.mainModel, modelRegistry),
     );
 
     // Resolve a requested model spec to a Model object. Specs use Pi CLI-style

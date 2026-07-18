@@ -3,13 +3,15 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
+import { createFauxCore, fauxAssistantMessage } from "@earendil-works/pi-ai";
+import { ModelRegistry, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import type { AgentRunOptions, AgentUsage } from "../src/agent.js";
 import { listAvailableModelSpecs, resolveAgentModelSpec, usageFromStats, WorkflowAgent } from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { resolveModelSpecWithThinking } from "../src/model-spec.js";
 import type { ModelTierConfig } from "../src/model-tier-config.js";
 import { runWorkflow } from "../src/workflow.js";
-import { withFakeHome } from "./helpers/fake-home.js";
+import { withFakeHome, withFakeHomeAsync } from "./helpers/fake-home.js";
 
 // Private methods used for testing - cast to this type to access them without `any`
 type WorkflowAgentPrivates = {
@@ -155,6 +157,141 @@ test("resolveAgentModelSpec: untagged agent with a config lacking a medium tier 
 
 test("resolveAgentModelSpec: tier with no main model and no config yields undefined", () => {
   assert.equal(resolveAgentModelSpec({ tier: "small" }, undefined, noCfg), undefined);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WorkflowAgent#loadTierConfig — memoize model-tiers.json once per instance
+// (perf fix: resolveAgentModelSpec's loadConfig previously re-read+parsed the
+// file from disk on every run() call for any agent without an explicit
+// options.model, which is a sync fs read on the hot per-agent path)
+// ═══════════════════════════════════════════════════════════════════════════
+
+type WorkflowAgentTierPrivates = {
+  loadTierConfig(loader?: () => ModelTierConfig | null): ModelTierConfig | null;
+};
+
+test("WorkflowAgent#loadTierConfig: the loader is invoked at most once across repeated calls", () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp" }) as unknown as WorkflowAgentTierPrivates;
+  let calls = 0;
+  const loader = () => {
+    calls++;
+    return tierConfig;
+  };
+
+  const first = agent.loadTierConfig(loader);
+  const second = agent.loadTierConfig(loader);
+  // Even a loader that would blow up if called proves the memoized branch
+  // never reaches the loader again.
+  const third = agent.loadTierConfig(() => {
+    throw new Error("loader must not be invoked again once memoized");
+  });
+
+  assert.equal(calls, 1, "the real loader should only run once");
+  assert.deepEqual(first, tierConfig);
+  assert.equal(second, first, "repeated calls must return the memoized value");
+  assert.equal(third, first);
+});
+
+test("WorkflowAgent#loadTierConfig: a legitimately-null config (no file) is memoized too, not re-checked", () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp" }) as unknown as WorkflowAgentTierPrivates;
+  let calls = 0;
+  const loader = () => {
+    calls++;
+    return null;
+  };
+
+  assert.equal(agent.loadTierConfig(loader), null);
+  assert.equal(agent.loadTierConfig(loader), null);
+  assert.equal(calls, 1, "null is a valid memoized result, not a 'try again' signal");
+});
+
+test("WorkflowAgent#loadTierConfig: memoization is per-instance (two agents, two runs, don't leak into each other)", () => {
+  const a = new WorkflowAgent({ cwd: "/tmp" }) as unknown as WorkflowAgentTierPrivates;
+  const b = new WorkflowAgent({ cwd: "/tmp" }) as unknown as WorkflowAgentTierPrivates;
+  const cfgA: ModelTierConfig = { tiers: { medium: "vendor-a/model" } };
+  const cfgB: ModelTierConfig = { tiers: { medium: "vendor-b/model" } };
+
+  assert.equal(
+    a.loadTierConfig(() => cfgA),
+    cfgA,
+  );
+  assert.equal(
+    b.loadTierConfig(() => cfgB),
+    cfgB,
+  );
+  // `a` stays pinned to cfgA even when handed a different loader later — a
+  // fresh WorkflowAgent per run (the production lifetime; see workflow.ts's
+  // `new WorkflowAgent(options)` per runWorkflow() call) means two runs with
+  // different on-disk configs still each see their own correct snapshot,
+  // without a process-global cache leaking state across them.
+  assert.equal(
+    a.loadTierConfig(() => cfgB),
+    cfgA,
+  );
+});
+
+test("WorkflowAgent.run(): tier routing resolves correctly through the real (non-injected) disk loader, read only once across two run() calls", async () => {
+  // End-to-end proof that memoization doesn't break the real wiring: writes an
+  // actual model-tiers.json to a fake home, runs two real subagents against a
+  // faux (no-network) provider, and confirms both resolve the tier-configured
+  // model AND that the underlying config object is reused (same reference)
+  // across both run() calls rather than re-read/re-parsed.
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-tier-memo-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-tier-memo-cwd-"));
+  const core = createFauxCore({
+    provider: "fauxtest",
+    models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 4096 }],
+  });
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const tiersDir = join(home, ".pi", "workflows");
+      mkdirSync(tiersDir, { recursive: true });
+      writeFileSync(join(tiersDir, "model-tiers.json"), JSON.stringify({ tiers: { medium: "fauxtest/faux-model" } }));
+
+      const runtime = await ModelRuntime.create({ authPath: join(home, "auth.json"), modelsPath: null });
+      runtime.registerProvider("fauxtest", {
+        name: "Faux Test",
+        baseUrl: "http://127.0.0.1:9/faux",
+        apiKey: "faux-dummy-key-not-used",
+        api: core.api,
+        streamSimple: core.streamSimple as never,
+        models: core.models.map((m) => ({
+          id: m.id,
+          name: m.name ?? m.id,
+          reasoning: false,
+          input: ["text"] as ("text" | "image")[],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: m.contextWindow ?? 128000,
+          maxTokens: m.maxTokens ?? 4096,
+        })),
+      });
+      const registry = new ModelRegistry(runtime);
+      core.setResponses([
+        fauxAssistantMessage("tier-routed-first", { stopReason: "stop" }),
+        fauxAssistantMessage("tier-routed-second", { stopReason: "stop" }),
+      ]);
+
+      const agent = new WorkflowAgent({ cwd, modelRegistry: registry });
+      const spy = test.mock.method(agent as unknown as WorkflowAgentTierPrivates, "loadTierConfig");
+
+      const first = await agent.run("task one", { label: "a", tier: "medium" });
+      const second = await agent.run("task two", { label: "b", tier: "medium" });
+
+      assert.ok(first.includes("tier-routed-first"), "first agent should route through the tiered faux model");
+      assert.ok(second.includes("tier-routed-second"), "second agent should route through the tiered faux model");
+
+      assert.equal(spy.mock.callCount(), 2, "loadTierConfig() is called once per run(), as expected");
+      const [firstResult, secondResult] = spy.mock.calls.map((c) => c.result);
+      assert.equal(
+        firstResult,
+        secondResult,
+        "the SAME config object must be reused across run() calls — the file was read/parsed only once",
+      );
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
 });
 
 test("WorkflowAgent constructor accepts all option shapes without throwing", () => {

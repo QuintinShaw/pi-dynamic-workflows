@@ -125,6 +125,18 @@ export type FsLayer = {
   writeFileSync: typeof writeFileSync;
 };
 
+/**
+ * `list()` does a full readdirSync + per-file readFileSync + JSON.parse of the
+ * entire lifetime run history. It is called on essentially every progress tick
+ * (task-panel re-render → WorkflowManager.listRuns()/listAllRuns()), so an
+ * unbounded number of ticks each re-walked and re-parsed every run file on
+ * disk. Cache the computed list for a short TTL — long enough to absorb a
+ * burst of same-tick reads, short enough that a read from a DIFFERENT process
+ * (or a mutation this instance doesn't own) still shows up quickly. Mirrors
+ * the ~1s settings-read TTL cache in task-panel.ts.
+ */
+const LIST_CACHE_TTL_MS = 300;
+
 export function createRunPersistence(cwd: string, fsOverride?: Partial<FsLayer>): RunPersistence {
   const _existsSync = fsOverride?.existsSync ?? existsSync;
   const _mkdirSync = fsOverride?.mkdirSync ?? mkdirSync;
@@ -173,6 +185,17 @@ export function createRunPersistence(cwd: string, fsOverride?: Partial<FsLayer>)
 
   const readLock = (runId: string): LockFile | null => readLockAt(primaryLockPath(runId));
 
+  // list() cache: recomputed lazily, invalidated synchronously by every
+  // mutation this instance performs (save()/delete()) so a stale read can
+  // never outlive a mutation this process made. A read from another process
+  // (or a direct fs write bypassing this instance) is picked up once the TTL
+  // elapses, same as before this cache existed on the next un-cached call.
+  let listCache: PersistedRunState[] | undefined;
+  let listCacheAt = 0;
+  const invalidateListCache = () => {
+    listCache = undefined;
+  };
+
   const removeStaleLegacyLock = (runId: string): boolean => {
     const lock = legacyLockPath(runId);
     const existing = readLockAt(lock);
@@ -201,6 +224,7 @@ export function createRunPersistence(cwd: string, fsOverride?: Partial<FsLayer>)
       } catch {
         // backup is best-effort; the primary write already succeeded
       }
+      invalidateListCache();
     },
 
     load(runId: string): PersistedRunState | null {
@@ -219,6 +243,13 @@ export function createRunPersistence(cwd: string, fsOverride?: Partial<FsLayer>)
     },
 
     list(): PersistedRunState[] {
+      const now = Date.now();
+      // Return a fresh array on every call (a cheap ref-copy) so a caller that
+      // sorts/reverses/mutates the result in place can't corrupt the cache — the
+      // pre-cache code re-parsed into a new array each call, preserve that.
+      if (listCache && now - listCacheAt < LIST_CACHE_TTL_MS) {
+        return [...listCache];
+      }
       const byRunId = new Map<string, PersistedRunState>();
       for (const dir of [runsDir, legacyRunsDir]) {
         try {
@@ -236,7 +267,12 @@ export function createRunPersistence(cwd: string, fsOverride?: Partial<FsLayer>)
           // Skip unreadable directories; another storage location may still work.
         }
       }
-      return [...byRunId.values()].sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+      const result = [...byRunId.values()].sort(
+        (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime(),
+      );
+      listCache = result;
+      listCacheAt = now;
+      return [...result];
     },
 
     delete(runId: string): boolean {
@@ -264,6 +300,8 @@ export function createRunPersistence(cwd: string, fsOverride?: Partial<FsLayer>)
         return deleted;
       } catch {
         return deleted;
+      } finally {
+        invalidateListCache();
       }
     },
 

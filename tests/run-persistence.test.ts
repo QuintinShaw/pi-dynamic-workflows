@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -440,6 +440,137 @@ test(
 
     const runs = rp.list();
     assert.deepEqual(runs, []);
+  }),
+);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// list() caching (perf fix) — list() is called on essentially every progress
+// tick (task-panel re-render), and previously did a full readdirSync +
+// per-file readFileSync + JSON.parse of the entire run history on every call.
+// A short in-memory TTL cache lets repeated same-tick reads reuse the parse,
+// invalidated synchronously by every save()/delete() this instance performs.
+// ═══════════════════════════════════════════════════════════════════════════
+
+function baseRunState(runId: string, updatedAt = "2024-01-01T00:00:00.000Z"): PersistedRunState {
+  return {
+    runId,
+    workflowName: "wf",
+    script: "export const meta = { name: 'w', description: 'w' }",
+    status: "completed",
+    phases: [],
+    agents: [],
+    logs: [],
+    startedAt: updatedAt,
+    updatedAt,
+  };
+}
+
+test(
+  "createRunPersistence list() caches within the TTL: a repeated call does not re-read disk",
+  withTempCwd(async (cwd) => {
+    let readdirCalls = 0;
+    let readFileCalls = 0;
+    const rp = createRunPersistence(cwd, {
+      readdirSync: ((...args: Parameters<typeof readdirSync>) => {
+        readdirCalls++;
+        return readdirSync(...args);
+      }) as typeof readdirSync,
+      readFileSync: ((...args: Parameters<typeof readFileSync>) => {
+        readFileCalls++;
+        return readFileSync(...args);
+      }) as typeof readFileSync,
+    });
+
+    rp.save(baseRunState("cache-1"));
+    // save() doesn't touch readdirSync/readFileSync, but reset for clarity.
+    readdirCalls = 0;
+    readFileCalls = 0;
+
+    const first = rp.list();
+    assert.equal(first.length, 1);
+    assert.ok(readdirCalls > 0, "the first (uncached) list() call should read the directory");
+    assert.ok(readFileCalls > 0, "the first (uncached) list() call should read+parse the run file");
+    const readdirAfterFirst = readdirCalls;
+    const readFileAfterFirst = readFileCalls;
+
+    const second = rp.list();
+    assert.equal(
+      readdirCalls,
+      readdirAfterFirst,
+      "a repeated list() within the TTL must not re-read the runs directory",
+    );
+    assert.equal(readFileCalls, readFileAfterFirst, "a repeated list() within the TTL must not re-parse the run files");
+    assert.deepEqual(second, first, "cached data must be identical to the freshly-computed data");
+  }),
+);
+
+test(
+  "createRunPersistence list() cache is invalidated by save(): a new run appears on the very next call",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd);
+    rp.save(baseRunState("a"));
+    const before = rp.list();
+    assert.equal(before.length, 1);
+
+    rp.save(baseRunState("b"));
+    const after = rp.list();
+    assert.equal(after.length, 2, "save() must invalidate the cache so the next list() reflects the new run");
+    assert.ok(after.some((r) => r.runId === "b"));
+  }),
+);
+
+test(
+  "createRunPersistence list() cache is invalidated by an update to an existing run's data",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd);
+    rp.save(baseRunState("a", "2024-01-01T00:00:00.000Z"));
+    const before = rp.list();
+    assert.equal(before[0].status, "completed");
+
+    rp.save({ ...baseRunState("a", "2024-01-02T00:00:00.000Z"), status: "running" });
+    const after = rp.list();
+    assert.equal(after[0].status, "running", "save() must invalidate the cache so an updated field is visible");
+  }),
+);
+
+test(
+  "createRunPersistence list() cache is invalidated by delete()",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd);
+    rp.save(baseRunState("a"));
+    rp.save(baseRunState("b"));
+    const before = rp.list();
+    assert.equal(before.length, 2);
+
+    rp.delete("a");
+    const after = rp.list();
+    assert.equal(after.length, 1, "delete() must invalidate the cache");
+    assert.equal(after[0].runId, "b");
+  }),
+);
+
+test(
+  "createRunPersistence list() re-reads disk again once the TTL has elapsed (not cached forever)",
+  withTempCwd(async (cwd) => {
+    let readdirCalls = 0;
+    const rp = createRunPersistence(cwd, {
+      readdirSync: ((...args: Parameters<typeof readdirSync>) => {
+        readdirCalls++;
+        return readdirSync(...args);
+      }) as typeof readdirSync,
+    });
+
+    rp.save(baseRunState("ttl-test"));
+    readdirCalls = 0;
+    rp.list();
+    assert.equal(readdirCalls, 1);
+
+    // Wait past the TTL window (well beyond any reasonable short cache) and
+    // confirm a later call does read disk again — this is a cache, not a
+    // permanent snapshot.
+    await new Promise((r) => setTimeout(r, 400));
+    rp.list();
+    assert.ok(readdirCalls >= 2, "list() should read disk again once the TTL has elapsed");
   }),
 );
 
