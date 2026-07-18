@@ -4,26 +4,35 @@ import { aggregateAgentUsage, tokenFigures, type WorkflowAgentSnapshot, type Wor
 import type { PersistedRunState, RunStatus } from "./run-persistence.js";
 import type { WorkflowManager } from "./workflow-manager.js";
 
-const runActionSchema = Type.Union([
-  Type.Literal("status"),
-  Type.Literal("pause"),
-  Type.Literal("resume"),
-  Type.Literal("stop"),
-]);
-
-const workflowControlSchema = Type.Union([
-  Type.Object(
-    { action: Type.Literal("list", { description: "List workflow runs." }) },
-    { additionalProperties: false },
-  ),
-  Type.Object(
-    {
-      action: runActionSchema,
-      runId: Type.String({ minLength: 1, description: "Canonical workflow run ID." }),
-    },
-    { additionalProperties: false },
-  ),
-]);
+// A tool's top-level parameter schema must be a JSON Schema object (`type:
+// "object"`). A discriminated Type.Union of two objects serializes to a
+// top-level `anyOf` with no `type`, which strict providers (e.g. DeepSeek)
+// reject with "schema must be type object, got type: null". So the schema is a
+// single object: `action` is the full set of verbs and `runId` is optional at
+// the schema level. The per-action requirement (runId is mandatory for every
+// action except `list`, and `list` takes no runId) is enforced at runtime in
+// normalizeInput() and guarded again in execute().
+const workflowControlSchema = Type.Object(
+  {
+    action: Type.Union(
+      [
+        Type.Literal("list"),
+        Type.Literal("status"),
+        Type.Literal("pause"),
+        Type.Literal("resume"),
+        Type.Literal("stop"),
+      ],
+      { description: "list = all runs (no runId); status/pause/resume/stop act on one run and require runId." },
+    ),
+    runId: Type.Optional(
+      Type.String({
+        minLength: 1,
+        description: "Canonical workflow run ID. Required for status, pause, resume, and stop; omit for list.",
+      }),
+    ),
+  },
+  { additionalProperties: false },
+);
 
 export type WorkflowControlInput = Static<typeof workflowControlSchema>;
 
@@ -81,6 +90,11 @@ export function createWorkflowControlTool(
         );
       }
 
+      // runId is optional in the schema (see workflowControlSchema) but required
+      // for every non-list action; normalizeInput already enforces this, and this
+      // guard both narrows the type and returns a structured error if a model
+      // somehow calls a run action without one.
+      if (!params.runId) return controlError(params.action, "", "runId is required for this action", ["list"]);
       const run = findRun(manager, params.runId);
       if (!run) return controlError(params.action, params.runId, "run not found", ["list"]);
 

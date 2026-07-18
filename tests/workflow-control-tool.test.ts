@@ -72,20 +72,32 @@ test("workflow_control exposes only list, status, pause, resume, and stop in a s
   const tool = createWorkflowControlTool({ manager });
 
   assert.equal(tool.name, "workflow_control");
+
+  // The top-level parameter schema MUST be `type: "object"`. A discriminated
+  // Type.Union serialized to a top-level `anyOf` with no `type`, which strict
+  // providers (DeepSeek) reject with "schema must be type object, got type:
+  // null" — a 400 on every request. This is the regression guard for that.
+  assert.equal((tool.parameters as { type?: string }).type, "object");
+
+  // Schema level: every valid action verb is accepted; runId is optional at the
+  // schema level (the per-action requirement is enforced by prepareArguments).
   assert.equal(Check(tool.parameters, { action: "list" }), true);
   assert.equal(Check(tool.parameters, { action: "status", runId: "abc" }), true);
   assert.equal(Check(tool.parameters, { action: "pause", runId: "abc" }), true);
   assert.equal(Check(tool.parameters, { action: "resume", runId: "abc" }), true);
   assert.equal(Check(tool.parameters, { action: "stop", runId: "abc" }), true);
+  assert.equal(Check(tool.parameters, { action: "status" }), true, "runId is optional at the schema level");
   assert.equal(Check(tool.parameters, { action: "restart", runId: "abc" }), false);
   assert.equal(Check(tool.parameters, { action: "remove", runId: "abc" }), false);
   assert.equal(Check(tool.parameters, { action: "set_concurrency", runId: "abc", concurrency: 2 }), false);
-  assert.equal(Check(tool.parameters, { action: "status" }), false);
-  assert.equal(Check(tool.parameters, { action: "list", runId: "abc" }), false);
   assert.equal(Check(tool.parameters, { action: "status", runId: "abc", extra: true }), false);
 
+  // prepareArguments (normalizeInput) enforces the real per-action rules that the
+  // permissive object schema deliberately leaves open.
   const prepare = tool.prepareArguments as (value: unknown) => unknown;
   assert.throws(() => prepare({ action: "pause" }), /requires runId/);
+  assert.throws(() => prepare({ action: "status" }), /requires runId/);
+  assert.throws(() => prepare({ action: "list", runId: "abc" }), /does not accept runId/);
   assert.throws(() => prepare({ action: "status", runId: "abc", extra: true }), /does not accept extra/);
   assert.throws(() => prepare({ action: "restart", runId: "abc" }), /requires action/);
 });
