@@ -33,6 +33,29 @@ test("compactAgentHistory captures user, assistant, tool call, and tool result e
   );
 });
 
+test("compactAgentHistory stores write source without its raw JSON envelope", () => {
+  const history = compactAgentHistory(
+    [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            name: "write",
+            arguments: { path: "src/example.rs", content: `fn main() {\n${"x".repeat(100)}\n}` },
+          },
+        ],
+      },
+    ],
+    { maxTextChars: 50 },
+  );
+
+  assert.equal(history[0]?.path, "src/example.rs");
+  assert.match(history[0]?.text ?? "", /^fn main/);
+  assert.match(history[0]?.text ?? "", /truncated/);
+  assert.doesNotMatch(history[0]?.text ?? "", /"content":/);
+});
+
 test("compactAgentHistory records assistant and tool errors", () => {
   const history = compactAgentHistory([
     {

@@ -1136,16 +1136,36 @@ function historyLabel(entry: NonNullable<WorkflowAgentSnapshot["history"]>[numbe
   return entry.role;
 }
 
+function writeCallSource(
+  entry: NonNullable<WorkflowAgentSnapshot["history"]>[number],
+): { path: string; content: string } | undefined {
+  if (entry.kind !== "toolCall" || entry.toolName !== "write") return undefined;
+  if (entry.path) return { path: entry.path, content: entry.text };
+  // Backward compatibility for older persisted histories that stored the whole
+  // write argument envelope as JSON.
+  try {
+    const args = JSON.parse(entry.text) as { path?: unknown; content?: unknown };
+    return typeof args.path === "string" && typeof args.content === "string"
+      ? { path: args.path, content: args.content }
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Infer source language for history that pi stores as raw tool text rather than
- * Markdown. Tool-call arguments are JSON; read results inherit the path from
- * their nearest preceding read call. */
+ * Markdown. Tool-call arguments are JSON; file writes and read results inherit
+ * their source language from the requested path. */
 function historyEntryLanguage(
   history: NonNullable<WorkflowAgentSnapshot["history"]>,
   index: number,
 ): string | undefined {
   const entry = history[index];
   if (!entry) return undefined;
-  if (entry.kind === "toolCall") return "json";
+  if (entry.kind === "toolCall") {
+    const write = writeCallSource(entry);
+    return write ? (getLanguageFromPath(write.path) ?? "text") : "json";
+  }
   if (entry.kind !== "toolResult" || entry.toolName !== "read") return undefined;
 
   for (let i = index - 1; i >= 0; i--) {
@@ -1171,12 +1191,14 @@ function renderHistoryEntryLines(
 ): string[] {
   const entry = history[index];
   if (!entry) return [];
+  const write = writeCallSource(entry);
   const language = historyEntryLanguage(history, index);
+  const text = write?.content ?? entry.text;
   return [
-    dim(`${historyLabel(entry)}:`),
+    dim(`${historyLabel(entry)}:${write ? ` ${write.path}` : ""}`),
     ...(language
-      ? renderCodeLines(entry.text, language, width, markdownTheme, renderCache)
-      : renderMarkdownLines(entry.text, width, markdownTheme, renderCache)),
+      ? renderCodeLines(text, language, width, markdownTheme, renderCache)
+      : renderMarkdownLines(text, width, markdownTheme, renderCache)),
   ];
 }
 

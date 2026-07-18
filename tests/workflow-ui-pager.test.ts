@@ -183,6 +183,34 @@ test("raw read results inherit syntax highlighting from the requested path", () 
   assert.match(text, /\[json\] \{"path":"src\/example.ts"\}/);
 });
 
+test("write calls render source code instead of a raw JSON argument envelope", () => {
+  const history: AgentHistoryEntry[] = [
+    {
+      role: "assistant",
+      kind: "toolCall",
+      toolName: "write",
+      path: "src/example.rs",
+      text: "use uuid::Uuid;\n\npub struct Example;",
+    },
+    { role: "tool", kind: "toolResult", toolName: "write", text: "Successfully wrote 42 bytes" },
+  ];
+  const model = modelForAgent({
+    id: 1,
+    label: "writer",
+    phase: "Work",
+    prompt: "write it",
+    status: "running",
+    history,
+  });
+  const state = enterAgentDetail(model);
+  state.togglePager();
+  const text = renderNavigator(state, model, 100, undefined, 30, plainMarkdownTheme).join("\n");
+
+  assert.match(text, /assistant tool write: src\/example\.rs/);
+  assert.match(text, /\[rust\] use uuid::Uuid;/);
+  assert.doesNotMatch(text, /"content":/);
+});
+
 test("short pagers and long run lists stay within their viewport", () => {
   const longResult = "Z".repeat(2000);
   const detailModel = modelForAgent({

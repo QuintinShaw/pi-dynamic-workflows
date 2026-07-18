@@ -7,6 +7,8 @@ export interface AgentHistoryEntry {
   kind: AgentHistoryKind;
   text: string;
   toolName?: string;
+  /** Source path for file-oriented tool calls whose text is stored as content. */
+  path?: string;
   isError?: boolean;
   timestamp?: number;
 }
@@ -46,11 +48,18 @@ export function compactAgentHistory(messages: unknown[], options: AgentHistoryOp
         if (block.type === "text" && typeof block.text === "string" && block.text.trim()) {
           entries.push({ role: "assistant", kind: "text", text: block.text, timestamp });
         } else if (block.type === "toolCall" && typeof block.name === "string") {
+          const args = asRecord(block.arguments);
+          const writePath = block.name === "write" && typeof args?.path === "string" ? args.path : undefined;
+          const writeContent = writePath && typeof args?.content === "string" ? args.content : undefined;
           entries.push({
             role: "assistant",
             kind: "toolCall",
             toolName: block.name,
-            text: stringifyCompact(block.arguments ?? {}),
+            // A write's JSON envelope is both noisy and likely to be truncated
+            // into invalid JSON. Preserve its source directly so the pager can
+            // render it as code, while retaining JSON for other tool calls.
+            text: writeContent ?? stringifyCompact(block.arguments ?? {}),
+            path: writeContent === undefined ? undefined : writePath,
             timestamp,
           });
         }
