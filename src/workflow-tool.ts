@@ -231,6 +231,13 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
     // message; see workflowHowToGuidelines / buildArmedWorkflowPrompt). It grows
     // the tool-DEFINITION budget; trimming the how-to itself is separate work
     // (#65 / contract-concision), not this change's job.
+    //
+    // CAVEAT: the off-keyword natural-language path only sees this description if
+    // the host keeps the `workflow` tool in its default active tool set. The
+    // arming paths add the tool on arm (installWorkflowEditor's setActiveTools),
+    // but a bare natural-language opt-in with no arm relies on the tool already
+    // being active in the host's config — keep `workflow` default-active so the
+    // gate line's "fan this out" promise (mechanics available) holds.
     description: [
       "Execute a deterministic JavaScript workflow that orchestrates multiple subagents with agent(), parallel(), and pipeline().",
       "script is required raw JavaScript. It must start with export const meta = { name, description, phases? } and must call agent() at least once.",
