@@ -379,6 +379,7 @@ test("keyToAction maps keys per view and itemKind", () => {
   assert.deepEqual(keyToAction("j", "agents"), { type: "move", delta: 1 });
   assert.deepEqual(keyToAction("enter", "runs"), { type: "drill" });
   assert.deepEqual(keyToAction("enter", "detail"), { type: "togglePager" });
+  assert.deepEqual(keyToAction("right", "detail"), { type: "openPager" });
   assert.deepEqual(keyToAction("right", "runs"), { type: "drill" });
   assert.deepEqual(keyToAction("escape", "phases"), { type: "back" });
   assert.deepEqual(keyToAction("left", "agents"), { type: "back" });

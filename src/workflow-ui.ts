@@ -285,28 +285,36 @@ type StackFrame = {
 };
 
 function persistedToSnapshot(p: PersistedRunState): WorkflowSnapshot {
+  // Resumable runs avoid duplicating full results in agents[] and the journal.
+  // Rehydrate done agents by deterministic call position for cold reads, using
+  // the same index mapping as resume(). A directly persisted result still wins
+  // for completed and legacy run files.
+  const journalByIndex = new Map((p.journal ?? []).map((entry) => [entry.index, entry.result] as const));
   return {
     name: p.workflowName,
     phases: p.phases,
     currentPhase: p.currentPhase,
     logs: p.logs,
-    agents: p.agents.map((a) => ({
-      id: a.id,
-      label: a.label,
-      phase: a.phase,
-      prompt: a.prompt,
-      status: a.status,
-      result: a.result,
-      resultPreview:
-        a.result == null ? a.resultPreview : String(typeof a.result === "string" ? a.result : JSON.stringify(a.result)),
-      error: a.error,
-      errorCode: a.errorCode,
-      recoverable: a.recoverable,
-      history: a.history,
-      tokens: a.tokens,
-      tokenUsage: a.tokenUsage,
-      model: a.model,
-    })),
+    agents: p.agents.map((a, callIndex) => {
+      const result = a.result === undefined && a.status === "done" ? journalByIndex.get(callIndex) : a.result;
+      return {
+        id: a.id,
+        label: a.label,
+        phase: a.phase,
+        prompt: a.prompt,
+        status: a.status,
+        result,
+        resultPreview:
+          result == null ? a.resultPreview : String(typeof result === "string" ? result : JSON.stringify(result)),
+        error: a.error,
+        errorCode: a.errorCode,
+        recoverable: a.recoverable,
+        history: a.history,
+        tokens: a.tokens,
+        tokenUsage: a.tokenUsage,
+        model: a.model,
+      };
+    }),
     agentCount: p.agents.length,
     runningCount: p.agents.filter((a) => a.status === "running").length,
     doneCount: p.agents.filter((a) => a.status === "done").length,
@@ -410,13 +418,24 @@ export class NavigatorState {
     this.cursor = edge === "start" || count <= 0 ? 0 : count - 1;
   }
 
+  /** Open the full pager without closing an already-open pager. */
+  openPager(): boolean {
+    if (this.kind !== "detail") return false;
+    if (!this.pagerOpen) {
+      this.pagerOpen = true;
+      this.scroll = 0;
+    }
+    return true;
+  }
+
   /** Toggle the full pager while retaining the compact agent summary view. */
   togglePager(): boolean {
     if (this.kind !== "detail") return false;
-    this.pagerOpen = !this.pagerOpen;
+    if (!this.pagerOpen) return this.openPager();
+    this.pagerOpen = false;
     this.scroll = 0;
-    if (!this.pagerOpen) this.tailing = false;
-    return this.pagerOpen;
+    this.tailing = false;
+    return false;
   }
 
   /** Toggle live follow mode in an agent detail pager. */
@@ -1313,6 +1332,7 @@ export type NavAction =
   | { type: "jump"; edge: "start" | "end" }
   | { type: "toggleTail" }
   | { type: "togglePager" }
+  | { type: "openPager" }
   | { type: "drill" }
   | { type: "back" }
   | { type: "close" }
@@ -1354,8 +1374,11 @@ export function keyToAction(keyId: string | undefined, kind: ViewKind, itemKind?
       return kind === "detail" ? { type: "toggleTail" } : { type: "none" };
     case "enter":
     case "return":
-    case "right":
       if (kind === "detail") return { type: "togglePager" };
+      if (kind === "savedDetail") return { type: "none" };
+      return { type: "drill" };
+    case "right":
+      if (kind === "detail") return { type: "openPager" };
       if (kind === "savedDetail") return { type: "none" };
       return { type: "drill" };
     case "escape":
@@ -1421,6 +1444,7 @@ export function openWorkflowNavigator(
       // Only agent detail consumes those updates, so ignore unrelated agents and
       // coalesce matching updates into a modest trailing redraw cadence.
       let historyRenderTimer: ReturnType<typeof setTimeout> | undefined;
+      let historyRenderTarget: { runId: string; agentId: number } | undefined;
       const onAgentHistory = (event: { runId: string; agentId?: number }) => {
         if (
           state.kind !== "detail" ||
@@ -1430,10 +1454,19 @@ export function openWorkflowNavigator(
         ) {
           return;
         }
+        // Keep the newest matching target even while a redraw is already
+        // scheduled. If navigation switches agents inside the coalescing window,
+        // the pending redraw should follow the new agent rather than the event
+        // that originally created the shared timer.
+        historyRenderTarget = { runId: event.runId, agentId: event.agentId };
         if (historyRenderTimer) return;
         historyRenderTimer = setTimeout(() => {
           historyRenderTimer = undefined;
-          if (state.kind === "detail" && event.runId === state.runId && event.agentId === state.agentId) rerender();
+          const target = historyRenderTarget;
+          historyRenderTarget = undefined;
+          if (target && state.kind === "detail" && target.runId === state.runId && target.agentId === state.agentId) {
+            rerender();
+          }
         }, 125);
         (historyRenderTimer as { unref?: () => void }).unref?.();
       };
@@ -1444,6 +1477,7 @@ export function openWorkflowNavigator(
         manager.off("agentHistory", onAgentHistory);
         if (historyRenderTimer) clearTimeout(historyRenderTimer);
         historyRenderTimer = undefined;
+        historyRenderTarget = undefined;
       };
 
       const act = (data: string) => {
@@ -1464,6 +1498,9 @@ export function openWorkflowNavigator(
             break;
           case "togglePager":
             state.togglePager();
+            break;
+          case "openPager":
+            state.openPager();
             break;
           case "drill":
             state.drill(model);

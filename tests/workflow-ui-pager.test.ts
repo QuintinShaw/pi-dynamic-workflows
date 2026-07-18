@@ -19,14 +19,17 @@ function modelForAgent(agent: WorkflowAgentSnapshot, status: PersistedRunState["
     doneCount: agent.status === "done" ? 1 : 0,
     errorCount: agent.status === "error" ? 1 : 0,
   };
-  const persisted = {
+  const persisted: PersistedRunState = {
     runId: "pager-run",
     workflowName: "pager-demo",
     status,
     phases: ["Work"],
     agents: snapshot.agents,
     logs: [],
-  } as PersistedRunState;
+    script: "",
+    startedAt: "",
+    updatedAt: "",
+  };
   const manager = {
     listRuns: () => [persisted],
     getRun: () => ({ runId: "pager-run", status, snapshot }) as unknown as ManagedRun,
@@ -63,12 +66,24 @@ const plainMarkdownTheme: MarkdownTheme = {
 
 test("pager key mappings include pages, boundaries, tail, and summary toggle", () => {
   assert.deepEqual(keyToAction("enter", "detail"), { type: "togglePager" });
+  assert.deepEqual(keyToAction("right", "detail"), { type: "openPager" });
   assert.deepEqual(keyToAction("pageUp", "detail"), { type: "page", direction: -1 });
   assert.deepEqual(keyToAction("pageDown", "detail"), { type: "page", direction: 1 });
   assert.deepEqual(keyToAction("home", "detail"), { type: "jump", edge: "start" });
   assert.deepEqual(keyToAction("end", "detail"), { type: "jump", edge: "end" });
   assert.deepEqual(keyToAction("t", "detail"), { type: "toggleTail" });
   assert.deepEqual(keyToAction("t", "runs"), { type: "none" });
+});
+
+test("opening an agent pager is idempotent", () => {
+  const model = modelForAgent({ id: 1, label: "worker", phase: "Work", prompt: "work", status: "running" });
+  const state = enterAgentDetail(model);
+
+  assert.equal(state.openPager(), true);
+  state.scroll = 4;
+  assert.equal(state.openPager(), true);
+  assert.equal(state.pagerOpen, true);
+  assert.equal(state.scroll, 4, "opening an existing pager does not reset its position");
 });
 
 test("completed agents default to result-only details and retain a full pager", () => {

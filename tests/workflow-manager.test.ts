@@ -6,6 +6,7 @@ import test from "node:test";
 import type { AgentUsage } from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
+import { NavigatorModel, NavigatorState, renderNavigator } from "../src/workflow-ui.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
 /** Agent runner that reports fixed usage so token accounting is exercised. */
@@ -315,6 +316,54 @@ test(
     assert.deepEqual(persisted?.result, expected);
     assert.match(live?.resultPreview ?? "", /complete/);
     assert.equal(persistedRun?.journal, undefined, "completed runs do not duplicate full results in the journal");
+  }),
+);
+
+test(
+  "cold persisted resumable runs restore full agent results from the journal",
+  withTempCwd(async (cwd) => {
+    const expected = {
+      summary: "x".repeat(100),
+      durableMarker: "FULL_RESULT_FROM_JOURNAL",
+    };
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt: string) {
+          if (prompt === "first") return expected;
+          throw new WorkflowError("quota reached", WorkflowErrorCode.PROVIDER_USAGE_LIMIT, {
+            recoverable: false,
+          });
+        },
+      } as never,
+    });
+    const script = `export const meta = { name: 'cold_result', description: 'cold result test' }
+phase('Work')
+await agent('first', { label: 'first' })
+await agent('second', { label: 'second' })`;
+
+    const { runId, promise } = manager.startInBackground(script);
+    await promise.catch(() => {});
+
+    const persisted = manager.listRuns().find((run) => run.runId === runId);
+    assert.equal(persisted?.status, "paused");
+    assert.equal(persisted?.agents[0]?.result, undefined, "resumable agent result is stored only in the journal");
+    assert.doesNotMatch(persisted?.agents[0]?.resultPreview ?? "", /FULL_RESULT_FROM_JOURNAL/);
+    assert.deepEqual(persisted?.journal?.find((entry) => entry.index === 0)?.result, expected);
+
+    // A fresh manager has no live snapshot, so NavigatorModel must rehydrate the
+    // pager's cold-read snapshot from the persisted journal.
+    const freshManager = new WorkflowManager({ cwd });
+    assert.equal(freshManager.getRun(runId), undefined);
+    const model = new NavigatorModel(freshManager);
+    assert.deepEqual(model.agentDetail(runId, 1)?.result, expected);
+
+    const state = new NavigatorState();
+    assert.equal(state.drill(model), true);
+    assert.equal(state.drill(model), true);
+    assert.equal(state.drill(model), true);
+    state.togglePager();
+    assert.match(renderNavigator(state, model, 120, undefined, 30).join("\n"), /FULL_RESULT_FROM_JOURNAL/);
   }),
 );
 
