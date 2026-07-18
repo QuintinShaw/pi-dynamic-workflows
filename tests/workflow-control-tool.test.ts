@@ -171,6 +171,59 @@ test("pause, resume, and stop call the shared manager lifecycle methods", async 
   );
 });
 
+test("stop succeeds via the tool for a run resolved from disk but not tracked in memory (cold pi restart)", async () => {
+  // Regression guard for the workflow_control "stop" bug: findRun() resolves
+  // candidates from manager.listRuns() (disk-backed), so a run persisted as
+  // "paused" by a prior pi session — never loaded into the manager's
+  // in-memory map — is still advertised with "stop" as an allowed action.
+  // Before the fix, manager.stop() only checked its in-memory map and
+  // returned false for such a run, so the tool reported invalidTransition
+  // even though "stop" was just advertised as allowed.
+  const coldRun = run("paused", "cold-restart-1");
+  const runs = new Map([[coldRun.runId, coldRun]]);
+  const manager = {
+    listRuns: () => [...runs.values()],
+    getSnapshot: () => null,
+    pause: () => false,
+    async resume() {
+      return false;
+    },
+    stop(runId: string) {
+      // Mirrors the real WorkflowManager.stop() persisted fallback: not in
+      // memory, but persisted status is stoppable, so it succeeds.
+      const item = runs.get(runId);
+      if (!item || (item.status !== "running" && item.status !== "paused")) return false;
+      item.status = "aborted";
+      return true;
+    },
+  } as unknown as WorkflowManager;
+
+  const response = await execute(manager, { action: "stop", runId: "cold-restart-1" });
+  assert.match(text(response), /^action=stop result=stopped /);
+  assert.equal(response.details.result, "stopped");
+  assert.doesNotMatch(text(response), /invalidTransition|cannot stop/);
+});
+
+test("a thrown error from the manager during an action is reported as a structured error, not a raw throw", async () => {
+  const throwingRun = run("paused", "throws-1");
+  const manager = {
+    listRuns: () => [throwingRun],
+    getSnapshot: () => null,
+    pause: () => false,
+    async resume() {
+      return false;
+    },
+    stop() {
+      throw new Error("disk I/O failed");
+    },
+  } as unknown as WorkflowManager;
+
+  const response = await execute(manager, { action: "stop", runId: "throws-1" });
+  assert.match(text(response), /^action=stop result=error runId=throws-1 error=disk I\/O failed/);
+  assert.equal(response.details.result, "error");
+  assert.equal(response.details.error, "disk I/O failed");
+});
+
 test("unknown IDs and illegal transitions return explicit errors with allowed actions", async () => {
   const fixture = fakeManager([run("completed"), run("running", "live-123")]);
 

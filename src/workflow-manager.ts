@@ -637,16 +637,39 @@ export class WorkflowManager extends EventEmitter {
 
   /**
    * Stop a running workflow.
+   *
+   * Fast path: the run is live in this process (`this.runs`) — abort its
+   * controller and persist "aborted" as before. Fallback: the run is not in
+   * memory but is persisted as "running" or "paused" — e.g. it belongs to a
+   * prior pi session that this process's recoverStaleRuns() flipped to
+   * "paused" on disk without repopulating this.runs (see workflow-control-tool's
+   * findRun(), which resolves candidates from disk via listRuns()). There is no
+   * live controller to abort in that case — the run simply isn't executing in
+   * this process — so mark it aborted on disk directly, mirroring resume()'s
+   * persisted-fallback lease handling.
    */
   stop(runId: string): boolean {
     const managed = this.runs.get(runId);
-    if (!managed || (managed.status !== "running" && managed.status !== "paused")) return false;
+    if (managed) {
+      if (managed.status !== "running" && managed.status !== "paused") return false;
+      managed.controller.abort();
+      managed.status = "aborted";
+      this.emit("stopped", { runId });
+      this.persistRun(managed);
+      this.releaseRunLease(managed);
+      return true;
+    }
 
-    managed.controller.abort();
-    managed.status = "aborted";
+    const persisted = this.persistence.load(runId);
+    if (!persisted || (persisted.status !== "running" && persisted.status !== "paused")) return false;
+    const lease = this.persistence.acquireRunLease(runId);
+    if (!lease) return false;
+    try {
+      this.persistence.save({ ...persisted, status: "aborted", updatedAt: new Date().toISOString() });
+    } finally {
+      this.persistence.releaseRunLease(lease);
+    }
     this.emit("stopped", { runId });
-    this.persistRun(managed);
-    this.releaseRunLease(managed);
     return true;
   }
 

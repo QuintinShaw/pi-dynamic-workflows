@@ -1153,6 +1153,137 @@ test(
   }),
 );
 
+test(
+  "cold-start stop: a persisted paused run not in this.runs can be stopped from disk",
+  withTempCwd(async (cwd) => {
+    // Simulate a prior pi session: a run persisted as "paused" (e.g. by
+    // recoverStaleRuns() flipping a stale "running" run on a previous cold
+    // start) that this fresh manager never loaded into its in-memory map.
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent() });
+    const pers = manager.getPersistence();
+    const runId = "cold-start-stop-paused-1";
+
+    pers.save({
+      runId,
+      workflowName: "cold_start_stop",
+      script: oneAgentScript,
+      args: undefined,
+      status: "paused",
+      phases: [],
+      agents: [],
+      logs: [],
+      startedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+
+    assert.equal(manager.getRun(runId), undefined, "run is not in memory (cold-start simulation)");
+
+    const stopped = manager.stop(runId);
+    assert.equal(stopped, true, "stop should succeed for a cold-start persisted paused run");
+
+    const persisted = manager.listRuns().find((r) => r.runId === runId);
+    assert.equal(persisted?.status, "aborted", "persisted status should become aborted");
+  }),
+);
+
+test(
+  "cold-start stop: a persisted running run not in this.runs can be stopped from disk",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent() });
+    const pers = manager.getPersistence();
+    const runId = "cold-start-stop-running-1";
+
+    pers.save({
+      runId,
+      workflowName: "cold_start_stop_running",
+      script: oneAgentScript,
+      args: undefined,
+      status: "running",
+      phases: [],
+      agents: [],
+      logs: [],
+      startedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+
+    const stopped = manager.stop(runId);
+    assert.equal(stopped, true, "stop should succeed for a cold-start persisted running run");
+
+    const persisted = manager.listRuns().find((r) => r.runId === runId);
+    assert.equal(persisted?.status, "aborted", "persisted status should become aborted");
+  }),
+);
+
+test(
+  "cold-start stop: a persisted completed run cannot be stopped",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd });
+    const pers = manager.getPersistence();
+    const runId = "cold-start-stop-completed-1";
+
+    pers.save({
+      runId,
+      workflowName: "cold_start_stop_completed",
+      script: oneAgentScript,
+      args: undefined,
+      status: "completed",
+      phases: [],
+      agents: [],
+      logs: [],
+      startedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      completedAt: new Date().toISOString(),
+    });
+
+    assert.equal(manager.stop(runId), false, "completed persisted run cannot be stopped");
+  }),
+);
+
+test(
+  "cold-start stop: an unknown run ID returns false",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd });
+    assert.equal(manager.stop("does-not-exist"), false);
+  }),
+);
+
+test(
+  "cold-start stop: a second manager cannot stop a run while another manager owns the lease",
+  withTempCwd(async (cwd) => {
+    const ownerAgent = deferredAgent();
+    const owner = new WorkflowManager({ cwd, agent: ownerAgent.runner });
+    owner.on("error", () => {});
+    const runId = "cold-start-stop-leased-1";
+    owner.getPersistence().save({
+      runId,
+      workflowName: "leased_stop",
+      script: oneAgentScript,
+      status: "paused",
+      phases: [],
+      agents: [],
+      logs: [],
+      startedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+
+    // Owner resumes the run, so it's live in owner's this.runs and owner holds
+    // the cross-process lease.
+    assert.equal(await owner.resume(runId), true, "owner should acquire the lease and start");
+    await new Promise((r) => setTimeout(r, 20));
+
+    // A second manager doesn't have the run in memory, so stop() takes the
+    // persisted fallback path — but the owner still holds the lease, so the
+    // contender must not be able to mark it aborted on disk.
+    const contender = new WorkflowManager({ cwd, agent: fakeAgent() });
+    assert.equal(contender.stop(runId), false, "contender cannot steal the lease to stop the run");
+    assert.equal(contender.getPersistence().load(runId)?.status, "running", "run is untouched by the contender");
+
+    ownerAgent.resolve("done");
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(owner.getRun(runId)?.status, "completed", "leased owner should still finish");
+  }),
+);
+
 // ─── getRun tests ──────────────────────────────────────────────────────────────
 
 test(

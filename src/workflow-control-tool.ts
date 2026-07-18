@@ -84,24 +84,32 @@ export function createWorkflowControlTool(
       const run = findRun(manager, params.runId);
       if (!run) return controlError(params.action, params.runId, "run not found", ["list"]);
 
-      switch (params.action) {
-        case "status": {
-          const summary = summarizeRun(run, manager.getSnapshot(run.runId));
-          return result(`action=status result=ok ${formatRun(summary)}`, {
-            action: "status",
-            result: "ok",
-            run: summary,
-          });
+      try {
+        switch (params.action) {
+          case "status": {
+            const summary = summarizeRun(run, manager.getSnapshot(run.runId));
+            return result(`action=status result=ok ${formatRun(summary)}`, {
+              action: "status",
+              result: "ok",
+              run: summary,
+            });
+          }
+          case "pause":
+            if (!manager.pause(run.runId)) return invalidTransition("pause", run);
+            return actionSuccess("pause", "paused", currentSummary(manager, run));
+          case "resume":
+            if (!(await manager.resume(run.runId))) return invalidTransition("resume", run);
+            return actionSuccess("resume", "resumed", currentSummary(manager, run));
+          case "stop":
+            if (!manager.stop(run.runId)) return invalidTransition("stop", run);
+            return actionSuccess("stop", "stopped", currentSummary(manager, run));
         }
-        case "pause":
-          if (!manager.pause(run.runId)) return invalidTransition("pause", run);
-          return actionSuccess("pause", "paused", currentSummary(manager, run));
-        case "resume":
-          if (!(await manager.resume(run.runId))) return invalidTransition("resume", run);
-          return actionSuccess("resume", "resumed", currentSummary(manager, run));
-        case "stop":
-          if (!manager.stop(run.runId)) return invalidTransition("stop", run);
-          return actionSuccess("stop", "stopped", currentSummary(manager, run));
+      } catch (err) {
+        // A transient persistence I/O error (or any unexpected throw from the
+        // manager) shouldn't surface as a raw stack trace to the model — report
+        // it via the tool's normal structured error shape instead.
+        const message = err instanceof Error ? err.message : String(err);
+        return controlError(params.action, run.runId, message, allowedActions(run.status));
       }
     },
   });
