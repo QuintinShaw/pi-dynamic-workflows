@@ -342,6 +342,11 @@ export class WorkflowManager extends EventEmitter {
     return this.executeRun(managed, script, args, exec);
   }
 
+  /** Drop terminal runs from memory after persist; keep paused for resume. */
+  private _cleanupRun(managed: ManagedRun): void {
+    if (managed.status !== "paused") this.runs.delete(managed.runId);
+  }
+
   /** Build a fresh managed run with an empty snapshot. */
   private createManaged(script: string, args?: unknown): ManagedRun {
     const parsed = parseWorkflowScript(script);
@@ -521,6 +526,7 @@ export class WorkflowManager extends EventEmitter {
       // Persist final state
       this.persistRun(managed);
       this.releaseRunLease(managed);
+      this._cleanupRun(managed);
 
       return result;
     } catch (error) {
@@ -565,6 +571,7 @@ export class WorkflowManager extends EventEmitter {
       // Persist final state
       this.persistRun(managed);
       this.releaseRunLease(managed);
+      this._cleanupRun(managed);
 
       throw workflowError;
     }
