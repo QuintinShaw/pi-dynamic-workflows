@@ -345,6 +345,21 @@ test("subagentExcludedTools always includes the defaults, plus caller/session na
   assert.ok(merged.includes("session-denied") && merged.includes("extra"), "both caller lists are folded in");
 });
 
+test("the subagent resource loader is built once per run and shared across subagents (#109)", () => {
+  // The #109 mitigation: one no-extensions loader per run, reused by every
+  // subagent, instead of createAgentSession re-running every extension factory
+  // (and rooting each disposed session) per subagent. Memoization is the invariant.
+  const agent = new WorkflowAgent({ cwd: "/tmp" });
+  type Priv = { getSharedResourceLoader(agentDir: string): Promise<unknown> };
+  const a = agent as unknown as Priv;
+  const first = a.getSharedResourceLoader("/tmp/agentdir");
+  const second = a.getSharedResourceLoader("/tmp/agentdir");
+  assert.equal(first, second, "same promise — the loader is built once and shared, not rebuilt per subagent");
+  // reload() may reject in a bare temp dir; we only assert memoization here.
+  first.catch(() => {});
+  second.catch(() => {});
+});
+
 // ═══════════════════════════════════════════════════════════════════════
 // finalAssistantText — the unstructured result must come AFTER the last tool
 // result, so stale progress text can't be reported as a completed answer (#111)

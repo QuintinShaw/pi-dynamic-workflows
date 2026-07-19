@@ -6,6 +6,7 @@ import {
   type CreateAgentSessionOptions,
   createAgentSession,
   createCodingTools,
+  DefaultResourceLoader,
   getAgentDir,
   ModelRegistry,
   ModelRuntime,
@@ -516,6 +517,11 @@ export class WorkflowAgent {
    * loadTierConfig() below for why this is scoped per-instance.
    */
   private tierConfigBox?: { value: ModelTierConfig | null };
+  /**
+   * Shared resource loader for every subagent of this run, built once. See
+   * getSharedResourceLoader — this is the #109 memory mitigation.
+   */
+  private sharedResourceLoaderPromise?: Promise<DefaultResourceLoader>;
 
   constructor(options: WorkflowAgentOptions = {}) {
     this.cwd = options.cwd ?? process.cwd();
@@ -526,6 +532,53 @@ export class WorkflowAgent {
     this.instructions = options.instructions;
     this.mainModel = options.mainModel;
     this.sharedRegistry = options.modelRegistry;
+  }
+
+  /**
+   * A resource loader shared by every subagent of this run, built once (#109).
+   *
+   * Without a resourceLoader, createAgentSession() builds a fresh
+   * DefaultResourceLoader per subagent and reloads it — re-running EVERY installed
+   * extension factory each time (verified: N subagents → N factory runs). Each
+   * such factory that arms a load-time timer/listener then roots its subagent
+   * session forever, because AgentSession.dispose() emits no session_shutdown to
+   * run the cleanup — the dominant #109 leak, and one our own extension
+   * (UsageLimitScheduler) can trigger.
+   *
+   * `noExtensions: true` skips loading host extensions; skills, prompts, and
+   * AGENTS.md context still load. The subagent keeps the tools this workflow
+   * hands it via `customTools` (coding tools + any toolset like web-research) —
+   * those are unaffected. What it loses is HOST EXTENSION-REGISTERED tools (MCP
+   * bridges, browser tools, anything a host extension added via ctx.registerTool):
+   * pre-change a subagent session inherited those from the full host extension
+   * set, now it does not, so an agentType `tools` allowlist naming one matches
+   * nothing. This is a deliberate trade-off — it also structurally kills recursive
+   * orchestration in subagents (no extension runtime at all), beyond the name-level
+   * #107 denylist — and must be release-noted. `createAgentSession` with a shared
+   * resourceLoader is a supported embedding pattern. runWorkflow builds one
+   * WorkflowAgent per run, so this loader's lifetime is exactly one run: built
+   * once, reused by all its subagents, then dropped with the agent.
+   */
+  private getSharedResourceLoader(agentDir: string): Promise<DefaultResourceLoader> {
+    if (!this.sharedResourceLoaderPromise) {
+      this.sharedResourceLoaderPromise = (async () => {
+        const loader = new DefaultResourceLoader({
+          cwd: this.cwd,
+          agentDir,
+          settingsManager: SettingsManager.create(this.cwd, agentDir),
+          noExtensions: true,
+        });
+        await loader.reload();
+        return loader;
+      })().catch((err) => {
+        // Don't let a transient build failure (e.g. EMFILE during reload's disk
+        // I/O) poison every subagent AND every retry of this run — clear the memo
+        // so the next caller rebuilds instead of replaying the same rejection.
+        this.sharedResourceLoaderPromise = undefined;
+        throw err;
+      });
+    }
+    return this.sharedResourceLoaderPromise;
   }
 
   /**
@@ -695,6 +748,11 @@ export class WorkflowAgent {
       // not have valid auth, causing silent empty responses.
       settingsManager: SettingsManager.create(this.cwd, agentDir),
       customTools,
+      // Shared per-run loader with no host extensions (#109) — see
+      // getSharedResourceLoader. An injected resourceLoader (tests / embedders)
+      // wins and skips the shared build entirely; the ...this.sessionOptions
+      // spread below re-applies the same injected value harmlessly.
+      resourceLoader: this.sessionOptions.resourceLoader ?? (await this.getSharedResourceLoader(agentDir)),
       // Share the resolved registry's ModelRuntime (catalog + auth, including
       // extension-registered providers) with the subagent session. pi >= 0.80.8
       // takes modelRuntime here; the old modelRegistry option is gone.

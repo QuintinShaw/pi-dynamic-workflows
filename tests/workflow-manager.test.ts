@@ -170,6 +170,48 @@ test(
 );
 
 test(
+  "an agent timeout aborts the subagent so its session can be released (#109)",
+  withTempCwd(async (cwd) => {
+    // A subagent whose run() never resolves on its own — only an abort ends it.
+    // Before the fix, a timeout rejected the race but left this running in the
+    // background with its session (and full messages) retained.
+    let sawAbort = false;
+    const hangingUntilAborted = {
+      async run(_prompt: string, options?: { signal?: AbortSignal }) {
+        return new Promise((_resolve, reject) => {
+          const signal = options?.signal;
+          if (signal?.aborted) {
+            sawAbort = true;
+            reject(new Error("aborted"));
+            return;
+          }
+          signal?.addEventListener(
+            "abort",
+            () => {
+              sawAbort = true;
+              reject(new Error("aborted"));
+            },
+            { once: true },
+          );
+        });
+      },
+    };
+    const manager = new WorkflowManager({ cwd, agent: hangingUntilAborted, defaultAgentTimeoutMs: 20 });
+
+    const result = await manager.runSync(oneAgentScript);
+
+    // Timed out → recoverable, no retry configured, so the agent result is null.
+    assert.equal((result.result as { a: unknown }).a, null);
+    const agent = manager.listRuns()[0]?.agents[0];
+    assert.equal(agent?.status, "error");
+    assert.match(agent?.error ?? "", /timed out/);
+    // The key #109 property: the timeout aborted the subagent, so run()'s finally
+    // disposes its session instead of leaking it while it streams on.
+    assert.equal(sawAbort, true, "the timing-out subagent must receive an abort");
+  }),
+);
+
+test(
   "manager defaultTokenBudget applies when run options omit tokenBudget (#68)",
   withTempCwd(async (cwd) => {
     // Each agent reports 100 tokens against a default budget of 50: the first

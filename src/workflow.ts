@@ -525,6 +525,8 @@ export async function runWorkflow<T = unknown>(
       try {
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
           usage = undefined;
+          const externalSignal = options.signal;
+          let onExternalAbort: (() => void) | undefined;
           try {
             throwIfAborted();
             // This agent's own fan-out already breached maxAgents while this
@@ -532,43 +534,57 @@ export async function runWorkflow<T = unknown>(
             // real API call instead of draining the whole reserved queue.
             if (batch?.cancelled) throw agentLimitError();
 
-            // Run agent with timeout
-            const result = await withTimeout(
-              agentRunner.run(prompt, {
-                label,
-                // Identifiable name for persisted sessions (persistAgentSessions).
-                sessionName: `workflow:${runId} ${label}`,
-                schema: agentOptions.schema,
-                signal: options.signal,
-                instructions: buildAgentInstructions(assignedPhase, agentOptions, agentDef, resolvedIsolation),
-                model: modelSpec,
-                tier: agentOptions.tier,
-                modelRegistry: options.modelRegistry,
-                toolNames: agentDef?.tools,
-                disallowedToolNames: agentDef?.disallowedTools,
-                // Per-agent store tools track this agent's writes by the
-                // run-unique deltaKey so the delta can be journaled and replayed
-                // correctly on resume, even when a nested workflow() run shares
-                // this store concurrently with the parent run.
-                systemTools: createAgentStoreTools(store, deltaKey),
-                cwd: runCwd,
-                onModelResolved: (id: string) => {
-                  displayModel = id;
-                },
-                onModelFallback: (spec: string) => {
-                  // Make the silent degrade visible in /workflows, not just console.
-                  log(`${label}: model "${spec}" unavailable — using the session default`);
-                },
-                onUsage: (u: AgentUsage) => {
-                  usage = u;
-                },
-                onHistory: (history: AgentHistoryEntry[]) => {
-                  options.onAgentHistory?.({ label, phase: assignedPhase, history });
-                },
-              }),
-              timeout,
+            // Per-attempt abort: on timeout we abort THIS agent so its session is
+            // disposed and its heavy state (messages, etc.) released, instead of
+            // leaving it streaming in the background — retries would otherwise
+            // stack live sessions on top of each other (#109). Linked to the run's
+            // external signal so an outer abort still cancels the agent too; the
+            // link is torn down per attempt in finally so listeners don't accrue.
+            const agentController = new AbortController();
+            if (externalSignal) {
+              if (externalSignal.aborted) agentController.abort();
+              else {
+                onExternalAbort = () => agentController.abort();
+                externalSignal.addEventListener("abort", onExternalAbort, { once: true });
+              }
+            }
+            const runPromise = agentRunner.run(prompt, {
               label,
-            );
+              // Identifiable name for persisted sessions (persistAgentSessions).
+              sessionName: `workflow:${runId} ${label}`,
+              schema: agentOptions.schema,
+              signal: agentController.signal,
+              instructions: buildAgentInstructions(assignedPhase, agentOptions, agentDef, resolvedIsolation),
+              model: modelSpec,
+              tier: agentOptions.tier,
+              modelRegistry: options.modelRegistry,
+              toolNames: agentDef?.tools,
+              disallowedToolNames: agentDef?.disallowedTools,
+              // Per-agent store tools track this agent's writes by the
+              // run-unique deltaKey so the delta can be journaled and replayed
+              // correctly on resume, even when a nested workflow() run shares
+              // this store concurrently with the parent run.
+              systemTools: createAgentStoreTools(store, deltaKey),
+              cwd: runCwd,
+              onModelResolved: (id: string) => {
+                displayModel = id;
+              },
+              onModelFallback: (spec: string) => {
+                // Make the silent degrade visible in /workflows, not just console.
+                log(`${label}: model "${spec}" unavailable — using the session default`);
+              },
+              onUsage: (u: AgentUsage) => {
+                usage = u;
+              },
+              onHistory: (history: AgentHistoryEntry[]) => {
+                options.onAgentHistory?.({ label, phase: assignedPhase, history });
+              },
+            });
+            // After a timeout the run() promise still settles later, rejecting with
+            // "aborted" once agentController fires; the race has already resolved,
+            // so swallow that to avoid an unhandled rejection.
+            runPromise.catch(() => {});
+            const result = await withTimeout(runPromise, timeout, label, () => agentController.abort());
 
             throwIfAborted();
             if (isEmptyTextAgentResult(result, agentOptions.schema)) {
@@ -629,6 +645,10 @@ export async function runWorkflow<T = unknown>(
               return null;
             }
             throw workflowError;
+          } finally {
+            // Drop this attempt's external-abort listener so it doesn't accrue one
+            // entry per attempt on the run's signal for the whole run (#109 hygiene).
+            if (onExternalAbort) externalSignal?.removeEventListener("abort", onExternalAbort);
           }
         }
         return null;
@@ -1214,14 +1234,30 @@ function normalizeAgentRetries(value: unknown): number {
 
 /**
  * Run a promise with a timeout.
+ *
+ * `onTimeout` fires when the deadline hits, BEFORE the timeout rejection wins the
+ * race — the caller uses it to abort the underlying work (e.g. the subagent
+ * session) so it can release its resources instead of streaming on in the
+ * background with the whole session graph (messages, etc.) retained (#109). The
+ * losing promise still settles later; the caller must swallow its rejection.
  */
-async function withTimeout<T>(promise: Promise<T>, ms: number | null, label: string): Promise<T> {
+async function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number | null,
+  label: string,
+  onTimeout?: () => void,
+): Promise<T> {
   if (ms === null) return promise;
 
   let timeoutId: NodeJS.Timeout | undefined;
 
   const timeoutPromise = new Promise<never>((_, reject) => {
     timeoutId = setTimeout(() => {
+      try {
+        onTimeout?.();
+      } catch {
+        // Best-effort cleanup; never let it mask the timeout error.
+      }
       reject(
         new WorkflowError(
           `Agent "${label}" timed out after ${ms}ms; raise or omit timeoutMs/agentTimeoutMs to allow longer runs`,
