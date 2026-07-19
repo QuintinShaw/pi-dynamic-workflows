@@ -71,6 +71,19 @@ export interface PersistedRunState {
    */
   autoResume?: boolean;
   /**
+   * The run's resolved hard token budget, fixed at start (per-run value, else
+   * the manager default at the time). Resume re-applies THIS value — never the
+   * current default — so an explicit no-budget (`null`) or custom cap survives
+   * a pause/resume cycle. Absent on legacy runs (resumed unbudgeted).
+   */
+  tokenBudget?: number | null;
+  /**
+   * Named toolset tag (WorkflowManagerOptions.toolsets). ToolDefinitions are
+   * functions and can't be serialized, so this tag is how a resumed run (e.g.
+   * /deep-research with web tools) re-resolves the tool set it started with.
+   */
+  toolset?: string;
+  /**
    * Auto-resume attempt counter for the current usage_limit pause-cycle, owned
    * and persisted by UsageLimitScheduler (best-effort). Absent/0 means no
    * auto-resume attempt has been recorded yet.

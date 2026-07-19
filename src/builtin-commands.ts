@@ -1,17 +1,28 @@
 /**
  * Bundled workflow commands: `/deep-research`, `/adversarial-review`,
  * `/multi-perspective`, `/code-review`, and `/codebase-audit`.
- * They run a generated workflow script and print the final report.
+ *
+ * Each command starts its generated workflow through the WorkflowManager's
+ * background path — the command returns immediately, progress is visible in
+ * the task panel and `/workflows` (pause/stop work like any managed run), and
+ * the report is delivered back into the conversation on completion by
+ * installResultDelivery. Running inline in the handler instead would block the
+ * whole session until the workflow finished (#104).
  */
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { createCodingTools, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import {
+  createCodingTools,
+  type ExtensionAPI,
+  type ExtensionCommandContext,
+  type ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
 import { generateAdversarialReviewWorkflow, generateMultiPerspectiveWorkflow } from "./adversarial-review.js";
 import { generateCodeReviewWorkflow, MAX_DIFF_CHARS } from "./code-review.js";
 import { generateCodebaseAuditWorkflow, generateDeepResearchWorkflow } from "./deep-research.js";
 import { createWebTools } from "./web-tools.js";
-import { runWorkflow, type WorkflowRunResult } from "./workflow.js";
+import type { WorkflowManager } from "./workflow-manager.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -41,14 +52,35 @@ function tokenizeArgs(input: string): string[] {
   return tokens;
 }
 
-function reportText(result: WorkflowRunResult): string {
-  const r = result.result as { report?: unknown } | undefined;
-  if (r && typeof r.report === "string" && r.report.trim()) return r.report;
-  return JSON.stringify(result.result, null, 2);
+/**
+ * Start a built-in workflow through the manager's background path and tell the
+ * user where to watch it. startInBackground can throw synchronously (script
+ * parse, run lease) — surface that as a notify instead of an unhandled error.
+ * Async failures are handled by the manager's generic delivery ("✗ Background
+ * workflow … failed"), so no handler-side await is needed — that await is
+ * exactly what used to hang the session (#104).
+ */
+function startBackground(
+  manager: WorkflowManager,
+  ctx: ExtensionCommandContext,
+  name: string,
+  script: string,
+  args?: unknown,
+  exec?: { tools?: ToolDefinition[]; toolset?: string },
+): void {
+  try {
+    const { runId } = manager.startInBackground(script, args, exec ?? {});
+    ctx.ui.notify(
+      `/${name} running in the background (${runId}) — watch the task panel or /workflows; the report is posted here when it finishes.`,
+      "info",
+    );
+  } catch (error) {
+    ctx.ui.notify(`${name} failed to start: ${error instanceof Error ? error.message : error}`, "error");
+  }
 }
 
-export function registerBuiltinWorkflows(pi: ExtensionAPI, opts: { cwd: string }): void {
-  const cwd = opts.cwd;
+export function registerBuiltinWorkflows(pi: ExtensionAPI, opts: { cwd: string; manager: WorkflowManager }): void {
+  const { cwd, manager } = opts;
 
   if (!alreadyRegistered(pi, "deep-research")) {
     pi.registerCommand("deep-research", {
@@ -56,21 +88,20 @@ export function registerBuiltinWorkflows(pi: ExtensionAPI, opts: { cwd: string }
       async handler(args: string, ctx: ExtensionCommandContext) {
         const question = args.trim();
         if (!question) return ctx.ui.notify("Usage: /deep-research <question>", "warning");
-        ctx.ui.notify("Researching — running web searches across several angles…", "info");
-        try {
-          const result = await runWorkflow(generateDeepResearchWorkflow(), {
-            cwd,
-            args: { question },
-            // Research agents need real web access on top of the coding tools.
+        // Research agents need real web access on top of the coding tools.
+        // `tools` covers this execution even on a manager without the toolset
+        // registered; the "web-research" tag is what a resume re-resolves.
+        startBackground(
+          manager,
+          ctx,
+          "deep-research",
+          generateDeepResearchWorkflow(),
+          { question },
+          {
             tools: [...createCodingTools(cwd), ...createWebTools()],
-            onPhase: (title) => ctx.ui.setStatus("deep-research", `research: ${title}`),
-          });
-          ctx.ui.setStatus("deep-research", undefined);
-          await pi.sendMessage({ customType: "deep-research", content: reportText(result), display: true });
-        } catch (error) {
-          ctx.ui.setStatus("deep-research", undefined);
-          ctx.ui.notify(`deep-research failed: ${error instanceof Error ? error.message : error}`, "error");
-        }
+            toolset: "web-research",
+          },
+        );
       },
     });
   }
@@ -81,20 +112,7 @@ export function registerBuiltinWorkflows(pi: ExtensionAPI, opts: { cwd: string }
       async handler(args: string, ctx: ExtensionCommandContext) {
         const task = args.trim();
         if (!task) return ctx.ui.notify("Usage: /adversarial-review <task or question>", "warning");
-        ctx.ui.notify("Reviewing — investigating then refuting each finding…", "info");
-        try {
-          const result = await runWorkflow(generateAdversarialReviewWorkflow(), {
-            cwd,
-            args: { task },
-            tools: createCodingTools(cwd),
-            onPhase: (title) => ctx.ui.setStatus("adversarial-review", `review: ${title}`),
-          });
-          ctx.ui.setStatus("adversarial-review", undefined);
-          await pi.sendMessage({ customType: "adversarial-review", content: reportText(result), display: true });
-        } catch (error) {
-          ctx.ui.setStatus("adversarial-review", undefined);
-          ctx.ui.notify(`adversarial-review failed: ${error instanceof Error ? error.message : error}`, "error");
-        }
+        startBackground(manager, ctx, "adversarial-review", generateAdversarialReviewWorkflow(), { task });
       },
     });
   }
@@ -164,20 +182,7 @@ export function registerBuiltinWorkflows(pi: ExtensionAPI, opts: { cwd: string }
           );
         }
 
-        ctx.ui.notify(`Reviewing diff (${diffSource}) — running 7 finder angles in parallel…`, "info");
-        try {
-          const result = await runWorkflow(generateCodeReviewWorkflow(), {
-            cwd,
-            args: { diff, diffSource },
-            tools: createCodingTools(cwd),
-            onPhase: (title) => ctx.ui.setStatus("code-review", `review: ${title}`),
-          });
-          ctx.ui.setStatus("code-review", undefined);
-          await pi.sendMessage({ customType: "code-review", content: reportText(result), display: true });
-        } catch (error) {
-          ctx.ui.setStatus("code-review", undefined);
-          ctx.ui.notify(`code-review failed: ${error instanceof Error ? error.message : error}`, "error");
-        }
+        startBackground(manager, ctx, "code-review", generateCodeReviewWorkflow(), { diff, diffSource });
       },
     });
   }
@@ -193,22 +198,7 @@ export function registerBuiltinWorkflows(pi: ExtensionAPI, opts: { cwd: string }
         // Fall back to a broadly-useful default set when fewer than two are given.
         const perspectives =
           rest.length >= 2 ? rest : ["technical", "product", "security", "user experience", "maintainability"];
-        ctx.ui.notify(`Analyzing from ${perspectives.length} perspectives…`, "info");
-        try {
-          const result = await runWorkflow(generateMultiPerspectiveWorkflow(topic, perspectives), {
-            cwd,
-            tools: createCodingTools(cwd),
-            onPhase: (title) => ctx.ui.setStatus("multi-perspective", `perspectives: ${title}`),
-          });
-          ctx.ui.setStatus("multi-perspective", undefined);
-          // This workflow returns its prose under `synthesis`, not `report`.
-          const r = result.result as { synthesis?: unknown } | undefined;
-          const content = r && typeof r.synthesis === "string" && r.synthesis.trim() ? r.synthesis : reportText(result);
-          await pi.sendMessage({ customType: "multi-perspective", content, display: true });
-        } catch (error) {
-          ctx.ui.setStatus("multi-perspective", undefined);
-          ctx.ui.notify(`multi-perspective failed: ${error instanceof Error ? error.message : error}`, "error");
-        }
+        startBackground(manager, ctx, "multi-perspective", generateMultiPerspectiveWorkflow(topic, perspectives));
       },
     });
   }
@@ -221,19 +211,7 @@ export function registerBuiltinWorkflows(pi: ExtensionAPI, opts: { cwd: string }
         if (!scope || checks.length === 0) {
           return ctx.ui.notify('Usage: /codebase-audit <scope> "<check1>" ["<check2>" …]', "warning");
         }
-        ctx.ui.notify(`Auditing ${scope} across ${checks.length} checks…`, "info");
-        try {
-          const result = await runWorkflow(generateCodebaseAuditWorkflow(scope, checks), {
-            cwd,
-            tools: createCodingTools(cwd),
-            onPhase: (title) => ctx.ui.setStatus("codebase-audit", `audit: ${title}`),
-          });
-          ctx.ui.setStatus("codebase-audit", undefined);
-          await pi.sendMessage({ customType: "codebase-audit", content: reportText(result), display: true });
-        } catch (error) {
-          ctx.ui.setStatus("codebase-audit", undefined);
-          ctx.ui.notify(`codebase-audit failed: ${error instanceof Error ? error.message : error}`, "error");
-        }
+        startBackground(manager, ctx, "codebase-audit", generateCodebaseAuditWorkflow(scope, checks));
       },
     });
   }

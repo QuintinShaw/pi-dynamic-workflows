@@ -170,7 +170,7 @@ Model tiers live at `~/.pi/workflows/model-tiers.json` and accept Pi CLI-style t
 
 Use `/workflows-models` to edit them interactively. Without a config, the extension ranks authenticated models by capability hints and assigns distinct models when possible.
 
-Runs have no default token budget or per-agent hard timeout. Add `tokenBudget`, `agentTimeoutMs`, phase budgets, or agent `timeoutMs` when you need explicit gates. `concurrency` is clamped to 16; `agentRetries` retries only recoverable failures. Defaults can be set in `~/.pi/workflows/settings.json`.
+Runs have no default token budget or per-agent hard timeout. Add `tokenBudget`, `agentTimeoutMs`, phase budgets, or agent `timeoutMs` when you need explicit gates. `concurrency` is clamped to 16; `agentRetries` retries only recoverable failures. Defaults can be set in `~/.pi/workflows/settings.json` — e.g. `defaultTokenBudget` applies a hard budget to every run that doesn't pass its own `tokenBudget` (a project-level override of `null` cancels a global budget).
 
 </details>
 

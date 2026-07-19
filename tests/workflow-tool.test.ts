@@ -135,7 +135,9 @@ test("workflowHowToGuidelines routes normal work through tiers and reserves exac
 test("workflowHowToGuidelines keep budget and timeout unbounded by default", () => {
   const all = workflowHowToGuidelines().join(" ");
   assert.match(all, /do not set tokenBudget or agentTimeoutMs/i);
-  assert.match(all, /defaults are unbounded/i);
+  // Unbounded unless the user configured settings defaults (#68).
+  assert.match(all, /runs are unbounded/i);
+  assert.match(all, /defaultTokenBudget/);
 });
 
 test("createWorkflowTool schema describes unbounded default timeout", () => {

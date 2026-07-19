@@ -113,24 +113,32 @@ describe("registerSavedWorkflow", () => {
     );
   });
 
-  it("runs through WorkflowManager when provided", async () => {
+  it("runs through WorkflowManager when provided — without blocking or duplicating delivery (#104)", async () => {
     const { registerSavedWorkflow } = await load();
     let startedBackground = false;
     const manager = {
       startInBackground: (_script: string, _args: unknown) => {
         startedBackground = true;
-        return { runId: "test-run", promise: Promise.resolve({ result: { report: "done" } }) };
+        // Never resolves: if the handler awaited the run (the old blocking
+        // behavior), this test would hang instead of passing.
+        return { runId: "test-run", promise: new Promise(() => {}) };
       },
     };
 
-    const { pi, commands } = makeCommandRegistryPi();
+    const { pi, commands, sent } = makeCommandRegistryPi();
     const wf = { name: "run-via-manager", script: "export..." };
     registerSavedWorkflow(pi, "/cwd", wf, manager as never);
 
-    const { ctx } = makeNotifyCtx();
+    const { ctx, notified } = makeNotifyCtx();
     await commands[0].handler("", ctx);
 
     assert.equal(startedBackground, true, "should use startInBackground when manager provided");
+    // Result delivery for managed background runs is installResultDelivery's job;
+    // the handler sending its own copy too was the double-delivery bug.
+    assert.equal(sent.length, 0, "handler must not send its own result message on the manager path");
+    assert.equal(notified.length, 1);
+    assert.equal(notified[0].type, "info");
+    assert.ok(notified[0].message.includes("test-run"), "start notice should include the run id");
   });
 
   it("falls back to runWorkflow (inline) when no manager is provided", async () => {

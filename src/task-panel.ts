@@ -66,8 +66,8 @@ function formatBytes(n: number): string {
 
 /**
  * Pick a clean human-readable summary from a workflow result, in order of
- * preference: a `verdict`/`report`/`summary` string field, a bare string
- * result, else a JSON dump capped at `maxChars`. When the dump is truncated the
+ * preference: a `verdict`/`report`/`summary`/`synthesis` string field, a bare
+ * string result, else a JSON dump capped at `maxChars`. When the dump is truncated the
  * dropped size is reported (the full result is still reachable via the pointer
  * that {@link deliverText} appends).
  */
@@ -76,7 +76,8 @@ function summarizeResult(result: unknown, maxChars: number = DEFAULT_DELIVERED_M
   if (result == null) return "null";
   if (typeof result === "object") {
     const obj = result as Record<string, unknown>;
-    for (const key of ["verdict", "report", "summary"] as const) {
+    // `synthesis` is what the built-in multi-perspective workflow returns.
+    for (const key of ["verdict", "report", "summary", "synthesis"] as const) {
       const val = obj[key];
       if (typeof val === "string" && val.trim()) return val;
     }

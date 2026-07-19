@@ -1,6 +1,7 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { createCodingTools, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   createEffortState,
+  createWebTools,
   createWorkflowControlTool,
   createWorkflowStorage,
   createWorkflowTool,
@@ -27,7 +28,14 @@ export default function extension(pi: ExtensionAPI) {
   const manager = new WorkflowManager({
     cwd,
     loadSavedWorkflow: (name) => storage.load(name)?.script,
+    // Named toolsets survive on the persisted run (the tag, not the functions),
+    // so a resumed run re-resolves the tools it started with — e.g. a paused
+    // /deep-research keeps web access instead of degrading to coding tools.
+    toolsets: {
+      "web-research": () => [...createCodingTools(cwd), ...createWebTools()],
+    },
     defaultAgentTimeoutMs: settings.defaultAgentTimeoutMs ?? null,
+    defaultTokenBudget: settings.defaultTokenBudget ?? null,
     concurrency: settings.defaultConcurrency,
     defaultAgentRetries: settings.defaultAgentRetries,
     persistAgentSessions: settings.persistAgentSessions,
@@ -52,7 +60,7 @@ export default function extension(pi: ExtensionAPI) {
   const effort = createEffortState();
   registerWorkflowCommands(pi, manager, { storage, cwd, effort });
   registerWorkflowModelsCommand(pi);
-  registerBuiltinWorkflows(pi, { cwd });
+  registerBuiltinWorkflows(pi, { cwd, manager });
   registerAllSavedWorkflows(pi, cwd, storage, manager);
   registerEffortCommand(pi, effort);
   // "Workflows mode": type `workflow(s)` to arm a forced workflow at submit

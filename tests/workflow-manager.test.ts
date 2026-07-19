@@ -170,6 +170,99 @@ test(
 );
 
 test(
+  "manager defaultTokenBudget applies when run options omit tokenBudget (#68)",
+  withTempCwd(async (cwd) => {
+    // Each agent reports 100 tokens against a default budget of 50: the first
+    // agent completes (budget checked before start), the second throws.
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent({ total: 100 }), defaultTokenBudget: 50 });
+    // Deliberately NO "error" listener: an unlistened EventEmitter "error" emit
+    // throws, which used to abort the catch block mid-way — surfacing as
+    // ERR_UNHANDLED_ERROR instead of the real error and leaking the run lease.
+    await assert.rejects(manager.runSync(twoAgentScript), (err: unknown) => {
+      assert.ok(err instanceof WorkflowError, `expected WorkflowError, got ${(err as Error)?.constructor?.name}`);
+      assert.equal(err.code, WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED);
+      return true;
+    });
+    // The failure was persisted and the lease released (a fresh save succeeds).
+    const run = manager.listRuns()[0];
+    assert.equal(run?.status, "failed");
+  }),
+);
+
+test(
+  "run option tokenBudget overrides manager defaultTokenBudget",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent({ total: 100 }), defaultTokenBudget: 50 });
+    // Explicit null = "no budget" beats the configured default.
+    const result = await manager.runSync(twoAgentScript, undefined, { tokenBudget: null });
+    assert.equal(result.agentCount, 2);
+  }),
+);
+
+test(
+  "resume re-resolves the run's toolset tag and keeps its start-time tokenBudget",
+  withTempCwd(async (cwd) => {
+    // Agent where 'first' completes (journaling it) and 'second' hangs on its
+    // first attempt — so the run can be paused mid-'second' and resumed, at
+    // which point attempt 2 resolves immediately.
+    let secondAttempts = 0;
+    const agent = {
+      async run(prompt: string, options?: { onUsage?: (u: AgentUsage) => void }) {
+        options?.onUsage?.({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 100, cost: 0 });
+        if (prompt === "second" && ++secondAttempts === 1) return new Promise(() => {});
+        return "ok";
+      },
+    };
+    let toolsetResolutions = 0;
+    const manager = new WorkflowManager({
+      cwd,
+      agent,
+      defaultTokenBudget: 50,
+      toolsets: {
+        webby: () => {
+          toolsetResolutions++;
+          return [];
+        },
+      },
+    });
+
+    // Explicit no-budget + a named toolset. (With the 100-token usage above, the
+    // 50-token default would exhaust this two-agent run — so mere completion
+    // already proves the explicit null won.)
+    const { runId, promise } = manager.startInBackground(twoAgentScript, undefined, {
+      tokenBudget: null,
+      toolset: "webby",
+    });
+    promise.catch(() => {}); // pause aborts the in-flight execution — expected
+    // Wait until 'second' is in flight, then pause the run.
+    for (let i = 0; i < 200 && secondAttempts === 0; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(secondAttempts, 1, "'second' should be in flight before pausing");
+    assert.equal(manager.pause(runId), true);
+    assert.equal(toolsetResolutions, 1, "toolset resolves for the initial execution");
+
+    const persisted = manager.getPersistence().load(runId);
+    assert.equal(persisted?.status, "paused");
+    assert.equal(persisted?.tokenBudget, null, "explicit null budget persists (not the 50 default)");
+    assert.equal(persisted?.toolset, "webby", "toolset tag persists with the run");
+
+    // Resume: the run must keep its start-time context — no budget (not the
+    // manager's current default) and the same re-resolved toolset.
+    assert.equal(await manager.resume(runId), true);
+    // resume() executes detached — poll until the run leaves "running".
+    for (let i = 0; i < 200 && manager.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(toolsetResolutions, 2, "resume re-resolves the toolset tag");
+    const resumed = manager.getPersistence().load(runId);
+    assert.equal(resumed?.status, "completed", "resume completes without TOKEN_BUDGET_EXHAUSTED");
+    assert.equal(resumed?.tokenBudget, null, "resume keeps the start-time budget, not the current default");
+    assert.equal(resumed?.toolset, "webby");
+  }),
+);
+
+test(
   "manager forwards exec concurrency and agentRetries to runtime",
   withTempCwd(async (cwd) => {
     let active = 0;

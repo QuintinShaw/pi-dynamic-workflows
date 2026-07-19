@@ -33,7 +33,11 @@ const RENDERED_PROMPT_BUDGET_BYTES = 800;
 // (the armed message dropped from ~6_765 to ~905 bytes). Trimming the how-to text
 // itself to shrink this definition is a SEPARATE concern (#65 / contract-concision
 // work), not this PR's job — this PR does not claim a token saving on the definition.
-const TOOL_DEFINITION_BUDGET_BYTES = 8_800;
+// Ratcheted 8_800 → 8_900 for #68: the budget/timeout guideline now names the
+// settings.json defaults (defaultTokenBudget, defaultAgentTimeoutMs) instead of
+// claiming "the defaults are unbounded", which became false once those settings
+// exist. Reviewed wording; ~90 bytes.
+const TOOL_DEFINITION_BUDGET_BYTES = 8_900;
 
 test("rendered workflow prompt contribution stays within its accepted size", async () => {
   await withRenderedWorkflow(async ({ systemPrompt, promptLines }) => {
