@@ -205,6 +205,13 @@ export interface WorkflowAgentOptions {
   cwd?: string;
   /** Extra tools available to the subagent in addition to the structured output tool. */
   tools?: ToolDefinition[];
+  /**
+   * Extra tool NAMES to deny in the subagent session, on top of the always-on
+   * defaults ({@link DEFAULT_EXCLUDED_SUBAGENT_TOOLS}). Lets the host exclude
+   * other recursive-orchestration tools it registers (e.g. a pi-subagents tool)
+   * so a workflow subagent can't fan out through them either (#107).
+   */
+  excludeTools?: string[];
   /** Override any createAgentSession option (model, modelRuntime, resourceLoader, etc.). */
   session?: Partial<CreateAgentSessionOptions>;
   /** Extra system guidance prepended to every subagent task. */
@@ -468,9 +475,22 @@ export type AgentRunResult<TSchemaDef extends TSchema | undefined> = TSchemaDef 
   ? Static<TSchemaDef>
   : string;
 
+/**
+ * Orchestration tools ALWAYS denied to workflow subagents. The `workflow` and
+ * `workflow_control` tools are registered globally by the extension, so — unless
+ * excluded — a subagent's session sees them and can start its own independent
+ * background workflows. Those nested runs recursively fan out and are NOT bounded
+ * by the parent run's maxAgents / concurrency / progress / accounting, and can
+ * drain a shared provider quota and pile up paused runs (#107). Callers may deny
+ * additional tool names via WorkflowAgentOptions.excludeTools.
+ */
+export const DEFAULT_EXCLUDED_SUBAGENT_TOOLS = ["workflow", "workflow_control"];
+
 export class WorkflowAgent {
   private readonly cwd: string;
   private readonly baseTools: ToolDefinition[];
+  /** Extra subagent tool-name denylist, merged with the always-on defaults. */
+  private readonly excludeTools: string[];
   private readonly sessionOptions: Partial<CreateAgentSessionOptions>;
   private readonly persistAgentSessions: boolean;
   private readonly instructions?: string;
@@ -489,6 +509,7 @@ export class WorkflowAgent {
   constructor(options: WorkflowAgentOptions = {}) {
     this.cwd = options.cwd ?? process.cwd();
     this.baseTools = options.tools ?? createCodingTools(this.cwd);
+    this.excludeTools = options.excludeTools ?? [];
     this.sessionOptions = options.session ?? {};
     this.persistAgentSessions = options.persistAgentSessions ?? false;
     this.instructions = options.instructions;
@@ -671,6 +692,14 @@ export class WorkflowAgent {
       // Per-call model/thinking wins over any sessionOptions defaults.
       ...(resolvedModel ? { model: resolvedModel } : {}),
       ...(resolvedThinkingLevel ? { thinkingLevel: resolvedThinkingLevel } : {}),
+      // Deny recursive-orchestration tools in the subagent (#107). Placed after
+      // the sessionOptions spread so it always applies; folds in any denylist
+      // the caller set on sessionOptions rather than dropping it.
+      excludeTools: [
+        ...DEFAULT_EXCLUDED_SUBAGENT_TOOLS,
+        ...(this.sessionOptions.excludeTools ?? []),
+        ...this.excludeTools,
+      ],
     });
 
     // Name the persisted session so it's identifiable in session pickers.

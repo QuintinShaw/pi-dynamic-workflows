@@ -142,6 +142,13 @@ export interface WorkflowManagerOptions {
    */
   toolsets?: Record<string, () => ToolDefinition[]>;
   /**
+   * Extra tool NAMES to deny in every subagent session, on top of the always-on
+   * `workflow`/`workflow_control` defaults (see DEFAULT_EXCLUDED_SUBAGENT_TOOLS).
+   * Host wiring passes settings.excludeSubagentTools here so users can also block
+   * other recursive-orchestration tools (#107).
+   */
+  excludeSubagentTools?: string[];
+  /**
    * Persist each subagent transcript as a real pi session file under the
    * standard sessions directory. Default false (in-memory, discarded).
    */
@@ -165,6 +172,7 @@ export class WorkflowManager extends EventEmitter {
   private defaultAgentRetries: number;
   private defaultTokenBudget: number | null;
   private toolsets?: Record<string, () => ToolDefinition[]>;
+  private excludeSubagentTools?: string[];
   private persistAgentSessions: boolean;
 
   constructor(options: WorkflowManagerOptions = {}) {
@@ -180,6 +188,7 @@ export class WorkflowManager extends EventEmitter {
     this.defaultAgentRetries = options.defaultAgentRetries ?? 0;
     this.defaultTokenBudget = options.defaultTokenBudget ?? null;
     this.toolsets = options.toolsets;
+    this.excludeSubagentTools = options.excludeSubagentTools;
     this.persistAgentSessions = options.persistAgentSessions ?? false;
     this.persistence = createRunPersistence(this.cwd);
     this.recoverStaleRuns();
@@ -433,6 +442,7 @@ export class WorkflowManager extends EventEmitter {
         agentTimeoutMs: resolvedAgentTimeoutMs,
         tokenBudget: resolvedTokenBudget,
         tools: resolvedTools,
+        excludeTools: this.excludeSubagentTools,
         confirm,
         loadSavedWorkflow: this.loadSavedWorkflow,
         resumeJournal,

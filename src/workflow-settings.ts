@@ -42,6 +42,13 @@ export interface WorkflowSettings {
    * `summary`/`synthesis` fields are never truncated.
    */
   deliveredResultMaxChars?: number;
+  /**
+   * Extra tool names to deny in workflow subagent sessions, on top of the
+   * always-on `workflow`/`workflow_control` defaults (#107). Use it to block
+   * other recursive-orchestration tools you have installed (e.g. a pi-subagents
+   * tool) so a subagent can't fan out through them.
+   */
+  excludeSubagentTools?: string[];
 }
 
 export interface WorkflowSettingsStore {
@@ -164,6 +171,10 @@ function normalizeSettings(value: unknown): WorkflowSettings {
   }
   const deliveredResultMaxChars = normalizeInteger(raw.deliveredResultMaxChars, 1, 1_000_000);
   if (deliveredResultMaxChars !== undefined) settings.deliveredResultMaxChars = deliveredResultMaxChars;
+  if (Array.isArray(raw.excludeSubagentTools)) {
+    const names = raw.excludeSubagentTools.filter((t): t is string => typeof t === "string" && t.trim().length > 0);
+    if (names.length) settings.excludeSubagentTools = names;
+  }
   return settings;
 }
 

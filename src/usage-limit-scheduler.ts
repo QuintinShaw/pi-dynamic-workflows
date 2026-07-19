@@ -264,11 +264,22 @@ export class UsageLimitScheduler {
 
     if (params.attempts > this.maxAttempts) {
       const alreadyLogged = existing?.gaveUp === true;
-      this.state.set(runId, { attempts: params.attempts, gaveUp: true });
-      this.persistAttempts(runId, params.attempts);
-      if (!alreadyLogged) {
+      // Freeze the counter at a single sentinel (maxAttempts + 1) instead of
+      // storing the raw overflow. coldStartRearm() reads the persisted count and
+      // adds 1 on every restart; without this clamp a given-up run's counter
+      // grew without bound (…6, 7, 8… → "giving up after 23") across cold starts
+      // (#106). Clamping makes the persisted value idempotent — a rearm of an
+      // already-given-up run rewrites the same 6.
+      const frozen = this.maxAttempts + 1;
+      this.state.set(runId, { attempts: frozen, gaveUp: true });
+      this.persistAttempts(runId, frozen);
+      // Log the give-up exactly once per crossing. In-process the gaveUp flag
+      // guards it; across restarts a fresh scheduler has no memory, so also
+      // suppress when this arm is merely re-giving-up an already-capped run
+      // (params.attempts already past the sentinel, i.e. prior was ≥ frozen).
+      if (!alreadyLogged && params.attempts <= frozen) {
         this.diagnostic(
-          `[usage-limit-scheduler] ${runId}: giving up after ${params.attempts - 1} auto-resume attempt(s) ` +
+          `[usage-limit-scheduler] ${runId}: giving up after ${this.maxAttempts} auto-resume attempt(s) ` +
             `(max ${this.maxAttempts}); leaving paused for manual resume`,
         );
       }

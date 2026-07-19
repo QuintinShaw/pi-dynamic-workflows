@@ -258,6 +258,89 @@ test("attempt cap reached: gives up, arms no further timers", async () => {
   scheduler.dispose();
 });
 
+test("cold start past the cap: no growth, no timer, no repeated give-up log (#106)", async () => {
+  const manager = new FakeManager();
+  manager.persistence.seed(
+    makeRun({
+      status: "paused",
+      pauseReason: "usage_limit",
+      resetHint: "resets in 1m",
+      autoResumeAttempts: 4, // already past the cap (maxAttempts 3 → sentinel 4)
+    }),
+  );
+  const diagnostics: string[] = [];
+
+  // Several Pi restarts, each a fresh scheduler (= a cold start). Before the fix,
+  // coldStartRearm() did prior+1 and arm() persisted the raw overflow, so the
+  // counter climbed (5, 6, 7…) and a give-up line printed on every boot.
+  for (let restart = 0; restart < 3; restart++) {
+    const clock = createFakeClock();
+    const scheduler = new UsageLimitScheduler(manager, {
+      now: clock.now,
+      setTimer: clock.setTimer,
+      clearTimer: clock.clearTimer,
+      onDiagnostic: (m) => diagnostics.push(m),
+      ...TUNABLES,
+    });
+    await flush();
+    assert.equal(clock.pendingCount(), 0, `restart ${restart}: no timer armed past the cap`);
+    assert.equal(
+      manager.persistence.get("run-1")?.autoResumeAttempts,
+      4,
+      `restart ${restart}: attempts frozen at the sentinel, never incremented`,
+    );
+    scheduler.dispose();
+  }
+
+  assert.equal(
+    diagnostics.filter((m) => m.includes("giving up")).length,
+    0,
+    "an already-given-up run must not re-log the give-up diagnostic on every cold start",
+  );
+});
+
+test("cold start crossing the cap logs give-up exactly once, then freezes (#106)", async () => {
+  const manager = new FakeManager();
+  manager.persistence.seed(
+    makeRun({
+      status: "paused",
+      pauseReason: "usage_limit",
+      resetHint: "resets in 1m",
+      autoResumeAttempts: 3, // exactly at maxAttempts — the next arm crosses the cap
+    }),
+  );
+  const diagnostics: string[] = [];
+  const boot = async () => {
+    const clock = createFakeClock();
+    const scheduler = new UsageLimitScheduler(manager, {
+      now: clock.now,
+      setTimer: clock.setTimer,
+      clearTimer: clock.clearTimer,
+      onDiagnostic: (m) => diagnostics.push(m),
+      ...TUNABLES,
+    });
+    await flush();
+    return { clock, scheduler };
+  };
+
+  const first = await boot();
+  assert.equal(first.clock.pendingCount(), 0, "crossing the cap arms no timer");
+  first.scheduler.dispose();
+  const second = await boot();
+  second.scheduler.dispose();
+
+  assert.equal(
+    manager.persistence.get("run-1")?.autoResumeAttempts,
+    4,
+    "counter freezes at the sentinel (maxAttempts + 1), not 5+",
+  );
+  assert.equal(
+    diagnostics.filter((m) => m.includes("giving up")).length,
+    1,
+    "give-up logs once at the crossing, not again on the next cold start",
+  );
+});
+
 test("cold-start re-arm uses REMAINING time, not the full base delay", async () => {
   const manager = new FakeManager();
   const pausedAt = new Date(0);

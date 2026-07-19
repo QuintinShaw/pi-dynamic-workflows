@@ -267,6 +267,221 @@ test("NavigatorState drills runs -> phases -> agents -> detail and back", () => 
   assert.equal(state.back(), false, "back at top returns false (caller closes)");
 });
 
+test("non-string phase titles are coerced, so the navigator never crashes on bad data (#110)", () => {
+  // A corrupt persisted run (or a script that passed a non-string to phase())
+  // could put a non-string into snapshot.phases. It used to reach the SDK's
+  // truncateToWidth(), whose text.slice() threw and crashed the whole overlay.
+  const snapshot: WorkflowSnapshot = {
+    name: "wf",
+    phases: [42 as unknown as string, "Real Phase"],
+    currentPhase: "Real Phase",
+    logs: [],
+    agents: [],
+    agentCount: 0,
+    runningCount: 0,
+    doneCount: 0,
+    errorCount: 0,
+  };
+  const manager: Pick<WorkflowManager, "listRuns" | "getRun"> = {
+    listRuns: () => [
+      {
+        runId: "run-bad",
+        workflowName: "wf",
+        status: "running",
+        phases: snapshot.phases,
+        agents: [],
+        logs: [],
+      } as unknown as PersistedRunState,
+    ],
+    getRun: (id: string) =>
+      id === "run-bad" ? ({ runId: "run-bad", status: "running", snapshot } as unknown as ManagedRun) : undefined,
+  };
+  const model = new NavigatorModel(manager as unknown as WorkflowManager);
+
+  // Data boundary coerces the bad title to a string.
+  const phases = model.phases("run-bad");
+  assert.equal(phases[0].title, "42", "non-string title is coerced to a string");
+  assert.equal(phases[1].title, "Real Phase");
+
+  // Render the exact path that crashed: drilled into the run's phases view.
+  const state = new NavigatorState();
+  assert.ok(state.drill(model), "drill into the run's phases");
+  assert.equal(state.kind, "phases");
+  assert.doesNotThrow(() => renderNavigator(state, model, 80), "rendering must not throw on a non-string title");
+});
+
+test("non-string agent labels and run names are coerced too, not just phase titles (#110)", () => {
+  // Same corrupt-data root cause reaches truncateToWidth() via the agent row
+  // (a.label) and the two-pane header (run name), not only the phase title.
+  const snapshot: WorkflowSnapshot = {
+    name: 999 as unknown as string, // non-string run name → header truncateToWidth
+    phases: ["Work"],
+    currentPhase: "Work",
+    logs: [],
+    agents: [
+      {
+        id: 1,
+        label: 42 as unknown as string, // non-string agent label → agent-row truncateToWidth
+        phase: "Work",
+        prompt: "do it",
+        status: "running",
+        tokens: 0,
+      },
+    ],
+    agentCount: 1,
+    runningCount: 1,
+    doneCount: 0,
+    errorCount: 0,
+  };
+  const manager: Pick<WorkflowManager, "listRuns" | "getRun"> = {
+    listRuns: () => [
+      {
+        runId: "run-corrupt",
+        workflowName: 999 as unknown as string,
+        status: "running",
+        phases: ["Work"],
+        agents: snapshot.agents,
+        logs: [],
+      } as unknown as PersistedRunState,
+    ],
+    getRun: (id: string) =>
+      id === "run-corrupt"
+        ? ({ runId: "run-corrupt", status: "running", snapshot } as unknown as ManagedRun)
+        : undefined,
+  };
+  const model = new NavigatorModel(manager as unknown as WorkflowManager);
+
+  assert.equal(model.runName("run-corrupt"), "999", "non-string run name coerced");
+  assert.equal(model.runs()[0].name, "999", "non-string name coerced in the runs list too");
+  assert.equal(model.agents("run-corrupt", "Work")[0].label, "42", "non-string agent label coerced");
+
+  // The agent grouped under the coerced phase key stays reachable (no lookup drift).
+  assert.equal(model.phases("run-corrupt")[0].total, 1, "agent stays grouped under its phase");
+
+  // Render every view — runs list, phases, and the drilled agent row/header.
+  const state = new NavigatorState();
+  assert.doesNotThrow(() => renderNavigator(state, model, 80), "runs list must not throw");
+  assert.ok(state.drill(model));
+  assert.doesNotThrow(() => renderNavigator(state, model, 80), "phases + agent row + header must not throw");
+});
+
+test("structurally corrupt persisted runs never crash the navigator (#110)", () => {
+  // A non-string status crashed twoPaneHeader (same text.slice signature as #110);
+  // non-array agents/phases crashed the runs list itself so /workflows wouldn't
+  // even open. getRun() returns undefined to force the persisted path.
+  const manager: Pick<WorkflowManager, "listRuns" | "getRun"> = {
+    listRuns: () => [
+      {
+        runId: "corrupt-1",
+        workflowName: { bad: 1 } as unknown as string,
+        status: { obj: true } as unknown as string,
+        phases: null as unknown as string[],
+        agents: null as unknown as [],
+        logs: null as unknown as string[],
+      } as unknown as PersistedRunState,
+    ],
+    getRun: () => undefined,
+  };
+  const model = new NavigatorModel(manager as unknown as WorkflowManager);
+
+  assert.doesNotThrow(() => model.runs(), "runs() must not throw on non-array agents");
+  assert.equal(typeof model.runStatus("corrupt-1"), "string", "non-string status coerced");
+  assert.doesNotThrow(() => model.phases("corrupt-1"), "phases() must not throw on non-array phases");
+  assert.doesNotThrow(() => model.agents("corrupt-1", "x"), "agents() must not throw");
+
+  // The runs list must open, and drilling in must not crash either.
+  assert.doesNotThrow(() => renderNavigator(new NavigatorState(), model, 80), "runs list must render");
+  const state = new NavigatorState();
+  assert.ok(state.drill(model));
+  assert.doesNotThrow(() => renderNavigator(state, model, 80), "drilled view must render (non-string status header)");
+});
+
+test("non-string agent prompt in the detail view is coerced, reachable from a live run (#110)", () => {
+  // agent(42) in a model-written script is never type-checked, so a non-string
+  // prompt reaches the detail view's wrap() and used to crash text.split().
+  const snapshot: WorkflowSnapshot = {
+    name: "wf",
+    phases: ["P"],
+    currentPhase: "P",
+    logs: [],
+    agents: [{ id: 1, label: "a", phase: "P", prompt: 42 as unknown as string, status: "done", tokens: 0 }],
+    agentCount: 1,
+    runningCount: 0,
+    doneCount: 1,
+    errorCount: 0,
+  };
+  const manager: Pick<WorkflowManager, "listRuns" | "getRun"> = {
+    listRuns: () => [
+      {
+        runId: "live-1",
+        workflowName: "wf",
+        status: "running",
+        phases: ["P"],
+        agents: snapshot.agents,
+        logs: [],
+      } as unknown as PersistedRunState,
+    ],
+    getRun: (id: string) =>
+      id === "live-1" ? ({ runId: "live-1", status: "running", snapshot } as unknown as ManagedRun) : undefined,
+  };
+  const model = new NavigatorModel(manager as unknown as WorkflowManager);
+  const state = new NavigatorState();
+  assert.ok(state.drill(model)); // → phases
+  assert.ok(state.drill(model)); // → agents
+  assert.ok(state.drill(model)); // → detail
+  assert.equal(state.kind, "detail");
+  assert.doesNotThrow(() => renderNavigator(state, model, 80), "detail view must not throw on a non-string prompt");
+});
+
+test("a null/primitive element in a corrupt agent history doesn't crash the detail view (#110)", () => {
+  // historyLabel(entry) reads entry.kind; a null element (valid JSON from a
+  // corrupt persisted run) would throw. Live history never emits null entries.
+  const snapshot: WorkflowSnapshot = {
+    name: "wf",
+    phases: ["P"],
+    currentPhase: "P",
+    logs: [],
+    agents: [
+      {
+        id: 1,
+        label: "a",
+        phase: "P",
+        prompt: "do it",
+        status: "error",
+        history: [
+          null as unknown as { role: string; kind: string; text: string },
+          { role: "tool", kind: "toolResult", toolName: "read", text: "ok" },
+        ],
+      },
+    ],
+    agentCount: 1,
+    runningCount: 0,
+    doneCount: 0,
+    errorCount: 1,
+  };
+  const manager: Pick<WorkflowManager, "listRuns" | "getRun"> = {
+    listRuns: () => [
+      {
+        runId: "hist-1",
+        workflowName: "wf",
+        status: "completed",
+        phases: ["P"],
+        agents: snapshot.agents,
+        logs: [],
+      } as unknown as PersistedRunState,
+    ],
+    getRun: (id: string) =>
+      id === "hist-1" ? ({ runId: "hist-1", status: "completed", snapshot } as unknown as ManagedRun) : undefined,
+  };
+  const model = new NavigatorModel(manager as unknown as WorkflowManager);
+  const state = new NavigatorState();
+  assert.ok(state.drill(model));
+  assert.ok(state.drill(model));
+  assert.ok(state.drill(model));
+  assert.equal(state.kind, "detail");
+  assert.doesNotThrow(() => renderNavigator(state, model, 80), "null history entry must be skipped, not crash");
+});
+
 test("NavigatorState cursor wraps and detail scroll clamps at 0", () => {
   const model = new NavigatorModel(fakeManager());
   const state = new NavigatorState();

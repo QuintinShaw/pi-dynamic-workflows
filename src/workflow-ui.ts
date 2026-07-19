@@ -80,10 +80,22 @@ interface AgentRow {
 }
 
 /** Short, human-friendly model label: drop the provider prefix for display. */
+/**
+ * Coerce a possibly-non-string value from a (corrupt) persisted run to a string,
+ * so it can never reach a downstream truncateToWidth()/visibleWidth() as a
+ * non-string and crash the whole /workflows overlay via text.slice() (#110).
+ * Applied at every Model read boundary that feeds the renderer: phase titles,
+ * agent labels/phases, and run names.
+ */
+function asText(v: unknown): string {
+  return typeof v === "string" ? v : String(v ?? "");
+}
+
 export function shortModel(model: string | undefined): string | undefined {
   if (!model) return undefined;
-  const slash = model.indexOf("/");
-  return slash > 0 ? model.slice(slash + 1) : model;
+  const m = asText(model);
+  const slash = m.indexOf("/");
+  return slash > 0 ? m.slice(slash + 1) : m;
 }
 
 /** Reads run/phase/agent data from the manager, preferring live snapshots. */
@@ -104,7 +116,11 @@ export class NavigatorModel {
   runs(): RunRow[] {
     return this.manager.listRuns().map((p) => {
       const live = this.manager.getRun(p.runId);
-      const agents = (live?.snapshot.agents ?? p.agents) as WorkflowAgentSnapshot[];
+      // Array guard (#110): a structurally corrupt persisted run (agents not an
+      // array) would otherwise throw "agents is not iterable" here and crash the
+      // runs list itself — i.e. /workflows would fail to open at all.
+      const rawAgents = live?.snapshot.agents ?? p.agents;
+      const agents = (Array.isArray(rawAgents) ? rawAgents : []) as WorkflowAgentSnapshot[];
       const usage = live?.snapshot.tokenUsage ?? p.tokenUsage;
       // The run-level aggregate is authoritative but only lands when the run
       // ends; per-agent figures update live. Use whichever accounts for more
@@ -116,7 +132,7 @@ export class NavigatorModel {
         fromAgents.fresh + fromAgents.cacheRead > fromUsage.fresh + fromUsage.cacheRead ? fromAgents : fromUsage;
       return {
         runId: p.runId,
-        name: live?.snapshot.name ?? p.workflowName,
+        name: asText(live?.snapshot.name ?? p.workflowName),
         status: live?.status ?? p.status,
         done: agents.filter((a) => a.status === "done").length,
         total: agents.length,
@@ -140,20 +156,27 @@ export class NavigatorModel {
   }
 
   runName(runId: string): string {
-    return this.snapshot(runId)?.snapshot.name ?? runId;
+    return asText(this.snapshot(runId)?.snapshot.name ?? runId);
   }
 
   runStatus(runId: string): string {
-    return this.snapshot(runId)?.status ?? "unknown";
+    // Coerce (#110): a corrupt persisted run can carry a non-string status, which
+    // would otherwise crash twoPaneHeader's truncateToWidth() with text.slice().
+    return asText(this.snapshot(runId)?.status ?? "unknown");
   }
 
   phases(runId: string): PhaseRow[] {
     const snap = this.snapshot(runId)?.snapshot;
     if (!snap) return [];
-    const order = snap.phases.length ? [...snap.phases] : [];
+    // Coerce phase keys up front (#110): a non-string phase — from a corrupt
+    // persisted run or a script that passed a non-string to phase() — would
+    // otherwise reach truncateToWidth() and crash the overlay. Coercing the
+    // grouping key too (not just the output title) keeps agents grouped under the
+    // same string the drilled-in agents() filter compares against.
+    const order = snap.phases.length ? snap.phases.map(asText) : [];
     const byPhase = new Map<string, AgentRow[]>();
     for (const a of snap.agents) {
-      const key = a.phase ?? "(no phase)";
+      const key = a.phase != null ? asText(a.phase) : "(no phase)";
       if (!byPhase.has(key)) byPhase.set(key, []);
       byPhase.get(key)?.push(a);
       if (!order.includes(key)) order.push(key);
@@ -162,7 +185,7 @@ export class NavigatorModel {
       const agents = byPhase.get(title) ?? [];
       const usage = aggregateAgentUsage(agents);
       return {
-        title,
+        title, // already coerced to a string above
         done: agents.filter((a) => a.status === "done").length,
         total: agents.length,
         fresh: usage.fresh,
@@ -175,12 +198,14 @@ export class NavigatorModel {
     const snap = this.snapshot(runId)?.snapshot;
     if (!snap) return [];
     return snap.agents
-      .filter((a) => (a.phase ?? "(no phase)") === phase)
+      .filter((a) => (a.phase != null ? asText(a.phase) : "(no phase)") === phase)
       .map((a) => ({
         id: a.id,
-        label: a.label,
+        // Coerce label/phase at the boundary so a non-string value from a corrupt
+        // run can't crash the agent row's truncateToWidth() (#110).
+        label: asText(a.label),
         status: a.status,
-        phase: a.phase,
+        phase: a.phase != null ? asText(a.phase) : a.phase,
         tokens: a.tokens,
         tokenUsage: a.tokenUsage,
         model: a.model,
@@ -202,12 +227,15 @@ type StackFrame = {
 };
 
 function persistedToSnapshot(p: PersistedRunState): WorkflowSnapshot {
+  // Array guards (#110): a structurally corrupt persisted run (phases/logs/agents
+  // not arrays) would otherwise throw when mapped/spread and crash the overlay.
+  const agents = Array.isArray(p.agents) ? p.agents : [];
   return {
-    name: p.workflowName,
-    phases: p.phases,
+    name: asText(p.workflowName),
+    phases: Array.isArray(p.phases) ? p.phases : [],
     currentPhase: p.currentPhase,
-    logs: p.logs,
-    agents: p.agents.map((a) => ({
+    logs: Array.isArray(p.logs) ? p.logs : [],
+    agents: agents.map((a) => ({
       id: a.id,
       label: a.label,
       phase: a.phase,
@@ -223,10 +251,10 @@ function persistedToSnapshot(p: PersistedRunState): WorkflowSnapshot {
       tokenUsage: a.tokenUsage,
       model: a.model,
     })),
-    agentCount: p.agents.length,
-    runningCount: p.agents.filter((a) => a.status === "running").length,
-    doneCount: p.agents.filter((a) => a.status === "done").length,
-    errorCount: p.agents.filter((a) => a.status === "error").length,
+    agentCount: agents.length,
+    runningCount: agents.filter((a) => a.status === "running").length,
+    doneCount: agents.filter((a) => a.status === "done").length,
+    errorCount: agents.filter((a) => a.status === "error").length,
     tokenUsage: p.tokenUsage ? { ...p.tokenUsage } : undefined,
     runId: p.runId,
   };
@@ -817,19 +845,26 @@ export function renderNavigator(
     const a = model.agentDetail(state.runId, state.agentId);
     lines.push(theme.bold(a ? a.label : "agent"));
     if (a) {
+      // Coerce every dynamic value before wrap() (#110): a non-string prompt is
+      // reachable even from a LIVE run — agent(42) in a model-written script is
+      // never type-checked — and would crash wrap()'s text.split(). Persisted
+      // error/status/history text can be non-string on a corrupt run too.
       const body: string[] = [];
-      body.push(dim("Status: ") + (a.status ?? ""));
+      body.push(dim("Status: ") + asText(a.status ?? ""));
       if (a.model) body.push(dim("Model: ") + (shortModel(a.model) ?? ""));
-      if (a.error) body.push(dim("Error: ") + a.error);
+      if (a.error) body.push(dim("Error: ") + asText(a.error));
       if (a.errorCode) body.push(`${dim("Error code: ")}${a.errorCode}${a.recoverable ? " (recoverable)" : ""}`);
       body.push("", dim("Prompt:"));
-      body.push(...wrap(a.prompt ?? "", width));
+      body.push(...wrap(asText(a.prompt ?? ""), width));
       body.push("", dim("Result:"));
-      body.push(...wrap(a.resultPreview ?? "(none)", width));
+      body.push(...wrap(asText(a.resultPreview ?? "(none)"), width));
       if (a.history?.length) {
         body.push("", dim("History:"));
         for (const entry of a.history) {
-          body.push(...wrap(`${historyLabel(entry)}: ${entry.text}`, width));
+          // Skip a null/primitive element from a corrupt persisted history —
+          // historyLabel() reads entry.kind and would throw on it (#110).
+          if (!entry || typeof entry !== "object") continue;
+          body.push(...wrap(`${historyLabel(entry)}: ${asText(entry.text)}`, width));
         }
       }
       pushScrollable(body);
@@ -840,12 +875,13 @@ export function renderNavigator(
     lines.push(theme.bold(w ? w.name : "saved workflow"));
     if (w) {
       const body: string[] = [];
-      if (w.description) body.push(dim("Description: ") + w.description);
+      if (w.description) body.push(dim("Description: ") + asText(w.description));
       body.push(dim("Location: ") + (w.location === "user" ? "user (~/.pi)" : "project (.pi)"));
-      body.push(dim("Saved at: ") + w.savedAt);
+      body.push(dim("Saved at: ") + asText(w.savedAt));
       if (w.parameters) body.push(dim("Parameters: ") + JSON.stringify(w.parameters));
       body.push("", dim("Script:"));
-      body.push(...wrap(w.script, width));
+      // Coerce (#110): corrupt saved-workflow JSON can carry a non-string script.
+      body.push(...wrap(asText(w.script), width));
       pushScrollable(body);
     }
   }

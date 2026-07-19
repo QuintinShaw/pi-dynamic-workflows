@@ -6,7 +6,13 @@ import test from "node:test";
 import { createFauxCore, fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { ModelRegistry, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import type { AgentRunOptions, AgentUsage } from "../src/agent.js";
-import { listAvailableModelSpecs, resolveAgentModelSpec, usageFromStats, WorkflowAgent } from "../src/agent.js";
+import {
+  DEFAULT_EXCLUDED_SUBAGENT_TOOLS,
+  listAvailableModelSpecs,
+  resolveAgentModelSpec,
+  usageFromStats,
+  WorkflowAgent,
+} from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { resolveModelSpecWithThinking } from "../src/model-spec.js";
 import type { ModelTierConfig } from "../src/model-tier-config.js";
@@ -300,6 +306,7 @@ test("WorkflowAgent constructor accepts all option shapes without throwing", () 
     { cwd: "/tmp" },
     { cwd: "/tmp", instructions: "custom instruction" },
     { cwd: "/tmp", tools: [], session: {}, instructions: "test" },
+    { cwd: "/tmp", excludeTools: ["pi-subagents"] },
     { cwd: "/tmp", mainModel: "openai/gpt-4.1" },
     { cwd: "/tmp", tools: [], session: {}, instructions: "test", mainModel: "openai/gpt-4.1" },
     {
@@ -315,6 +322,14 @@ test("WorkflowAgent constructor accepts all option shapes without throwing", () 
     const agent = opts ? new WorkflowAgent(opts) : new WorkflowAgent();
     assert.ok(agent instanceof WorkflowAgent, `agent should be constructed for options: ${JSON.stringify(opts)}`);
   }
+});
+
+test("DEFAULT_EXCLUDED_SUBAGENT_TOOLS denies the recursive orchestration tools (#107)", () => {
+  // Subagents must never see the globally-registered orchestration tools, or they
+  // could start independent nested workflows that bypass the parent run's caps.
+  // This is the always-on denylist folded into every subagent session; the guard
+  // is a regression fence so it can't be silently narrowed.
+  assert.deepEqual(DEFAULT_EXCLUDED_SUBAGENT_TOOLS, ["workflow", "workflow_control"]);
 });
 
 test("WorkflowAgent reuses an injected ModelRegistry instead of building its own", async () => {

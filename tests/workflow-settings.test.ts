@@ -90,6 +90,25 @@ describe("workflow settings", () => {
     });
   });
 
+  it("loads and normalizes excludeSubagentTools, dropping non-string/blank entries (#107)", () => {
+    withSettingsPath((settingsPath) => {
+      mkdirSync(dirname(settingsPath), { recursive: true });
+
+      writeFileSync(settingsPath, JSON.stringify({ excludeSubagentTools: ["pi-subagents", "spawn"] }), "utf-8");
+      assert.deepEqual(loadWorkflowSettings(settingsPath), { excludeSubagentTools: ["pi-subagents", "spawn"] });
+
+      // Non-string and blank entries are filtered out.
+      writeFileSync(settingsPath, JSON.stringify({ excludeSubagentTools: ["keep", 42, "", "  ", null] }), "utf-8");
+      assert.deepEqual(loadWorkflowSettings(settingsPath), { excludeSubagentTools: ["keep"] });
+
+      // An all-invalid (or empty) list yields no key at all.
+      writeFileSync(settingsPath, JSON.stringify({ excludeSubagentTools: [1, 2, ""] }), "utf-8");
+      assert.deepEqual(loadWorkflowSettings(settingsPath), {});
+      writeFileSync(settingsPath, JSON.stringify({ excludeSubagentTools: "nope" }), "utf-8");
+      assert.deepEqual(loadWorkflowSettings(settingsPath), {});
+    });
+  });
+
   it("normalizes default concurrency and agent retries", () => {
     withSettingsPath((settingsPath) => {
       mkdirSync(dirname(settingsPath), { recursive: true });

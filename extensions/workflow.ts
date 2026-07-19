@@ -34,6 +34,9 @@ export default function extension(pi: ExtensionAPI) {
     toolsets: {
       "web-research": () => [...createCodingTools(cwd), ...createWebTools()],
     },
+    // On top of the always-on workflow/workflow_control denial in subagents
+    // (#107), let users block additional recursive-orchestration tools.
+    excludeSubagentTools: settings.excludeSubagentTools,
     defaultAgentTimeoutMs: settings.defaultAgentTimeoutMs ?? null,
     defaultTokenBudget: settings.defaultTokenBudget ?? null,
     concurrency: settings.defaultConcurrency,
