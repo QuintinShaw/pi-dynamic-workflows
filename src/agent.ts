@@ -486,6 +486,17 @@ export type AgentRunResult<TSchemaDef extends TSchema | undefined> = TSchemaDef 
  */
 export const DEFAULT_EXCLUDED_SUBAGENT_TOOLS = ["workflow", "workflow_control"];
 
+/**
+ * The full subagent tool denylist: the always-on defaults plus any names the
+ * caller added (via WorkflowAgentOptions.excludeTools) or set on the injected
+ * session options. Extracted so the merge — and its order — is unit-testable;
+ * a spread-order regression that dropped the defaults would slip past a test
+ * that only asserts the constant. The SDK dedupes, so overlap is harmless.
+ */
+export function subagentExcludedTools(extra?: string[], sessionExclude?: string[]): string[] {
+  return [...DEFAULT_EXCLUDED_SUBAGENT_TOOLS, ...(sessionExclude ?? []), ...(extra ?? [])];
+}
+
 export class WorkflowAgent {
   private readonly cwd: string;
   private readonly baseTools: ToolDefinition[];
@@ -695,11 +706,7 @@ export class WorkflowAgent {
       // Deny recursive-orchestration tools in the subagent (#107). Placed after
       // the sessionOptions spread so it always applies; folds in any denylist
       // the caller set on sessionOptions rather than dropping it.
-      excludeTools: [
-        ...DEFAULT_EXCLUDED_SUBAGENT_TOOLS,
-        ...(this.sessionOptions.excludeTools ?? []),
-        ...this.excludeTools,
-      ],
+      excludeTools: subagentExcludedTools(this.excludeTools, this.sessionOptions.excludeTools),
     });
 
     // Name the persisted session so it's identifiable in session pickers.
@@ -750,7 +757,11 @@ export class WorkflowAgent {
         )) as AgentRunResult<TSchemaDef>;
       }
 
-      const text = this.lastAssistantText(session.messages);
+      // Unstructured result: require assistant text AFTER the last tool result.
+      // Text emitted before it is stale progress (the agent's last real action was
+      // a tool call) — accepting it would report an incomplete run as successful
+      // and suppress the AGENT_EMPTY_OUTPUT retry (#111).
+      const text = this.finalAssistantText(session.messages);
       if (!text.trim()) {
         throw new WorkflowError("Subagent produced no assistant output", WorkflowErrorCode.AGENT_EMPTY_OUTPUT, {
           recoverable: true,
@@ -804,6 +815,37 @@ export class WorkflowAgent {
 
   private lastAssistantText(messages: unknown[]): string {
     for (let i = messages.length - 1; i >= 0; i--) {
+      const message = messages[i] as Partial<AssistantMessage> | undefined;
+      if (message?.role !== "assistant" || !Array.isArray(message.content)) continue;
+      const text = message.content
+        .filter((part): part is TextContent => part.type === "text")
+        .map((part) => part.text)
+        .join("");
+      if (text.trim()) return text;
+    }
+    return "";
+  }
+
+  /**
+   * The unstructured agent's FINAL answer: assistant text that appears after the
+   * last tool result. Text before the final tool result is stale progress (the
+   * agent's last real action was a tool call, not answering), so returning it
+   * would mask an incomplete run and suppress AGENT_EMPTY_OUTPUT retries (#111).
+   *
+   * Distinct from lastAssistantText(), which stays deliberately lenient — the
+   * schema path's prose-JSON recovery (resolveStructuredOutput) may need to read
+   * the structured payload out of any assistant message, not only the terminal one.
+   */
+  private finalAssistantText(messages: unknown[]): string {
+    // Locate the last tool result; only assistant text strictly after it counts.
+    let lastToolResult = -1;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if ((messages[i] as { role?: string } | undefined)?.role === "toolResult") {
+        lastToolResult = i;
+        break;
+      }
+    }
+    for (let i = messages.length - 1; i > lastToolResult; i--) {
       const message = messages[i] as Partial<AssistantMessage> | undefined;
       if (message?.role !== "assistant" || !Array.isArray(message.content)) continue;
       const text = message.content

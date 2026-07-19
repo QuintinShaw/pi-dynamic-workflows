@@ -10,6 +10,7 @@ import {
   DEFAULT_EXCLUDED_SUBAGENT_TOOLS,
   listAvailableModelSpecs,
   resolveAgentModelSpec,
+  subagentExcludedTools,
   usageFromStats,
   WorkflowAgent,
 } from "../src/agent.js";
@@ -23,6 +24,7 @@ import { withFakeHome, withFakeHomeAsync } from "./helpers/fake-home.js";
 type WorkflowAgentPrivates = {
   buildPrompt(prompt: string, options: AgentRunOptions<any>, structured: boolean): string;
   lastAssistantText(messages: unknown[]): string;
+  finalAssistantText(messages: unknown[]): string;
   createSessionManager(): { isPersisted(): boolean; getCwd(): string };
 };
 
@@ -330,6 +332,62 @@ test("DEFAULT_EXCLUDED_SUBAGENT_TOOLS denies the recursive orchestration tools (
   // This is the always-on denylist folded into every subagent session; the guard
   // is a regression fence so it can't be silently narrowed.
   assert.deepEqual(DEFAULT_EXCLUDED_SUBAGENT_TOOLS, ["workflow", "workflow_control"]);
+});
+
+test("subagentExcludedTools always includes the defaults, plus caller/session names (#107)", () => {
+  // This is what run() passes to createAgentSession as excludeTools. Fencing the
+  // merge here catches a spread-order regression that drops the defaults — which
+  // a deepEqual on the constant alone would miss.
+  assert.deepEqual(subagentExcludedTools(), ["workflow", "workflow_control"]);
+  assert.deepEqual(subagentExcludedTools(["pi-subagents"]), ["workflow", "workflow_control", "pi-subagents"]);
+  const merged = subagentExcludedTools(["extra"], ["session-denied"]);
+  assert.ok(merged.includes("workflow") && merged.includes("workflow_control"), "defaults are never dropped");
+  assert.ok(merged.includes("session-denied") && merged.includes("extra"), "both caller lists are folded in");
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// finalAssistantText — the unstructured result must come AFTER the last tool
+// result, so stale progress text can't be reported as a completed answer (#111)
+// ═══════════════════════════════════════════════════════════════════════
+
+const progressThenToolResult = [
+  { role: "assistant", content: [{ type: "text", text: "I'll inspect the repository now." }] },
+  { role: "assistant", content: [{ type: "toolCall", name: "bash", arguments: {} }] },
+  { role: "toolResult", toolName: "bash", content: [{ type: "text", text: "command output" }] },
+];
+
+test("finalAssistantText rejects progress text before a terminal tool result (#111)", () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp" });
+  const text = (agent as unknown as WorkflowAgentPrivates).finalAssistantText(progressThenToolResult);
+  assert.equal(text, "", "text emitted before the final tool result is not a final answer");
+});
+
+test("finalAssistantText accepts a real assistant answer AFTER tools (#111)", () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp" });
+  const messages = [
+    { role: "assistant", content: [{ type: "text", text: "Let me check." }] },
+    { role: "assistant", content: [{ type: "toolCall", name: "bash", arguments: {} }] },
+    { role: "toolResult", toolName: "bash", content: [{ type: "text", text: "output" }] },
+    { role: "assistant", content: [{ type: "text", text: "The answer is 42." }] },
+  ];
+  const text = (agent as unknown as WorkflowAgentPrivates).finalAssistantText(messages);
+  assert.equal(text, "The answer is 42.", "a genuine post-tool answer still counts");
+});
+
+test("finalAssistantText returns a plain answer when no tools were used (#111)", () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp" });
+  const messages = [{ role: "assistant", content: [{ type: "text", text: "Direct answer." }] }];
+  const text = (agent as unknown as WorkflowAgentPrivates).finalAssistantText(messages);
+  assert.equal(text, "Direct answer.");
+});
+
+test("lastAssistantText stays lenient for schema prose extraction (unchanged by #111)", () => {
+  // The schema path's JSON recovery may read the payload from any assistant
+  // message, so lastAssistantText must NOT adopt finalAssistantText's stricter
+  // "after the last tool result" rule.
+  const agent = new WorkflowAgent({ cwd: "/tmp" });
+  const text = (agent as unknown as WorkflowAgentPrivates).lastAssistantText(progressThenToolResult);
+  assert.equal(text, "I'll inspect the repository now.", "lastAssistantText still finds earlier assistant text");
 });
 
 test("WorkflowAgent reuses an injected ModelRegistry instead of building its own", async () => {

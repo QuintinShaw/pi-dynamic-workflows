@@ -147,12 +147,21 @@ export class UsageLimitScheduler {
 
   private readonly state = new Map<string, RunState>();
   private disposed = false;
+  /**
+   * Runs this scheduler is currently auto-resuming (its own timer fired). Used to
+   * tell an auto-resume's "resumed" event apart from a manual one: an auto-resume
+   * must keep the backoff counter (it IS the backoff), a manual resume resets it.
+   */
+  private readonly autoResumingRunIds = new Set<string>();
 
   private readonly onPaused = (event: { runId?: string; reason?: string; resetHint?: string }): void => {
     this.safe(() => this.handlePaused(event));
   };
   private readonly onTerminal = (event: { runId?: string }): void => {
     this.safe(() => this.cleanup(event?.runId));
+  };
+  private readonly onResumed = (event: { runId?: string }): void => {
+    this.safe(() => this.handleResumed(event));
   };
 
   constructor(manager: SchedulableWorkflowManager, options: UsageLimitSchedulerOptions = {}) {
@@ -171,6 +180,7 @@ export class UsageLimitScheduler {
       });
 
     this.manager.on("paused", this.onPaused);
+    this.manager.on("resumed", this.onResumed);
     this.manager.on("complete", this.onTerminal);
     this.manager.on("error", this.onTerminal);
     this.manager.on("stopped", this.onTerminal);
@@ -185,6 +195,7 @@ export class UsageLimitScheduler {
     if (this.disposed) return;
     this.disposed = true;
     this.manager.off("paused", this.onPaused);
+    this.manager.off("resumed", this.onResumed);
     this.manager.off("complete", this.onTerminal);
     this.manager.off("error", this.onTerminal);
     this.manager.off("stopped", this.onTerminal);
@@ -236,6 +247,21 @@ export class UsageLimitScheduler {
     const entry = this.state.get(runId);
     if (entry?.timer !== undefined) this.clearTimer(entry.timer);
     this.state.delete(runId);
+  }
+
+  /**
+   * A run was resumed. If WE resumed it (auto-resume timer fired), leave the
+   * backoff counter alone — that's the sequence doing its job, and it must still
+   * be able to reach the cap. If a human resumed it (via /workflows), treat that
+   * as a deliberate fresh start: drop the in-memory given-up state and reset the
+   * persisted counter so a later pause re-enters the normal backoff from attempt 1
+   * instead of staying silently given-up forever.
+   */
+  private handleResumed(event: { runId?: string }): void {
+    if (this.disposed || !event?.runId) return;
+    if (this.autoResumingRunIds.has(event.runId)) return;
+    this.cleanup(event.runId);
+    this.persistAttempts(event.runId, 0);
   }
 
   private coldStartRearm(): void {
@@ -308,11 +334,17 @@ export class UsageLimitScheduler {
     this.state.set(runId, { ...entry, timer: undefined });
 
     let resumed = false;
+    // Mark this as OUR resume so handleResumed() (fired synchronously inside
+    // resume(), before it returns) doesn't mistake it for a manual resume and
+    // reset the backoff counter mid-sequence.
+    this.autoResumingRunIds.add(runId);
     try {
       resumed = await this.manager.resume(runId);
     } catch (err) {
       this.diagnostic(`[usage-limit-scheduler] ${runId}: resume() threw`, err);
       resumed = false;
+    } finally {
+      this.autoResumingRunIds.delete(runId);
     }
     if (this.disposed) return;
 

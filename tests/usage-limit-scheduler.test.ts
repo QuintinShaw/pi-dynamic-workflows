@@ -341,6 +341,68 @@ test("cold start crossing the cap logs give-up exactly once, then freezes (#106)
   );
 });
 
+test("a manual resume clears the given-up state and resets the counter", async () => {
+  const manager = new FakeManager();
+  manager.persistence.seed(
+    makeRun({
+      status: "paused",
+      pauseReason: "usage_limit",
+      resetHint: "resets in 10m",
+      autoResumeAttempts: 4, // already given up (cap 3)
+    }),
+  );
+  const clock = createFakeClock();
+  const scheduler = new UsageLimitScheduler(manager, {
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    ...TUNABLES,
+  });
+  await flush();
+  assert.equal(scheduler.hasArmedTimer("run-1"), false, "given-up run arms nothing on cold start");
+
+  // User resumes via /workflows → the manager emits "resumed" (not our timer).
+  manager.emit("resumed", { runId: "run-1" });
+  await flush();
+  assert.equal(scheduler.getAttemptCount("run-1"), undefined, "in-memory given-up state cleared");
+  assert.equal(manager.persistence.get("run-1")?.autoResumeAttempts, 0, "persisted counter reset to 0");
+
+  // A later pause now re-enters the normal backoff from attempt 1.
+  manager.emit("paused", { runId: "run-1", reason: "usage_limit", resetHint: "resets in 10m" });
+  assert.equal(scheduler.hasArmedTimer("run-1"), true, "a fresh attempt is armed after the manual resume");
+  assert.equal(scheduler.getAttemptCount("run-1"), 1, "counter starts over at 1");
+  scheduler.dispose();
+});
+
+test("an auto-resume (our own timer firing) does NOT reset the backoff counter", async () => {
+  const manager = new FakeManager();
+  manager.persistence.seed(makeRun({ resetHint: "resets in 10m" }));
+  // Our resume emits "resumed" the same way the real manager does.
+  manager.resumeImpl = async (runId) => {
+    manager.emit("resumed", { runId });
+    return true;
+  };
+  const clock = createFakeClock();
+  const scheduler = new UsageLimitScheduler(manager, {
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    ...TUNABLES,
+  });
+
+  // Two live pauses climb the counter to 2.
+  manager.emit("paused", { runId: "run-1", reason: "usage_limit", resetHint: "resets in 10m" });
+  manager.emit("paused", { runId: "run-1", reason: "usage_limit", resetHint: "resets in 10m" });
+  assert.equal(scheduler.getAttemptCount("run-1"), 2);
+
+  // The timer fires → our resume() runs and emits "resumed". The counter must be
+  // kept (this is the backoff working), not reset by handleResumed.
+  clock.fireAll();
+  await flush();
+  assert.equal(scheduler.getAttemptCount("run-1"), 2, "auto-resume kept the backoff counter");
+  scheduler.dispose();
+});
+
 test("cold-start re-arm uses REMAINING time, not the full base delay", async () => {
   const manager = new FakeManager();
   const pausedAt = new Date(0);

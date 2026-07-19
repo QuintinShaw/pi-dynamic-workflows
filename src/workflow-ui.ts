@@ -91,6 +91,26 @@ function asText(v: unknown): string {
   return typeof v === "string" ? v : String(v ?? "");
 }
 
+/** The (coerced) phase an agent belongs to; "(no phase)" when unset. Shared by
+ *  agents()/agentsByPhase() so grouping and the drilled-in filter always agree. */
+function agentPhaseKey(a: WorkflowAgentSnapshot): string {
+  return a.phase != null ? asText(a.phase) : "(no phase)";
+}
+
+/** Build a render-safe AgentRow: coerce label/phase so a non-string value from a
+ *  corrupt run can't crash the agent row's truncateToWidth() (#110). */
+function toAgentRow(a: WorkflowAgentSnapshot): AgentRow {
+  return {
+    id: a.id,
+    label: asText(a.label),
+    status: a.status,
+    phase: a.phase != null ? asText(a.phase) : a.phase,
+    tokens: a.tokens,
+    tokenUsage: a.tokenUsage,
+    model: a.model,
+  };
+}
+
 export function shortModel(model: string | undefined): string | undefined {
   if (!model) return undefined;
   const m = asText(model);
@@ -170,13 +190,15 @@ export class NavigatorModel {
     if (!snap) return [];
     // Coerce phase keys up front (#110): a non-string phase — from a corrupt
     // persisted run or a script that passed a non-string to phase() — would
-    // otherwise reach truncateToWidth() and crash the overlay. Coercing the
-    // grouping key too (not just the output title) keeps agents grouped under the
-    // same string the drilled-in agents() filter compares against.
-    const order = snap.phases.length ? snap.phases.map(asText) : [];
+    // otherwise reach truncateToWidth() and crash the overlay. Grouping through
+    // the shared agentPhaseKey() (not an inline copy) locks the invariant that
+    // agents land under the same string the drilled-in agents() filter compares
+    // against; the Array.isArray guards mirror agents()/agentsByPhase().
+    const order = Array.isArray(snap.phases) ? snap.phases.map(asText) : [];
     const byPhase = new Map<string, AgentRow[]>();
-    for (const a of snap.agents) {
-      const key = a.phase != null ? asText(a.phase) : "(no phase)";
+    const agents = Array.isArray(snap.agents) ? snap.agents : [];
+    for (const a of agents) {
+      const key = agentPhaseKey(a);
       if (!byPhase.has(key)) byPhase.set(key, []);
       byPhase.get(key)?.push(a);
       if (!order.includes(key)) order.push(key);
@@ -196,20 +218,30 @@ export class NavigatorModel {
 
   agents(runId: string, phase: string): AgentRow[] {
     const snap = this.snapshot(runId)?.snapshot;
-    if (!snap) return [];
-    return snap.agents
-      .filter((a) => (a.phase != null ? asText(a.phase) : "(no phase)") === phase)
-      .map((a) => ({
-        id: a.id,
-        // Coerce label/phase at the boundary so a non-string value from a corrupt
-        // run can't crash the agent row's truncateToWidth() (#110).
-        label: asText(a.label),
-        status: a.status,
-        phase: a.phase != null ? asText(a.phase) : a.phase,
-        tokens: a.tokens,
-        tokenUsage: a.tokenUsage,
-        model: a.model,
-      }));
+    if (!snap || !Array.isArray(snap.agents)) return [];
+    return snap.agents.filter((a) => agentPhaseKey(a) === phase).map((a) => toAgentRow(a));
+  }
+
+  /**
+   * All agents grouped by their (coerced) phase in a SINGLE pass — O(agents).
+   * The navigator's phase pane needs each phase's agents (status colour + the
+   * selected phase's rows); calling agents() once per phase row was O(phases ×
+   * agents) per frame. Callers that render every phase use this instead.
+   */
+  agentsByPhase(runId: string): Map<string, AgentRow[]> {
+    const out = new Map<string, AgentRow[]>();
+    const snap = this.snapshot(runId)?.snapshot;
+    if (!snap || !Array.isArray(snap.agents)) return out;
+    for (const a of snap.agents) {
+      const key = agentPhaseKey(a);
+      let arr = out.get(key);
+      if (!arr) {
+        arr = [];
+        out.set(key, arr);
+      }
+      arr.push(toAgentRow(a));
+    }
+    return out;
   }
 
   agentDetail(runId: string, agentId: number): WorkflowAgentSnapshot | undefined {
@@ -621,13 +653,18 @@ function renderPhasesAgents(
   bodyCap: number,
 ): string[] {
   const phases = model.phases(runId);
+  // Group agents by phase ONCE per frame (O(agents)). leftPhaseRow needs each
+  // visible phase's agents (status colour) and the selected phase's agents drive
+  // the right pane; calling model.agents() per phase row was O(phases × agents).
+  const agentsByPhase = model.agentsByPhase(runId);
+  const agentsOf = (title: string): AgentRow[] => agentsByPhase.get(title) ?? [];
   // Which phase is selected drives the right pane. In "phases" view it's the
   // cursor; in "agents" view it's the drilled-in phase (state.phase).
   const inAgents = state.kind === "agents";
   let selPhaseIdx = inAgents ? phases.findIndex((p) => p.title === state.phase) : state.cursor;
   if (selPhaseIdx < 0) selPhaseIdx = 0;
   const selPhase = phases[selPhaseIdx];
-  const agents = selPhase ? model.agents(runId, selPhase.title) : [];
+  const agents = selPhase ? agentsOf(selPhase.title) : [];
 
   // Narrow-terminal degrade: single pane (spec §7.1).
   if (width < LW_MIN + RW_MIN - 1) {
@@ -654,7 +691,7 @@ function renderPhasesAgents(
     }
     const p = phases[idx];
     const selected = !inAgents && idx === state.cursor;
-    const ag = model.agents(runId, p.title);
+    const ag = agentsOf(p.title);
     let row = leftPhaseRow(p, idx, selected, ag, leftInner, theme);
     if (k === bodyRows - 1 && leftRows.more) {
       row = truncateToWidth(theme.fg("dim", `  ${ELLIPSIS}`), leftInner, "", true);
