@@ -1193,12 +1193,19 @@ export class WorkflowManager extends EventEmitter {
       if (managed.status !== "running" && managed.status !== "paused") return false;
       // Whether this run's OWN executeRun() promise has already fully settled
       // matters for whether stop() itself must be the one to call
-      // recordTerminalRun(): a "paused" run got there via pause() or a
-      // usage-limit checkpoint, both of which already ran executeRun()'s
-      // catch tail to completion at pause time (it deliberately skipped
-      // recordTerminalRun() then, since "paused" isn't terminal) — so there
-      // is no FUTURE tail left that will ever call it for this managed
-      // object. A "running" run, by contrast, still has that tail pending;
+      // recordTerminalRun(): a usage-limit checkpoint runs executeRun()'s
+      // catch tail to completion before "paused" is ever observable (it
+      // deliberately skipped recordTerminalRun() then, since "paused" isn't
+      // terminal) — so there is no FUTURE tail left that will ever call it
+      // for this managed object. A manual pause() sets "paused" while its
+      // cooperative abort may still be settling; in that narrow window the
+      // tail later settles this object to "aborted" (terminal) and records a
+      // SECOND time — a tolerated duplicate: recordTerminalRun() is
+      // idempotent-safe under duplicates (re-validates the current entry),
+      // the lease was already cleared here, and the worst case is the
+      // stopped run leaving memory earlier than FIFO order (persistence
+      // fallback covers every consumer). A "running" run, by contrast,
+      // always still has that tail pending;
       // it (not stop()) is what calls recordTerminalRun() once it actually
       // settles to "aborted" — see the `runs` field doc comment's rule that
       // eviction eligibility must wait for the real settle, not a request to
