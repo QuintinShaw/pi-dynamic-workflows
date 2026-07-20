@@ -196,10 +196,91 @@ export interface WorkflowManagerOptions {
    * standard sessions directory. Default false (in-memory, discarded).
    */
   persistAgentSessions?: boolean;
+  /**
+   * How many terminal (completed/failed/aborted) runs to retain full
+   * in-memory state for before the oldest is evicted from `runs` (see the
+   * class-level doc comment on that field). Defaults to
+   * DEFAULT_MAX_TERMINAL_RUNS_IN_MEMORY; exposed mainly for tests that want
+   * to observe eviction without creating dozens of runs.
+   */
+  maxTerminalRunsInMemory?: number;
 }
 
+/**
+ * Statuses in which a run's execution has genuinely settled — no promise is
+ * still pending, no lease is still held, nothing will asynchronously mutate
+ * this ManagedRun again. "paused" is deliberately excluded: both a manual
+ * pause() and a usage-limit checkpoint leave the run resumable and, from the
+ * in-memory-retention question's point of view, still "the run the user is
+ * looking at" — only completed/failed/aborted runs are eviction candidates.
+ * See the `runs` field doc comment for the full eviction lifecycle contract.
+ */
+const IN_MEMORY_TERMINAL_STATUSES: ReadonlySet<RunStatus> = new Set(["completed", "failed", "aborted"]);
+
+/**
+ * How many terminal (completed/failed/aborted) runs' full in-memory state
+ * (agents array, journal, snapshot, agentTimestamps) to retain in `runs`
+ * before the oldest is evicted. Kept small: a terminal run's data is fully
+ * on disk (run-persistence.ts) by the time it's eviction-eligible, so the
+ * in-memory copy exists only to serve a `getRun()`/`getSnapshot()` caller
+ * that wants the LIVE object (vs. listRuns()'s persisted view) for a run
+ * that *just* finished — a handful is enough for that; unbounded retention
+ * is exactly the leak this bounds (run-level analog of the subagent
+ * memory-retention mitigation in agent.ts).
+ */
+const DEFAULT_MAX_TERMINAL_RUNS_IN_MEMORY = 20;
+
 export class WorkflowManager extends EventEmitter {
+  /**
+   * Lifecycle contract for `runs`:
+   *
+   *  - An entry is added when a run starts (startInBackground/runSync) or is
+   *    resumed (resume()), always with a live AbortController and (usually)
+   *    an active RunLease.
+   *  - While status is "running" or "paused", the entry is NEVER evicted —
+   *    its execution could still settle (a pending executeRun() promise) or
+   *    it is mid-usage-limit-checkpoint/manually-paused and still considered
+   *    "the current state of this run" by callers. Eviction only ever
+   *    considers an entry AFTER executeRun() has fully settled it to
+   *    "completed" | "failed" | "aborted" (see IN_MEMORY_TERMINAL_STATUSES)
+   *    and persisted + released its lease — i.e. strictly after the same
+   *    isCurrent()-gated persistRun()/releaseRunLease() calls in
+   *    executeRun()'s success/catch tails.
+   *  - Once terminal, an entry becomes eviction-ELIGIBLE (recordTerminalRun())
+   *    but is not necessarily evicted immediately: up to
+   *    maxTerminalRunsInMemory terminal entries are kept, oldest evicted
+   *    first, so a `getRun()` call immediately after completion (e.g. the
+   *    "complete" event's own synchronous listeners — task-panel's result
+   *    delivery, `/workflows watch`) still sees the live object. Once
+   *    evicted, the entry is simply removed from `runs`; nothing else reads
+   *    or writes it again.
+   *  - Every caller of getRun()/getSnapshot() must treat "undefined"/null as
+   *    "no live in-memory copy right now" and fall back to listRuns() (backed
+   *    by run-persistence.ts, which is what's authoritative for a run once
+   *    the in-memory copy is gone) — this mirrors how those callers already
+   *    treat any run this process never had in memory (e.g. one started by a
+   *    different process and only ever seen via listRuns()). resume() never
+   *    depends on `runs` for a run's state either: it always reloads from
+   *    persistence, so an evicted runId resumes exactly like one from a
+   *    prior process.
+   *  - isCurrent(managed) composes with eviction the same way it composes
+   *    with resume()/deleteRun() replacing or removing an entry: eviction
+   *    removes the map entry outright, so a stale execution's later settle
+   *    (isCurrent() check) sees `this.runs.get(runId) !== managed` (in fact
+   *    undefined) and correctly no-ops, exactly as it would after
+   *    resume()/deleteRun().
+   */
   private runs = new Map<string, ManagedRun>();
+  /**
+   * FIFO of runIds that reached IN_MEMORY_TERMINAL_STATUSES, oldest first —
+   * the eviction order for `runs` (see its doc comment). A runId can appear
+   * more than once (e.g. resumed after eviction, then terminates again);
+   * evicting is idempotent (recordTerminalRun() re-checks the CURRENT status
+   * of the current map entry for that id before deleting), so duplicates
+   * are harmless.
+   */
+  private terminalRunQueue: string[] = [];
+  private maxTerminalRunsInMemory: number;
   private persistence: RunPersistence;
   private cwd: string;
   private concurrency: number;
@@ -233,6 +314,7 @@ export class WorkflowManager extends EventEmitter {
     this.toolsets = options.toolsets;
     this.excludeSubagentTools = options.excludeSubagentTools;
     this.persistAgentSessions = options.persistAgentSessions ?? false;
+    this.maxTerminalRunsInMemory = options.maxTerminalRunsInMemory ?? DEFAULT_MAX_TERMINAL_RUNS_IN_MEMORY;
     this.persistence = createRunPersistence(this.cwd);
     this.recoverStaleRuns();
   }
@@ -647,7 +729,13 @@ export class WorkflowManager extends EventEmitter {
       // stale execution settling after resume() has already acquired a NEW
       // lease for this runId must not touch that newer lease's bookkeeping.
       this.persistRun(managed);
-      if (this.isCurrent(managed)) this.releaseRunLease(managed);
+      if (this.isCurrent(managed)) {
+        this.releaseRunLease(managed);
+        // Now (and only now — after the run's data is safely on disk and its
+        // lease released) does this run become eviction-eligible; see the
+        // `runs` field doc comment.
+        this.recordTerminalRun(managed.runId);
+      }
 
       return result;
     } catch (error) {
@@ -694,7 +782,16 @@ export class WorkflowManager extends EventEmitter {
       // Persist final state (see the success-path comment above for the
       // isCurrent() rationale — same guard, same reason).
       this.persistRun(managed);
-      if (this.isCurrent(managed)) this.releaseRunLease(managed);
+      if (this.isCurrent(managed)) {
+        this.releaseRunLease(managed);
+        // "paused" (manual pause() or a usage-limit checkpoint) is
+        // deliberately NOT eviction-eligible — only a genuinely settled
+        // terminal status is (see IN_MEMORY_TERMINAL_STATUSES / the `runs`
+        // field doc comment). recordTerminalRun() itself re-checks this too,
+        // but skip the call entirely here so a paused run never even enters
+        // the eviction queue.
+        if (IN_MEMORY_TERMINAL_STATUSES.has(managed.status)) this.recordTerminalRun(managed.runId);
+      }
 
       throw workflowError;
     }
@@ -733,6 +830,33 @@ export class WorkflowManager extends EventEmitter {
    */
   private emitLive(managed: ManagedRun, event: string, payload: unknown): void {
     if (this.isCurrent(managed)) this.emit(event, payload);
+  }
+
+  /**
+   * Mark `runId` as eviction-eligible now that its execution has genuinely
+   * settled to a terminal status (completed/failed/aborted — see
+   * IN_MEMORY_TERMINAL_STATUSES), and evict the oldest eligible entries
+   * beyond maxTerminalRunsInMemory. Callers must only invoke this after the
+   * same isCurrent()-gated persistRun()/releaseRunLease() sequence executeRun()
+   * already uses (see the `runs` field doc comment for the full contract) —
+   * this method itself re-validates the CURRENT entry's status before
+   * deleting anything, so it never evicts a run that isn't (or is no longer)
+   * genuinely terminal, including one resumed back to "running" after being
+   * queued here but before its turn to be evicted came up.
+   */
+  private recordTerminalRun(runId: string): void {
+    this.terminalRunQueue.push(runId);
+    while (this.terminalRunQueue.length > this.maxTerminalRunsInMemory) {
+      const oldest = this.terminalRunQueue.shift();
+      if (oldest === undefined) break;
+      const current = this.runs.get(oldest);
+      // Re-check the CURRENT entry for this id (not the ManagedRun object
+      // that was terminal when queued) — resume() may have since replaced
+      // it with a fresh, live execution, which must never be evicted here.
+      if (current && IN_MEMORY_TERMINAL_STATUSES.has(current.status)) {
+        this.runs.delete(oldest);
+      }
+    }
   }
 
   /**

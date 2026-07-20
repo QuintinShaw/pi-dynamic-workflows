@@ -2950,3 +2950,112 @@ test(
     assert.ok(promptsDuringResume.includes("SECOND-ORIGINAL"), "persisted script's original agent 2 re-ran");
   }),
 );
+
+// ═══════════════════════════════════════════════════════════════════════════
+// `runs` map eviction (run-level analog of the subagent memory-retention
+// mitigation): terminal runs' in-memory ManagedRun (agents array, journal,
+// snapshot) must not accumulate forever, but the navigator/resume must keep
+// working against persisted state once a run's in-memory copy is gone.
+// ═══════════════════════════════════════════════════════════════════════════
+
+test(
+  "completed runs beyond maxTerminalRunsInMemory are evicted from the in-memory map, but stay listable via listRuns()",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent(), maxTerminalRunsInMemory: 2 });
+    const runIds: string[] = [];
+    for (let i = 0; i < 4; i++) {
+      const result = await manager.runSync(oneAgentScript);
+      assert.ok(result.runId);
+      runIds.push(result.runId as string);
+    }
+
+    // Only the 2 most recent terminal runs still have a live ManagedRun.
+    assert.equal(manager.getRun(runIds[0]), undefined, "oldest completed run's in-memory state is evicted");
+    assert.equal(manager.getRun(runIds[1]), undefined, "2nd oldest completed run's in-memory state is evicted");
+    assert.ok(manager.getRun(runIds[2]), "3rd run (within the cap) is still in memory");
+    assert.ok(manager.getRun(runIds[3]), "most recent run is still in memory");
+
+    // But every run is still reachable via listRuns() (backed by persistence)
+    // — eviction from the in-memory map must never mean "the run vanished".
+    const listed = manager
+      .listRuns()
+      .map((r) => r.runId)
+      .sort();
+    assert.deepEqual(listed, [...runIds].sort(), "all runs remain listable after eviction");
+    for (const id of runIds) {
+      const persisted = manager.listRuns().find((r) => r.runId === id);
+      assert.equal(persisted?.status, "completed");
+      assert.equal(persisted?.agents[0]?.status, "done", "persisted agent detail survives eviction too");
+    }
+  }),
+);
+
+test(
+  "eviction never removes a running or paused run's in-memory entry, however many terminal runs pile up around it",
+  withTempCwd(async (cwd) => {
+    const held = deferredAgent();
+    // A dedicated manager for the long-running run so its agent (never
+    // resolving until we say so) doesn't block the terminal runs below.
+    const runningManager = new WorkflowManager({ cwd, agent: held.runner, maxTerminalRunsInMemory: 1 });
+    const { runId: runningId, promise: runningPromise } = runningManager.startInBackground(oneAgentScript);
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal(runningManager.getRun(runningId)?.status, "running");
+
+    // Pause a second run so it sits in memory as "paused".
+    const pausedManager = new WorkflowManager({ cwd, agent: held.runner, maxTerminalRunsInMemory: 1 });
+    const { runId: pausedId } = pausedManager.startInBackground(oneAgentScript);
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal(pausedManager.pause(pausedId), true);
+    assert.equal(pausedManager.getRun(pausedId)?.status, "paused");
+
+    // Now complete several terminal runs on a manager with a tiny cap and
+    // confirm neither the running nor the paused run's manager evicted them
+    // (they're on other manager instances, but exercises the same in-process
+    // eviction path with a maximally aggressive cap of 1).
+    const busyManager = new WorkflowManager({ cwd, agent: fakeAgent(), maxTerminalRunsInMemory: 1 });
+    for (let i = 0; i < 3; i++) {
+      await busyManager.runSync(oneAgentScript);
+    }
+
+    assert.equal(runningManager.getRun(runningId)?.status, "running", "the running run's entry survives eviction");
+    assert.equal(pausedManager.getRun(pausedId)?.status, "paused", "the paused run's entry survives eviction");
+
+    held.resolve();
+    await runningPromise.catch(() => {});
+  }),
+);
+
+test(
+  "resume() succeeds for a run whose in-memory ManagedRun was already evicted (reads persisted state, not the map)",
+  withTempCwd(async (cwd) => {
+    // A non-recoverable WorkflowError propagates all the way up (unlike a
+    // plain agent error, which workflow.ts swallows per-agent and the run
+    // still completes) — this settles the run to "failed" (evictable and,
+    // per WorkflowManager.resume()'s status guard, still resumable).
+    const failingAgent = {
+      async run() {
+        throw new WorkflowError("fatal agent error", WorkflowErrorCode.AGENT_EXECUTION_ERROR, { recoverable: false });
+      },
+    };
+    const manager = new WorkflowManager({ cwd, agent: failingAgent, maxTerminalRunsInMemory: 1 });
+    manager.on("error", () => {});
+
+    const first = await manager.runSync(oneAgentScript).catch((e) => e);
+    void first;
+    const evictedRunId = manager.listRuns()[0]?.runId as string;
+
+    // Push it out of the in-memory cap with more failing runs.
+    for (let i = 0; i < 2; i++) {
+      await manager.runSync(oneAgentScript).catch(() => {});
+    }
+    assert.equal(manager.getRun(evictedRunId), undefined, "the run's in-memory entry has been evicted");
+
+    // Fix the agent so the resumed attempt succeeds, then resume the evicted run.
+    const succeedingAgent = fakeAgent();
+    const manager2 = new WorkflowManager({ cwd, agent: succeedingAgent, maxTerminalRunsInMemory: 1 });
+    const resumed = await manager2.resume(evictedRunId);
+    assert.equal(resumed, true, "resume works purely from persisted state even though the in-memory copy is gone");
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(manager2.listRuns().find((r) => r.runId === evictedRunId)?.status, "completed");
+  }),
+);

@@ -451,12 +451,16 @@ test(
 // invalidated synchronously by every save()/delete() this instance performs.
 // ═══════════════════════════════════════════════════════════════════════════
 
-function baseRunState(runId: string, updatedAt = "2024-01-01T00:00:00.000Z"): PersistedRunState {
+function baseRunState(
+  runId: string,
+  updatedAt = "2024-01-01T00:00:00.000Z",
+  status: PersistedRunState["status"] = "completed",
+): PersistedRunState {
   return {
     runId,
     workflowName: "wf",
     script: "export const meta = { name: 'w', description: 'w' }",
-    status: "completed",
+    status,
     phases: [],
     agents: [],
     logs: [],
@@ -481,7 +485,11 @@ test(
       }) as typeof readFileSync,
     });
 
-    rp.save(baseRunState("cache-1"));
+    // "running" (non-terminal): a terminal save would trigger the retention
+    // scan (see enforceRetention() in run-persistence.ts), which itself reads
+    // and mtime-caches this file as a side effect — defeating the point of
+    // this test, which measures list()'s OWN caching in isolation.
+    rp.save(baseRunState("cache-1", undefined, "running"));
     // save() doesn't touch readdirSync/readFileSync, but reset for clarity.
     readdirCalls = 0;
     readFileCalls = 0;
@@ -571,6 +579,69 @@ test(
     await new Promise((r) => setTimeout(r, 400));
     rp.list();
     assert.ok(readdirCalls >= 2, "list() should read disk again once the TTL has elapsed");
+  }),
+);
+
+test(
+  "createRunPersistence list() does not re-parse a file whose mtime/size are unchanged, even across TTL expiry",
+  withTempCwd(async (cwd) => {
+    let readFileCalls = 0;
+    const rp = createRunPersistence(cwd, {
+      readFileSync: ((...args: Parameters<typeof readFileSync>) => {
+        readFileCalls++;
+        return readFileSync(...args);
+      }) as typeof readFileSync,
+    });
+
+    // Two runs: one that will never change again ("stable"), one that will
+    // be re-saved between list() calls ("changing"). Both are "running" so
+    // retention-enforcement (a terminal-only path) never fires here.
+    rp.save(baseRunState("stable", "2024-01-01T00:00:00.000Z", "running"));
+    rp.save(baseRunState("changing", "2024-01-01T00:00:00.000Z", "running"));
+    readFileCalls = 0;
+
+    const first = rp.list();
+    assert.equal(first.length, 2);
+    assert.equal(readFileCalls, 2, "first (cold) scan parses both files");
+
+    // Wait past the TTL so the next list() forces a real disk re-scan
+    // (readdirSync fires again), then re-save only "changing" with a
+    // different byte size (not just mtime) so this test's signal doesn't
+    // depend on the filesystem's mtime resolution.
+    await new Promise((r) => setTimeout(r, 400));
+    rp.save({ ...baseRunState("changing", "2024-01-02T00:00:00.000Z", "running"), logs: ["it changed"] });
+    readFileCalls = 0;
+
+    const second = rp.list();
+    assert.equal(second.length, 2);
+    assert.equal(readFileCalls, 1, "only the file that actually changed on disk should be re-parsed");
+  }),
+);
+
+test(
+  "createRunPersistence retention: terminal runs beyond the cap are evicted oldest-first; running/paused are never touched",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd, undefined, { maxTerminalRunsOnDisk: 3 });
+
+    // 5 terminal runs, oldest to newest.
+    for (let i = 0; i < 5; i++) {
+      rp.save(baseRunState(`terminal-${i}`, `2024-01-0${i + 1}T00:00:00.000Z`, "completed"));
+    }
+    // A running and a paused run — must survive retention regardless of age.
+    rp.save(baseRunState("still-running", "2023-01-01T00:00:00.000Z", "running"));
+    rp.save(baseRunState("still-paused", "2023-01-01T00:00:00.000Z", "paused"));
+
+    const runIds = rp.list().map((r) => r.runId);
+    const terminalKept = runIds.filter((id) => id.startsWith("terminal-"));
+    assert.equal(terminalKept.length, 3, "only maxTerminalRunsOnDisk terminal runs are kept");
+    assert.deepEqual(
+      new Set(terminalKept),
+      new Set(["terminal-2", "terminal-3", "terminal-4"]),
+      "the oldest terminal runs are evicted first, newest are kept",
+    );
+    assert.ok(runIds.includes("still-running"), "a running run is never evicted by retention");
+    assert.ok(runIds.includes("still-paused"), "a paused run is never evicted by retention");
+    assert.equal(rp.load("terminal-0"), null, "an evicted run's file is actually gone from disk");
   }),
 );
 
