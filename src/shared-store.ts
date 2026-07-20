@@ -116,6 +116,16 @@ export class SharedStore {
    * inconsistent. Each key touched during this delta window is restored to
    * whatever it held immediately before the window started (or deleted, if
    * it did not exist yet) — never to some other attempt's or caller's value.
+   *
+   * Per-key guard: a key is only rolled back if the store STILL holds this
+   * attempt's own last write to it (checked with `Object.is` against the
+   * value recorded in `delta`). If a concurrently-running sibling (a
+   * different `deltaKey`, e.g. another agent in the same parallel() batch)
+   * legitimately overwrote the same key AFTER this attempt wrote it but
+   * BEFORE it failed, that sibling's write is left untouched — rolling back
+   * unconditionally would silently erase a live, unrelated write that this
+   * attempt never made and has no business undoing.
+   *
    * A no-op if `deltaKey` never wrote anything (nothing to roll back).
    */
   discardDelta(deltaKey: string): void {
@@ -123,6 +133,9 @@ export class SharedStore {
     if (!delta) return;
     const priors = this.priorValues.get(deltaKey);
     for (const key of Object.keys(delta)) {
+      // Someone else already overwrote this key since our last write to it —
+      // leave their write in place instead of clobbering it with our rollback.
+      if (!Object.is(this.map.get(key), delta[key])) continue;
       const prior = priors?.get(key);
       if (prior?.existed) this.map.set(key, prior.value);
       else this.map.delete(key);

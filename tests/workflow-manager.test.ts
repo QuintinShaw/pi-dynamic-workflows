@@ -3104,6 +3104,100 @@ test(
   }),
 );
 
+/** Runner that records prompts and pauses (usage limit) on a third, later call. */
+function nestedPauseResumeRunner() {
+  const seen: string[] = [];
+  const state = { failThird: true };
+  return {
+    seen,
+    state,
+    runner: {
+      async run(prompt: string) {
+        seen.push(prompt);
+        if (prompt === "third-call" && state.failThird) {
+          throw new WorkflowError("usage limit reached", WorkflowErrorCode.PROVIDER_USAGE_LIMIT, {
+            recoverable: false,
+            resetHint: "Resets soon",
+          });
+        }
+        return `ran:${prompt}`;
+      },
+    },
+  };
+}
+
+test(
+  "manager resume: both a nested child's AND the parent's own index-0 journal entries cache-hit, not re-run live (M6)",
+  withTempCwd(async (cwd) => {
+    // Regression coverage for the manager-level journal dedup keying. The
+    // nested child's agent('inner-call') and the parent's own
+    // agent('outer-call') both land at callIndex 0 in their respective
+    // frames and BOTH journal successfully during the SAME live execution —
+    // this is exactly the shape that collides if managed.journal's dedup
+    // filter matched on `index` alone (not `(index, runId)`): whichever of
+    // the two journals SECOND would evict the other from managed.journal,
+    // so the persisted journal silently ends up with only one of the two
+    // entries. A third call then fails (usage limit) to force a pause with
+    // that (possibly corrupted) journal on disk, and resume must show BOTH
+    // completed calls cache-hitting — not just whichever survived a buggy
+    // dedup.
+    const { seen, state, runner } = nestedPauseResumeRunner();
+    const manager = new WorkflowManager({ cwd, agent: runner });
+    manager.on("paused", () => {});
+    manager.on("error", () => {});
+
+    const script = `export const meta = { name: 'nested_pause_resume', description: 'nested resume' }
+const inner = await workflow(\`
+  export const meta = { name: 'nested_pause_resume_inner', description: 'inner' }
+  const x = await agent('inner-call', { label: 'inner' })
+  return x
+\`, {})
+const outer = await agent('outer-call', { label: 'outer' })
+const third = await agent('third-call', { label: 'third' })
+return { inner, outer, third }`;
+
+    // First run: the nested child's index-0 call AND the parent's own
+    // index-0 call both complete and journal; the parent's third call hits
+    // a usage limit -> run pauses.
+    const { runId, promise } = manager.startInBackground(script);
+    await promise.catch(() => {});
+    assert.equal(manager.getRun(runId)?.status, "paused", "run pauses on the third call's usage limit");
+    assert.equal(seen.filter((p) => p === "inner-call").length, 1, "the nested child's agent ran once before pause");
+    assert.equal(seen.filter((p) => p === "outer-call").length, 1, "the parent's own agent ran once before pause");
+
+    const persisted = manager.listRuns().find((r) => r.runId === runId);
+    assert.equal(
+      persisted?.journal?.length,
+      2,
+      "BOTH the child's and the parent's completed index-0 calls must be journaled — neither may have evicted the other",
+    );
+
+    // Resume: let the third call succeed this time.
+    state.failThird = false;
+    const seenBeforeResume = seen.length;
+    const resumed = await manager.resume(runId);
+    assert.equal(resumed, true);
+    await new Promise((r) => setTimeout(r, 80));
+
+    const finalRun = manager.getRun(runId);
+    assert.equal(finalRun?.status, "completed", "resumed run completes");
+    assert.equal(finalRun?.result?.result?.inner, "ran:inner-call");
+    assert.equal(finalRun?.result?.result?.outer, "ran:outer-call");
+    assert.equal(finalRun?.result?.result?.third, "ran:third-call");
+
+    const promptsDuringResume = seen.slice(seenBeforeResume);
+    assert.ok(
+      !promptsDuringResume.includes("inner-call"),
+      "the nested child's journaled call must cache-hit on resume, not re-run live",
+    );
+    assert.ok(
+      !promptsDuringResume.includes("outer-call"),
+      "the parent's own journaled call must cache-hit on resume, not re-run live",
+    );
+    assert.ok(promptsDuringResume.includes("third-call"), "the parent's previously-failed third call re-runs live");
+  }),
+);
+
 // ═══════════════════════════════════════════════════════════════════════════
 // `runs` map eviction (run-level analog of the subagent memory-retention
 // mitigation): terminal runs' in-memory ManagedRun (agents array, journal,

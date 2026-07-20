@@ -76,6 +76,85 @@ test("SharedStore.dispose clears map and agent deltas", () => {
   assert.deepEqual(store.commitDelta("run-1:1"), {});
 });
 
+test("SharedStore.discardDelta rolls back to the pre-window value, not an intermediate write", () => {
+  // Load-bearing guard: trackPut only shadows a key's value the FIRST time it
+  // is written within the current delta window — a second write to the SAME
+  // key within that window must not overwrite the shadow with the first
+  // write's (still in-window) value. If it did, discardDelta would roll back
+  // to the intermediate write "w1" instead of the true pre-window value
+  // "pre" — an in-window leak of a value that was never meant to survive
+  // either.
+  const store = new SharedStore();
+  store.put("k", "pre");
+  store.trackPut("k", "w1", "run-1:0");
+  store.trackPut("k", "w2", "run-1:0"); // second write to the SAME key, same window
+  store.discardDelta("run-1:0");
+  assert.equal(store.get("k"), "pre", "rollback must restore the true pre-window value, not the first in-window write");
+  assert.deepEqual(store.commitDelta("run-1:0"), {}, "the delta must be fully discarded, including the first write");
+});
+
+test("SharedStore.discardDelta deletes a key that did not exist before the window", () => {
+  const store = new SharedStore();
+  store.trackPut("brandNew", "w1", "run-1:0");
+  assert.equal(store.has("brandNew"), true);
+  store.discardDelta("run-1:0");
+  assert.equal(
+    store.has("brandNew"),
+    false,
+    "a key with no pre-window value must be deleted on rollback, not left as undefined",
+  );
+});
+
+test("SharedStore.discardDelta on a deltaKey with no writes is a no-op", () => {
+  const store = new SharedStore();
+  store.put("k", "v");
+  store.discardDelta("run-1:never-wrote");
+  assert.equal(store.get("k"), "v");
+});
+
+test("SharedStore.discardDelta must not clobber a concurrent sibling's legitimate overwrite of the same key", () => {
+  // A failed attempt ("run-1:0") writes key "k", then — before it's rolled
+  // back — a concurrently-running SIBLING call ("run-1:1", e.g. another
+  // agent in the same parallel() batch) legitimately overwrites the same
+  // key. Rolling back "run-1:0" unconditionally to its pre-window value
+  // would erase the sibling's write, which "run-1:0" never made and has no
+  // business undoing.
+  const store = new SharedStore();
+  store.put("k", "pre");
+  store.trackPut("k", "poisoned", "run-1:0");
+  store.trackPut("k", "sibling-value", "run-1:1");
+  store.discardDelta("run-1:0");
+  assert.equal(
+    store.get("k"),
+    "sibling-value",
+    "the sibling's legitimate write must survive the failed attempt's rollback",
+  );
+});
+
+test("SharedStore.discardDelta still rolls back a key untouched by any concurrent sibling", () => {
+  const store = new SharedStore();
+  store.put("k", "pre");
+  store.put("other", "pre-other");
+  store.trackPut("k", "poisoned", "run-1:0");
+  store.trackPut("other", "sibling-value", "run-1:1"); // sibling touches a DIFFERENT key
+  store.discardDelta("run-1:0");
+  assert.equal(store.get("k"), "pre", "a key no sibling touched still rolls back normally");
+  assert.equal(
+    store.get("other"),
+    "sibling-value",
+    "the sibling's own key is untouched by the other deltaKey's rollback",
+  );
+});
+
+test("SharedStore.commitDelta (success) does not roll back — the discardDelta shadow is cleared, not applied", () => {
+  const store = new SharedStore();
+  store.put("k", "pre");
+  store.trackPut("k", "w1", "run-1:0");
+  const delta = store.commitDelta("run-1:0");
+  assert.deepEqual(delta, { k: "w1" });
+  assert.equal(store.get("k"), "w1", "a successful commit keeps the write live — commitDelta must not roll back");
+});
+
 // ─── Delta-key collision regression (defect: nested workflow() shares a store
 // but restarts callSeq at 0) ───────────────────────────────────────────────────
 
@@ -375,6 +454,77 @@ test("resume degrades gracefully (never corrupts) when replaying a pre-namespaci
     JSON.stringify(first.result),
     "no corruption: the final result still matches a live run's",
   );
+});
+
+const prefixNestedScript = (aPrompt: string) => `
+  export const meta = { name: "prefix-nested-outer", description: "outer" };
+  const a = await agent(${JSON.stringify(aPrompt)}, {});
+  const inner = await workflow(\`
+    export const meta = { name: "prefix-nested-inner", description: "inner" };
+    const x = await agent("inner-call", {});
+    return x;
+  \`, {});
+  return { a, inner };
+`;
+
+test("resume: an upstream parent-call miss cuts the nested child off from the journal (child re-runs live)", async () => {
+  // Regression test for a correctness gap introduced by namespacing the
+  // journal: propagating resumeJournal into a nested workflow() call is only
+  // safe while the PARENT's own longest-unchanged-prefix is still intact.
+  // SharedStore content is not part of any call's hash — a cached child
+  // result was computed against whatever the store held when it originally
+  // ran, which depended on the (now-edited) upstream parent call's live
+  // output. If the parent's agent('A') call misses and re-runs live, a stale
+  // cached child result must NOT be wholesale-replayed just because the
+  // child's own hash still matches; the child must run fully live too.
+  const journal: import("../src/workflow.js").JournalEntry[] = [];
+  const firstCalls = { count: 0 };
+  await runWorkflow<{ a: string; inner: string }>(prefixNestedScript("A-v1"), {
+    agent: countingRunnerFor(firstCalls),
+    persistLogs: false,
+    runId: "prefix-nested-run",
+    onAgentJournal: (e) => journal.push(e),
+  });
+  assert.equal(firstCalls.count, 2, "one live call for the parent's agent('A'), one for the nested child");
+
+  const resumeJournal = new Map(journal.map((e) => [`${e.runId}:${e.index}`, e] as const));
+
+  // Edit ONLY the parent's agent('A-v1') call to 'A-v2'. The child script is
+  // byte-identical, so the child's own callHash still matches its journaled
+  // entry — the only thing that changed is upstream of it.
+  const editedCalls = { count: 0 };
+  const edited = await runWorkflow<{ a: string; inner: string }>(prefixNestedScript("A-v2"), {
+    agent: countingRunnerFor(editedCalls),
+    persistLogs: false,
+    runId: "prefix-nested-run",
+    resumeJournal,
+  });
+  assert.equal(editedCalls.count, 2, "both the edited parent call AND the downstream child call must re-run live");
+  assert.equal(edited.result.a, "ran:A-v2", "the parent call reflects the edit");
+  assert.equal(edited.result.inner, "ran:inner-call", "the child re-ran live rather than replaying a stale cache hit");
+});
+
+test("resume: nested child still cache-hits when nothing upstream of it changed (positive control)", async () => {
+  const journal: import("../src/workflow.js").JournalEntry[] = [];
+  const firstCalls = { count: 0 };
+  const first = await runWorkflow<{ a: string; inner: string }>(prefixNestedScript("A-v1"), {
+    agent: countingRunnerFor(firstCalls),
+    persistLogs: false,
+    runId: "prefix-nested-stable-run",
+    onAgentJournal: (e) => journal.push(e),
+  });
+  assert.equal(firstCalls.count, 2);
+
+  const resumeJournal = new Map(journal.map((e) => [`${e.runId}:${e.index}`, e] as const));
+  const secondCalls = { count: 0 };
+  const second = await runWorkflow<{ a: string; inner: string }>(prefixNestedScript("A-v1"), {
+    agent: countingRunnerFor(secondCalls),
+    persistLogs: false,
+    runId: "prefix-nested-stable-run",
+    resumeJournal,
+  });
+  assert.equal(secondCalls.count, 0, "nothing changed upstream — both parent and child cache-hit, no live re-run");
+  assert.equal(JSON.stringify(second.result), JSON.stringify(first.result));
 });
 
 // ─── Retry-attempt store-delta isolation ──────────────────────────────────────

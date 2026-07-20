@@ -968,23 +968,31 @@ export async function runWorkflow<T = unknown>(
     options.onRuntimeEvent?.({ type: "workflow", stage: "start", name: workflowName, args: childArgs });
     shared.depth++;
     try {
+      // Propagate the resumeJournal into the child frame ONLY while the
+      // parent's own longest-unchanged-prefix is still intact at the moment
+      // of this workflow() call (state.firstMiss === Infinity, i.e. every
+      // parent agent()/checkpoint() call BEFORE this one was a cache hit).
+      // This is namespacing-safe (see JournalEntry.runId) but namespacing
+      // alone is NOT sufficient: SharedStore content itself is not part of
+      // any call's hash, so a cached child result was computed against
+      // whatever store state the UPSTREAM parent calls had written at the
+      // time it originally ran live. If an upstream parent call misses
+      // (edited script) and re-runs live, it may write different store
+      // values than it did originally — a child cached under the OLD store
+      // state would then be replaying a result that's stale with respect to
+      // the NEW live state, even though the child's own hash still matches.
+      // The prefix contract already treats "this call sits after a miss" as
+      // "must run live" for calls within one frame; a nested workflow() is
+      // no exception; once anything upstream in the parent has missed, cut
+      // the child off from the journal entirely so it runs fully live.
+      const prefixIntact = state.firstMiss === Number.POSITIVE_INFINITY;
       const child = await runWorkflow(childScript, {
         ...options,
         args: childArgs,
         sharedRuntime: shared,
         // Propagate the parent's store so nested agents share the same key-value space.
         sharedStore: store,
-        // Propagate the SAME resumeJournal Map down into the child frame. This
-        // is safe (and required for nested resume caching to work at all) now
-        // that entries are namespaced by runId: the child looks itself up
-        // under `${childRunId}:${index}`, which can never collide with the
-        // parent's `${runId}:${index}` entries in the same Map — see
-        // JournalEntry.runId. Previously this was unconditionally cleared to
-        // `undefined` specifically BECAUSE the un-namespaced Map made a
-        // shared journal unsafe to reuse across nesting levels; that
-        // workaround also meant a nested workflow() call could never cache-hit
-        // on resume at all, which this fix corrects.
-        resumeJournal: options.resumeJournal,
+        resumeJournal: prefixIntact ? options.resumeJournal : undefined,
         resumeFromRunId: undefined,
         // shared.nestedCallSeq, not shared.depth — see its doc comment: depth
         // returns to 0 between sequential sibling calls, which would otherwise
