@@ -513,6 +513,67 @@ return { a, second }`;
   assert.equal(result.result.second, "blocked");
 });
 
+test("runWorkflow initialTokenUsage seeds the run-wide budget so it holds cumulatively across resume (#A2)", async () => {
+  // Simulates what WorkflowManager.resume() passes: a prior execution already
+  // spent 60 (persisted). This fresh execution's own SharedRuntime must start
+  // counting from there — 'a' (allowed: seeded 60 + budget 100 leaves 40
+  // headroom) then spends 60 more, landing at 120; 'b' must then be blocked,
+  // even though neither the seed alone (60) nor 'a' alone (60) would trip it.
+  const script = `export const meta = { name: 'seeded_budget', description: 'seed' }
+const a = await agent('a', { label: 'a' })
+let blocked = false
+try { await agent('b', { label: 'b' }) } catch (e) { blocked = (e && e.code) === 'TOKEN_BUDGET_EXHAUSTED' }
+return { a, blocked }`;
+
+  const result = await runWorkflow<{ a: unknown; blocked: boolean }>(script, {
+    agent: fakeAgent({ input: 60, output: 0, total: 60, cost: 0 }),
+    tokenBudget: 100,
+    initialTokenUsage: { input: 60, output: 0, total: 60, cost: 0, cacheRead: 0, cacheWrite: 0 },
+    persistLogs: false,
+  });
+
+  assert.equal(result.result.a, "ok", "'a' itself is allowed to run (remaining was 40 > 0 before it)");
+  assert.equal(
+    result.result.blocked,
+    true,
+    "'b' must be blocked once the seeded + this-run spend sums past the budget",
+  );
+  assert.equal(result.tokenUsage?.total, 120, "final total reflects the seed (60) plus 'a's spend (60); 'b' never ran");
+});
+
+test("runWorkflow initialTokenUsage integrates correctly with phase() sub-budgets (seeded baseline isn't corrupted)", async () => {
+  // phase()'s sub-budget deliberately re-bases from shared.spent AT the
+  // phase() call (see workflow.ts's phase(): "Re-declaring re-bases from the
+  // current spent"), so a seed doesn't make the phase's OWN ceiling trip any
+  // sooner than usual — it only shifts the visible baseline. This mirrors the
+  // existing "phase sub-budget throws..." test's budget/spend shape exactly,
+  // plus a seed, to confirm seeding doesn't corrupt that mechanism.
+  const script = `export const meta = { name: 'seeded_phase_budget', description: 'seed' }
+const spentAtStart = budget.spent()
+phase('noisy', { budget: 100 })
+let blocked = false
+await agent('a', { label: '1' })
+try { await agent('b', { label: '2' }) } catch (e) { blocked = (e && e.code) === 'TOKEN_BUDGET_EXHAUSTED' }
+return { spentAtStart, blocked }`;
+
+  const result = await runWorkflow<{ spentAtStart: number; blocked: boolean }>(script, {
+    agent: fakeAgent({ input: 100, output: 0, total: 100, cost: 0 }),
+    initialTokenUsage: { input: 40, output: 0, total: 40, cost: 0, cacheRead: 0, cacheWrite: 0 },
+    persistLogs: false,
+  });
+
+  assert.equal(
+    result.result.spentAtStart,
+    40,
+    "budget.spent() reflects the seed before any agent in this execution runs",
+  );
+  assert.equal(
+    result.result.blocked,
+    true,
+    "the phase sub-budget still gates normally on top of a seeded run-wide total",
+  );
+});
+
 test("token budget exhaustion inside parallel() halts (non-recoverable, not swallowed)", async () => {
   // A warm-up agent spends the whole budget (soft gate: spent accrues after it
   // finishes); the agent() inside parallel() then hits the gate and must
