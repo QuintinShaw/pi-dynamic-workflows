@@ -3,8 +3,9 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
-import { createFauxCore, fauxAssistantMessage } from "@earendil-works/pi-ai";
+import { createFauxCore, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { ModelRegistry, ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 import type { AgentRunOptions, AgentUsage } from "../src/agent.js";
 import {
   DEFAULT_EXCLUDED_SUBAGENT_TOOLS,
@@ -295,6 +296,69 @@ test("WorkflowAgent.run(): tier routing resolves correctly through the real (non
         secondResult,
         "the SAME config object must be reused across run() calls — the file was read/parsed only once",
       );
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WorkflowAgent.run(): opts.schema must be a top-level JSON object schema
+// (#330 audit) — a non-object schema (e.g. array/primitive) would otherwise
+// reach a strict OpenAI-compatible provider (DeepSeek) as an invalid tool
+// parameters schema and fail with an opaque transport-level 400.
+// ═══════════════════════════════════════════════════════════════════════════
+
+test("WorkflowAgent.run() rejects a non-object top-level schema before touching the model registry", async () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp" });
+  await assert.rejects(
+    agent.run("task", { schema: Type.Array(Type.Object({ finding: Type.String() })) }),
+    (error: unknown) => {
+      assert.ok(error instanceof WorkflowError);
+      assert.equal(error.code, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR);
+      assert.match(error.message, /opts\.schema must be a top-level JSON object schema/);
+      assert.match(error.message, /got type: array/);
+      return true;
+    },
+  );
+});
+
+test("WorkflowAgent.run() still completes with a normal object schema (no regression)", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-schema-ok-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-schema-ok-cwd-"));
+  const core = createFauxCore({
+    provider: "fauxtest-schema",
+    models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 4096 }],
+  });
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const runtime = await ModelRuntime.create({ authPath: join(home, "auth.json"), modelsPath: null });
+      runtime.registerProvider("fauxtest-schema", {
+        name: "Faux Test Schema",
+        baseUrl: "http://127.0.0.1:9/faux",
+        apiKey: "faux-dummy-key-not-used",
+        api: core.api,
+        streamSimple: core.streamSimple as never,
+        models: core.models.map((m) => ({
+          id: m.id,
+          name: m.name ?? m.id,
+          reasoning: false,
+          input: ["text"] as ("text" | "image")[],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: m.contextWindow ?? 128000,
+          maxTokens: m.maxTokens ?? 4096,
+        })),
+      });
+      const registry = new ModelRegistry(runtime);
+      core.setResponses([
+        fauxAssistantMessage(fauxToolCall("structured_output", { verdict: "ok" }), { stopReason: "toolUse" }),
+      ]);
+
+      const agent = new WorkflowAgent({ cwd, modelRegistry: registry, mainModel: "fauxtest-schema/faux-model" });
+      const result = await agent.run("task", { schema: Type.Object({ verdict: Type.String() }) });
+
+      assert.deepEqual(result, { verdict: "ok" });
     });
   } finally {
     rmSync(home, { recursive: true, force: true });

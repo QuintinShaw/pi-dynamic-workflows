@@ -1,11 +1,20 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import type { Component } from "@earendil-works/pi-tui";
 import type { WorkflowSnapshot } from "../src/display.js";
 import { WorkflowErrorCode } from "../src/errors.js";
 import type { PersistedRunState } from "../src/run-persistence.js";
+import { parseWorkflowScript } from "../src/workflow.js";
 import type { ManagedRun, WorkflowManager } from "../src/workflow-manager.js";
 import type { SavedWorkflow } from "../src/workflow-saved.js";
-import { keyToAction, NavigatorModel, NavigatorState, renderNavigator } from "../src/workflow-ui.js";
+import {
+  keyToAction,
+  NavigatorModel,
+  NavigatorState,
+  openWorkflowNavigator,
+  renderNavigator,
+} from "../src/workflow-ui.js";
 
 /** Fake manager exposing one running run with two phases. */
 function fakeManager(): Pick<WorkflowManager, "listRuns" | "getRun"> {
@@ -986,4 +995,171 @@ test("runs list aggregates per-agent figures for live runs whose run-level usage
   assert.equal(model.runs()[0].fresh, 1200);
   const lines = renderNavigator(new NavigatorState(), model, 80);
   assert.match(lines.join("\n"), /1,200 tok|1[ .\u00a0]200 tok/);
+});
+
+test("restarting a run with a corrupt persisted script notifies an error instead of crashing the overlay (#330 audit)", async () => {
+  const notifications: { message: string; type?: string }[] = [];
+  const fakeUi = {
+    notify: (message: string, type?: string) => {
+      notifications.push({ message, type });
+    },
+    custom: <T>(
+      factory: (
+        tui: unknown,
+        theme: unknown,
+        keybindings: unknown,
+        done: (result: T) => void,
+      ) => (Component & { dispose?(): void }) | Promise<Component & { dispose?(): void }>,
+    ) => {
+      const tui = { requestRender: () => {}, terminal: { rows: 24 } };
+      const theme = {
+        fg: (_name: string, s: string) => s,
+        bg: (_name: string, s: string) => s,
+        bold: (s: string) => s,
+      };
+      const component = factory(tui, theme, {}, () => {});
+      return Promise.resolve(component).then((c) => {
+        capturedComponent = c;
+        return undefined as unknown as T;
+      });
+    },
+  };
+  let capturedComponent: (Component & { dispose?(): void }) | undefined;
+
+  // A run whose persisted script is missing the required `export const meta`
+  // block \u2014 exactly the kind of corrupt on-disk run-persistence data #330
+  // found no schema validation guards against.
+  const corruptScript = "console.log('not a workflow script')";
+  const fakeManager = {
+    on: () => {},
+    off: () => {},
+    listRuns: () => [
+      {
+        runId: "run-corrupt",
+        workflowName: "corrupt-run",
+        status: "completed",
+        phases: [],
+        agents: [],
+        logs: [],
+        script: corruptScript,
+        args: undefined,
+      } as unknown as PersistedRunState,
+    ],
+    getRun: () => undefined,
+    startInBackground: (script: string) => {
+      // Mirrors the real WorkflowManager.startInBackground, which parses the
+      // script synchronously before doing anything else.
+      parseWorkflowScript(script);
+      return { runId: "should-not-be-reached" };
+    },
+  } as unknown as WorkflowManager;
+
+  openWorkflowNavigator({} as ExtensionAPI, fakeManager, fakeUi as unknown as ExtensionUIContext).catch(() => {});
+
+  // Let the custom()'s factory promise resolve before driving input.
+  await Promise.resolve();
+  await Promise.resolve();
+
+  assert.ok(capturedComponent, "openWorkflowNavigator should have produced a component");
+  assert.doesNotThrow(() => capturedComponent?.handleInput("r"), "restart must not throw/crash the overlay");
+
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].type, "error");
+  assert.match(notifications[0].message, /Failed to restart corrupt-run/);
+});
+
+function fakeUiCapturingComponent(): {
+  ui: ExtensionUIContext;
+  notifications: { message: string; type?: string }[];
+  getComponent: () => (Component & { dispose?(): void }) | undefined;
+} {
+  const notifications: { message: string; type?: string }[] = [];
+  let capturedComponent: (Component & { dispose?(): void }) | undefined;
+  const ui = {
+    notify: (message: string, type?: string) => {
+      notifications.push({ message, type });
+    },
+    custom: <T>(
+      factory: (
+        tui: unknown,
+        theme: unknown,
+        keybindings: unknown,
+        done: (result: T) => void,
+      ) => (Component & { dispose?(): void }) | Promise<Component & { dispose?(): void }>,
+    ) => {
+      const tui = { requestRender: () => {}, terminal: { rows: 24 } };
+      const theme = {
+        fg: (_name: string, s: string) => s,
+        bg: (_name: string, s: string) => s,
+        bold: (s: string) => s,
+      };
+      const component = factory(tui, theme, {}, () => {});
+      return Promise.resolve(component).then((c) => {
+        capturedComponent = c;
+        return undefined as unknown as T;
+      });
+    },
+  } as unknown as ExtensionUIContext;
+  return { ui, notifications, getComponent: () => capturedComponent };
+}
+
+test("deleting a saved workflow whose storage.delete throws (e.g. EACCES) notifies an error instead of crashing the overlay (#330 audit follow-up)", async () => {
+  const { ui, notifications, getComponent } = fakeUiCapturingComponent();
+
+  // No runs, one saved workflow — cursor 0 lands on the saved item (itemKind "saved").
+  const fakeManager = {
+    on: () => {},
+    off: () => {},
+    listRuns: () => [] as PersistedRunState[],
+    getRun: () => undefined,
+  } as unknown as WorkflowManager;
+  const storage = {
+    list: () => [{ name: "flaky", description: "", location: "project", path: "/x", savedAt: "2025-01-01" }],
+    delete: () => {
+      throw new Error("EACCES: permission denied, unlink '/x'");
+    },
+  };
+
+  openWorkflowNavigator({} as ExtensionAPI, fakeManager, ui, { storage }).catch(() => {});
+  await Promise.resolve();
+  await Promise.resolve();
+
+  const component = getComponent();
+  assert.ok(component, "openWorkflowNavigator should have produced a component");
+  assert.doesNotThrow(() => component?.handleInput("x"), "deleteSaved must not throw/crash the overlay");
+
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].type, "error");
+  assert.match(notifications[0].message, /deleteSaved.*failed/);
+  assert.match(notifications[0].message, /EACCES/);
+});
+
+test("stopping a run whose manager.stop throws (cold-run lease/persistence failure) notifies an error instead of crashing the overlay (#330 audit follow-up)", async () => {
+  const { ui, notifications, getComponent } = fakeUiCapturingComponent();
+
+  const fakeManager = {
+    on: () => {},
+    off: () => {},
+    listRuns: () =>
+      [
+        { runId: "run-cold", workflowName: "cold-run", status: "running", phases: [], agents: [], logs: [] },
+      ] as unknown as PersistedRunState[],
+    getRun: () => undefined,
+    stop: () => {
+      throw new Error("ENOSPC: no space left on device");
+    },
+  } as unknown as WorkflowManager;
+
+  openWorkflowNavigator({} as ExtensionAPI, fakeManager, ui).catch(() => {});
+  await Promise.resolve();
+  await Promise.resolve();
+
+  const component = getComponent();
+  assert.ok(component, "openWorkflowNavigator should have produced a component");
+  assert.doesNotThrow(() => component?.handleInput("x"), "stop must not throw/crash the overlay");
+
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].type, "error");
+  assert.match(notifications[0].message, /stop.*failed/);
+  assert.match(notifications[0].message, /ENOSPC/);
 });

@@ -14,30 +14,12 @@ import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
 // Exact post-change measurements: ratchet only after reviewing a new accepted form.
 // The prompt baseline intentionally uses an empty agentType registry so user configuration cannot alter it.
-//
-// ALWAYS-ON prompt (promptSnippet line + the single gate line): the authorize-
-// keyword-trigger change took this DOWN from ~6_500 bytes (the ~20 "For workflow, …"
-// how-to lines used to render every turn) to a single opt-in gate line. This PR then
-// added concise task-shape positives to the gate line (#P4: balance the strong
-// "do not call it" negative so the model still recognizes a good fit off-keyword),
-// nudging the rendered always-on surface up to ~766 bytes — still an order of
-// magnitude below the old always-on cost, and still self-priming-safe (no how-to here).
+// The upstream authorization gate is the only always-on guideline. Authoring
+// mechanics stay in the compact static tool definition and discoverable skill.
 const RENDERED_PROMPT_BUDGET_BYTES = 800;
-// TOOL DEFINITION (name + description + parameters): this GREW on purpose. The how-to
-// mechanics moved OUT of the always-on prompt and the per-armed-turn message and INTO
-// the tool's static `description` (see createWorkflowTool / workflowHowToGuidelines),
-// where the model sees them whenever it looks at the tool — on every arming path and on
-// off-keyword natural-language opt-ins — as a cacheable part of the tool definition
-// rather than per-turn priming. So the definition went from ~2_529 to ~8_770 bytes.
-// This is a MOVE, not new weight: it removed ~6.1KB re-injected on EACH armed turn
-// (the armed message dropped from ~6_765 to ~905 bytes). Trimming the how-to text
-// itself to shrink this definition is a SEPARATE concern (#65 / contract-concision
-// work), not this PR's job — this PR does not claim a token saving on the definition.
-// Ratcheted 8_800 → 8_900 for #68: the budget/timeout guideline now names the
-// settings.json defaults (defaultTokenBudget, defaultAgentTimeoutMs) instead of
-// claiming "the defaults are unbounded", which became false once those settings
-// exist. Reviewed wording; ~90 bytes.
-const TOOL_DEFINITION_BUDGET_BYTES = 8_900;
+// #105 corrected omitted timeout/budget semantics to name configured defaults,
+// increasing the compact definition from 3,802 to 3,918 bytes.
+const TOOL_DEFINITION_BUDGET_BYTES = 3_918;
 
 test("rendered workflow prompt contribution stays within its accepted size", async () => {
   await withRenderedWorkflow(async ({ systemPrompt, promptLines }) => {
@@ -68,19 +50,6 @@ test("provider-visible workflow tool definition stays within its accepted size",
       actualBytes <= TOOL_DEFINITION_BUDGET_BYTES,
       `Workflow tool definition is ${actualBytes} bytes; budget is ${TOOL_DEFINITION_BUDGET_BYTES} (parameters: ${parameterBytes} bytes).\n${definitionJson}`,
     );
-  });
-});
-
-test("the how-to mechanics live in the tool DESCRIPTION, not the always-on prompt", async () => {
-  await withRenderedWorkflow(async ({ systemPrompt, wrappedWorkflow }) => {
-    // The description is where the manual now lives (the model sees it whenever it
-    // looks at the tool, on any arming path).
-    assert.match(wrappedWorkflow.description, /How to write the script:/);
-    assert.match(wrappedWorkflow.description, /export const meta = \{/);
-    assert.match(wrappedWorkflow.description, /parallel\(\) takes functions, not promises/);
-
-    // ...and NOT re-rendered into the always-on system prompt every turn.
-    assert.doesNotMatch(systemPrompt, /parallel\(\) takes functions, not promises/);
   });
 });
 

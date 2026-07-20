@@ -692,6 +692,18 @@ export class WorkflowAgent {
     }
 
     if (options.schema) {
+      // Strict OpenAI-compatible providers (e.g. DeepSeek) reject a tool whose top-level
+      // parameters schema isn't a JSON object with a transport-level 400, before any of
+      // this file's SCHEMA_NONCOMPLIANCE/empty-output classification ever runs. Fail fast
+      // here instead, so a script's non-object opts.schema surfaces a clear workflow error.
+      const schemaType = (options.schema as { type?: unknown }).type;
+      if (schemaType !== "object") {
+        throw new WorkflowError(
+          `agent() opts.schema must be a top-level JSON object schema (type: "object") — got type: ${schemaType ?? "undefined"}; wrap array/primitive results in an object, e.g. { type: "object", properties: { items: <your schema> } }`,
+          WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+          { recoverable: false },
+        );
+      }
       customTools.push(createStructuredOutputTool({ schema: options.schema, capture }) as unknown as ToolDefinition);
     }
 

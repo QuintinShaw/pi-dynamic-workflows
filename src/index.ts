@@ -95,6 +95,31 @@ export type {
   WorkflowRunResult,
 } from "./workflow.js";
 export { parseWorkflowScript, runWorkflow } from "./workflow.js";
+export type {
+  AlignmentEvidence,
+  CapabilityDescriptor,
+  CapabilityDiagnostic,
+  DynamicReferenceDescriptor,
+  OptionDescriptor,
+  OptionShape,
+  PresentAtVersion,
+  RuntimeBindingAssembly,
+  StaticCapabilityFact,
+  WorkflowCapabilityContract,
+  WorkflowCapabilityDefinition,
+  WorkflowRuntimeImplementations,
+} from "./workflow-capability-contract.js";
+export {
+  CapabilityClassification,
+  CapabilityOrigin,
+  CapabilitySupport,
+  DiagnosticSeverity,
+  DiscoveryPlacement,
+  defineWorkflowCapabilityContract,
+  WORKFLOW_CAPABILITY_CONTRACT,
+  WORKFLOW_CAPABILITY_DEFINITION,
+  WorkflowCapabilityContractError,
+} from "./workflow-capability-contract.js";
 export { registerWorkflowCommands } from "./workflow-commands.js";
 export type {
   WorkflowControlInput,

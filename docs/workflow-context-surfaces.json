@@ -1,0 +1,108 @@
+{
+  "formatVersion": 2,
+  "encoding": "utf8",
+  "sources": [
+    "src/workflow-tool.ts",
+    "skills/workflow-authoring"
+  ],
+  "surfaces": {
+    "permanentWorkflowPrompt": {
+      "serialization": "UTF-8 bytes of LF-joined Pi prompt lines",
+      "bytes": 742
+    },
+    "providerVisibleWorkflowToolDefinition": {
+      "serialization": "UTF-8 bytes of JSON.stringify({ name, description, parameters })",
+      "bytes": 3918
+    },
+    "workflowAuthoringSkillDiscovery": {
+      "serialization": "UTF-8 bytes of normalized Pi skill XML with package-relative location",
+      "bytes": 338
+    },
+    "ordinaryWorkflowOwnedAlwaysOn": {
+      "serialization": "sum of permanent prompt, provider-visible tool definition, and normalized skill discovery bytes",
+      "bytes": 4998
+    },
+    "workflowAuthoringSkillCorpus": {
+      "serialization": "sum of UTF-8 bytes for every file under skills/workflow-authoring",
+      "files": 27,
+      "bytes": 67089
+    },
+    "representativeAuthoringProfiles": {
+      "serialization": "sum of UTF-8 bytes for each profile's declared package-relative files",
+      "medianBytes": 11662,
+      "profiles": [
+        {
+          "name": "write",
+          "files": [
+            "skills/workflow-authoring/SKILL.md",
+            "skills/workflow-authoring/references/runtime.md",
+            "skills/workflow-authoring/references/pattern-selection.md",
+            "skills/workflow-authoring/references/focused-recipes.md",
+            "skills/workflow-authoring/examples/fan-out-and-synthesize.js",
+            "skills/workflow-authoring/examples/structured-output.js"
+          ],
+          "bytes": 11590
+        },
+        {
+          "name": "edit",
+          "files": [
+            "skills/workflow-authoring/SKILL.md",
+            "skills/workflow-authoring/references/runtime.md",
+            "skills/workflow-authoring/references/lifecycle.md",
+            "skills/workflow-authoring/references/focused-recipes.md",
+            "skills/workflow-authoring/examples/phased-budgets.js",
+            "skills/workflow-authoring/examples/saved-nested-workflows.js"
+          ],
+          "bytes": 14828
+        },
+        {
+          "name": "review",
+          "files": [
+            "skills/workflow-authoring/SKILL.md",
+            "skills/workflow-authoring/references/runtime.md",
+            "skills/workflow-authoring/references/review.md",
+            "skills/workflow-authoring/references/quality-helpers.md",
+            "skills/workflow-authoring/examples/adversarial-verification.js"
+          ],
+          "bytes": 10772
+        },
+        {
+          "name": "debug",
+          "files": [
+            "skills/workflow-authoring/SKILL.md",
+            "skills/workflow-authoring/references/runtime.md",
+            "skills/workflow-authoring/references/debugging.md",
+            "skills/workflow-authoring/references/specialized-helpers.md",
+            "skills/workflow-authoring/examples/validated-gate.js"
+          ],
+          "bytes": 11734
+        },
+        {
+          "name": "loop",
+          "files": [
+            "skills/workflow-authoring/SKILL.md",
+            "skills/workflow-authoring/references/runtime.md",
+            "skills/workflow-authoring/references/pattern-selection.md",
+            "skills/workflow-authoring/references/lifecycle.md",
+            "skills/workflow-authoring/references/focused-recipes.md",
+            "skills/workflow-authoring/examples/loop-until-done.js",
+            "skills/workflow-authoring/examples/structured-output.js"
+          ],
+          "bytes": 15416
+        },
+        {
+          "name": "retry",
+          "files": [
+            "skills/workflow-authoring/SKILL.md",
+            "skills/workflow-authoring/references/runtime.md",
+            "skills/workflow-authoring/references/retry-helper.md",
+            "skills/workflow-authoring/references/focused-recipes.md",
+            "skills/workflow-authoring/examples/bounded-semantic-retry.js",
+            "skills/workflow-authoring/examples/structured-output.js"
+          ],
+          "bytes": 10568
+        }
+      ]
+    }
+  }
+}

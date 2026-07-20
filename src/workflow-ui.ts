@@ -1105,91 +1105,112 @@ export function openWorkflowNavigator(
       const act = (data: string) => {
         const itemKind = state.kind === "runs" ? state.itemKindAt(model, state.cursor) : undefined;
         const action = keyToAction(parseKey(data), state.kind, itemKind);
-        switch (action.type) {
-          case "move":
-            state.move(action.delta, currentCount(state, model));
-            break;
-          case "drill":
-            state.drill(model);
-            break;
-          case "back":
-            if (!state.back()) {
+        // Single error boundary around the whole dispatch: any case here can call
+        // into manager/storage methods that throw synchronously on bad on-disk
+        // state (corrupt persisted scripts, EACCES/ENOSPC, a stale run lease) —
+        // uncaught, that would crash/freeze this TUI overlay's input handler,
+        // which has no boundary of its own (#330 audit). A per-case try/catch
+        // (see "restart" below) can still add a friendlier, action-specific
+        // message; this is the backstop for every other case, present and future.
+        try {
+          switch (action.type) {
+            case "move":
+              state.move(action.delta, currentCount(state, model));
+              break;
+            case "drill":
+              state.drill(model);
+              break;
+            case "back":
+              if (!state.back()) {
+                cleanup();
+                done(undefined);
+              }
+              break;
+            case "close":
               cleanup();
               done(undefined);
-            }
-            break;
-          case "close":
-            cleanup();
-            done(undefined);
-            return;
-          case "deleteSaved": {
-            if (state.kind === "runs") {
-              const saved = model.saved();
-              const runCount = model.runs().length;
-              const item = saved[state.cursor - runCount];
-              if (item) {
-                model.deleteSaved(item.name);
-                ui.notify(`Deleted /${item.name}`, "info");
+              return;
+            case "deleteSaved": {
+              if (state.kind === "runs") {
+                const saved = model.saved();
+                const runCount = model.runs().length;
+                const item = saved[state.cursor - runCount];
+                if (item) {
+                  model.deleteSaved(item.name);
+                  ui.notify(`Deleted /${item.name}`, "info");
+                }
+              } else if (state.kind === "savedDetail" && state.savedName) {
+                model.deleteSaved(state.savedName);
+                ui.notify(`Deleted /${state.savedName}`, "info");
+                state.back();
               }
-            } else if (state.kind === "savedDetail" && state.savedName) {
-              model.deleteSaved(state.savedName);
-              ui.notify(`Deleted /${state.savedName}`, "info");
-              state.back();
-            }
-            break;
-          }
-          case "pause": {
-            const id = state.activeRunId(model);
-            if (id) ui.notify(manager.pause(id) ? `Paused ${id}` : `Cannot pause ${id}`, "info");
-            break;
-          }
-          case "stop": {
-            const id = state.activeRunId(model);
-            if (id) ui.notify(manager.stop(id) ? `Stopped ${id}` : `Cannot stop ${id}`, "info");
-            break;
-          }
-          case "restart": {
-            const id = state.activeRunId(model);
-            const run = id ? manager.listRuns().find((r) => r.runId === id) : undefined;
-            if (!run?.script) {
-              ui.notify(id ? `Cannot restart ${id} (no script saved)` : "No run selected to restart", "warning");
               break;
             }
-            const { runId: newId } = manager.startInBackground(run.script, run.args);
-            ui.notify(`Restarted ${run.workflowName || "workflow"} as ${newId}`, "info");
-            break;
-          }
-          case "save": {
-            const id = state.activeRunId(model);
-            const run = id ? manager.listRuns().find((r) => r.runId === id) : undefined;
-            if (!run?.script) {
-              ui.notify("No saved run script to save", "warning");
-            } else if (!opts.storage) {
-              ui.notify("Saving is not available (no storage)", "error");
-            } else {
-              const storage = opts.storage;
-              const name = run.workflowName || "workflow";
-              let saved: ReturnType<WorkflowStorage["save"]>;
-              try {
-                saved = storage.save({
-                  name,
-                  description: run.workflowName,
-                  script: run.script,
-                  location: "project",
-                });
-              } catch (error) {
-                ui.notify(error instanceof Error ? error.message : String(error), "error");
+            case "pause": {
+              const id = state.activeRunId(model);
+              if (id) ui.notify(manager.pause(id) ? `Paused ${id}` : `Cannot pause ${id}`, "info");
+              break;
+            }
+            case "stop": {
+              const id = state.activeRunId(model);
+              if (id) ui.notify(manager.stop(id) ? `Stopped ${id}` : `Cannot stop ${id}`, "info");
+              break;
+            }
+            case "restart": {
+              const id = state.activeRunId(model);
+              const run = id ? manager.listRuns().find((r) => r.runId === id) : undefined;
+              if (!run?.script) {
+                ui.notify(id ? `Cannot restart ${id} (no script saved)` : "No run selected to restart", "warning");
                 break;
               }
-              registerSavedWorkflow(pi, opts.cwd ?? process.cwd(), saved, undefined, () =>
-                storage.list().some((w) => w.name === saved.name),
-              );
-              ui.notify(`Saved /${name}`, "info");
+              try {
+                const { runId: newId } = manager.startInBackground(run.script, run.args);
+                ui.notify(`Restarted ${run.workflowName || "workflow"} as ${newId}`, "info");
+              } catch (error) {
+                ui.notify(
+                  `Failed to restart ${run.workflowName || "workflow"}: ${error instanceof Error ? error.message : error}`,
+                  "error",
+                );
+              }
+              break;
             }
-            break;
+            case "save": {
+              const id = state.activeRunId(model);
+              const run = id ? manager.listRuns().find((r) => r.runId === id) : undefined;
+              if (!run?.script) {
+                ui.notify("No saved run script to save", "warning");
+              } else if (!opts.storage) {
+                ui.notify("Saving is not available (no storage)", "error");
+              } else {
+                const storage = opts.storage;
+                const name = run.workflowName || "workflow";
+                let saved: ReturnType<WorkflowStorage["save"]>;
+                try {
+                  saved = storage.save({
+                    name,
+                    description: run.workflowName,
+                    script: run.script,
+                    location: "project",
+                  });
+                } catch (error) {
+                  ui.notify(error instanceof Error ? error.message : String(error), "error");
+                  break;
+                }
+                registerSavedWorkflow(pi, opts.cwd ?? process.cwd(), saved, undefined, () =>
+                  storage.list().some((w) => w.name === saved.name),
+                );
+                ui.notify(`Saved /${name}`, "info");
+              }
+              break;
+            }
+            default:
+              return;
           }
-          default:
-            return;
+        } catch (error) {
+          ui.notify(
+            `Workflow action "${action.type}" failed: ${error instanceof Error ? error.message : error}`,
+            "error",
+          );
         }
         rerender();
       };

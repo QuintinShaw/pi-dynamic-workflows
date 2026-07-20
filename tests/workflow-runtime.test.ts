@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { AgentUsage } from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
-import { type JournalEntry, runWorkflow } from "../src/workflow.js";
+import { type JournalEntry, parseWorkflowScript, runWorkflow } from "../src/workflow.js";
 
 /** Agent runner that counts real invocations and echoes a per-call result. */
 function countingAgent() {
@@ -807,6 +807,31 @@ return results`;
   assert.equal(result.result.length, 2);
 });
 
+test("pipeline forwards a recoverable null to the next stage with original item and index", async () => {
+  const script = `export const meta = { name: 'pipeline_null', description: 'null forwarding' }
+const results = await pipeline(
+  ['alpha'],
+  (item) => agent('first ' + item, { label: 'first' }),
+  (previousValue, originalItem, index) => ({ previousValue, originalItem, index }),
+)
+return results`;
+  const agent = {
+    async run() {
+      throw new Error("recoverable first-stage failure");
+    },
+  };
+
+  const result = await runWorkflow<Array<{ previousValue: null; originalItem: string; index: number }>>(script, {
+    agent,
+    persistLogs: false,
+  });
+
+  assert.deepEqual(
+    Array.from(result.result, ({ previousValue, originalItem, index }) => ({ previousValue, originalItem, index })),
+    [{ previousValue: null, originalItem: "alpha", index: 0 }],
+  );
+});
+
 test("runWorkflow agent with different labels", async () => {
   const script = `export const meta = { name: 'label_test', description: 'labels' }
 const a = await agent('task1', { label: 'worker-1' })
@@ -965,6 +990,17 @@ test("parse-time guard rejects literal Date.now / Math.random / new Date()", asy
       /deterministic|unavailable/i,
       `${expr} literal should be rejected at parse time`,
     );
+  }
+});
+
+test("parse-time guard preserves the source blocklist used by existing workflows", () => {
+  for (const forbidden of ["Date.now()", "Math.random()", "new Date()"]) {
+    const script = `export const meta = { name: 'blocked-prose', description: 'fixture' }
+// ${forbidden} is unavailable here.
+const warning = ${JSON.stringify(`Do not call ${forbidden}`)}
+return { warning }`;
+
+    assert.throws(() => parseWorkflowScript(script), /deterministic|unavailable/i);
   }
 });
 

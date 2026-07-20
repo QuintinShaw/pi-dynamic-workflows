@@ -1,7 +1,6 @@
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { listAgentTypes, loadAgentRegistry } from "./agent-registry.js";
 import {
   createToolUpdateWorkflowDisplay,
   createWorkflowSnapshot,
@@ -19,115 +18,23 @@ import { WorkflowManager } from "./workflow-manager.js";
 import { createWorkflowStorage, type WorkflowStorage } from "./workflow-saved.js";
 import { loadWorkflowSettings } from "./workflow-settings.js";
 
-/**
- * Model routing guideline for workflow authors.
- * Tells the LLM about opts.tier (small/medium/big) for runtime-enforced
- * model selection, and opts.model for an exact provider/id override.
- *
- * This string is injected into the workflow tool's promptGuidelines and
- * therefore appears in the LLM's system prompt for every workflow execution.
- */
-export function modelRoutingGuideline(): string {
-  return [
-    "For workflow, the user configures per-tier models (/workflows-models), so TAG EVERY agent with opts.tier by role so those models are actually used.",
-    "opts.tier accepts 'small', 'medium', or 'big' and is enforced at runtime.",
-    "Small tier: lightweight exploration/search/inventory agents.",
-    "Medium tier: balanced analysis agents.",
-    "Big tier: synthesis/judgment/decision agents spanning the full context.",
-    "An agent with no opts.tier and no opts.model falls back to the user's medium tier; do not rely on that — tag agents explicitly so small/big are used where they fit.",
-    "Use opts.model only when the user names a specific model; pass that exact provider/id. opts.model always takes precedence over opts.tier.",
-    "Exact model specs may include Pi CLI-style thinking suffixes such as openai-codex/gpt-5.5:xhigh or anthropic/claude-fable-5:max when the user requests a specific effort level.",
-  ].join(" ");
-}
-
-/**
- * Tells the LLM which named subagent definitions (agentType) are available, so
- * it can route an agent() to a reusable role that binds tools+model+prompt.
- * Returns undefined when no definitions are registered (nothing to advertise).
- */
-export function agentTypeGuideline(cwd: string = process.cwd()): string | undefined {
-  let types: Array<{ name: string; description?: string }>;
-  try {
-    types = listAgentTypes(loadAgentRegistry(cwd));
-  } catch {
-    return undefined;
-  }
-  if (!types.length) return undefined;
-  const list = types.map((t) => (t.description ? `${t.name} (${t.description})` : t.name)).join(", ");
-  return `For workflow, opts.agentType routes an agent to a named definition that binds its tools, model, and role prompt. Available agentTypes: ${list}. An explicit opts.model still overrides the definition's model.`;
-}
-
-/**
- * The single ALWAYS-ON guideline rendered into the system prompt every turn.
- * It is a pure gate: it tells the model when the tool is in scope and, crucially,
- * that it should NOT reach for the tool otherwise. The how-to mechanics live in
- * {@link workflowHowToGuidelines} and are folded into the tool's static
- * `description` (see {@link createWorkflowTool}), not into this always-on line.
- *
- * The line is balanced on purpose: a task-shape positive ("this is the kind of
- * work the tool is for") so the model recognizes a good fit even when the user
- * phrases it off-keyword, PLUS the explicit-opt-in gate and the "do not call it
- * otherwise" negative so it doesn't self-trigger (#88). The "offer with a rough
- * cost" keeps a non-forcing path open for a task that fits but wasn't opted into.
- */
+/** The single always-on gate that authorizes workflow use without forcing it. */
 export const WORKFLOW_GATE_GUIDELINE =
   "The `workflow` tool runs multi-agent orchestration — it fans decomposable work out across subagents, and fits tasks shaped like: repo-wide inspection, independent parallel research/checks, multi-perspective review, or fan-out/fan-in synthesis. ONLY call it when the user explicitly opts in — via the workflow trigger word, `/workflows run`, or their own words (e.g. 'run a workflow', 'fan this out', '并行审一遍'). For any other task — even one that would clearly benefit — do not call it; you may briefly offer it (with a rough cost) as an option instead.";
-
-/**
- * The how-to guidance for actually WRITING a workflow script. These lines are
- * folded into the tool's static `description` (see {@link createWorkflowTool}),
- * NOT into the always-on `promptGuidelines` and NOT re-injected into the armed
- * turn's message.
- *
- * A tool description is the right home for this "manual": it is visible to the
- * model whenever it considers or calls the tool — regardless of which path armed
- * the turn, and even on the natural-language opt-ins that the gate line blesses
- * but that never trip the literal keyword arm — and it is a static, prefix-
- * cacheable part of the tool definition rather than per-turn behavioral priming.
- * That fixes both the "armed off-keyword ⇒ no mechanics ⇒ lower-quality script"
- * gap and the ~1.4KB-per-armed-turn re-injection (worse for `/effort` users).
- *
- * Keeping it out of `promptGuidelines` still shrinks the always-on prompt (#88
- * self-priming) — this array is the how-to only, never the always-on gate. Note
- * the description now carries this weight in the tool DEFINITION budget; trimming
- * the how-to text itself is a separate concern (#65 / contract-concision work),
- * not this change's job.
- */
-export function workflowHowToGuidelines(cwd: string = process.cwd()): string[] {
-  return [
-    "For workflow, always pass one raw JavaScript string in the required script parameter; do not include Markdown fences or prose around the script.",
-    "For workflow, the script's first statement must be `export const meta = { name: 'short_snake_case', description: 'non-empty human description', phases: [{ title: 'Phase name' }] }`; meta.name and meta.description are required non-empty strings.",
-    "For workflow, write plain JavaScript after the meta export. Do not use TypeScript syntax, imports, require(), fs, Date.now(), Math.random(), or new Date().",
-    "For workflow, available globals are agent(prompt, opts), parallel(thunks), pipeline(items, ...stages), phase(title), log(message), args, cwd, process.cwd(), and budget. Every workflow must call agent() at least once; do not use workflow only to declare phases or return a static object.",
-    "For workflow, prefer the built-in quality helpers when they fit (each is built on agent()/parallel() and returns plain data): verify(item, {reviewers, threshold, lens}) for adversarial fact-checking; judgePanel(attempts, {judges, rubric}) to score N candidates and return the best; loopUntilDry({round, key, consecutiveEmpty}) to keep finding until rounds stop yielding new items; completenessCheck(args, results) as a final 'what's missing' critic.",
-    "For workflow, when meta.phases declares more than one phase, call phase('Exact Title') at the start of each phase's work (or set opts.phase on each agent) so every agent groups under the correct phase; never declare a phase you don't switch into — a declared phase with no agents shows as 0/0 and any agent you forgot to move stays in the previous phase.",
-    "For workflow, do not set tokenBudget or agentTimeoutMs unless the user explicitly asks to cap spend or time; runs are unbounded unless settings.json sets defaults (defaultTokenBudget, defaultAgentTimeoutMs).",
-    "For workflow, to bound spend: pass tokenBudget for a hard run-wide cap; carve a per-phase ceiling with phase('Name', {budget: N}) (that phase throws at its sub-budget without touching the run total — wrap its work in try/catch so later phases proceed); use retry(thunk, {attempts, until}) for bounded retry, and gate(thunk, validator, {attempts}) when a validator's feedback should steer the next attempt. To degrade gracefully, branch on budget.remaining() to skip optional rounds or choose a lighter tier.",
-    "For workflow, prefer it for decomposable work: repository inspection, independent research/checks, multi-perspective review, or fan-out/fan-in synthesis. Do not use it for a single quick file read/edit or when ordinary tools are enough.",
-    "For workflow, parallel() takes functions, not promises: use `await parallel(items.map(item => () => agent('...', { label: '...' })))`, never `await parallel(items.map(item => agent(...)))`. Results are returned in input order.",
-    "For workflow, pipeline(items, ...stages) runs each item through stages sequentially, while different items may run concurrently. Each stage receives (previousValue, originalItem, index).",
-    "For workflow, every agent() call should include a unique short label option, 2-5 words, such as { label: 'repo inventory' } or { label: 'source modules' }; unique labels make live status and error reporting readable.",
-    "For workflow, use low concurrency and agentRetries for unstable provider/transport fan-out runs; retries apply only to recoverable agent failures and still require explicit null handling after exhaustion.",
-    "For workflow, failed agent(), parallel(), or pipeline() branches return null and log the failure unless the workflow is aborted. Check for nulls before synthesizing conclusions.",
-    "For workflow, include a final synthesis/assertion agent when combining multiple subagent results; return a compact JSON-serializable value with ok/verdict plus the important outputs.",
-    "For workflow, the default quality shape for fan-out work is finder -> verify -> merge: run one agent per angle or work-unit (in parallel), pass each candidate finding through verify() and drop the unconfirmed, then a single synthesis agent that de-duplicates, ranks by confidence/severity, and caps the output. If nothing survives verification, return an empty result and say so rather than padding.",
-    "For workflow, give each subagent a substantive, self-contained task: do not spawn an agent just to read one file or run one command, and do not use one agent only to check on another. Prefer fewer, higher-level agents over many trivial micro-tasks.",
-    "For workflow, if agent() needs machine-readable output, pass a plain JSON Schema via opts.schema; agent() will return the validated object. Use JSON Schema syntax, not TypeScript or TypeBox constructors.",
-    modelRoutingGuideline(),
-    agentTypeGuideline(cwd),
-    "For workflow, do not assume the parent assistant has repository code context inside subagents; include enough task context and relevant paths in each agent prompt.",
-    "For workflow, runs are background by default: the tool returns immediately with a run ID, the turn ends so the user isn't blocked, and the result is delivered back into the conversation when the run finishes. Pass background: false only when you must use the result inline in this same turn (it will block).",
-    "For workflow, you may call `await workflow('saved-name', argsObject)` to run a saved workflow inline and use its result; nesting is one level deep only, and the global 16-concurrent / 1000-total caps hold across the nesting.",
-  ].filter((g): g is string => typeof g === "string" && g.length > 0);
-}
 
 const workflowToolSchema = Type.Object({
   script: Type.String({
     description: [
       "Required raw JavaScript workflow script, with no Markdown fences.",
-      "First statement: export const meta = { name: 'short_snake_case', description: 'non-empty description', phases: [{ title: 'Phase' }] }",
-      "Use phase('Name'), agent(prompt, opts), parallel(arrayOfFunctions), pipeline(items, ...stages), log(message), args, and budget. The workflow must call agent() at least once.",
-      "parallel() requires functions, not promises: await parallel(items.map(item => () => agent(...))).",
+      "First statement: export const meta = { name: 'short_snake_case', description: 'non-empty description' }. Add phases: [{ title: 'Phase' }] only when the workflow has named phases, and declare only phases it will use. With multiple phases, call phase('Exact Title') before each phase's work or set `phase` in the agent options.",
+      "Use `await workflow(savedName, childArgs)` to run a saved workflow inline; nesting is limited to one level and shares the parent run's concurrency, agent, and token limits.",
+      "Optional quality helpers include verify(), judgePanel(), loopUntilDry(), and completenessCheck().",
+      "Optional control helpers include retry() and gate(); budget exposes total, spent(), and remaining(), and phase('Name', { budget: N }) sets a phase token limit.",
+      "The optional `agentType` option selects a named user or project definition that can bind tools, a model, and role instructions; use it only when its name and purpose are provided in context. Its bound model overrides `tier`; an explicit `model` overrides both.",
+      "Use plain JavaScript only; imports, require(), filesystem modules, Date.now(), Math.random(), and new Date() are unavailable.",
+      "Use phase('Name'), agent(prompt, opts), parallel(arrayOfFunctions), pipeline(items, ...stages), log(message), args, cwd, process.cwd(), and budget. The workflow must call agent() at least once.",
+      "parallel() requires functions, not promises, and returns results in input order: await parallel(items.map(item => () => agent(...))).",
+      "pipeline(items, ...stages) runs stages sequentially for each item while items proceed concurrently; each stage receives (previousValue, originalItem, index).",
     ].join(" "),
   }),
   args: Type.Optional(
@@ -141,7 +48,8 @@ const workflowToolSchema = Type.Object({
   ),
   maxAgents: Type.Optional(
     Type.Number({
-      description: "Maximum number of agents allowed in this run. Default: 1000.",
+      description:
+        "Maximum number of agents allowed in this run. Default: 1000; this is a safety ceiling, not a target. Set a lower limit for dynamic or exploratory fan-out, and reserve large fan-outs for explicit user intent.",
     }),
   ),
   concurrency: Type.Optional(
@@ -159,13 +67,13 @@ const workflowToolSchema = Type.Object({
   agentTimeoutMs: Type.Optional(
     Type.Number({
       description:
-        "Timeout per agent in milliseconds. Omit for no hard timeout by default. Set only when the user asks to bound time.",
+        "Timeout per agent in milliseconds. Omit to use configured `defaultAgentTimeoutMs`; without one, there is no hard timeout. Set only when the user asks to bound time.",
     }),
   ),
   tokenBudget: Type.Optional(
     Type.Number({
       description:
-        "Hard total-token budget for the whole run. Once spent reaches it, further agent() calls fail and the run stops. Omit for no limit. Set it when the user asks to cap spend.",
+        "Soft pre-call token gate for the whole run. Once recorded spend reaches it, further agent() calls fail; concurrent in-flight work can overshoot. Omit to use configured `defaultTokenBudget`; without one, the run is unlimited. Set it only when the user asks to bound spend.",
     }),
   ),
   resumeFromRunId: Type.Optional(
@@ -223,39 +131,10 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
   return defineTool({
     name: "workflow",
     label: "Workflow",
-    // The how-to "manual" lives here, in the static tool description, so the
-    // model has the mechanics whenever it considers/calls the tool — on every
-    // arming path AND on off-keyword natural-language opt-ins that never trip the
-    // literal keyword arm. This is a cacheable part of the tool definition, not
-    // per-turn priming (that's why it's here and not appended to the armed
-    // message; see workflowHowToGuidelines / buildArmedWorkflowPrompt). It grows
-    // the tool-DEFINITION budget; trimming the how-to itself is separate work
-    // (#65 / contract-concision), not this change's job.
-    //
-    // CAVEAT: the off-keyword natural-language path only sees this description if
-    // the host keeps the `workflow` tool in its default active tool set. The
-    // arming paths add the tool on arm (installWorkflowKeywordArming's setActiveTools),
-    // but a bare natural-language opt-in with no arm relies on the tool already
-    // being active in the host's config — keep `workflow` default-active so the
-    // gate line's "fan this out" promise (mechanics available) holds.
-    description: [
-      "Execute a deterministic JavaScript workflow that orchestrates multiple subagents with agent(), parallel(), and pipeline().",
-      "script is required raw JavaScript. It must start with export const meta = { name, description, phases? } and must call agent() at least once.",
-      "",
-      "How to write the script:",
-      ...workflowHowToGuidelines(cwd).map((g) => `- ${g}`),
-    ].join("\n"),
+    description:
+      "Run a JavaScript workflow that delegates work to subagents with agent(), optionally composing calls with parallel() and pipeline().",
     promptSnippet:
-      "Run a deterministic JavaScript workflow. Required script header: export const meta = { name: 'short_snake_case', description: 'non-empty description', phases: [{ title: 'Phase' }] }.",
-    // Lazy accessor: the SDK re-reads definition.promptGuidelines on every
-    // tool-registry refresh. This is ALWAYS-ON weight (rendered into the system
-    // prompt every turn), so it is deliberately a single gate line — see #65
-    // (always-on prompt budget) and #88 (self-priming: a wall of "For workflow, …"
-    // how-to text nudges the model toward the tool even when it wasn't asked for).
-    // The ~20 how-to lines that used to live here now live in the tool's static
-    // `description` (see above / workflowHowToGuidelines), so the model has the
-    // mechanics whenever it looks at the tool — without paying the always-on cost
-    // or the per-armed-turn re-injection.
+      "Delegate substantive independent or staged work to subagents with a JavaScript workflow, optionally composing agent calls with parallel(), pipeline(), or both",
     get promptGuidelines() {
       return [WORKFLOW_GATE_GUIDELINE];
     },

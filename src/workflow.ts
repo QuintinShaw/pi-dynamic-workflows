@@ -5,7 +5,7 @@ import type { Node } from "acorn";
 import { parse } from "acorn";
 import type { TSchema } from "typebox";
 import type { AgentUsage } from "./agent.js";
-import { WorkflowAgent, type WorkflowAgentOptions } from "./agent.js";
+import { type AgentRunOptions, WorkflowAgent, type WorkflowAgentOptions } from "./agent.js";
 import type { AgentHistoryEntry } from "./agent-history.js";
 import {
   type AgentDefinition,
@@ -19,6 +19,7 @@ import { WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
 import { createWorkflowLogger } from "./logger.js";
 import { parseModelRoutingFromMeta, resolveModelForPhase } from "./model-routing.js";
 import { createAgentStoreTools, SharedStore } from "./shared-store.js";
+import { WORKFLOW_CAPABILITY_CONTRACT, type WorkflowRuntimeImplementations } from "./workflow-capability-contract.js";
 import { createWorktree, removeWorktree, type Worktree } from "./worktree.js";
 
 /**
@@ -84,9 +85,21 @@ export interface SharedRuntime {
   depth: number;
 }
 
+/** Runtime instrumentation for workflow boundaries, quality helpers, and control attempts. */
+export type WorkflowRuntimeEvent =
+  | { type: "phase"; title: string; budget: number | null }
+  | { type: "workflow"; stage: "start" | "end"; name: string; args: unknown }
+  | { type: "quality"; stage: "start" | "end"; helper: "verify" | "judgePanel" | "completenessCheck" }
+  | { type: "control-attempt"; helper: "retry" | "gate"; attempt: number; accepted: boolean };
+
+/** Minimal injected agent surface used by the workflow runtime and deterministic tests. */
+export interface WorkflowAgentRunner {
+  run(prompt: string, options?: AgentRunOptions<TSchema>): Promise<unknown>;
+}
+
 export interface WorkflowRunOptions extends WorkflowAgentOptions {
   args?: unknown;
-  agent?: Pick<WorkflowAgent, "run">;
+  agent?: WorkflowAgentRunner;
   /** The session's main model (provider/id), shown in /workflows for default agents. */
   mainModel?: string;
   /**
@@ -151,6 +164,8 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   confirm?: (promptText: string, options: CheckpointOptions) => Promise<unknown>;
   onLog?: (message: string) => void;
   onPhase?: (title: string) => void;
+  /** Runtime behavior trace used by diagnostics and comprehension evidence. */
+  onRuntimeEvent?: (event: WorkflowRuntimeEvent) => void;
   onAgentStart?: (event: { label: string; phase?: string; prompt: string; model?: string }) => void;
   onAgentEnd?: (event: {
     label: string;
@@ -388,6 +403,11 @@ export async function runWorkflow<T = unknown>(
       state.phaseBudgets.set(title, { budget: phaseOptions.budget, startSpent: shared.spent, warned: false });
     }
     options.onPhase?.(title);
+    options.onRuntimeEvent?.({
+      type: "phase",
+      title,
+      budget: typeof phaseOptions?.budget === "number" && phaseOptions.budget > 0 ? phaseOptions.budget : null,
+    });
   };
 
   const budget = Object.freeze({
@@ -782,6 +802,8 @@ export async function runWorkflow<T = unknown>(
     }
     const resolved = options.loadSavedWorkflow?.(String(nameOrScript));
     const childScript = resolved ?? String(nameOrScript);
+    const workflowName = String(nameOrScript);
+    options.onRuntimeEvent?.({ type: "workflow", stage: "start", name: workflowName, args: childArgs });
     shared.depth++;
     try {
       const child = await runWorkflow(childScript, {
@@ -799,6 +821,7 @@ export async function runWorkflow<T = unknown>(
       return child.result;
     } finally {
       shared.depth--;
+      options.onRuntimeEvent?.({ type: "workflow", stage: "end", name: workflowName, args: childArgs });
     }
   };
 
@@ -815,6 +838,7 @@ export async function runWorkflow<T = unknown>(
     item: unknown,
     opts: { reviewers?: number; threshold?: number; lens?: string | string[] } = {},
   ) => {
+    options.onRuntimeEvent?.({ type: "quality", stage: "start", helper: "verify" });
     const reviewers = Math.max(1, opts.reviewers ?? 2);
     const threshold = opts.threshold ?? 0.5;
     const lenses = opts.lens ? (Array.isArray(opts.lens) ? opts.lens : [opts.lens]) : [];
@@ -832,7 +856,14 @@ export async function runWorkflow<T = unknown>(
       )
     ).filter(Boolean) as Array<{ real?: boolean; reason?: string }>;
     const realCount = votes.filter((v) => v?.real).length;
-    return { real: votes.length > 0 && realCount / votes.length >= threshold, realCount, total: votes.length, votes };
+    const verdict = {
+      real: votes.length > 0 && realCount / votes.length >= threshold,
+      realCount,
+      total: votes.length,
+      votes,
+    };
+    options.onRuntimeEvent?.({ type: "quality", stage: "end", helper: "verify" });
+    return verdict;
   };
 
   const JUDGE_SCHEMA = {
@@ -841,6 +872,7 @@ export async function runWorkflow<T = unknown>(
     required: ["score"],
   };
   const judgePanel = async (attempts: unknown[], opts: { judges?: number; rubric?: string } = {}) => {
+    options.onRuntimeEvent?.({ type: "quality", stage: "start", helper: "judgePanel" });
     const judges = Math.max(1, opts.judges ?? 3);
     const rubric = opts.rubric ?? "overall quality and correctness";
     const scored = (
@@ -870,6 +902,7 @@ export async function runWorkflow<T = unknown>(
     // Highest mean score; stable tie-break by input index.
     let best = scored[0];
     for (const s of scored) if (s.score > best.score || (s.score === best.score && s.index < best.index)) best = s;
+    options.onRuntimeEvent?.({ type: "quality", stage: "end", helper: "judgePanel" });
     return best;
   };
 
@@ -916,11 +949,15 @@ export async function runWorkflow<T = unknown>(
     properties: { complete: { type: "boolean" }, missing: { type: "array", items: { type: "string" } } },
     required: ["complete"],
   };
-  const completenessCheck = (taskArgs: unknown, results: unknown) =>
-    agent(
+  const completenessCheck = async (taskArgs: unknown, results: unknown) => {
+    options.onRuntimeEvent?.({ type: "quality", stage: "start", helper: "completenessCheck" });
+    const verdict = await agent(
       `Given the task and the results gathered so far, list what is still MISSING (modalities not covered, claims unverified, gaps). Be specific and concise.\n\nTask:\n${JSON.stringify(taskArgs)}\n\nResults so far:\n${JSON.stringify(results).slice(0, 4000)}`,
       { label: "completeness critic", schema: COMPLETENESS_SCHEMA },
     );
+    options.onRuntimeEvent?.({ type: "quality", stage: "end", helper: "completenessCheck" });
+    return verdict;
+  };
 
   // Thin bounded-retry / validation-gate combinators. Sugar over the for-loop +
   // agent() pattern, but each attempt is a real agent() call so it auto-journals
@@ -935,7 +972,9 @@ export async function runWorkflow<T = unknown>(
     let last: unknown;
     for (let i = 0; i < attempts; i++) {
       last = await thunk(i);
-      if (!opts.until || opts.until(last)) return last;
+      const accepted = !opts.until || opts.until(last);
+      options.onRuntimeEvent?.({ type: "control-attempt", helper: "retry", attempt: i + 1, accepted });
+      if (accepted) return last;
     }
     return last; // attempts exhausted — return the last result (caller inspects it)
   };
@@ -950,7 +989,9 @@ export async function runWorkflow<T = unknown>(
     for (let i = 0; i < attempts; i++) {
       last = await thunk(feedback, i);
       const verdict = await validator(last);
-      if (verdict?.ok) return { ok: true, value: last, attempts: i + 1 };
+      const accepted = Boolean(verdict?.ok);
+      options.onRuntimeEvent?.({ type: "control-attempt", helper: "gate", attempt: i + 1, accepted });
+      if (accepted) return { ok: true, value: last, attempts: i + 1 };
       feedback = verdict?.feedback; // fed into the next attempt
     }
     return { ok: false, value: last, attempts };
@@ -994,7 +1035,7 @@ export async function runWorkflow<T = unknown>(
     return reply;
   };
 
-  const context = vm.createContext({
+  const runtimeImplementations = {
     agent,
     parallel,
     pipeline,
@@ -1018,6 +1059,12 @@ export async function runWorkflow<T = unknown>(
       warn: (m: unknown) => log(`[warn] ${String(m)}`),
       error: (m: unknown) => log(`[error] ${String(m)}`),
     },
+  } satisfies WorkflowRuntimeImplementations;
+  const { globals: projectGlobals, diagnostics: bindingDiagnostics } =
+    WORKFLOW_CAPABILITY_CONTRACT.assembleRuntimeBindings(runtimeImplementations);
+  for (const diagnostic of bindingDiagnostics) logger.warn(diagnostic.message);
+  const context = vm.createContext({
+    ...projectGlobals,
     // Object/Array/JSON/Math/Date/Promise/Set/Map/etc. come from the vm realm
     // itself — we deliberately do NOT inject host built-ins, whose .constructor
     // would be the host Function (a determinism-guard bypass). Math/Date are

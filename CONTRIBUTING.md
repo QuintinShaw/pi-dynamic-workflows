@@ -6,7 +6,7 @@ Thanks for contributing to pi-dynamic-workflows. This project values small, well
 
 ```bash
 npm install
-npm test     # biome check + tsc build + unit tests — must pass
+npm test     # Biome, TypeScript, unit tests, and release checks — must pass
 ```
 
 `npm test` runs exactly what CI runs. If it's green locally it should be green in CI. CI runs on every PR to `main`; for fork PRs a maintainer approves the first run.
@@ -26,6 +26,29 @@ If you add a `workflow` tool parameter or a `~/.pi/workflows/settings.json` sett
 Fake-agent unit tests are necessary but not sufficient. Any change to how agents actually run — retries, timeouts, model routing, token accounting, concurrency, resume — must also be verified **end-to-end against a real Pi subagent session** (real `createAgentSession` → real model), because the real SDK path behaves differently than a mock. If you don't have a real-provider environment, say so in the PR and a maintainer will run it before merge.
 
 A throwaway harness for this should live in the repo root (not `/tmp`, whose symlink breaks relative imports), import from `./src`, and be deleted before commit — don't commit harnesses.
+
+## Protected workflow-authoring guidance
+
+The goal is to keep workflow guidance accurate as the runtime changes without bloating the context sent to every model. Stable capability facts come from the executable capability contract and generated documentation. Detailed authoring guidance lives in the on-demand `workflow-authoring` skill instead of the permanent prompt. Context checks keep these surfaces from growing unnoticed.
+
+Some files under `skills/workflow-authoring/` contain mixed or partially behavior-covered guidance. Their full-file SHA-256 hashes in `WORKFLOW_AUTHORING_FROZEN_FILES` (`src/workflow-authoring-coverage.ts`) are explicit review checkpoints, not proof that the wording is correct.
+
+If `PROTECTED_GUIDANCE_DRIFT` reports an accidental change, revert it. For housekeeping such as a typo, link, formatting, or version update, deterministic checks and review are enough. For a semantic guidance change, inspect the affected coverage manifest entry, update relevant behavioral tests, and review provider evidence when needed. Required anchors and required text in the manifest may also need deliberate updates.
+
+After that review, explicitly accept each changed frozen file:
+
+```bash
+npm run guidance:accept -- skills/workflow-authoring/path/to/file
+```
+
+The command updates only explicitly named frozen files and prints each old and new hash for review. It does not update protected anchors or required text. `npm run guidance:generate` refreshes only the non-contractual prose baseline; it does not update protected hashes. Validate the accepted change with exactly:
+
+```bash
+npm run docs:check
+npm run context:check
+npm run guidance:check
+npm run release:verify
+```
 
 ## Style
 
