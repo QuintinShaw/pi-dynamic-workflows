@@ -114,20 +114,47 @@ test("generateCodebaseAuditWorkflow includes validator and report phases", () =>
   assert.match(body, /report-writer/);
 });
 
-test("generateCodebaseAuditWorkflow escapes single quotes in scope", () => {
-  const body = generateCodebaseAuditWorkflow("it's a test", ["check"]);
-  // Should not contain unescaped quotes that would break the script
-  assert.ok(!body.includes("it's") || body.includes("it\\'s"), "should not contain it's");
+test("generateCodebaseAuditWorkflow embeds a scope/check containing quotes/backticks as a valid, parseable script", () => {
+  const tricky = 'it\'s a "test" with `backticks` and \\backslashes\\';
+  const body = generateCodebaseAuditWorkflow(tricky, ["find TODO's", 'quote "marks"', "back`ticks`"]);
+  // JSON.stringify-embedded values must round-trip through parsing/execution
+  // without breaking out of the generated script (see the quote-injection fix).
+  const { meta } = parseWorkflowScript(body);
+  assert.equal(meta.name, "codebase_audit");
 });
 
-test("generateCodebaseAuditWorkflow truncates long scope names", () => {
+test("generateCodebaseAuditWorkflow running with quote-laden scope/checks executes without a parse error", async () => {
+  const tricky = 'it\'s a "test" with `backticks`';
+  const body = generateCodebaseAuditWorkflow(tricky, ["find TODO's"]);
+  const seenScopes: string[] = [];
+  const result = await runWorkflow(body, {
+    agent: {
+      async run(prompt: string) {
+        seenScopes.push(prompt);
+        return "ok";
+      },
+    },
+    persistLogs: false,
+  });
+  assert.equal(result.agentCount, 3, "the check agent + validator + report agents all run without throwing");
+  assert.ok(
+    seenScopes.some((p) => p.includes(tricky)),
+    "the full, untruncated scope should reach the check agent's prompt",
+  );
+});
+
+test("generateCodebaseAuditWorkflow truncates only the display description, never the operative scope", () => {
   const long = "x".repeat(100);
   const body = generateCodebaseAuditWorkflow(long, ["check"]);
-  // The scope in the script is .slice(0, 60), so the full 100-char string should not appear
-  const fullString = "x".repeat(100);
-  assert.ok(!body.includes(fullString), "should not contain the full 100-char string verbatim");
-  // But the truncated 60-char version should appear
-  assert.ok(body.includes("x".repeat(60)), "should contain the truncated 60-char version");
+  // The operative `const scope = ...` must carry the full, untruncated value —
+  // a truncated operative scope would silently narrow what gets audited.
+  assert.ok(body.includes(JSON.stringify(long)), "the operative scope must be the full 100-char string");
+  // The human-readable meta.description is display-only and may be truncated.
+  assert.ok(body.includes(`${"x".repeat(60)}…`), "meta.description should show the truncated, ellipsized scope");
+  assert.ok(
+    !body.includes(JSON.stringify(`Codebase audit: ${long}`)),
+    "meta.description itself should not contain the full untruncated scope",
+  );
 });
 
 // ─── Multi-Perspective ──────────────────────────────────────────────────────────
@@ -165,6 +192,33 @@ test("generateMultiPerspectiveWorkflow returns analyses and synthesis", () => {
   const body = generateMultiPerspectiveWorkflow("topic", ["p1"]);
   assert.match(body, /analyses/);
   assert.match(body, /synthesis/);
+});
+
+test("generateMultiPerspectiveWorkflow embeds a topic/perspective containing quotes/backticks as a valid, parseable script", () => {
+  const trickyTopic = 'it\'s a "test" with `backticks` and \\backslashes\\';
+  const body = generateMultiPerspectiveWorkflow(trickyTopic, ["user's view", 'quote "marks"', "back`ticks`"]);
+  const { meta } = parseWorkflowScript(body);
+  assert.equal(meta.name, "multi_perspective_analysis");
+});
+
+test("generateMultiPerspectiveWorkflow running with quote-laden topic/perspectives executes without a parse error", async () => {
+  const trickyTopic = 'it\'s a "test" with `backticks`';
+  const body = generateMultiPerspectiveWorkflow(trickyTopic, ["user's view", "another's angle"]);
+  const seenPrompts: string[] = [];
+  const result = await runWorkflow(body, {
+    agent: {
+      async run(prompt: string) {
+        seenPrompts.push(prompt);
+        return "ok";
+      },
+    },
+    persistLogs: false,
+  });
+  assert.equal(result.agentCount, 3, "2 perspective agents + the synthesizer all run without throwing");
+  assert.ok(
+    seenPrompts.some((p) => p.includes(trickyTopic)),
+    "the full topic should reach a perspective agent's prompt",
+  );
 });
 
 // ─── Web Tools ──────────────────────────────────────────────────────────────────

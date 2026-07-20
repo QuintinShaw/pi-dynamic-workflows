@@ -190,6 +190,10 @@ test("createWorkflowTool invalid args throws descriptive error", () => {
     const prepare = tool.prepareArguments as (args: unknown) => unknown;
     assert.throws(() => prepare({ script: 123 }), /script.*string/);
     assert.throws(() => prepare("not-an-object"), /object argument/);
+    assert.throws(() => prepare({}), /script.*name/i, "neither `script` nor `name` should throw clearly");
+    // A malformed `script` alongside `name` must not be silently coerced away
+    // — it should throw the same way a malformed script-only call does.
+    assert.throws(() => prepare({ name: "deep-research", script: 123 }), /script.*string/i);
   }
 });
 

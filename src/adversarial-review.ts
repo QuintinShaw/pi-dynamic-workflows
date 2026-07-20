@@ -74,18 +74,28 @@ return { total: findings.length, survivors, report }`;
 
 /**
  * Generate a multi-perspective analysis workflow.
+ *
+ * `topic` and each `perspectives` entry are user-supplied strings baked
+ * directly into the generated script's source, so every one is embedded via
+ * JSON.stringify — a proper JS string literal that can't be broken out of by
+ * a quote, backslash, or backtick in the value.
  */
 export function generateMultiPerspectiveWorkflow(topic: string, perspectives: string[]): string {
   const perspectiveAgents = perspectives
-    .map(
-      (p, _i) =>
-        `  () => agent('Analyze from ${p} perspective: ' + topic, { label: '${p.toLowerCase().replace(/\\s+/g, "-")}' }),`,
-    )
+    .map((p, i) => {
+      const label =
+        p
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, "-")
+          .replace(/^-+|-+$/g, "")
+          .slice(0, 20) || `perspective-${i + 1}`;
+      return `  () => agent(${JSON.stringify(`Analyze from ${p} perspective: `)} + topic, { label: ${JSON.stringify(label)} }),`;
+    })
     .join("\n");
 
   return `export const meta = {
   name: 'multi_perspective_analysis',
-  description: 'Analyze from ${perspectives.length} different perspectives',
+  description: ${JSON.stringify(`Analyze from ${perspectives.length} different perspectives`)},
   phases: [
     { title: 'Perspective Analysis' },
     { title: 'Synthesis' },
@@ -93,7 +103,7 @@ export function generateMultiPerspectiveWorkflow(topic: string, perspectives: st
 };
 
 phase('Perspective Analysis');
-const topic = '${topic.replace(/'/g, "\\'")}';
+const topic = ${JSON.stringify(topic)};
 const analyses = await parallel([
 ${perspectiveAgents}
 ]);

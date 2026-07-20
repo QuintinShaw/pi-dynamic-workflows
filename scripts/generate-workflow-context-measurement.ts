@@ -12,14 +12,19 @@ const measurement = check ? measureWorkflowContextSurfaces() : writeWorkflowCont
 const {
   permanentWorkflowPrompt,
   providerVisibleWorkflowToolDefinition,
-  workflowAuthoringSkillDiscovery,
+  registeredSkillsDiscovery,
   workflowAuthoringSkillCorpus,
   representativeAuthoringProfiles,
 } = measurement.surfaces;
 
 console.log(`Permanent workflow prompt: ${permanentWorkflowPrompt.bytes} bytes`);
 console.log(`Provider-visible workflow tool definition: ${providerVisibleWorkflowToolDefinition.bytes} bytes`);
-console.log(`Workflow-authoring skill discovery: ${workflowAuthoringSkillDiscovery.bytes} bytes`);
+console.log(
+  `Registered skills discovery (all ${registeredSkillsDiscovery.skills.length}): ${registeredSkillsDiscovery.bytes} bytes`,
+);
+for (const skill of registeredSkillsDiscovery.skills) {
+  console.log(`  - ${skill.root}: ${skill.bytes} bytes`);
+}
 console.log(
   `Workflow-authoring skill corpus: ${workflowAuthoringSkillCorpus.bytes} bytes across ${workflowAuthoringSkillCorpus.files} files`,
 );

@@ -82,15 +82,27 @@ interface ByteSurface {
   bytes: number;
 }
 
+/** One registered skill's always-on discovery-entry byte cost. */
+export interface SkillDiscoverySurface extends ByteSurface {
+  root: string;
+}
+
 /** Versioned byte measurements for always-on, discovery, corpus, and representative authoring surfaces. */
 export interface WorkflowContextMeasurement {
-  formatVersion: 2;
+  formatVersion: 3;
   encoding: "utf8";
-  sources: ["src/workflow-tool.ts", "skills/workflow-authoring"];
+  sources: ["src/workflow-tool.ts", "skills/workflow-authoring", "package.json#pi.skills"];
   surfaces: {
     permanentWorkflowPrompt: ByteSurface;
     providerVisibleWorkflowToolDefinition: ByteSurface;
-    workflowAuthoringSkillDiscovery: ByteSurface;
+    /**
+     * Every skill this package registers (package.json's `pi.skills` — read
+     * from disk, not hardcoded here) contributes an always-on discovery entry
+     * (name + description) the model sees regardless of whether the skill is
+     * ever loaded. This sums all of them, not just workflow-authoring, so a
+     * new skill's always-on cost can't silently go untracked.
+     */
+    registeredSkillsDiscovery: ByteSurface & { skills: SkillDiscoverySurface[] };
     ordinaryWorkflowOwnedAlwaysOn: ByteSurface;
     workflowAuthoringSkillCorpus: ByteSurface & { files: number };
     representativeAuthoringProfiles: {
@@ -125,16 +137,33 @@ function skillFiles(root: string): string[] {
   return files.sort();
 }
 
-function skillDiscoveryEntry(root: string): string {
-  const skill = readFileSync(join(root, SKILL_PATH), "utf8");
+/**
+ * Every skill root this package registers, read from package.json's
+ * `pi.skills` array rather than hardcoded — so a newly added skill is picked
+ * up automatically instead of silently missing from the always-on tally.
+ */
+function registeredSkillRoots(root: string): string[] {
+  const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as {
+    pi?: { skills?: unknown };
+  };
+  const skills = manifest.pi?.skills;
+  if (!Array.isArray(skills) || skills.length === 0 || !skills.every((s) => typeof s === "string")) {
+    throw new Error("package.json must declare a non-empty pi.skills array of skill root paths");
+  }
+  return skills;
+}
+
+function skillDiscoveryEntry(root: string, skillRoot: string): string {
+  const skillPath = `${skillRoot}/SKILL.md`;
+  const skill = readFileSync(join(root, skillPath), "utf8");
   const name = /^name:\s*(.+)$/m.exec(skill)?.[1]?.trim();
   const description = /^description:\s*(.+)$/m.exec(skill)?.[1]?.trim();
-  if (!name || !description) throw new Error(`${SKILL_PATH} must declare name and description`);
+  if (!name || !description) throw new Error(`${skillPath} must declare name and description`);
   return [
     "<skill>",
     `  <name>${name}</name>`,
     `  <description>${description}</description>`,
-    `  <location>${SKILL_PATH}</location>`,
+    `  <location>${skillPath}</location>`,
     "</skill>",
   ].join("\n");
 }
@@ -159,7 +188,13 @@ export function measureWorkflowContextSurfaces(root: string = ROOT): WorkflowCon
     description: tool.description,
     parameters: tool.parameters,
   });
-  const discoveryEntry = skillDiscoveryEntry(root);
+  const skillRoots = registeredSkillRoots(root);
+  const skillDiscoverySurfaces: SkillDiscoverySurface[] = skillRoots.map((skillRoot) => ({
+    root: skillRoot,
+    serialization: "UTF-8 bytes of normalized Pi skill XML with package-relative location",
+    bytes: bytes(skillDiscoveryEntry(root, skillRoot)),
+  }));
+  const registeredSkillsDiscoveryBytes = skillDiscoverySurfaces.reduce((sum, surface) => sum + surface.bytes, 0);
   const corpusFiles = skillFiles(root);
   const corpusBytes = corpusFiles.reduce((sum, path) => sum + fileBytes(root, path), 0);
   const profiles = WORKFLOW_AUTHORING_PROFILES.map((profile) => ({
@@ -169,12 +204,11 @@ export function measureWorkflowContextSurfaces(root: string = ROOT): WorkflowCon
   }));
   const promptBytes = bytes(permanentWorkflowPrompt);
   const toolBytes = bytes(providerVisibleWorkflowToolDefinition);
-  const discoveryBytes = bytes(discoveryEntry);
 
   return {
-    formatVersion: 2,
+    formatVersion: 3,
     encoding: "utf8",
-    sources: ["src/workflow-tool.ts", "skills/workflow-authoring"],
+    sources: ["src/workflow-tool.ts", "skills/workflow-authoring", "package.json#pi.skills"],
     surfaces: {
       permanentWorkflowPrompt: {
         serialization: "UTF-8 bytes of LF-joined Pi prompt lines",
@@ -184,14 +218,16 @@ export function measureWorkflowContextSurfaces(root: string = ROOT): WorkflowCon
         serialization: "UTF-8 bytes of JSON.stringify({ name, description, parameters })",
         bytes: toolBytes,
       },
-      workflowAuthoringSkillDiscovery: {
-        serialization: "UTF-8 bytes of normalized Pi skill XML with package-relative location",
-        bytes: discoveryBytes,
+      registeredSkillsDiscovery: {
+        serialization:
+          "sum of UTF-8 bytes of normalized Pi skill XML (name + description + location) across every root in package.json's pi.skills",
+        bytes: registeredSkillsDiscoveryBytes,
+        skills: skillDiscoverySurfaces,
       },
       ordinaryWorkflowOwnedAlwaysOn: {
         serialization:
-          "sum of permanent prompt, provider-visible tool definition, and normalized skill discovery bytes",
-        bytes: promptBytes + toolBytes + discoveryBytes,
+          "sum of permanent prompt, provider-visible tool definition, and every registered skill's discovery bytes",
+        bytes: promptBytes + toolBytes + registeredSkillsDiscoveryBytes,
       },
       workflowAuthoringSkillCorpus: {
         serialization: "sum of UTF-8 bytes for every file under skills/workflow-authoring",

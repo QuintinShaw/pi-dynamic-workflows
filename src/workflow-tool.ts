@@ -433,9 +433,14 @@ function normalizeWorkflowToolArgs(args: unknown): WorkflowToolInput {
     throw new Error("workflow requires an object argument with a `script` string or a `name`");
   const value = args as Record<string, unknown>;
   // `name` resolves a saved/built-in workflow at execute() time, so `script` is
-  // optional here — but when both are given as strings, normalize `script` too
-  // (name still wins; script is otherwise unused for this call).
+  // optional here — but if `script` is present at all it must still be a
+  // string (same requirement as the script-only path below), so a caller
+  // passing a malformed `script` alongside `name` gets a clear error instead
+  // of it being silently dropped.
   if (typeof value.name === "string" && value.name.trim()) {
+    if (value.script !== undefined && typeof value.script !== "string") {
+      throw new Error("workflow's `script` must be a string when provided alongside `name`");
+    }
     return {
       ...value,
       name: value.name.trim(),
