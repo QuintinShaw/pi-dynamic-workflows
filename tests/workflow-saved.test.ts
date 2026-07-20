@@ -299,3 +299,103 @@ test(
     assert.deepEqual(storage.list(), []);
   }),
 );
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Write safety: atomic write-with-backup + corrupt-file recovery, unified
+// with run-persistence.ts via fs-persistence.ts (previously saved-workflow
+// writes were a plain writeFileSync with no backup/recovery).
+// ═══════════════════════════════════════════════════════════════════════════
+
+test(
+  "createWorkflowStorage save writes atomically (tmp+rename, no leftover .tmp) and leaves a .bak",
+  withIsolatedHome(async (cwd) => {
+    const storage = createWorkflowStorage(cwd);
+    storage.save({ name: "atomic-wf", description: "d", script: "s" });
+    const path = join(workflowProjectPaths(cwd).savedDir, "atomic-wf.json");
+    assert.ok(existsSync(path), "primary written");
+    assert.ok(existsSync(`${path}.bak`), ".bak written");
+    assert.equal(existsSync(`${path}.tmp`), false, "no leftover .tmp");
+  }),
+);
+
+test(
+  "createWorkflowStorage save survives a simulated crash mid-write: a rename that never completes leaves the previous good file intact",
+  withIsolatedHome(async (cwd) => {
+    const storage = createWorkflowStorage(cwd, {
+      // Simulate a crash between the .tmp write and the rename: the .tmp
+      // lands on disk but the atomic rename into place never happens. The
+      // previously-saved good primary must still be there and loadable —
+      // exactly the property tmp+rename is supposed to give us.
+      renameSync: () => {
+        throw new Error("simulated crash before rename completed");
+      },
+    });
+    const goodStorage = createWorkflowStorage(cwd);
+    goodStorage.save({ name: "crash-wf", description: "good version", script: "good script" });
+
+    assert.throws(() => storage.save({ name: "crash-wf", description: "new version", script: "new script" }));
+
+    // The primary file must be untouched — still the last good save.
+    const recovered = goodStorage.load("crash-wf");
+    assert.equal(recovered?.description, "good version", "primary is unaffected by the failed rename");
+    assert.equal(recovered?.script, "good script");
+  }),
+);
+
+test(
+  "createWorkflowStorage load recovers from .bak when the primary is corrupt",
+  withIsolatedHome(async (cwd) => {
+    const storage = createWorkflowStorage(cwd);
+    storage.save({ name: "corrupt-recovery", description: "good", script: "good script" });
+    const path = join(workflowProjectPaths(cwd).savedDir, "corrupt-recovery.json");
+    writeFileSync(path, "{ truncated by a crash", "utf-8");
+
+    const loaded = storage.load("corrupt-recovery");
+    assert.ok(loaded, "load falls back to the intact .bak");
+    assert.equal(loaded?.script, "good script");
+  }),
+);
+
+test(
+  "createWorkflowStorage delete removes the .bak sidecar too",
+  withIsolatedHome(async (cwd) => {
+    const storage = createWorkflowStorage(cwd);
+    storage.save({ name: "del-bak", description: "d", script: "s" });
+    const path = join(workflowProjectPaths(cwd).savedDir, "del-bak.json");
+    assert.ok(existsSync(`${path}.bak`), ".bak exists before delete");
+    storage.delete("del-bak");
+    assert.equal(existsSync(path), false);
+    assert.equal(existsSync(`${path}.bak`), false, ".bak cleaned up too");
+  }),
+);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Unguarded directory read: list() must degrade to "no files" for a missing
+// or unreadable directory instead of throwing (same guard run-persistence.ts
+// uses, via the shared listJsonFilesSafe()).
+// ═══════════════════════════════════════════════════════════════════════════
+
+test(
+  "createWorkflowStorage list returns empty (not throw) when a saved-workflow directory is unreadable",
+  withIsolatedHome(async (cwd) => {
+    const storage = createWorkflowStorage(cwd, {
+      readdirSync: () => {
+        throw new Error("EACCES: permission denied, scandir");
+      },
+    });
+    // Make sure the directory actually exists, so the throwing readdirSync
+    // path (not the pre-existing existsSync-false path) is what's exercised.
+    mkdirSync(workflowProjectPaths(cwd).savedDir, { recursive: true });
+
+    assert.deepEqual(storage.list(), [], "an unreadable directory degrades to an empty list, not a thrown error");
+  }),
+);
+
+test(
+  "createWorkflowStorage list returns empty for a project directory that was never created",
+  withIsolatedHome(async (cwd) => {
+    const storage = createWorkflowStorage(cwd);
+    assert.equal(existsSync(workflowProjectPaths(cwd).savedDir), false, "directory really doesn't exist yet");
+    assert.deepEqual(storage.list(), []);
+  }),
+);

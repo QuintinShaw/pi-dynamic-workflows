@@ -15,6 +15,12 @@ export interface WorkflowSettings {
   /** Literal keyword that arms workflows mode from interactive input. */
   keywordTriggerWord?: string;
   defaultAgentTimeoutMs?: number | null;
+  /**
+   * Default hard token budget applied to runs that don't pass their own
+   * `tokenBudget` (#68). null explicitly means "no budget" (useful in a
+   * project override to cancel a global budget); omitted also means no budget.
+   */
+  defaultTokenBudget?: number | null;
   /** Default max concurrent agents per run. Clamped to the runtime maximum. */
   defaultConcurrency?: number;
   /** Default retry attempts after recoverable agent failures. */
@@ -31,10 +37,18 @@ export interface WorkflowSettings {
    */
   persistAgentSessions?: boolean;
   /**
-   * Character cap on a delivered background-run result's JSON-dump fallback before
-   * truncation (default 400). String/`verdict`/`summary` results are never truncated.
+   * Character cap on a delivered background-run result's JSON-dump fallback
+   * before truncation (default 400). String results and `verdict`/`report`/
+   * `summary`/`synthesis` fields are never truncated.
    */
   deliveredResultMaxChars?: number;
+  /**
+   * Extra tool names to deny in workflow subagent sessions, on top of the
+   * always-on `workflow`/`workflow_control` defaults (#107). Use it to block
+   * other recursive-orchestration tools you have installed (e.g. a pi-subagents
+   * tool) so a subagent can't fan out through them.
+   */
+  excludeSubagentTools?: string[];
 }
 
 export interface WorkflowSettingsStore {
@@ -132,6 +146,12 @@ function normalizeSettings(value: unknown): WorkflowSettings {
   ) {
     settings.defaultAgentTimeoutMs = raw.defaultAgentTimeoutMs;
   }
+  if (raw.defaultTokenBudget === null) {
+    settings.defaultTokenBudget = null;
+  } else {
+    const defaultTokenBudget = normalizeInteger(raw.defaultTokenBudget, 1, Number.MAX_SAFE_INTEGER);
+    if (defaultTokenBudget !== undefined) settings.defaultTokenBudget = defaultTokenBudget;
+  }
   const defaultConcurrency = normalizeInteger(raw.defaultConcurrency, 1, MAX_CONCURRENCY);
   if (defaultConcurrency !== undefined) settings.defaultConcurrency = defaultConcurrency;
   const defaultAgentRetries = normalizeInteger(raw.defaultAgentRetries, 0, MAX_AGENT_RETRIES);
@@ -151,6 +171,10 @@ function normalizeSettings(value: unknown): WorkflowSettings {
   }
   const deliveredResultMaxChars = normalizeInteger(raw.deliveredResultMaxChars, 1, 1_000_000);
   if (deliveredResultMaxChars !== undefined) settings.deliveredResultMaxChars = deliveredResultMaxChars;
+  if (Array.isArray(raw.excludeSubagentTools)) {
+    const names = raw.excludeSubagentTools.filter((t): t is string => typeof t === "string" && t.trim().length > 0);
+    if (names.length) settings.excludeSubagentTools = names;
+  }
   return settings;
 }
 

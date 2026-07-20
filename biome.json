@@ -1,7 +1,14 @@
 {
   "$schema": "https://biomejs.dev/schemas/2.4.16/schema.json",
   "files": {
-    "includes": ["**", "!dist", "!node_modules", "!.pi"]
+    "includes": [
+      "**",
+      "!dist",
+      "!node_modules",
+      "!.pi",
+      "!docs/workflow-context-surfaces.json",
+      "!skills/workflow-authoring/examples/*.js"
+    ]
   },
   "formatter": {
     "enabled": true,

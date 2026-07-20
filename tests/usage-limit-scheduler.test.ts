@@ -258,6 +258,151 @@ test("attempt cap reached: gives up, arms no further timers", async () => {
   scheduler.dispose();
 });
 
+test("cold start past the cap: no growth, no timer, no repeated give-up log (#106)", async () => {
+  const manager = new FakeManager();
+  manager.persistence.seed(
+    makeRun({
+      status: "paused",
+      pauseReason: "usage_limit",
+      resetHint: "resets in 1m",
+      autoResumeAttempts: 4, // already past the cap (maxAttempts 3 → sentinel 4)
+    }),
+  );
+  const diagnostics: string[] = [];
+
+  // Several Pi restarts, each a fresh scheduler (= a cold start). Before the fix,
+  // coldStartRearm() did prior+1 and arm() persisted the raw overflow, so the
+  // counter climbed (5, 6, 7…) and a give-up line printed on every boot.
+  for (let restart = 0; restart < 3; restart++) {
+    const clock = createFakeClock();
+    const scheduler = new UsageLimitScheduler(manager, {
+      now: clock.now,
+      setTimer: clock.setTimer,
+      clearTimer: clock.clearTimer,
+      onDiagnostic: (m) => diagnostics.push(m),
+      ...TUNABLES,
+    });
+    await flush();
+    assert.equal(clock.pendingCount(), 0, `restart ${restart}: no timer armed past the cap`);
+    assert.equal(
+      manager.persistence.get("run-1")?.autoResumeAttempts,
+      4,
+      `restart ${restart}: attempts frozen at the sentinel, never incremented`,
+    );
+    scheduler.dispose();
+  }
+
+  assert.equal(
+    diagnostics.filter((m) => m.includes("giving up")).length,
+    0,
+    "an already-given-up run must not re-log the give-up diagnostic on every cold start",
+  );
+});
+
+test("cold start crossing the cap logs give-up exactly once, then freezes (#106)", async () => {
+  const manager = new FakeManager();
+  manager.persistence.seed(
+    makeRun({
+      status: "paused",
+      pauseReason: "usage_limit",
+      resetHint: "resets in 1m",
+      autoResumeAttempts: 3, // exactly at maxAttempts — the next arm crosses the cap
+    }),
+  );
+  const diagnostics: string[] = [];
+  const boot = async () => {
+    const clock = createFakeClock();
+    const scheduler = new UsageLimitScheduler(manager, {
+      now: clock.now,
+      setTimer: clock.setTimer,
+      clearTimer: clock.clearTimer,
+      onDiagnostic: (m) => diagnostics.push(m),
+      ...TUNABLES,
+    });
+    await flush();
+    return { clock, scheduler };
+  };
+
+  const first = await boot();
+  assert.equal(first.clock.pendingCount(), 0, "crossing the cap arms no timer");
+  first.scheduler.dispose();
+  const second = await boot();
+  second.scheduler.dispose();
+
+  assert.equal(
+    manager.persistence.get("run-1")?.autoResumeAttempts,
+    4,
+    "counter freezes at the sentinel (maxAttempts + 1), not 5+",
+  );
+  assert.equal(
+    diagnostics.filter((m) => m.includes("giving up")).length,
+    1,
+    "give-up logs once at the crossing, not again on the next cold start",
+  );
+});
+
+test("a manual resume clears the given-up state and resets the counter", async () => {
+  const manager = new FakeManager();
+  manager.persistence.seed(
+    makeRun({
+      status: "paused",
+      pauseReason: "usage_limit",
+      resetHint: "resets in 10m",
+      autoResumeAttempts: 4, // already given up (cap 3)
+    }),
+  );
+  const clock = createFakeClock();
+  const scheduler = new UsageLimitScheduler(manager, {
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    ...TUNABLES,
+  });
+  await flush();
+  assert.equal(scheduler.hasArmedTimer("run-1"), false, "given-up run arms nothing on cold start");
+
+  // User resumes via /workflows → the manager emits "resumed" (not our timer).
+  manager.emit("resumed", { runId: "run-1" });
+  await flush();
+  assert.equal(scheduler.getAttemptCount("run-1"), undefined, "in-memory given-up state cleared");
+  assert.equal(manager.persistence.get("run-1")?.autoResumeAttempts, 0, "persisted counter reset to 0");
+
+  // A later pause now re-enters the normal backoff from attempt 1.
+  manager.emit("paused", { runId: "run-1", reason: "usage_limit", resetHint: "resets in 10m" });
+  assert.equal(scheduler.hasArmedTimer("run-1"), true, "a fresh attempt is armed after the manual resume");
+  assert.equal(scheduler.getAttemptCount("run-1"), 1, "counter starts over at 1");
+  scheduler.dispose();
+});
+
+test("an auto-resume (our own timer firing) does NOT reset the backoff counter", async () => {
+  const manager = new FakeManager();
+  manager.persistence.seed(makeRun({ resetHint: "resets in 10m" }));
+  // Our resume emits "resumed" the same way the real manager does.
+  manager.resumeImpl = async (runId) => {
+    manager.emit("resumed", { runId });
+    return true;
+  };
+  const clock = createFakeClock();
+  const scheduler = new UsageLimitScheduler(manager, {
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    ...TUNABLES,
+  });
+
+  // Two live pauses climb the counter to 2.
+  manager.emit("paused", { runId: "run-1", reason: "usage_limit", resetHint: "resets in 10m" });
+  manager.emit("paused", { runId: "run-1", reason: "usage_limit", resetHint: "resets in 10m" });
+  assert.equal(scheduler.getAttemptCount("run-1"), 2);
+
+  // The timer fires → our resume() runs and emits "resumed". The counter must be
+  // kept (this is the backoff working), not reset by handleResumed.
+  clock.fireAll();
+  await flush();
+  assert.equal(scheduler.getAttemptCount("run-1"), 2, "auto-resume kept the backoff counter");
+  scheduler.dispose();
+});
+
 test("cold-start re-arm uses REMAINING time, not the full base delay", async () => {
   const manager = new FakeManager();
   const pausedAt = new Date(0);

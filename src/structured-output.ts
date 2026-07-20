@@ -1,4 +1,4 @@
-import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { defineTool } from "@earendil-works/pi-coding-agent";
 import type { Static, TSchema } from "typebox";
 
 export interface StructuredOutputCapture<T = unknown> {
@@ -23,7 +23,7 @@ export function createStructuredOutputTool<TSchemaDef extends TSchema>({
   schema,
   capture,
   name = "structured_output",
-}: StructuredOutputToolOptions<TSchemaDef>): ToolDefinition<TSchemaDef, Static<TSchemaDef>> {
+}: StructuredOutputToolOptions<TSchemaDef>): ReturnType<typeof defineTool<TSchemaDef, Static<TSchemaDef>>> {
   return defineTool({
     name,
     label: "Structured Output",

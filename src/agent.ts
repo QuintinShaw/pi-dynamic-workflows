@@ -6,6 +6,7 @@ import {
   type CreateAgentSessionOptions,
   createAgentSession,
   createCodingTools,
+  DefaultResourceLoader,
   getAgentDir,
   ModelRegistry,
   ModelRuntime,
@@ -205,6 +206,13 @@ export interface WorkflowAgentOptions {
   cwd?: string;
   /** Extra tools available to the subagent in addition to the structured output tool. */
   tools?: ToolDefinition[];
+  /**
+   * Extra tool NAMES to deny in the subagent session, on top of the always-on
+   * defaults ({@link DEFAULT_EXCLUDED_SUBAGENT_TOOLS}). Lets the host exclude
+   * other recursive-orchestration tools it registers (e.g. a pi-subagents tool)
+   * so a workflow subagent can't fan out through them either (#107).
+   */
+  excludeTools?: string[];
   /** Override any createAgentSession option (model, modelRuntime, resourceLoader, etc.). */
   session?: Partial<CreateAgentSessionOptions>;
   /** Extra system guidance prepended to every subagent task. */
@@ -468,9 +476,33 @@ export type AgentRunResult<TSchemaDef extends TSchema | undefined> = TSchemaDef 
   ? Static<TSchemaDef>
   : string;
 
+/**
+ * Orchestration tools ALWAYS denied to workflow subagents. The `workflow` and
+ * `workflow_control` tools are registered globally by the extension, so — unless
+ * excluded — a subagent's session sees them and can start its own independent
+ * background workflows. Those nested runs recursively fan out and are NOT bounded
+ * by the parent run's maxAgents / concurrency / progress / accounting, and can
+ * drain a shared provider quota and pile up paused runs (#107). Callers may deny
+ * additional tool names via WorkflowAgentOptions.excludeTools.
+ */
+export const DEFAULT_EXCLUDED_SUBAGENT_TOOLS = ["workflow", "workflow_control"];
+
+/**
+ * The full subagent tool denylist: the always-on defaults plus any names the
+ * caller added (via WorkflowAgentOptions.excludeTools) or set on the injected
+ * session options. Extracted so the merge — and its order — is unit-testable;
+ * a spread-order regression that dropped the defaults would slip past a test
+ * that only asserts the constant. The SDK dedupes, so overlap is harmless.
+ */
+export function subagentExcludedTools(extra?: string[], sessionExclude?: string[]): string[] {
+  return [...DEFAULT_EXCLUDED_SUBAGENT_TOOLS, ...(sessionExclude ?? []), ...(extra ?? [])];
+}
+
 export class WorkflowAgent {
   private readonly cwd: string;
   private readonly baseTools: ToolDefinition[];
+  /** Extra subagent tool-name denylist, merged with the always-on defaults. */
+  private readonly excludeTools: string[];
   private readonly sessionOptions: Partial<CreateAgentSessionOptions>;
   private readonly persistAgentSessions: boolean;
   private readonly instructions?: string;
@@ -485,15 +517,68 @@ export class WorkflowAgent {
    * loadTierConfig() below for why this is scoped per-instance.
    */
   private tierConfigBox?: { value: ModelTierConfig | null };
+  /**
+   * Shared resource loader for every subagent of this run, built once. See
+   * getSharedResourceLoader — this is the #109 memory mitigation.
+   */
+  private sharedResourceLoaderPromise?: Promise<DefaultResourceLoader>;
 
   constructor(options: WorkflowAgentOptions = {}) {
     this.cwd = options.cwd ?? process.cwd();
     this.baseTools = options.tools ?? createCodingTools(this.cwd);
+    this.excludeTools = options.excludeTools ?? [];
     this.sessionOptions = options.session ?? {};
     this.persistAgentSessions = options.persistAgentSessions ?? false;
     this.instructions = options.instructions;
     this.mainModel = options.mainModel;
     this.sharedRegistry = options.modelRegistry;
+  }
+
+  /**
+   * A resource loader shared by every subagent of this run, built once (#109).
+   *
+   * Without a resourceLoader, createAgentSession() builds a fresh
+   * DefaultResourceLoader per subagent and reloads it — re-running EVERY installed
+   * extension factory each time (verified: N subagents → N factory runs). Each
+   * such factory that arms a load-time timer/listener then roots its subagent
+   * session forever, because AgentSession.dispose() emits no session_shutdown to
+   * run the cleanup — the dominant #109 leak, and one our own extension
+   * (UsageLimitScheduler) can trigger.
+   *
+   * `noExtensions: true` skips loading host extensions; skills, prompts, and
+   * AGENTS.md context still load. The subagent keeps the tools this workflow
+   * hands it via `customTools` (coding tools + any toolset like web-research) —
+   * those are unaffected. What it loses is HOST EXTENSION-REGISTERED tools (MCP
+   * bridges, browser tools, anything a host extension added via ctx.registerTool):
+   * pre-change a subagent session inherited those from the full host extension
+   * set, now it does not, so an agentType `tools` allowlist naming one matches
+   * nothing. This is a deliberate trade-off — it also structurally kills recursive
+   * orchestration in subagents (no extension runtime at all), beyond the name-level
+   * #107 denylist — and must be release-noted. `createAgentSession` with a shared
+   * resourceLoader is a supported embedding pattern. runWorkflow builds one
+   * WorkflowAgent per run, so this loader's lifetime is exactly one run: built
+   * once, reused by all its subagents, then dropped with the agent.
+   */
+  private getSharedResourceLoader(agentDir: string): Promise<DefaultResourceLoader> {
+    if (!this.sharedResourceLoaderPromise) {
+      this.sharedResourceLoaderPromise = (async () => {
+        const loader = new DefaultResourceLoader({
+          cwd: this.cwd,
+          agentDir,
+          settingsManager: SettingsManager.create(this.cwd, agentDir),
+          noExtensions: true,
+        });
+        await loader.reload();
+        return loader;
+      })().catch((err) => {
+        // Don't let a transient build failure (e.g. EMFILE during reload's disk
+        // I/O) poison every subagent AND every retry of this run — clear the memo
+        // so the next caller rebuilds instead of replaying the same rejection.
+        this.sharedResourceLoaderPromise = undefined;
+        throw err;
+      });
+    }
+    return this.sharedResourceLoaderPromise;
   }
 
   /**
@@ -607,6 +692,18 @@ export class WorkflowAgent {
     }
 
     if (options.schema) {
+      // Strict OpenAI-compatible providers (e.g. DeepSeek) reject a tool whose top-level
+      // parameters schema isn't a JSON object with a transport-level 400, before any of
+      // this file's SCHEMA_NONCOMPLIANCE/empty-output classification ever runs. Fail fast
+      // here instead, so a script's non-object opts.schema surfaces a clear workflow error.
+      const schemaType = (options.schema as { type?: unknown }).type;
+      if (schemaType !== "object") {
+        throw new WorkflowError(
+          `agent() opts.schema must be a top-level JSON object schema (type: "object") — got type: ${schemaType ?? "undefined"}; wrap array/primitive results in an object, e.g. { type: "object", properties: { items: <your schema> } }`,
+          WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+          { recoverable: false },
+        );
+      }
       customTools.push(createStructuredOutputTool({ schema: options.schema, capture }) as unknown as ToolDefinition);
     }
 
@@ -663,6 +760,11 @@ export class WorkflowAgent {
       // not have valid auth, causing silent empty responses.
       settingsManager: SettingsManager.create(this.cwd, agentDir),
       customTools,
+      // Shared per-run loader with no host extensions (#109) — see
+      // getSharedResourceLoader. An injected resourceLoader (tests / embedders)
+      // wins and skips the shared build entirely; the ...this.sessionOptions
+      // spread below re-applies the same injected value harmlessly.
+      resourceLoader: this.sessionOptions.resourceLoader ?? (await this.getSharedResourceLoader(agentDir)),
       // Share the resolved registry's ModelRuntime (catalog + auth, including
       // extension-registered providers) with the subagent session. pi >= 0.80.8
       // takes modelRuntime here; the old modelRegistry option is gone.
@@ -671,6 +773,10 @@ export class WorkflowAgent {
       // Per-call model/thinking wins over any sessionOptions defaults.
       ...(resolvedModel ? { model: resolvedModel } : {}),
       ...(resolvedThinkingLevel ? { thinkingLevel: resolvedThinkingLevel } : {}),
+      // Deny recursive-orchestration tools in the subagent (#107). Placed after
+      // the sessionOptions spread so it always applies; folds in any denylist
+      // the caller set on sessionOptions rather than dropping it.
+      excludeTools: subagentExcludedTools(this.excludeTools, this.sessionOptions.excludeTools),
     });
 
     // Name the persisted session so it's identifiable in session pickers.
@@ -721,7 +827,11 @@ export class WorkflowAgent {
         )) as AgentRunResult<TSchemaDef>;
       }
 
-      const text = this.lastAssistantText(session.messages);
+      // Unstructured result: require assistant text AFTER the last tool result.
+      // Text emitted before it is stale progress (the agent's last real action was
+      // a tool call) — accepting it would report an incomplete run as successful
+      // and suppress the AGENT_EMPTY_OUTPUT retry (#111).
+      const text = this.finalAssistantText(session.messages);
       if (!text.trim()) {
         throw new WorkflowError("Subagent produced no assistant output", WorkflowErrorCode.AGENT_EMPTY_OUTPUT, {
           recoverable: true,
@@ -775,6 +885,37 @@ export class WorkflowAgent {
 
   private lastAssistantText(messages: unknown[]): string {
     for (let i = messages.length - 1; i >= 0; i--) {
+      const message = messages[i] as Partial<AssistantMessage> | undefined;
+      if (message?.role !== "assistant" || !Array.isArray(message.content)) continue;
+      const text = message.content
+        .filter((part): part is TextContent => part.type === "text")
+        .map((part) => part.text)
+        .join("");
+      if (text.trim()) return text;
+    }
+    return "";
+  }
+
+  /**
+   * The unstructured agent's FINAL answer: assistant text that appears after the
+   * last tool result. Text before the final tool result is stale progress (the
+   * agent's last real action was a tool call, not answering), so returning it
+   * would mask an incomplete run and suppress AGENT_EMPTY_OUTPUT retries (#111).
+   *
+   * Distinct from lastAssistantText(), which stays deliberately lenient — the
+   * schema path's prose-JSON recovery (resolveStructuredOutput) may need to read
+   * the structured payload out of any assistant message, not only the terminal one.
+   */
+  private finalAssistantText(messages: unknown[]): string {
+    // Locate the last tool result; only assistant text strictly after it counts.
+    let lastToolResult = -1;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if ((messages[i] as { role?: string } | undefined)?.role === "toolResult") {
+        lastToolResult = i;
+        break;
+      }
+    }
+    for (let i = messages.length - 1; i > lastToolResult; i--) {
       const message = messages[i] as Partial<AssistantMessage> | undefined;
       if (message?.role !== "assistant" || !Array.isArray(message.content)) continue;
       const text = message.content

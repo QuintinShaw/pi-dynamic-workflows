@@ -222,6 +222,21 @@ export function formatTierFallbackNotice(
 // ---------------------------------------------------------------------------
 
 /**
+ * True iff `value` is a usable tiers map: a plain (non-array) object with at
+ * least one entry, every key and value a non-empty string. Anything else
+ * (an array, `{}`, or a tier mapped to `""`) is treated as absent rather than
+ * a truthy-but-broken config — resolveTierModel would silently resolve such
+ * entries to `undefined`/`""` while the caller's "no model-tiers.json
+ * configured" warning only fires on an exactly-null config.
+ */
+function isValidTiersMap(value: unknown): value is Record<string, string> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const entries = Object.entries(value as Record<string, unknown>);
+  if (entries.length === 0) return false;
+  return entries.every(([key, val]) => key.trim().length > 0 && typeof val === "string" && val.trim().length > 0);
+}
+
+/**
  * Load the model tier config from disk. Returns null if the file does not
  * exist or is unparseable (callers fall back to a default).
  */
@@ -232,10 +247,7 @@ export function loadModelTierConfig(configPath?: string): ModelTierConfig | null
     const raw = readFileSync(path, "utf-8");
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== "object") return null;
-    if (!parsed.tiers || typeof parsed.tiers !== "object") return null;
-    for (const val of Object.values(parsed.tiers)) {
-      if (typeof val !== "string") return null;
-    }
+    if (!isValidTiersMap(parsed.tiers)) return null;
     return parsed as ModelTierConfig;
   } catch {
     return null;
@@ -244,8 +256,18 @@ export function loadModelTierConfig(configPath?: string): ModelTierConfig | null
 
 /**
  * Save a model tier config to disk. Creates parent directories if needed.
+ *
+ * Refuses a degenerate `tiers` (e.g. all-empty-string, from buildDefaultTierConfig
+ * with an empty model registry) using the same isValidTiersMap check the loader
+ * uses — otherwise the write side could produce exactly the shape loadModelTierConfig
+ * now rejects on the next read, silently discarding the "saved" config.
  */
 export function saveModelTierConfig(config: ModelTierConfig, configPath?: string): void {
+  if (!isValidTiersMap(config?.tiers)) {
+    throw new Error(
+      "Refusing to save a degenerate model tier config: tiers must be a non-empty map of tier name to a non-empty model spec string.",
+    );
+  }
   const path = configPath ?? getModelTierConfigPath();
   const dir = dirname(path);
   if (!existsSync(dir)) {

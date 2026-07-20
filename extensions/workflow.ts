@@ -1,12 +1,13 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { createCodingTools, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   createEffortState,
+  createWebTools,
   createWorkflowControlTool,
   createWorkflowStorage,
   createWorkflowTool,
   installResultDelivery,
   installTaskPanel,
-  installWorkflowEditor,
+  installWorkflowKeywordArming,
   loadWorkflowSettings,
   registerAllSavedWorkflows,
   registerBuiltinWorkflows,
@@ -27,7 +28,17 @@ export default function extension(pi: ExtensionAPI) {
   const manager = new WorkflowManager({
     cwd,
     loadSavedWorkflow: (name) => storage.load(name)?.script,
+    // Named toolsets survive on the persisted run (the tag, not the functions),
+    // so a resumed run re-resolves the tools it started with — e.g. a paused
+    // /deep-research keeps web access instead of degrading to coding tools.
+    toolsets: {
+      "web-research": () => [...createCodingTools(cwd), ...createWebTools()],
+    },
+    // On top of the always-on workflow/workflow_control denial in subagents
+    // (#107), let users block additional recursive-orchestration tools.
+    excludeSubagentTools: settings.excludeSubagentTools,
     defaultAgentTimeoutMs: settings.defaultAgentTimeoutMs ?? null,
+    defaultTokenBudget: settings.defaultTokenBudget ?? null,
     concurrency: settings.defaultConcurrency,
     defaultAgentRetries: settings.defaultAgentRetries,
     persistAgentSessions: settings.persistAgentSessions,
@@ -52,13 +63,13 @@ export default function extension(pi: ExtensionAPI) {
   const effort = createEffortState();
   registerWorkflowCommands(pi, manager, { storage, cwd, effort });
   registerWorkflowModelsCommand(pi);
-  registerBuiltinWorkflows(pi, { cwd });
+  registerBuiltinWorkflows(pi, { cwd, manager, storage });
   registerAllSavedWorkflows(pi, cwd, storage, manager);
   registerEffortCommand(pi, effort);
-  // "Workflows mode": type `workflow(s)` to arm a forced workflow (animated),
-  // Backspace right after the word disarms it. Registers the `input` hook now;
-  // the editor itself is installed once the UI is available (session_start).
-  let editorInstalled = false;
+  // "Workflows mode": type `workflow(s)` to arm a forced workflow at submit
+  // time. Installed once (guarded below) inside session_start alongside the
+  // other per-session installers.
+  let armingInstalled = false;
 
   pi.on("session_start", (_event: unknown, ctx: ExtensionContext) => {
     // Tell the manager the session's main model so "explore" agents auto-tier
@@ -90,14 +101,14 @@ export default function extension(pi: ExtensionAPI) {
     // Pass a live settings loader so /workflows-progress (compact|detailed) takes
     // effect without a restart.
     installTaskPanel(pi, manager, ctx.ui, { storage, cwd, loadSettings: () => loadWorkflowSettings({ cwd }) });
-    if (!editorInstalled) {
-      installWorkflowEditor(pi, ctx.ui, effort, {
+    if (!armingInstalled) {
+      installWorkflowKeywordArming(pi, effort, {
         settingsStore: {
           load: () => loadWorkflowSettings({ cwd }),
           save: (nextSettings) => saveWorkflowSettingsForCwd(nextSettings, cwd),
         },
       });
-      editorInstalled = true;
+      armingInstalled = true;
     }
   });
 }

@@ -69,25 +69,27 @@ export function registerSavedWorkflow(
         return;
       }
       try {
-        ctx.ui.notify(`Starting /${wf.name}…`, "info");
-
-        let result: WorkflowRunResult;
         if (manager) {
-          // Run through the WorkflowManager: background execution, visible in
-          // /workflows TUI, task panel, pause/resume/stop support.
-          const { runId, promise } = manager.startInBackground(wf.script, parseCommandArgs(args, wf.parameters));
-          ctx.ui.setStatus(`wf:${wf.name}`, `${wf.name}: running (${runId})`);
-          result = await promise;
-        } else {
-          // Fallback: inline runWorkflow (foreground, no TUI tracking).
-          result = await runWorkflow(wf.script, {
-            cwd,
-            args: parseCommandArgs(args, wf.parameters),
-            tools: createCodingTools(cwd),
-            onPhase: (title) => ctx.ui.setStatus(`wf:${wf.name}`, `${wf.name}: ${title}`),
-          });
+          // Run through the WorkflowManager's background path: the handler
+          // returns immediately (awaiting the promise here would block the whole
+          // session, #104), progress shows in the /workflows TUI and task panel,
+          // and installResultDelivery posts the result back into the
+          // conversation on completion — sending it here too would duplicate it.
+          const { runId } = manager.startInBackground(wf.script, parseCommandArgs(args, wf.parameters));
+          ctx.ui.notify(
+            `/${wf.name} running in the background (${runId}) — watch the task panel or /workflows; the result is posted here when it finishes.`,
+            "info",
+          );
+          return;
         }
-
+        // Fallback: inline runWorkflow (foreground, no TUI tracking, blocks).
+        ctx.ui.notify(`Starting /${wf.name}…`, "info");
+        const result = await runWorkflow(wf.script, {
+          cwd,
+          args: parseCommandArgs(args, wf.parameters),
+          tools: createCodingTools(cwd),
+          onPhase: (title) => ctx.ui.setStatus(`wf:${wf.name}`, `${wf.name}: ${title}`),
+        });
         ctx.ui.setStatus(`wf:${wf.name}`, undefined);
         await pi.sendMessage({ customType: `workflow:${wf.name}`, content: reportText(result), display: true });
       } catch (error) {

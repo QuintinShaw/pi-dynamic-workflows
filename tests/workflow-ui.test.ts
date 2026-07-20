@@ -1,11 +1,20 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import type { Component } from "@earendil-works/pi-tui";
 import type { WorkflowSnapshot } from "../src/display.js";
 import { WorkflowErrorCode } from "../src/errors.js";
 import type { PersistedRunState } from "../src/run-persistence.js";
+import { parseWorkflowScript } from "../src/workflow.js";
 import type { ManagedRun, WorkflowManager } from "../src/workflow-manager.js";
 import type { SavedWorkflow } from "../src/workflow-saved.js";
-import { keyToAction, NavigatorModel, NavigatorState, renderNavigator } from "../src/workflow-ui.js";
+import {
+  keyToAction,
+  NavigatorModel,
+  NavigatorState,
+  openWorkflowNavigator,
+  renderNavigator,
+} from "../src/workflow-ui.js";
 
 /** Fake manager exposing one running run with two phases. */
 function fakeManager(): Pick<WorkflowManager, "listRuns" | "getRun"> {
@@ -265,6 +274,221 @@ test("NavigatorState drills runs -> phases -> agents -> detail and back", () => 
   assert.ok(state.back(), "back() should succeed");
   assert.equal(state.kind, "runs");
   assert.equal(state.back(), false, "back at top returns false (caller closes)");
+});
+
+test("non-string phase titles are coerced, so the navigator never crashes on bad data (#110)", () => {
+  // A corrupt persisted run (or a script that passed a non-string to phase())
+  // could put a non-string into snapshot.phases. It used to reach the SDK's
+  // truncateToWidth(), whose text.slice() threw and crashed the whole overlay.
+  const snapshot: WorkflowSnapshot = {
+    name: "wf",
+    phases: [42 as unknown as string, "Real Phase"],
+    currentPhase: "Real Phase",
+    logs: [],
+    agents: [],
+    agentCount: 0,
+    runningCount: 0,
+    doneCount: 0,
+    errorCount: 0,
+  };
+  const manager: Pick<WorkflowManager, "listRuns" | "getRun"> = {
+    listRuns: () => [
+      {
+        runId: "run-bad",
+        workflowName: "wf",
+        status: "running",
+        phases: snapshot.phases,
+        agents: [],
+        logs: [],
+      } as unknown as PersistedRunState,
+    ],
+    getRun: (id: string) =>
+      id === "run-bad" ? ({ runId: "run-bad", status: "running", snapshot } as unknown as ManagedRun) : undefined,
+  };
+  const model = new NavigatorModel(manager as unknown as WorkflowManager);
+
+  // Data boundary coerces the bad title to a string.
+  const phases = model.phases("run-bad");
+  assert.equal(phases[0].title, "42", "non-string title is coerced to a string");
+  assert.equal(phases[1].title, "Real Phase");
+
+  // Render the exact path that crashed: drilled into the run's phases view.
+  const state = new NavigatorState();
+  assert.ok(state.drill(model), "drill into the run's phases");
+  assert.equal(state.kind, "phases");
+  assert.doesNotThrow(() => renderNavigator(state, model, 80), "rendering must not throw on a non-string title");
+});
+
+test("non-string agent labels and run names are coerced too, not just phase titles (#110)", () => {
+  // Same corrupt-data root cause reaches truncateToWidth() via the agent row
+  // (a.label) and the two-pane header (run name), not only the phase title.
+  const snapshot: WorkflowSnapshot = {
+    name: 999 as unknown as string, // non-string run name → header truncateToWidth
+    phases: ["Work"],
+    currentPhase: "Work",
+    logs: [],
+    agents: [
+      {
+        id: 1,
+        label: 42 as unknown as string, // non-string agent label → agent-row truncateToWidth
+        phase: "Work",
+        prompt: "do it",
+        status: "running",
+        tokens: 0,
+      },
+    ],
+    agentCount: 1,
+    runningCount: 1,
+    doneCount: 0,
+    errorCount: 0,
+  };
+  const manager: Pick<WorkflowManager, "listRuns" | "getRun"> = {
+    listRuns: () => [
+      {
+        runId: "run-corrupt",
+        workflowName: 999 as unknown as string,
+        status: "running",
+        phases: ["Work"],
+        agents: snapshot.agents,
+        logs: [],
+      } as unknown as PersistedRunState,
+    ],
+    getRun: (id: string) =>
+      id === "run-corrupt"
+        ? ({ runId: "run-corrupt", status: "running", snapshot } as unknown as ManagedRun)
+        : undefined,
+  };
+  const model = new NavigatorModel(manager as unknown as WorkflowManager);
+
+  assert.equal(model.runName("run-corrupt"), "999", "non-string run name coerced");
+  assert.equal(model.runs()[0].name, "999", "non-string name coerced in the runs list too");
+  assert.equal(model.agents("run-corrupt", "Work")[0].label, "42", "non-string agent label coerced");
+
+  // The agent grouped under the coerced phase key stays reachable (no lookup drift).
+  assert.equal(model.phases("run-corrupt")[0].total, 1, "agent stays grouped under its phase");
+
+  // Render every view — runs list, phases, and the drilled agent row/header.
+  const state = new NavigatorState();
+  assert.doesNotThrow(() => renderNavigator(state, model, 80), "runs list must not throw");
+  assert.ok(state.drill(model));
+  assert.doesNotThrow(() => renderNavigator(state, model, 80), "phases + agent row + header must not throw");
+});
+
+test("structurally corrupt persisted runs never crash the navigator (#110)", () => {
+  // A non-string status crashed twoPaneHeader (same text.slice signature as #110);
+  // non-array agents/phases crashed the runs list itself so /workflows wouldn't
+  // even open. getRun() returns undefined to force the persisted path.
+  const manager: Pick<WorkflowManager, "listRuns" | "getRun"> = {
+    listRuns: () => [
+      {
+        runId: "corrupt-1",
+        workflowName: { bad: 1 } as unknown as string,
+        status: { obj: true } as unknown as string,
+        phases: null as unknown as string[],
+        agents: null as unknown as [],
+        logs: null as unknown as string[],
+      } as unknown as PersistedRunState,
+    ],
+    getRun: () => undefined,
+  };
+  const model = new NavigatorModel(manager as unknown as WorkflowManager);
+
+  assert.doesNotThrow(() => model.runs(), "runs() must not throw on non-array agents");
+  assert.equal(typeof model.runStatus("corrupt-1"), "string", "non-string status coerced");
+  assert.doesNotThrow(() => model.phases("corrupt-1"), "phases() must not throw on non-array phases");
+  assert.doesNotThrow(() => model.agents("corrupt-1", "x"), "agents() must not throw");
+
+  // The runs list must open, and drilling in must not crash either.
+  assert.doesNotThrow(() => renderNavigator(new NavigatorState(), model, 80), "runs list must render");
+  const state = new NavigatorState();
+  assert.ok(state.drill(model));
+  assert.doesNotThrow(() => renderNavigator(state, model, 80), "drilled view must render (non-string status header)");
+});
+
+test("non-string agent prompt in the detail view is coerced, reachable from a live run (#110)", () => {
+  // agent(42) in a model-written script is never type-checked, so a non-string
+  // prompt reaches the detail view's wrap() and used to crash text.split().
+  const snapshot: WorkflowSnapshot = {
+    name: "wf",
+    phases: ["P"],
+    currentPhase: "P",
+    logs: [],
+    agents: [{ id: 1, label: "a", phase: "P", prompt: 42 as unknown as string, status: "done", tokens: 0 }],
+    agentCount: 1,
+    runningCount: 0,
+    doneCount: 1,
+    errorCount: 0,
+  };
+  const manager: Pick<WorkflowManager, "listRuns" | "getRun"> = {
+    listRuns: () => [
+      {
+        runId: "live-1",
+        workflowName: "wf",
+        status: "running",
+        phases: ["P"],
+        agents: snapshot.agents,
+        logs: [],
+      } as unknown as PersistedRunState,
+    ],
+    getRun: (id: string) =>
+      id === "live-1" ? ({ runId: "live-1", status: "running", snapshot } as unknown as ManagedRun) : undefined,
+  };
+  const model = new NavigatorModel(manager as unknown as WorkflowManager);
+  const state = new NavigatorState();
+  assert.ok(state.drill(model)); // → phases
+  assert.ok(state.drill(model)); // → agents
+  assert.ok(state.drill(model)); // → detail
+  assert.equal(state.kind, "detail");
+  assert.doesNotThrow(() => renderNavigator(state, model, 80), "detail view must not throw on a non-string prompt");
+});
+
+test("a null/primitive element in a corrupt agent history doesn't crash the detail view (#110)", () => {
+  // historyLabel(entry) reads entry.kind; a null element (valid JSON from a
+  // corrupt persisted run) would throw. Live history never emits null entries.
+  const snapshot: WorkflowSnapshot = {
+    name: "wf",
+    phases: ["P"],
+    currentPhase: "P",
+    logs: [],
+    agents: [
+      {
+        id: 1,
+        label: "a",
+        phase: "P",
+        prompt: "do it",
+        status: "error",
+        history: [
+          null as unknown as { role: string; kind: string; text: string },
+          { role: "tool", kind: "toolResult", toolName: "read", text: "ok" },
+        ],
+      },
+    ],
+    agentCount: 1,
+    runningCount: 0,
+    doneCount: 0,
+    errorCount: 1,
+  };
+  const manager: Pick<WorkflowManager, "listRuns" | "getRun"> = {
+    listRuns: () => [
+      {
+        runId: "hist-1",
+        workflowName: "wf",
+        status: "completed",
+        phases: ["P"],
+        agents: snapshot.agents,
+        logs: [],
+      } as unknown as PersistedRunState,
+    ],
+    getRun: (id: string) =>
+      id === "hist-1" ? ({ runId: "hist-1", status: "completed", snapshot } as unknown as ManagedRun) : undefined,
+  };
+  const model = new NavigatorModel(manager as unknown as WorkflowManager);
+  const state = new NavigatorState();
+  assert.ok(state.drill(model));
+  assert.ok(state.drill(model));
+  assert.ok(state.drill(model));
+  assert.equal(state.kind, "detail");
+  assert.doesNotThrow(() => renderNavigator(state, model, 80), "null history entry must be skipped, not crash");
 });
 
 test("NavigatorState cursor wraps and detail scroll clamps at 0", () => {
@@ -809,4 +1033,171 @@ test("runs list aggregates per-agent figures for live runs whose run-level usage
   assert.equal(model.runs()[0].fresh, 1200);
   const lines = renderNavigator(new NavigatorState(), model, 80);
   assert.match(lines.join("\n"), /1,200 tok|1[ .\u00a0]200 tok/);
+});
+
+test("restarting a run with a corrupt persisted script notifies an error instead of crashing the overlay (#330 audit)", async () => {
+  const notifications: { message: string; type?: string }[] = [];
+  const fakeUi = {
+    notify: (message: string, type?: string) => {
+      notifications.push({ message, type });
+    },
+    custom: <T>(
+      factory: (
+        tui: unknown,
+        theme: unknown,
+        keybindings: unknown,
+        done: (result: T) => void,
+      ) => (Component & { dispose?(): void }) | Promise<Component & { dispose?(): void }>,
+    ) => {
+      const tui = { requestRender: () => {}, terminal: { rows: 24 } };
+      const theme = {
+        fg: (_name: string, s: string) => s,
+        bg: (_name: string, s: string) => s,
+        bold: (s: string) => s,
+      };
+      const component = factory(tui, theme, {}, () => {});
+      return Promise.resolve(component).then((c) => {
+        capturedComponent = c;
+        return undefined as unknown as T;
+      });
+    },
+  };
+  let capturedComponent: (Component & { dispose?(): void }) | undefined;
+
+  // A run whose persisted script is missing the required `export const meta`
+  // block \u2014 exactly the kind of corrupt on-disk run-persistence data #330
+  // found no schema validation guards against.
+  const corruptScript = "console.log('not a workflow script')";
+  const fakeManager = {
+    on: () => {},
+    off: () => {},
+    listRuns: () => [
+      {
+        runId: "run-corrupt",
+        workflowName: "corrupt-run",
+        status: "completed",
+        phases: [],
+        agents: [],
+        logs: [],
+        script: corruptScript,
+        args: undefined,
+      } as unknown as PersistedRunState,
+    ],
+    getRun: () => undefined,
+    startInBackground: (script: string) => {
+      // Mirrors the real WorkflowManager.startInBackground, which parses the
+      // script synchronously before doing anything else.
+      parseWorkflowScript(script);
+      return { runId: "should-not-be-reached" };
+    },
+  } as unknown as WorkflowManager;
+
+  openWorkflowNavigator({} as ExtensionAPI, fakeManager, fakeUi as unknown as ExtensionUIContext).catch(() => {});
+
+  // Let the custom()'s factory promise resolve before driving input.
+  await Promise.resolve();
+  await Promise.resolve();
+
+  assert.ok(capturedComponent, "openWorkflowNavigator should have produced a component");
+  assert.doesNotThrow(() => capturedComponent?.handleInput("r"), "restart must not throw/crash the overlay");
+
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].type, "error");
+  assert.match(notifications[0].message, /Failed to restart corrupt-run/);
+});
+
+function fakeUiCapturingComponent(): {
+  ui: ExtensionUIContext;
+  notifications: { message: string; type?: string }[];
+  getComponent: () => (Component & { dispose?(): void }) | undefined;
+} {
+  const notifications: { message: string; type?: string }[] = [];
+  let capturedComponent: (Component & { dispose?(): void }) | undefined;
+  const ui = {
+    notify: (message: string, type?: string) => {
+      notifications.push({ message, type });
+    },
+    custom: <T>(
+      factory: (
+        tui: unknown,
+        theme: unknown,
+        keybindings: unknown,
+        done: (result: T) => void,
+      ) => (Component & { dispose?(): void }) | Promise<Component & { dispose?(): void }>,
+    ) => {
+      const tui = { requestRender: () => {}, terminal: { rows: 24 } };
+      const theme = {
+        fg: (_name: string, s: string) => s,
+        bg: (_name: string, s: string) => s,
+        bold: (s: string) => s,
+      };
+      const component = factory(tui, theme, {}, () => {});
+      return Promise.resolve(component).then((c) => {
+        capturedComponent = c;
+        return undefined as unknown as T;
+      });
+    },
+  } as unknown as ExtensionUIContext;
+  return { ui, notifications, getComponent: () => capturedComponent };
+}
+
+test("deleting a saved workflow whose storage.delete throws (e.g. EACCES) notifies an error instead of crashing the overlay (#330 audit follow-up)", async () => {
+  const { ui, notifications, getComponent } = fakeUiCapturingComponent();
+
+  // No runs, one saved workflow — cursor 0 lands on the saved item (itemKind "saved").
+  const fakeManager = {
+    on: () => {},
+    off: () => {},
+    listRuns: () => [] as PersistedRunState[],
+    getRun: () => undefined,
+  } as unknown as WorkflowManager;
+  const storage = {
+    list: () => [{ name: "flaky", description: "", location: "project", path: "/x", savedAt: "2025-01-01" }],
+    delete: () => {
+      throw new Error("EACCES: permission denied, unlink '/x'");
+    },
+  };
+
+  openWorkflowNavigator({} as ExtensionAPI, fakeManager, ui, { storage }).catch(() => {});
+  await Promise.resolve();
+  await Promise.resolve();
+
+  const component = getComponent();
+  assert.ok(component, "openWorkflowNavigator should have produced a component");
+  assert.doesNotThrow(() => component?.handleInput("x"), "deleteSaved must not throw/crash the overlay");
+
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].type, "error");
+  assert.match(notifications[0].message, /deleteSaved.*failed/);
+  assert.match(notifications[0].message, /EACCES/);
+});
+
+test("stopping a run whose manager.stop throws (cold-run lease/persistence failure) notifies an error instead of crashing the overlay (#330 audit follow-up)", async () => {
+  const { ui, notifications, getComponent } = fakeUiCapturingComponent();
+
+  const fakeManager = {
+    on: () => {},
+    off: () => {},
+    listRuns: () =>
+      [
+        { runId: "run-cold", workflowName: "cold-run", status: "running", phases: [], agents: [], logs: [] },
+      ] as unknown as PersistedRunState[],
+    getRun: () => undefined,
+    stop: () => {
+      throw new Error("ENOSPC: no space left on device");
+    },
+  } as unknown as WorkflowManager;
+
+  openWorkflowNavigator({} as ExtensionAPI, fakeManager, ui).catch(() => {});
+  await Promise.resolve();
+  await Promise.resolve();
+
+  const component = getComponent();
+  assert.ok(component, "openWorkflowNavigator should have produced a component");
+  assert.doesNotThrow(() => component?.handleInput("x"), "stop must not throw/crash the overlay");
+
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].type, "error");
+  assert.match(notifications[0].message, /stop.*failed/);
+  assert.match(notifications[0].message, /ENOSPC/);
 });

@@ -14,7 +14,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -388,6 +388,26 @@ describe("model-tier-config", () => {
       rmSync(tmpDir, { recursive: true, force: true });
     });
 
+    it("refuses to save a degenerate config (all-empty tiers) instead of writing what the loader would reject (#330 audit follow-up)", async () => {
+      const { saveModelTierConfig, loadModelTierConfig } = await loadModule();
+      const tmpDir = mkdtempSync(join(tmpdir(), "mtc-test-"));
+      const cfgPath = join(tmpDir, "model-tiers.json");
+      const degenerate = { tiers: { small: "", medium: "", big: "" } };
+      assert.throws(() => saveModelTierConfig(degenerate, cfgPath), /degenerate/);
+      assert.equal(existsSync(cfgPath), false, "no file should be written");
+      assert.equal(loadModelTierConfig(cfgPath), null);
+      rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    it("refuses to save a config whose tiers is an empty object", async () => {
+      const { saveModelTierConfig } = await loadModule();
+      const tmpDir = mkdtempSync(join(tmpdir(), "mtc-test-"));
+      const cfgPath = join(tmpDir, "model-tiers.json");
+      assert.throws(() => saveModelTierConfig({ tiers: {} }, cfgPath));
+      assert.equal(existsSync(cfgPath), false);
+      rmSync(tmpDir, { recursive: true, force: true });
+    });
+
     it("returns null when file does not exist", async () => {
       const { loadModelTierConfig } = await loadModule();
       assert.equal(loadModelTierConfig(join(tmpdir(), "nonexistent-test-file.json")), null);
@@ -436,6 +456,52 @@ describe("model-tier-config", () => {
       writeFileSync(cfgPath, '{"tiers": {"small": "gpt-4.1-mini"}}', "utf-8");
       const result = loadModelTierConfig(cfgPath);
       assert.equal(result?.tiers.small, "gpt-4.1-mini");
+      rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    it("returns null when tiers is an empty array (#330 audit)", async () => {
+      const { loadModelTierConfig } = await loadModule();
+      const tmpDir = mkdtempSync(join(tmpdir(), "mtc-test-"));
+      const cfgPath = join(tmpDir, "model-tiers.json");
+      writeFileSync(cfgPath, '{"tiers": []}', "utf-8");
+      assert.equal(loadModelTierConfig(cfgPath), null);
+      rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    it("returns null when tiers is a non-empty array (#330 audit)", async () => {
+      const { loadModelTierConfig } = await loadModule();
+      const tmpDir = mkdtempSync(join(tmpdir(), "mtc-test-"));
+      const cfgPath = join(tmpDir, "model-tiers.json");
+      writeFileSync(cfgPath, '{"tiers": ["openai/gpt-4.1-mini", "openai/gpt-5"]}', "utf-8");
+      assert.equal(loadModelTierConfig(cfgPath), null);
+      rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    it("returns null when tiers is an empty object (#330 audit)", async () => {
+      const { loadModelTierConfig } = await loadModule();
+      const tmpDir = mkdtempSync(join(tmpdir(), "mtc-test-"));
+      const cfgPath = join(tmpDir, "model-tiers.json");
+      writeFileSync(cfgPath, '{"tiers": {}}', "utf-8");
+      assert.equal(loadModelTierConfig(cfgPath), null);
+      rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    it("returns null when a tier value is an empty string (#330 audit)", async () => {
+      const { loadModelTierConfig } = await loadModule();
+      const tmpDir = mkdtempSync(join(tmpdir(), "mtc-test-"));
+      const cfgPath = join(tmpDir, "model-tiers.json");
+      writeFileSync(cfgPath, '{"tiers": {"small": ""}}', "utf-8");
+      assert.equal(loadModelTierConfig(cfgPath), null);
+      rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    it("still loads a normal valid config (no regression)", async () => {
+      const { loadModelTierConfig } = await loadModule();
+      const tmpDir = mkdtempSync(join(tmpdir(), "mtc-test-"));
+      const cfgPath = join(tmpDir, "model-tiers.json");
+      writeFileSync(cfgPath, '{"tiers": {"small": "openai/gpt-4.1-mini"}}', "utf-8");
+      const result = loadModelTierConfig(cfgPath);
+      assert.deepEqual(result, { tiers: { small: "openai/gpt-4.1-mini" } });
       rmSync(tmpDir, { recursive: true, force: true });
     });
   });

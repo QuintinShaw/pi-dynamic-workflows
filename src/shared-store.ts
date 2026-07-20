@@ -32,6 +32,15 @@ export class SharedStore {
   // `${runId}:${callIndex}` string (see class doc) so nested workflow() runs
   // sharing this store can't collide on a bare callIndex.
   private readonly agentDeltas = new Map<string, Record<string, unknown>>();
+  // Pre-write shadow values for the CURRENT delta-key's in-progress writes,
+  // so a failed retry attempt's mutations can be rolled back (see
+  // `discardDelta`) instead of leaking into the live store or a later
+  // successful attempt's recorded delta. Populated lazily by `trackPut` (only
+  // the first write to a given key within the current delta window is
+  // shadowed — later writes to the same key within the same attempt are
+  // already covered by that first shadow) and cleared whenever the delta is
+  // finalized, either way, via `commitDelta`/`discardDelta`.
+  private readonly priorValues = new Map<string, Map<string, { existed: boolean; value: unknown }>>();
 
   /** Store a value under `key`. Overwrites any existing value. */
   put(key: string, value: unknown): void {
@@ -45,6 +54,20 @@ export class SharedStore {
    * writes can be journaled and replayed independently.
    */
   trackPut(key: string, value: unknown, deltaKey: string): void {
+    let priors = this.priorValues.get(deltaKey);
+    if (!priors) {
+      priors = new Map();
+      this.priorValues.set(deltaKey, priors);
+    }
+    // Only shadow the value from BEFORE this delta window started writing to
+    // this key — a second write to the same key within the same attempt must
+    // not overwrite the shadow with its own (already-in-window) value.
+    if (!priors.has(key)) {
+      priors.set(
+        key,
+        this.map.has(key) ? { existed: true, value: this.map.get(key) } : { existed: false, value: undefined },
+      );
+    }
     this.map.set(key, value);
     let delta = this.agentDeltas.get(deltaKey);
     if (!delta) {
@@ -76,7 +99,49 @@ export class SharedStore {
   commitDelta(deltaKey: string): Record<string, unknown> {
     const delta = this.agentDeltas.get(deltaKey) ?? {};
     this.agentDeltas.delete(deltaKey);
+    this.priorValues.delete(deltaKey);
     return delta;
+  }
+
+  /**
+   * Undo the writes recorded for `deltaKey` and discard its bookkeeping,
+   * without touching any other key. Used when a retry attempt fails: that
+   * attempt's writes must not remain visible in the live store (e.g. to a
+   * concurrently-running sibling agent's store_get, or to script code reading
+   * `store.get` directly) and must not merge into the delta eventually
+   * recorded when a later attempt of the SAME call succeeds — otherwise a
+   * failed attempt's mutations would silently survive into the run's live
+   * state while being absent from the journaled delta that resume replay
+   * reconstructs from, leaving live execution and replay permanently
+   * inconsistent. Each key touched during this delta window is restored to
+   * whatever it held immediately before the window started (or deleted, if
+   * it did not exist yet) — never to some other attempt's or caller's value.
+   *
+   * Per-key guard: a key is only rolled back if the store STILL holds this
+   * attempt's own last write to it (checked with `Object.is` against the
+   * value recorded in `delta`). If a concurrently-running sibling (a
+   * different `deltaKey`, e.g. another agent in the same parallel() batch)
+   * legitimately overwrote the same key AFTER this attempt wrote it but
+   * BEFORE it failed, that sibling's write is left untouched — rolling back
+   * unconditionally would silently erase a live, unrelated write that this
+   * attempt never made and has no business undoing.
+   *
+   * A no-op if `deltaKey` never wrote anything (nothing to roll back).
+   */
+  discardDelta(deltaKey: string): void {
+    const delta = this.agentDeltas.get(deltaKey);
+    if (!delta) return;
+    const priors = this.priorValues.get(deltaKey);
+    for (const key of Object.keys(delta)) {
+      // Someone else already overwrote this key since our last write to it —
+      // leave their write in place instead of clobbering it with our rollback.
+      if (!Object.is(this.map.get(key), delta[key])) continue;
+      const prior = priors?.get(key);
+      if (prior?.existed) this.map.set(key, prior.value);
+      else this.map.delete(key);
+    }
+    this.agentDeltas.delete(deltaKey);
+    this.priorValues.delete(deltaKey);
   }
 
   /**
@@ -105,6 +170,7 @@ export class SharedStore {
   dispose(): void {
     this.map.clear();
     this.agentDeltas.clear();
+    this.priorValues.clear();
   }
 }
 

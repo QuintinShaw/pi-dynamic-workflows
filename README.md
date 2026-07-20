@@ -84,6 +84,42 @@ return await agent(
 - **Quality patterns** — compose `verify()`, `judgePanel()`, `loopUntilDry()`, and `completenessCheck()` instead of rebuilding review loops.
 - **Reusable workflows** — save any run as a command and call saved workflows from other workflows.
 
+## Supported workflow capabilities
+
+The installed extension generates this compact index from its executable capability contract. Read the [workflow authoring guide](docs/workflow-authoring.md) or use the packaged `workflow-authoring` skill for constraints, lifecycle guidance, and adaptable examples; configured route and agent-type values remain environment-specific.
+
+<!-- BEGIN GENERATED SUPPORTED WORKFLOW CAPABILITIES -->
+| Name | Classification | Signature | Options and defaults |
+| --- | --- | --- | --- |
+| agent | runtime-global | `agent(prompt, options?) => Promise<string \| structured value \| null>` | `label`: string (optional; default: derived from phase and call count)<br>`phase`: string (optional; default: current phase)<br>`schema`: plain JSON Schema (optional)<br>`model`: string (optional)<br>`tier`: string (optional)<br>`isolation`: "worktree" (optional)<br>`agentType`: string (optional)<br>`timeoutMs`: number \| null (optional; default: run timeout; null disables)<br>`retries`: number (optional; default: run retry count) |
+| parallel | runtime-global | `parallel(thunks) => Promise<Array<unknown \| null>>` | — |
+| pipeline | runtime-global | `pipeline(items, ...stages) => Promise<Array<unknown \| null>>` | — |
+| workflow | runtime-global | `workflow(savedName, childArgs?) => Promise<unknown>` | — |
+| verify | runtime-global | `verify(item: unknown, options?: { reviewers?: number; threshold?: number; lens?: string \| string[] }) => Promise<{ real: boolean; realCount: number; total: number; votes: Array<{ real: boolean; reason?: string }> }>` | `reviewers`: number (optional; default: 2)<br>`threshold`: number (optional; default: 0.5)<br>`lens`: string \| string[] (optional) |
+| judgePanel | runtime-global | `judgePanel(attempts: unknown[], options?: { judges?: number; rubric?: string }) => Promise<{ index: number; attempt: unknown; score: number; judgments: Array<{ score: number; reason?: string }> } \| undefined>` | `judges`: number (optional; default: 3)<br>`rubric`: string (optional; default: "overall quality and correctness") |
+| loopUntilDry | runtime-global | `loopUntilDry(options: { round: (roundIndex: number) => unknown[] \| Promise<unknown[]>; key?: (item: unknown) => string; consecutiveEmpty?: number; maxRounds?: number }) => Promise<unknown[]>` | `round`: (roundIndex: number) => unknown[] \| Promise<unknown[]> (required)<br>`key`: (item: unknown) => string (optional; default: JSON.stringify)<br>`consecutiveEmpty`: number (optional; default: 2)<br>`maxRounds`: number (optional; default: 50) |
+| completenessCheck | runtime-global | `completenessCheck(taskArgs: unknown, results: unknown) => Promise<{ complete: boolean; missing?: string[] } \| null>` | — |
+| retry | runtime-global | `retry(thunk: (attempt: number) => unknown \| Promise<unknown>, options?: { attempts?: number; until?: (result: unknown) => boolean }) => Promise<unknown>` | `attempts`: number (optional; default: 3)<br>`until`: (result: unknown) => boolean (optional; default: accept first result when omitted) |
+| gate | runtime-global | `gate(thunk: (feedback: string \| undefined, attempt: number) => unknown \| Promise<unknown>, validator: (value: unknown) => { ok: boolean; feedback?: string } \| Promise<{ ok: boolean; feedback?: string }>, options?: { attempts?: number }) => Promise<{ ok: boolean; value: unknown; attempts: number }>` | `attempts`: number (optional; default: 3) |
+| checkpoint | runtime-global | `checkpoint(prompt, options?) => Promise<unknown>` | `default`: unknown (optional; default: true when no UI and omitted)<br>`headless`: "default" \| "abort" (optional; default: "default")<br>`kind`: "confirm" \| "input" \| "select" (optional; default: "confirm")<br>`choices`: string[] (optional)<br>`timeoutMs`: number (optional) |
+| log | runtime-global | `log(message) => void` | — |
+| phase | runtime-global | `phase(title, options?) => void` | `budget`: number (optional) |
+| args | runtime-global | `args: unknown` | — |
+| cwd | runtime-global | `cwd: string` | — |
+| process | runtime-global | `process: { cwd(): string }` | — |
+| budget | runtime-global | `budget: { total, spent(), remaining() }` | — |
+| script | workflow-tool-input | `script?: string` | — |
+| name | workflow-tool-input | `name?: string` | — |
+| args | workflow-tool-input | `args?: unknown` | — |
+| background | workflow-tool-input | `background?: boolean = true` | — |
+| maxAgents | workflow-tool-input | `maxAgents?: number = 1000` | — |
+| concurrency | workflow-tool-input | `concurrency?: number` | — |
+| agentRetries | workflow-tool-input | `agentRetries?: number = configured value or 0` | — |
+| agentTimeoutMs | workflow-tool-input | `agentTimeoutMs?: number = configured default or unbounded` | — |
+| tokenBudget | workflow-tool-input | `tokenBudget?: number = configured default or unlimited` | — |
+| resumeFromRunId | workflow-tool-input | `resumeFromRunId?: string` | — |
+<!-- END GENERATED SUPPORTED WORKFLOW CAPABILITIES -->
+
 ## Built-in workflows
 
 ```text
@@ -107,6 +143,14 @@ return await agent(
 
 For an always-on exhaustive mode, use `/ultracode`; `/effort high` is the lighter standing option.
 
+These same 5 patterns are also reachable by name without a slash command — Pi can recognize a decomposable request and run the matching curated pattern directly:
+
+```text
+Do a deep-research on whether Bun's test runner is production-ready.
+```
+
+is equivalent to `/deep-research "..."`. A saved workflow always wins over a built-in of the same name, on both the slash-command and natural-language paths — so saving your own `code-review` shadows the built-in one everywhere.
+
 ## Commands and run control
 
 Pi can manage background runs directly with the `workflow_control` tool instead of asking you to type a command. It supports `list`, `status`, `pause`, `resume`, and `stop`; run-specific actions use the canonical run ID returned when the workflow starts. Status output includes the run state, current phase, agent counts, active labels, and recorded token total.
@@ -120,8 +164,7 @@ Pi can manage background runs directly with the `workflow_control` tool instead 
 | `/workflows save <name>` | Save the latest script as a reusable command |
 | `/workflows-trigger off\|on\|status` | Control automatic keyword triggering |
 | `/workflows-trigger set <word>\|reset` | Set or reset the trigger word |
-| `/workflows-progress compact\|detailed\|status` | Choose the live-panel detail level, including fresh/cache token splits |
-| `/workflows-progress-max <N>` | Limit agents shown per phase in detailed mode |
+| `/workflows-progress compact\|detailed\|status\|max <N>` | Live-panel detail level (and max agents shown per phase in detailed mode) |
 | `/workflows-models` | Map model tiers and thinking levels |
 | `/ultracode [off]` | Toggle exhaustive automatic workflows |
 | `/effort off\|high\|ultra` | Set the standing orchestration effort |
@@ -173,7 +216,9 @@ Model tiers live at `~/.pi/workflows/model-tiers.json` and accept Pi CLI-style t
 
 Use `/workflows-models` to edit them interactively. Without a config, the extension ranks authenticated models by capability hints and assigns distinct models when possible.
 
-Runs have no default token budget or per-agent hard timeout. Add `tokenBudget`, `agentTimeoutMs`, phase budgets, or agent `timeoutMs` when you need explicit gates. `concurrency` is clamped to 16; `agentRetries` retries only recoverable failures. Defaults can be set in `~/.pi/workflows/settings.json`.
+Omitted `tokenBudget` and `agentTimeoutMs` values use configured `defaultTokenBudget` and `defaultAgentTimeoutMs` settings; without them, runs are unlimited and have no hard per-agent timeout. Add per-run or per-agent values when you need explicit gates. `concurrency` is clamped to 16; `agentRetries` retries only recoverable failures. Defaults live in `~/.pi/workflows/settings.json`; `defaultTokenBudget` is a soft pre-call gate, and a project-level override of `null` cancels a global budget.
+
+Pausing and resuming a run keeps the limits it started with — `maxAgents`, `agentTimeoutMs`, `concurrency`, and `agentRetries` carry over instead of falling back to defaults, and `tokenBudget` tracking is cumulative across the pause, so a run can't reset its spend by pausing and resuming.
 
 </details>
 
@@ -190,10 +235,12 @@ Subagents are in-memory by default. Set `persistAgentSessions: true` to retain f
 
 Completed background runs persist their full result in the project run JSON. The conversation delivery includes a pointer to that file when the visible summary is shortened.
 
+Finished runs (completed, failed, or aborted) are retained in full on disk, capped at the 300 most recent per project — older ones are evicted first, and a running or paused run is never touched. Only a smaller number (20 by default) also stay fully loaded in memory for instant access right after they finish; older finished runs still show up in `/workflows` and `workflow_control list`, just read back from disk instead of memory. Library embedders can tune both caps — `maxTerminalRunsInMemory` on `WorkflowManager` and `maxTerminalRunsOnDisk` on the run-persistence layer.
+
 </details>
 
 <details>
-<summary><strong>Keyword trigger and editor compatibility</strong></summary>
+<summary><strong>Keyword trigger</strong></summary>
 
 Set a literal, case-insensitive custom trigger in `~/.pi/workflows/settings.json`:
 
@@ -203,7 +250,7 @@ Set a literal, case-insensitive custom trigger in `~/.pi/workflows/settings.json
 }
 ```
 
-The default `workflow` also matches `workflows`; a custom word matches exactly. Trigger words are case-insensitive and Unicode identifier-bounded, and do not activate inside paths, slash commands, or identifier-like text. If another extension owns Pi's custom editor, the submit-time trigger still works, but animated keyword highlighting and Backspace one-shot disarm are unavailable. Editor visuals are load-order dependent.
+The default `workflow` also matches `workflows`; a custom word matches exactly. Trigger words are case-insensitive and Unicode identifier-bounded, and do not activate inside paths, slash commands, or identifier-like text. Detection is purely textual, applied at submit time to the message you send — it does not depend on, or own, Pi's editor component, so it works the same regardless of what else is installed.
 
 </details>
 
@@ -239,12 +286,31 @@ Everything else is additive or a fix: the `workflow_control` tool (list/status/p
 
 Library API note: the unused `createSharedStoreTools` export was removed — use `createAgentStoreTools`.
 
+## Upgrading past 3.2
+
+Two behavior changes to know about:
+
+- **Subagents no longer load host extensions by default.** Each run now builds one shared, extension-free resource loader for all of its subagents (a memory-leak mitigation). Skills, prompts, and `AGENTS.md` context still load, and the coding tools and any toolset (e.g. `web-research`) you hand a subagent are unaffected. What subagents lose is **host-extension-registered tools** — MCP bridges, browser tools, or anything else another installed extension adds. If an `agentType` names one of those tools in its allowlist, that entry now matches nothing. This also means a subagent can no longer recurse into another orchestration extension, even one not covered by the existing tool denylist.
+- **Checkpoints persisted before this release re-run once.** `checkpoint()`'s resume-identity hash now also covers `default`, `headless`, and `timeoutMs`, so changing any of them between runs correctly invalidates a stale cached answer. This is a one-time effect: any checkpoint cached under the old hash simply re-prompts once and then caches normally again.
+
 ## Development
 
 ```bash
 npm install
-npm test     # Biome + TypeScript + unit tests
+npm test     # Biome, TypeScript, unit tests, and release checks
 ```
+
+### Optional model-comprehension evidence
+
+The comprehension harness is manual and never runs in normal CI, `npm test`, or the release gate. Select an available model explicitly; the harness never embeds or chooses from a static model or agent-type catalogue.
+
+```bash
+npm run comprehension -- --model provider/model                    # quick writing scenario
+npm run comprehension -- --model provider/model --suite full       # write, edit, review, and debug
+npm run comprehension -- --model provider/model --output runs/a.json
+```
+
+By default, evidence is written under ignored `.pi/model-comprehension/`. Each JSON run records the exact prompts and versions, generated workflows, skill reads, provider token usage, deterministic runtime calls/topology/results, assertions, and failure details. Scenario failures are retained as non-blocking evidence and do not produce a failing exit status; argument, model-selection, and setup errors do.
 
 Features are also verified end-to-end against real Pi subagent sessions before release. See [CONTRIBUTING.md](./CONTRIBUTING.md) to contribute.
 

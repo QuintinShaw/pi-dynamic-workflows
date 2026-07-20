@@ -8,6 +8,8 @@ export type WorkflowAgentStatus = "queued" | "running" | "done" | "error" | "ski
 
 export interface WorkflowAgentSnapshot {
   id: number;
+  /** Runtime call identity (`${runId}:${callIndex}`), used to rehydrate journaled results. */
+  callId?: string;
   label: string;
   phase?: string;
   prompt: string;

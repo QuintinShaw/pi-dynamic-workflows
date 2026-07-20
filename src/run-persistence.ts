@@ -2,17 +2,27 @@
  * Workflow run state persistence for pause/resume support.
  */
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { AgentUsage } from "./agent.js";
 import type { AgentHistoryEntry } from "./agent-history.js";
 import type { WorkflowErrorCode } from "./errors.js";
+import {
+  ensureDir as ensureDirFs,
+  listJsonFilesSafe,
+  type PersistenceFsLayer,
+  readJsonWithBackupRecovery,
+  resolvePersistenceFs,
+  unlinkIfExistsSafe,
+  writeJsonAtomicWithBackup,
+} from "./fs-persistence.js";
 import { workflowProjectPaths } from "./workflow-paths.js";
 
 export type RunStatus = "pending" | "running" | "paused" | "completed" | "failed" | "aborted";
 
 export interface PersistedAgentState {
   id: number;
+  /** Runtime call identity (`${runId}:${callIndex}`), used to rehydrate journaled results. */
+  callId?: string;
   label: string;
   phase?: string;
   prompt: string;
@@ -64,14 +74,68 @@ export interface PersistedRunState {
     cacheRead?: number;
     cacheWrite?: number;
   };
-  /** Cached agent results for resume, keyed by deterministic call index. */
-  journal?: Array<{ index: number; hash: string; result: unknown }>;
+  /**
+   * Cached agent/checkpoint results for resume, keyed by deterministic call
+   * index. `runId` namespaces `index` (a nested workflow() call restarts its
+   * own callSeq at 0) — absent on journals persisted before that namespacing
+   * existed; see JournalEntry.runId in workflow.ts for the resume-time
+   * legacy-degradation behavior. `storeDelta` is this call's SharedStore
+   * write delta, replayed additively on resume.
+   */
+  journal?: Array<{
+    index: number;
+    runId?: string;
+    hash: string;
+    result: unknown;
+    storeDelta?: Record<string, unknown>;
+  }>;
   /**
    * Opt-out of auto-resume for this run (default true, i.e. eligible unless
    * explicitly set to false via ExecOptions.autoResume). Set once at run start
    * and carried through resumes; see UsageLimitScheduler.
    */
   autoResume?: boolean;
+  /**
+   * The run's resolved hard token budget, fixed at start (per-run value, else
+   * the manager default at the time). Resume re-applies THIS value — never the
+   * current default — so an explicit no-budget (`null`) or custom cap survives
+   * a pause/resume cycle. Absent on legacy runs (resumed unbudgeted).
+   */
+  tokenBudget?: number | null;
+  /**
+   * Named toolset tag (WorkflowManagerOptions.toolsets). ToolDefinitions are
+   * functions and can't be serialized, so this tag is how a resumed run (e.g.
+   * /deep-research with web tools) re-resolves the tool set it started with.
+   */
+  toolset?: string;
+  /**
+   * The run's resolved cap on total agents, fixed at start (per-run value,
+   * else undefined so runWorkflow applies its own MAX_AGENTS_PER_RUN default).
+   * Resume re-applies THIS value — never the manager's current default — same
+   * rationale as tokenBudget. Absent on legacy runs (resumed with no cap
+   * carried forward, i.e. runWorkflow's own default applies).
+   */
+  maxAgents?: number;
+  /**
+   * The run's resolved per-agent timeout, fixed at start (per-run value, else
+   * the manager default at the time). Absent on legacy runs — unlike
+   * tokenBudget, a legacy run's real timeout was never "no timeout" by
+   * omission; it was always the manager's default (pre-A1 resume always fell
+   * back to it), so resume applies the manager's CURRENT default for such
+   * runs rather than null, preserving both the run's original semantics and
+   * pre-fix resume behavior.
+   */
+  agentTimeoutMs?: number | null;
+  /**
+   * The run's resolved concurrency, fixed at start (per-run value, else the
+   * manager's concurrency at the time). Same rationale as tokenBudget.
+   */
+  concurrency?: number;
+  /**
+   * The run's resolved agent-retry count, fixed at start (per-run value, else
+   * the manager default at the time). Same rationale as tokenBudget.
+   */
+  agentRetries?: number;
   /**
    * Auto-resume attempt counter for the current usage_limit pause-cycle, owned
    * and persisted by UsageLimitScheduler (best-effort). Absent/0 means no
@@ -116,16 +180,28 @@ interface LockFile {
 /**
  * Filesystem operations used by run persistence.
  * Exposed for testing – pass overrides to inject mock implementations.
+ * (Alias of the shared PersistenceFsLayer — see fs-persistence.ts.)
  */
-export type FsLayer = {
-  existsSync: typeof existsSync;
-  mkdirSync: typeof mkdirSync;
-  readdirSync: typeof readdirSync;
-  readFileSync: typeof readFileSync;
-  renameSync: typeof renameSync;
-  unlinkSync: typeof unlinkSync;
-  writeFileSync: typeof writeFileSync;
-};
+export type FsLayer = PersistenceFsLayer;
+
+/**
+ * Retention policy for terminal (completed/failed/aborted) runs kept on
+ * disk. Bounded so a long-lived project directory can't accumulate an
+ * unbounded number of run files (each polled/listed on every list() call).
+ * A run in "running" or "paused" status is NEVER counted against this cap
+ * or evicted by it — only genuinely finished runs age out, oldest (by
+ * updatedAt) first, once the terminal-run count exceeds the cap. 300 is
+ * generous enough to cover weeks of typical usage while keeping list()'s
+ * per-call directory scan bounded.
+ */
+export const DEFAULT_MAX_TERMINAL_RUNS_ON_DISK = 300;
+
+const TERMINAL_RUN_STATUSES: ReadonlySet<RunStatus> = new Set(["completed", "failed", "aborted"]);
+
+export interface RunPersistenceOptions {
+  /** Override DEFAULT_MAX_TERMINAL_RUNS_ON_DISK (tests; advanced tuning). */
+  maxTerminalRunsOnDisk?: number;
+}
 
 /**
  * `list()` does a full readdirSync + per-file readFileSync + JSON.parse of the
@@ -139,24 +215,24 @@ export type FsLayer = {
  */
 const LIST_CACHE_TTL_MS = 300;
 
-export function createRunPersistence(cwd: string, fsOverride?: Partial<FsLayer>): RunPersistence {
-  const _existsSync = fsOverride?.existsSync ?? existsSync;
-  const _mkdirSync = fsOverride?.mkdirSync ?? mkdirSync;
-  const _readdirSync = fsOverride?.readdirSync ?? readdirSync;
-  const _readFileSync = fsOverride?.readFileSync ?? readFileSync;
-  const _renameSync = fsOverride?.renameSync ?? renameSync;
-  const _unlinkSync = fsOverride?.unlinkSync ?? unlinkSync;
-  const _writeFileSync = fsOverride?.writeFileSync ?? writeFileSync;
+export function createRunPersistence(
+  cwd: string,
+  fsOverride?: Partial<FsLayer>,
+  options?: RunPersistenceOptions,
+): RunPersistence {
+  const fs = resolvePersistenceFs(fsOverride);
+  const _existsSync = fs.existsSync;
+  const _readFileSync = fs.readFileSync;
+  const _statSync = fs.statSync;
+  const _unlinkSync = fs.unlinkSync;
+  const _writeFileSync = fs.writeFileSync;
+  const maxTerminalRunsOnDisk = options?.maxTerminalRunsOnDisk ?? DEFAULT_MAX_TERMINAL_RUNS_ON_DISK;
 
   const paths = workflowProjectPaths(cwd);
   const runsDir = paths.runsDir;
   const legacyRunsDir = paths.legacyRunsDir;
 
-  const ensureDir = () => {
-    if (!_existsSync(runsDir)) {
-      _mkdirSync(runsDir, { recursive: true });
-    }
-  };
+  const ensureDir = () => ensureDirFs(fs, runsDir);
 
   const runPath = (dir: string, runId: string) => join(dir, `${runId}.json`);
   const primaryRunPath = (runId: string) => runPath(runsDir, runId);
@@ -198,6 +274,29 @@ export function createRunPersistence(cwd: string, fsOverride?: Partial<FsLayer>)
     listCache = undefined;
   };
 
+  // Per-file mtime+size+ino cache, keyed by absolute path: even once the
+  // TTL-level listCache above expires (the active panel polls roughly every
+  // 300ms, i.e. faster than or comparable to the TTL), most run files on
+  // disk haven't changed since the last recompute. Re-stat is cheap; re-read
+  // + re-JSON.parse is not, and scales with total lifetime run history, not
+  // with what actually changed. A file whose (mtimeMs, size, ino) all match
+  // what we last parsed is reused as-is instead of being re-read; entries
+  // for files that vanished between recomputes are pruned so this cache
+  // can't grow unbounded independent of what's actually on disk.
+  //
+  // ino is load-bearing, not redundant with mtime+size: save() writes via
+  // tmp-write + rename (writeJsonAtomicWithBackup), and a rename onto an
+  // existing path allocates a NEW inode for the replacement file. Two
+  // consecutive saves landing in the same mtime tick (400ms-throttled
+  // progress persists vs. 1-2s mtime granularity on HFS+/many network
+  // mounts/some Docker volume drivers is entirely realistic) with
+  // coincidentally equal byte length (e.g. "paused" and "failed" are the
+  // same length) would otherwise be indistinguishable from "unchanged" by
+  // (mtimeMs, size) alone — serving stale, previously-cached content
+  // forever until something ELSE about the file changes. The inode always
+  // changes on such a rename, so adding it closes that hole for free.
+  const fileStateCache = new Map<string, { mtimeMs: number; size: number; ino: number; state: PersistedRunState }>();
+
   const removeStaleLegacyLock = (runId: string): boolean => {
     const lock = legacyLockPath(runId);
     const existing = readLockAt(lock);
@@ -210,36 +309,96 @@ export function createRunPersistence(cwd: string, fsOverride?: Partial<FsLayer>)
     return true;
   };
 
+  const computeList = (): PersistedRunState[] => {
+    const byRunId = new Map<string, PersistedRunState>();
+    const seenPaths = new Set<string>();
+    for (const dir of [runsDir, legacyRunsDir]) {
+      for (const file of listJsonFilesSafe(fs, dir)) {
+        const path = join(dir, file);
+        seenPaths.add(path);
+        try {
+          const stat = _statSync(path);
+          const cached = fileStateCache.get(path);
+          // Reuse the last parse when the file is byte-identical (same
+          // mtime + size + inode) to what produced it — the dominant case
+          // on every poll tick once a run goes terminal and stops changing.
+          // ino is what actually rules out a false "unchanged" match on a
+          // coarse-mtime filesystem (see the field doc comment above).
+          if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size && cached.ino === stat.ino) {
+            if (!byRunId.has(cached.state.runId)) byRunId.set(cached.state.runId, cached.state);
+            continue;
+          }
+          const state = JSON.parse(_readFileSync(path, "utf-8")) as PersistedRunState;
+          fileStateCache.set(path, { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino, state });
+          if (!byRunId.has(state.runId)) byRunId.set(state.runId, state);
+        } catch {
+          // Skip corrupted/unreadable files; don't let a stale cache entry
+          // for a file that's now failing to read linger either.
+          fileStateCache.delete(path);
+        }
+      }
+    }
+    // Prune cache entries for files that no longer exist (deleted runs) so
+    // this map's size tracks what's actually on disk, not lifetime history.
+    for (const path of fileStateCache.keys()) {
+      if (!seenPaths.has(path)) fileStateCache.delete(path);
+    }
+    return [...byRunId.values()].sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+  };
+
+  // Bound the number of terminal (completed/failed/aborted) runs kept on
+  // disk (see DEFAULT_MAX_TERMINAL_RUNS_ON_DISK) — called after every save()
+  // whose state is terminal, since that's the only time the terminal count
+  // can grow. Running/paused runs are never candidates: they're filtered out
+  // before the cap is even considered.
+  const enforceRetention = () => {
+    const terminal = computeList()
+      .filter((r) => TERMINAL_RUN_STATUSES.has(r.status))
+      .sort((a, b) => new Date(a.updatedAt).getTime() - new Date(b.updatedAt).getTime());
+    const excess = terminal.length - maxTerminalRunsOnDisk;
+    if (excess <= 0) return;
+    for (const run of terminal.slice(0, excess)) {
+      deleteRunFiles(run.runId);
+    }
+    invalidateListCache();
+  };
+
+  const deleteRunFiles = (runId: string): boolean => {
+    let deleted = false;
+    for (const path of candidateRunPaths(runId)) {
+      const dir = path === primaryRunPath(runId) ? runsDir : legacyRunsDir;
+      // Best-effort cleanup of the sidecar files alongside the primary.
+      for (const sidecar of [`${path}.bak`, `${path}.tmp`, lockPath(dir, runId)]) {
+        unlinkIfExistsSafe(fs, sidecar);
+        fileStateCache.delete(sidecar);
+      }
+      if (unlinkIfExistsSafe(fs, path)) deleted = true;
+      fileStateCache.delete(path);
+    }
+    return deleted;
+  };
+
   return {
     save(state: PersistedRunState) {
       ensureDir();
       state.updatedAt = new Date().toISOString();
       const path = primaryRunPath(state.runId);
-      const json = JSON.stringify(state, null, 2);
       // Atomic write: a crash mid-write can't corrupt the live file (tmp+rename is
       // atomic on the same filesystem). A .bak from the previous good save is the
       // recovery fallback if the primary is somehow truncated.
-      _writeFileSync(`${path}.tmp`, json);
-      _renameSync(`${path}.tmp`, path);
-      try {
-        _writeFileSync(`${path}.bak`, json);
-      } catch {
-        // backup is best-effort; the primary write already succeeded
-      }
+      writeJsonAtomicWithBackup(fs, path, state);
       invalidateListCache();
+      // Only a terminal write can grow the terminal-run count, so only check
+      // the cap then — a "running"/"paused" save is on the hot path (every
+      // progress tick) and must not pay for a retention scan.
+      if (TERMINAL_RUN_STATUSES.has(state.status)) enforceRetention();
     },
 
     load(runId: string): PersistedRunState | null {
       // Try the primary, then the .bak — so a corrupt primary doesn't lose the run.
       for (const path of candidateRunPaths(runId)) {
-        for (const candidate of [path, `${path}.bak`]) {
-          try {
-            if (!_existsSync(candidate)) continue;
-            return JSON.parse(_readFileSync(candidate, "utf-8")) as PersistedRunState;
-          } catch {
-            // corrupt candidate -> fall through to the next candidate
-          }
-        }
+        const state = readJsonWithBackupRecovery<PersistedRunState>(fs, path);
+        if (state) return state;
       }
       return null;
     },
@@ -252,56 +411,15 @@ export function createRunPersistence(cwd: string, fsOverride?: Partial<FsLayer>)
       if (listCache && now - listCacheAt < LIST_CACHE_TTL_MS) {
         return [...listCache];
       }
-      const byRunId = new Map<string, PersistedRunState>();
-      for (const dir of [runsDir, legacyRunsDir]) {
-        try {
-          if (!_existsSync(dir)) continue;
-          const files = _readdirSync(dir).filter((f) => f.endsWith(".json"));
-          for (const file of files) {
-            try {
-              const state = JSON.parse(_readFileSync(join(dir, file), "utf-8")) as PersistedRunState;
-              if (!byRunId.has(state.runId)) byRunId.set(state.runId, state);
-            } catch {
-              // Skip corrupted files
-            }
-          }
-        } catch {
-          // Skip unreadable directories; another storage location may still work.
-        }
-      }
-      const result = [...byRunId.values()].sort(
-        (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime(),
-      );
+      const result = computeList();
       listCache = result;
       listCacheAt = now;
       return [...result];
     },
 
     delete(runId: string): boolean {
-      let deleted = false;
       try {
-        for (const path of candidateRunPaths(runId)) {
-          const dir = path === primaryRunPath(runId) ? runsDir : legacyRunsDir;
-          // Best-effort cleanup of the sidecar files alongside the primary.
-          for (const sidecar of [`${path}.bak`, `${path}.tmp`, lockPath(dir, runId)]) {
-            try {
-              if (_existsSync(sidecar)) _unlinkSync(sidecar);
-            } catch {
-              // ignore sidecar cleanup failures
-            }
-          }
-          try {
-            if (_existsSync(path)) {
-              _unlinkSync(path);
-              deleted = true;
-            }
-          } catch {
-            // ignore per-file cleanup failures
-          }
-        }
-        return deleted;
-      } catch {
-        return deleted;
+        return deleteRunFiles(runId);
       } finally {
         invalidateListCache();
       }

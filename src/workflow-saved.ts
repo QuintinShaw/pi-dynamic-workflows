@@ -2,8 +2,16 @@
  * Save and load reusable workflow commands.
  */
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import {
+  ensureDir as ensureDirFs,
+  listJsonFilesSafe,
+  type PersistenceFsLayer,
+  readJsonWithBackupRecovery,
+  resolvePersistenceFs,
+  unlinkIfExistsSafe,
+  writeJsonAtomicWithBackup,
+} from "./fs-persistence.js";
 import { workflowProjectPaths, workflowUserSavedDir } from "./workflow-paths.js";
 
 export interface SavedWorkflow {
@@ -51,17 +59,14 @@ export function assertSafeSavedWorkflowName(name: string): void {
   }
 }
 
-export function createWorkflowStorage(cwd: string): WorkflowStorage {
+export function createWorkflowStorage(cwd: string, fsOverride?: Partial<PersistenceFsLayer>): WorkflowStorage {
+  const fs = resolvePersistenceFs(fsOverride);
   const paths = workflowProjectPaths(cwd);
   const projectDir = paths.savedDir;
   const legacyProjectDir = paths.legacySavedDir;
   const userDir = workflowUserSavedDir();
 
-  const ensureDir = (dir: string) => {
-    if (!existsSync(dir)) {
-      mkdirSync(dir, { recursive: true });
-    }
-  };
+  const ensureDir = (dir: string) => ensureDirFs(fs, dir);
 
   const workflowPath = (name: string, location: "project" | "user") => {
     assertSafeSavedWorkflowName(name);
@@ -73,21 +78,20 @@ export function createWorkflowStorage(cwd: string): WorkflowStorage {
     return join(legacyProjectDir, `${name}.json`);
   };
 
+  // Same atomic-write-with-backup + corrupt-file recovery contract as
+  // run-persistence.ts (see fs-persistence.ts) — a saved workflow is a
+  // user-authored artifact just as worth protecting from a crash mid-write
+  // or a truncated file as a run's resumable state is.
   const loadFromFile = (path: string, location: "project" | "user"): SavedWorkflow | null => {
-    try {
-      if (!existsSync(path)) return null;
-      const data = JSON.parse(readFileSync(path, "utf-8"));
-      if (!data || typeof data !== "object" || !isSafeSavedWorkflowName((data as { name?: string }).name ?? "")) {
-        return null;
-      }
-      return {
-        ...data,
-        location,
-        path,
-      };
-    } catch {
+    const data = readJsonWithBackupRecovery<Record<string, unknown>>(fs, path);
+    if (!data || typeof data !== "object" || !isSafeSavedWorkflowName((data as { name?: string }).name ?? "")) {
       return null;
     }
+    return {
+      ...(data as Omit<SavedWorkflow, "location" | "path">),
+      location,
+      path,
+    };
   };
 
   return {
@@ -104,7 +108,7 @@ export function createWorkflowStorage(cwd: string): WorkflowStorage {
         savedAt: new Date().toISOString(),
       };
 
-      writeFileSync(path, JSON.stringify(saved, null, 2));
+      writeJsonAtomicWithBackup(fs, path, saved);
       return saved;
     },
 
@@ -127,8 +131,11 @@ export function createWorkflowStorage(cwd: string): WorkflowStorage {
 
       const seen = new Set<string>();
       const addDir = (dir: string, location: "project" | "user") => {
-        if (!existsSync(dir)) return;
-        for (const file of readdirSync(dir).filter((f) => f.endsWith(".json"))) {
+        // A missing or unreadable directory (not yet created, deleted
+        // mid-race, permission-denied) degrades to "no files" here — same
+        // guard run-persistence.ts's list() uses — rather than throwing and
+        // taking down the whole listing over one bad storage location.
+        for (const file of listJsonFilesSafe(fs, dir)) {
           const wf = loadFromFile(join(dir, file), location);
           if (wf && !seen.has(wf.name)) {
             seen.add(wf.name);
@@ -152,14 +159,16 @@ export function createWorkflowStorage(cwd: string): WorkflowStorage {
 
       for (const loc of locations) {
         const path = workflowPath(name, loc);
-        if (existsSync(path)) {
-          unlinkSync(path);
+        // Clean up the .bak sidecar too, mirroring run-persistence.ts's delete()
+        // (sidecar cleanup does not by itself count as "deleted the workflow").
+        unlinkIfExistsSafe(fs, `${path}.bak`);
+        if (unlinkIfExistsSafe(fs, path)) {
           deleted = true;
         }
         if (loc === "project") {
           const legacyPath = legacyProjectWorkflowPath(name);
-          if (existsSync(legacyPath)) {
-            unlinkSync(legacyPath);
+          unlinkIfExistsSafe(fs, `${legacyPath}.bak`);
+          if (unlinkIfExistsSafe(fs, legacyPath)) {
             deleted = true;
           }
         }

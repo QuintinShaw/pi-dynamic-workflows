@@ -2,6 +2,32 @@
  * Workflow-specific error types.
  */
 
+/** Dependency-neutral diagnostic payload retained by capability contract failures. */
+export interface CapabilityErrorDiagnostic {
+  code: string;
+  severity: "error" | "warning" | "information";
+  subject: string;
+  message: string;
+}
+
+/** Dependency-neutral skill-loading payload retained by generation failures. */
+export interface ModelGenerationSkillLoadingEvidence {
+  discovered: boolean;
+  loaded: boolean;
+  toolCalls: Array<{ tool: string; path?: string }>;
+}
+
+/** Dependency-neutral provider-usage payload retained by generation failures. */
+export interface ModelGenerationTokenUsage {
+  input: number;
+  output: number;
+  total: number;
+  cost: number;
+  cacheRead: number;
+  cacheWrite: number;
+}
+
+/** Stable runtime and persistence failure codes exposed to callers and UI surfaces. */
 export enum WorkflowErrorCode {
   /** Agent exceeded timeout. */
   AGENT_TIMEOUT = "AGENT_TIMEOUT",
@@ -31,6 +57,7 @@ export enum WorkflowErrorCode {
   UNKNOWN = "UNKNOWN",
 }
 
+/** Classified workflow failure with recoverability and optional agent/provider context. */
 export class WorkflowError extends Error {
   readonly code: WorkflowErrorCode;
   readonly recoverable: boolean;
@@ -54,10 +81,40 @@ export class WorkflowError extends Error {
   }
 }
 
+/** Contract failure that retains every definition or assembly diagnostic. */
+export class WorkflowCapabilityContractError extends Error {
+  readonly diagnostics: readonly CapabilityErrorDiagnostic[];
+
+  constructor(message: string, diagnostics: readonly CapabilityErrorDiagnostic[]) {
+    super(message);
+    this.name = "WorkflowCapabilityContractError";
+    this.diagnostics = diagnostics;
+  }
+}
+
+/** Generation failure that retains loading and token evidence for diagnosis. */
+export class ModelGenerationError extends Error {
+  readonly skillLoadingEvidence: ModelGenerationSkillLoadingEvidence;
+  readonly tokenUsage: ModelGenerationTokenUsage;
+
+  constructor(
+    message: string,
+    skillLoadingEvidence: ModelGenerationSkillLoadingEvidence,
+    tokenUsage: ModelGenerationTokenUsage,
+  ) {
+    super(message);
+    this.name = "ModelGenerationError";
+    this.skillLoadingEvidence = skillLoadingEvidence;
+    this.tokenUsage = tokenUsage;
+  }
+}
+
+/** Narrow an unknown failure to WorkflowError. */
 export function isWorkflowError(error: unknown): error is WorkflowError {
   return error instanceof WorkflowError;
 }
 
+/** Report whether an unknown failure is a provider usage-limit checkpoint condition. */
 export function isProviderUsageLimit(error: unknown): error is WorkflowError {
   return isWorkflowError(error) && error.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT;
 }
@@ -85,11 +142,13 @@ export function classifyProviderLimit(text: string | undefined): { matched: bool
   return { matched: true, resetHint: reset?.[0]?.trim() };
 }
 
+/** Recognize abort-like Error messages without assuming a provider-specific class. */
 export function isAbortError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   return /\babort(?:ed)?\b/i.test(error.message);
 }
 
+/** Recognize timeout-like errors by name or message. */
 export function isTimeoutError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   return /\btimeout\b/i.test(error.message) || error.name === "TimeoutError";
