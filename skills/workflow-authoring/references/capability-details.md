@@ -220,8 +220,17 @@ Every exact fact below is projected from the installed extension's capability co
 
 - Classification: `workflow-tool-input`
 - Support: `supported`
-- Signature: `script: string`
-- Constraint: required raw JavaScript workflow source
+- Signature: `script?: string`
+- Constraint: required raw JavaScript workflow source unless `name` is given
+
+<a id="tool-input-name"></a>
+## name
+
+- Classification: `workflow-tool-input`
+- Support: `supported`
+- Signature: `name?: string`
+- Constraint: resolves a project/user saved workflow first, then one of the 5 built-in patterns
+- Constraint: mutually exclusive with resumeFromRunId
 
 <a id="tool-input-args"></a>
 ## args

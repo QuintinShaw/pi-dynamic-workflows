@@ -12,16 +12,9 @@
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import {
-  createCodingTools,
-  type ExtensionAPI,
-  type ExtensionCommandContext,
-  type ToolDefinition,
-} from "@earendil-works/pi-coding-agent";
-import { generateAdversarialReviewWorkflow, generateMultiPerspectiveWorkflow } from "./adversarial-review.js";
-import { generateCodeReviewWorkflow, MAX_DIFF_CHARS } from "./code-review.js";
-import { generateCodebaseAuditWorkflow, generateDeepResearchWorkflow } from "./deep-research.js";
-import { createWebTools } from "./web-tools.js";
+import type { ExtensionAPI, ExtensionCommandContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { findBuiltinWorkflow } from "./builtin-workflows.js";
+import { MAX_DIFF_CHARS } from "./code-review.js";
 import type { WorkflowManager } from "./workflow-manager.js";
 
 const execFileAsync = promisify(execFile);
@@ -88,18 +81,20 @@ export function registerBuiltinWorkflows(pi: ExtensionAPI, opts: { cwd: string; 
       async handler(args: string, ctx: ExtensionCommandContext) {
         const question = args.trim();
         if (!question) return ctx.ui.notify("Usage: /deep-research <question>", "warning");
-        // Research agents need real web access on top of the coding tools.
-        // `tools` covers this execution even on a manager without the toolset
-        // registered; the "web-research" tag is what a resume re-resolves.
+        // Resolve through the shared builtin registry (builtin-workflows.ts) so
+        // this command and the workflow tool's `name` input always run the exact
+        // same generated script and exec context (tools/toolset) for this pattern.
+        const resolved = findBuiltinWorkflow("deep-research")?.resolve(cwd, { question });
+        if (!resolved) return ctx.ui.notify("deep-research: built-in workflow not found", "error");
         startBackground(
           manager,
           ctx,
           "deep-research",
-          generateDeepResearchWorkflow(),
+          resolved.script,
           { question },
           {
-            tools: [...createCodingTools(cwd), ...createWebTools()],
-            toolset: "web-research",
+            tools: resolved.tools,
+            toolset: resolved.toolset,
           },
         );
       },
@@ -112,7 +107,9 @@ export function registerBuiltinWorkflows(pi: ExtensionAPI, opts: { cwd: string; 
       async handler(args: string, ctx: ExtensionCommandContext) {
         const task = args.trim();
         if (!task) return ctx.ui.notify("Usage: /adversarial-review <task or question>", "warning");
-        startBackground(manager, ctx, "adversarial-review", generateAdversarialReviewWorkflow(), { task });
+        const resolved = findBuiltinWorkflow("adversarial-review")?.resolve(cwd, { task });
+        if (!resolved) return ctx.ui.notify("adversarial-review: built-in workflow not found", "error");
+        startBackground(manager, ctx, "adversarial-review", resolved.script, { task });
       },
     });
   }
@@ -182,7 +179,9 @@ export function registerBuiltinWorkflows(pi: ExtensionAPI, opts: { cwd: string; 
           );
         }
 
-        startBackground(manager, ctx, "code-review", generateCodeReviewWorkflow(), { diff, diffSource });
+        const resolved = findBuiltinWorkflow("code-review")?.resolve(cwd, { diff, diffSource });
+        if (!resolved) return ctx.ui.notify("code-review: built-in workflow not found", "error");
+        startBackground(manager, ctx, "code-review", resolved.script, { diff, diffSource });
       },
     });
   }
@@ -195,10 +194,11 @@ export function registerBuiltinWorkflows(pi: ExtensionAPI, opts: { cwd: string; 
         if (!topic) {
           return ctx.ui.notify('Usage: /multi-perspective "<topic>" [perspective1] [perspective2] …', "warning");
         }
-        // Fall back to a broadly-useful default set when fewer than two are given.
-        const perspectives =
-          rest.length >= 2 ? rest : ["technical", "product", "security", "user experience", "maintainability"];
-        startBackground(manager, ctx, "multi-perspective", generateMultiPerspectiveWorkflow(topic, perspectives));
+        // resolve() falls back to a broadly-useful default set when fewer than
+        // two perspectives are given (see builtin-workflows.ts).
+        const resolved = findBuiltinWorkflow("multi-perspective")?.resolve(cwd, { topic, perspectives: rest });
+        if (!resolved) return ctx.ui.notify("multi-perspective: built-in workflow not found", "error");
+        startBackground(manager, ctx, "multi-perspective", resolved.script);
       },
     });
   }
@@ -211,7 +211,9 @@ export function registerBuiltinWorkflows(pi: ExtensionAPI, opts: { cwd: string; 
         if (!scope || checks.length === 0) {
           return ctx.ui.notify('Usage: /codebase-audit <scope> "<check1>" ["<check2>" …]', "warning");
         }
-        startBackground(manager, ctx, "codebase-audit", generateCodebaseAuditWorkflow(scope, checks));
+        const resolved = findBuiltinWorkflow("codebase-audit")?.resolve(cwd, { scope, checks });
+        if (!resolved) return ctx.ui.notify("codebase-audit: built-in workflow not found", "error");
+        startBackground(manager, ctx, "codebase-audit", resolved.script);
       },
     });
   }

@@ -450,7 +450,11 @@ const capabilities: readonly CapabilityDescriptor[] = [
     discovery: DiscoveryPlacement.WORKFLOW_AUTHORING_SKILL,
     constraints: ["new workflows should use log()"],
   }),
-  toolInput("script", "script: string", ["required raw JavaScript workflow source"]),
+  toolInput("script", "script?: string", ["required raw JavaScript workflow source unless `name` is given"]),
+  toolInput("name", "name?: string", [
+    "resolves a project/user saved workflow first, then one of the 5 built-in patterns",
+    "mutually exclusive with resumeFromRunId",
+  ]),
   toolInput("args", "args?: unknown"),
   toolInput("background", "background?: boolean = true", [
     "background workflows are headless; use background false when checkpoint must show foreground confirmation",

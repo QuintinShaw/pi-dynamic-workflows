@@ -12,7 +12,7 @@
     },
     "providerVisibleWorkflowToolDefinition": {
       "serialization": "UTF-8 bytes of JSON.stringify({ name, description, parameters })",
-      "bytes": 3918
+      "bytes": 4267
     },
     "workflowAuthoringSkillDiscovery": {
       "serialization": "UTF-8 bytes of normalized Pi skill XML with package-relative location",
@@ -20,12 +20,12 @@
     },
     "ordinaryWorkflowOwnedAlwaysOn": {
       "serialization": "sum of permanent prompt, provider-visible tool definition, and normalized skill discovery bytes",
-      "bytes": 4998
+      "bytes": 5347
     },
     "workflowAuthoringSkillCorpus": {
       "serialization": "sum of UTF-8 bytes for every file under skills/workflow-authoring",
       "files": 27,
-      "bytes": 67089
+      "bytes": 67450
     },
     "representativeAuthoringProfiles": {
       "serialization": "sum of UTF-8 bytes for each profile's declared package-relative files",

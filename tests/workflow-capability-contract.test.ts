@@ -40,6 +40,7 @@ const EXPECTED_TOOL_INPUTS = [
   "background",
   "concurrency",
   "maxAgents",
+  "name",
   "resumeFromRunId",
   "script",
   "tokenBudget",

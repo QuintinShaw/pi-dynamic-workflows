@@ -19,7 +19,16 @@ import { withFakeHomeAsync } from "./helpers/fake-home.js";
 const RENDERED_PROMPT_BUDGET_BYTES = 800;
 // #105 corrected omitted timeout/budget semantics to name configured defaults,
 // increasing the compact definition from 3,802 to 3,918 bytes.
-const TOOL_DEFINITION_BUDGET_BYTES = 3_918;
+// Made the 5 built-in workflow patterns (deep-research, adversarial-review,
+// code-review, multi-perspective, codebase-audit) reachable from the tool
+// itself, not only slash commands: added an optional `name` input (with a
+// deliberately terse description that defers argument-shape details to the
+// workflow-patterns skill) and a one-clause addition to `script`'s
+// description noting it's optional when `name` is given. This is the smallest
+// schema growth that lets the model discover and invoke a curated pattern by
+// name instead of improvising an equivalent script — increasing the compact
+// definition from 3,918 to 4,267 bytes.
+const TOOL_DEFINITION_BUDGET_BYTES = 4_267;
 
 test("rendered workflow prompt contribution stays within its accepted size", async () => {
   await withRenderedWorkflow(async ({ systemPrompt, promptLines }) => {

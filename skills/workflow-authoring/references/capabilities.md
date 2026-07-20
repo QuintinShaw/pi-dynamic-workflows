@@ -28,7 +28,8 @@ This compact generated index covers supported runtime globals and workflow-tool 
 | cwd | runtime-global | `cwd: string` | — |
 | process | runtime-global | `process: { cwd(): string }` | — |
 | budget | runtime-global | `budget: { total, spent(), remaining() }` | — |
-| script | workflow-tool-input | `script: string` | — |
+| script | workflow-tool-input | `script?: string` | — |
+| name | workflow-tool-input | `name?: string` | — |
 | args | workflow-tool-input | `args?: unknown` | — |
 | background | workflow-tool-input | `background?: boolean = true` | — |
 | maxAgents | workflow-tool-input | `maxAgents?: number = 1000` | — |
