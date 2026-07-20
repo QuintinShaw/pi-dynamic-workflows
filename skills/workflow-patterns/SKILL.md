@@ -2,7 +2,7 @@
 name: workflow-patterns
 description: Argument shapes for the 5 built-in workflow patterns — deep-research, adversarial-review, code-review, multi-perspective, codebase-audit — runnable via the `workflow` tool's `name` input, without slash-command syntax. Use for requests like "research X", "fact-check/adversarially review this", "review this diff/PR", "analyze from multiple perspectives", or "audit the codebase for Y". Not for authoring a new workflow script — see workflow-authoring.
 metadata:
-  version: "3.2.2"
+  version: "3.3.0"
 ---
 
 # Built-in workflow patterns
