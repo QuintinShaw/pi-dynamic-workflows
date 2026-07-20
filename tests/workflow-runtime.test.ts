@@ -497,6 +497,60 @@ return { err }`;
   assert.match(result.result.err, /one level deep/);
 });
 
+test("sequential nested workflow() calls at the same depth get distinct child run ids (no cross-child id/deltaKey collision)", async () => {
+  // `shared.depth` alone would give BOTH of these sequential children the
+  // same `${runId}-nested1` suffix (depth returns to 0 between them, since
+  // only one level of nesting is ever live at a time) — and each child's own
+  // callSeq restarts at 0, so their first agent() calls would then compute
+  // the identical deltaKey (also used as the onAgentStart/onAgentEnd event
+  // id — see item 2's identity model), corrupting SharedStore deltas and
+  // misattributing events. child1's agent() call is deliberately left
+  // un-awaited — realistically, that's exactly when the collision bites:
+  // the stray can still be in SharedRuntime.inFlight (only the top-level
+  // frame drains, not each nested frame) when child2 starts and mints an id.
+  const seenIds = new Set<string>();
+  let duplicateId: string | undefined;
+  const runner = {
+    async run(prompt: string) {
+      if (prompt === "child1-stray") {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        return "child1-stray-done";
+      }
+      return `ran:${prompt}`;
+    },
+  };
+  const scripts: Record<string, string> = {
+    child1: `export const meta = { name: 'child1', description: 'c1' }
+// Deliberately NOT awaited.
+agent('child1-stray', { label: 'stray' })
+return 'child1-done'`,
+    child2: `export const meta = { name: 'child2', description: 'c2' }
+const r = await agent('child2-live', { label: 'live' })
+return r`,
+  };
+  const parent = `export const meta = { name: 'parent', description: 'p' }
+const a = await workflow('child1')
+const b = await workflow('child2')
+return { a, b }`;
+
+  const result = await runWorkflow<{ a: string; b: string }>(parent, {
+    agent: runner,
+    persistLogs: false,
+    loadSavedWorkflow: (name) => scripts[name],
+    onAgentStart: (event) => {
+      if (seenIds.has(event.id)) duplicateId = event.id;
+      seenIds.add(event.id);
+    },
+  });
+  assert.equal(result.result.a, "child1-done");
+  assert.equal(result.result.b, "ran:child2-live");
+  assert.equal(
+    duplicateId,
+    undefined,
+    "child1's un-awaited stray and child2's live call must never share an id/deltaKey",
+  );
+});
+
 test("runWorkflow budget gates on accumulated tokens", async () => {
   const script = `export const meta = { name: 'budget_demo', description: 'budget' }
 const a = await agent('first', { label: 'a' })
@@ -1145,6 +1199,41 @@ return xs`;
   assert.deepEqual(result.result, [null, "done:sib"], "the thrown thunk resolves to null; the sibling still succeeds");
   assert.equal(state.aborted, 0, "a recoverable, swallowed-to-null error must never trigger a run-fatal abort");
   assert.equal(state.completed, 1);
+});
+
+test("a parent script that catches a nested workflow()'s uncaught child error can still run agents afterward (isTopLevelRun gate)", async () => {
+  // Only the TOP-level frame is allowed to seal shared.runFatalController (see
+  // isTopLevelRun in runWorkflow's catch) — a NESTED frame reaching its own
+  // catch must never seal it, because the error hasn't finished propagating
+  // yet: the parent script may still catch workflow()'s rejection and
+  // continue normally. If a nested frame sealed it too (the mutation this
+  // test targets — dropping the isTopLevelRun guard), the shared runtime
+  // (shared between parent and child via sharedRuntime) would already be
+  // aborted by the time control returns to the parent's catch block, so the
+  // parent's own SUBSEQUENT agent() call would be aborted before it could
+  // even start — even though the parent legitimately handled the failure.
+  const { state, runner } = abortAwareAgent(20);
+  const child = `export const meta = { name: 'child', description: 'c' }
+await agent('failer', { label: 'child-failer' })
+return 1`;
+  const parent = `export const meta = { name: 'parent', description: 'p' }
+let caught = false
+try {
+  await workflow('child')
+} catch (e) {
+  caught = true
+}
+const after = await agent('after', { label: 'after' })
+return { caught, after }`;
+
+  const result = await runWorkflow<{ caught: boolean; after: string }>(parent, {
+    agent: runner,
+    persistLogs: false,
+    loadSavedWorkflow: (name) => (name === "child" ? child : undefined),
+  });
+  assert.equal(result.result.caught, true, "the parent's own try/catch saw the child workflow's escaping error");
+  assert.equal(result.result.after, "done:after", "a later agent() call must still run normally after the catch");
+  assert.equal(state.aborted, 0, "sealing at the child (nested) level must never abort the parent's own later agent");
 });
 
 // ── Un-awaited agent() calls must not outlive the run: the run drains every

@@ -975,6 +975,23 @@ export class WorkflowManager extends EventEmitter {
     // it, or deleteRun() removed it), not an error: writing anyway would
     // resurrect a torn-down run's file, or clobber a newer execution's
     // in-progress/completed state with this stale one's.
+    //
+    // This check is redundant with persistRun()'s own early-return for every
+    // CURRENT call site — it earns its keep solely for schedulePersist()'s
+    // deferred setTimeout callback, the one path into this method that skips
+    // persistRun() entirely. That callback only fires from onAgentJournal, and
+    // onAgentJournal only fires for a call that got PAST agent()'s
+    // throwIfAborted() check (see workflow.ts) — which, since run-fatal abort
+    // (SharedRuntime.runFatalController) now seals every top-level run's
+    // shared runtime the instant any error escapes it uncaught, means a
+    // genuinely superseded-but-never-aborted execution (the only kind that
+    // could previously still journal a stray call after resume() replaced it)
+    // is structurally impossible to construct anymore — see the "unreachable
+    // defense-in-depth (#2)" test in workflow-manager.test.ts for the worked
+    // example and its own note. This check is KEPT anyway: it costs nothing,
+    // and removing it would silently reopen a stale-write path the moment any
+    // future change (e.g. a new way to journal without throwIfAborted()'s
+    // gate) reintroduces a producer for it.
     if (!this.isCurrent(managed)) return;
     try {
       this.persistence.save({

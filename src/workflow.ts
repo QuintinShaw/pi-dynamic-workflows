@@ -84,6 +84,24 @@ export interface SharedRuntime {
   tokenUsage: { input: number; output: number; total: number; cost: number; cacheRead: number; cacheWrite: number };
   depth: number;
   /**
+   * Monotonic count of every workflow() call anywhere in this run tree,
+   * regardless of nesting depth — used (instead of `depth`) to build each
+   * nested run's runId suffix (see workflowFn below). `depth` alone is NOT
+   * enough: it returns to 0 after each nested call finishes, so two
+   * SEQUENTIAL nested workflow() calls at the same depth (`await
+   * workflow('a'); await workflow('b')`) would otherwise both compute the
+   * exact same `${runId}-nested1` suffix. That collision matters because a
+   * child's own callSeq restarts at 0, so its deltaKey (`${childRunId}:
+   * ${callIndex}`) — the same id used as SharedStore's delta key AND as the
+   * onAgentStart/onAgentEnd/onAgentHistory event id (see item 2's identity
+   * model) — would collide between the two children's same-callIndex calls.
+   * That's a real, not just theoretical, collision risk: an un-awaited
+   * stray agent() call from the first child (still in SharedRuntime.inFlight,
+   * not yet drained — only the top-level frame drains) can still be pending
+   * when the second child starts and mints the very same id.
+   */
+  nestedCallSeq: number;
+  /**
    * Fires exactly once a run-fatal error is determined: an error that escaped
    * the TOP-level script's own execution completely uncaught (see runWorkflow's
    * catch below) — i.e. nothing anywhere in the call chain, at any nesting
@@ -429,6 +447,7 @@ export async function runWorkflow<T = unknown>(
       ? { ...options.initialTokenUsage }
       : { input: 0, output: 0, total: 0, cost: 0, cacheRead: 0, cacheWrite: 0 },
     depth: 0,
+    nestedCallSeq: 0,
     runFatalController: new AbortController(),
     inFlight: new Set<Promise<unknown>>(),
   };
@@ -583,10 +602,14 @@ export async function runWorkflow<T = unknown>(
     // Store delta key: callIndex alone is NOT run-unique. A nested workflow()
     // call (see workflowFn below) shares this run's SharedStore instance but
     // restarts its own callSeq at 0, so a parent agent and a concurrently
-    // running nested-run agent can both get callIndex 0 and collide in
-    // SharedStore.agentDeltas — whichever commits last steals/overwrites the
-    // other's journaled delta. Composing the run's own runId (unique per
-    // top-level run AND per nested run, see `${runId}-nested${shared.depth}`
+    // running nested-run agent — or two SEQUENTIAL sibling nested runs, whose
+    // depth alone would otherwise repeat — can both get callIndex 0 and
+    // collide in SharedStore.agentDeltas — whichever commits last
+    // steals/overwrites the other's journaled delta (and, via this same
+    // deltaKey doubling as the onAgentStart/onAgentEnd/onAgentHistory event
+    // id, misattributes one agent's events to the other — see item 2's
+    // identity model). Composing the run's own runId (unique per top-level
+    // run AND per nested run, see `${runId}-nested${++shared.nestedCallSeq}`
     // below) with callIndex makes the key unique across the whole store.
     const deltaKey = `${runId}:${callIndex}`;
 
@@ -918,7 +941,11 @@ export async function runWorkflow<T = unknown>(
         // A nested run is its own script; never reuse the parent's resume journal.
         resumeJournal: undefined,
         resumeFromRunId: undefined,
-        runId: `${runId}-nested${shared.depth}`,
+        // shared.nestedCallSeq, not shared.depth — see its doc comment: depth
+        // returns to 0 between sequential sibling calls, which would otherwise
+        // mint the same child runId (and hence colliding deltaKeys/event ids)
+        // for two different children.
+        runId: `${runId}-nested${++shared.nestedCallSeq}`,
         persistLogs: false,
       });
       return child.result;
@@ -1212,6 +1239,15 @@ export async function runWorkflow<T = unknown>(
     // Idempotent: if this is already an intentional pause/stop (options.signal
     // aborted) or a second escape after the fatal signal already fired,
     // aborting an already-aborted controller is a no-op.
+    //
+    // This also fires on a PROVIDER_USAGE_LIMIT escape (a quota/rate-limit
+    // hit), not just a genuine bug — that error is non-recoverable too (see
+    // errors.ts), so it escapes exactly like any other run-fatal error and
+    // seals the same way. Deliberate tradeoff: any sibling still in flight
+    // when the quota was hit gets aborted rather than allowed to finish and
+    // journal — this stops burning an already-exhausted budget right now, at
+    // the cost of that sibling's work being thrown away and re-run live when
+    // the paused run resumes (it was never journaled, so it isn't cached).
     if (isTopLevelRun) shared.runFatalController.abort();
     throw error;
   } finally {
@@ -1225,6 +1261,16 @@ export async function runWorkflow<T = unknown>(
       // state after the run is marked complete/failed and torn down. Loop
       // (not a single Promise.allSettled) because draining can itself let a
       // still-running call schedule further work that adds to the set.
+      //
+      // Caveat: this can block indefinitely. A run-fatal abort (see the catch
+      // above) aborts the AbortSignal passed to each in-flight agent, but that
+      // is cooperative — an agent runner that ignores its signal (or one still
+      // waiting out a real subagent process that won't die) never settles on
+      // its own. Combined with agentTimeoutMs: null (no hard timeout, the
+      // default), a single hung, signal-ignoring, un-awaited agent() call can
+      // wedge this drain — and therefore the whole run's completion — forever.
+      // Configure a finite agentTimeoutMs (run- or per-agent-level) for any
+      // workflow where this is a real risk; there is no drain-side timeout.
       if (shared.inFlight.size > 0) {
         log(`waiting for ${shared.inFlight.size} outstanding agent() call(s) to settle before this run completes`);
       }
