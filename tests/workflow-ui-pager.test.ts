@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { initTheme } from "@earendil-works/pi-coding-agent";
 import type { MarkdownTheme } from "@earendil-works/pi-tui";
 import type { AgentHistoryEntry } from "../src/agent-history.js";
 import type { WorkflowAgentSnapshot, WorkflowSnapshot } from "../src/display.js";
@@ -224,6 +225,42 @@ test("write calls render source code instead of a raw JSON argument envelope", (
   assert.match(text, /assistant tool write: src\/example\.rs/);
   assert.match(text, /\[rust\] use uuid::Uuid;/);
   assert.doesNotMatch(text, /"content":/);
+});
+
+test("edit calls render with Pi's native diff view instead of replacement JSON", () => {
+  initTheme("dark");
+  const history: AgentHistoryEntry[] = [
+    {
+      role: "assistant",
+      kind: "toolCall",
+      toolName: "edit",
+      path: "src/example.ts",
+      text: '{"path":"src/example.ts","edits":[{"oldText":"old value","newText":"new value"}]}',
+    },
+    {
+      role: "tool",
+      kind: "toolResult",
+      toolName: "edit",
+      text: "Successfully replaced 1 block(s) in src/example.ts.",
+      diff: " 1 before\n-2 old value\n+2 new value\n 3 after",
+    },
+  ];
+  const model = modelForAgent({
+    id: 1,
+    label: "editor",
+    phase: "Work",
+    prompt: "edit it",
+    status: "running",
+    history,
+  });
+  const state = enterAgentDetail(model);
+  state.togglePager();
+  const text = renderNavigator(state, model, 100, undefined, 30, plainMarkdownTheme).join("\n");
+
+  assert.match(text, /assistant tool edit: src\/example\.ts/);
+  assert.match(text, /-2 old value/);
+  assert.match(text, /\+2 new value/);
+  assert.doesNotMatch(text, /oldText/);
 });
 
 test("short pagers and long run lists stay within their viewport", () => {

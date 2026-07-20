@@ -18,6 +18,7 @@ import {
   type ExtensionUIContext,
   getLanguageFromPath,
   getMarkdownTheme,
+  renderDiff,
   type Theme,
 } from "@earendil-works/pi-coding-agent";
 import type { Component, Focusable, MarkdownTheme, TUI } from "@earendil-works/pi-tui";
@@ -1237,6 +1238,19 @@ function historyLabel(entry: NonNullable<WorkflowAgentSnapshot["history"]>[numbe
   return asText(entry.role);
 }
 
+function editCallPath(entry: NonNullable<WorkflowAgentSnapshot["history"]>[number]): string | undefined {
+  if (entry.kind !== "toolCall" || entry.toolName !== "edit") return undefined;
+  if (typeof entry.path === "string") return entry.path;
+  // Backward compatibility for persisted histories from before edit paths were
+  // stored separately from the JSON argument envelope.
+  try {
+    const args = JSON.parse(asText(entry.text)) as { path?: unknown };
+    return typeof args.path === "string" ? args.path : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function writeCallSource(
   entry: NonNullable<WorkflowAgentSnapshot["history"]>[number],
 ): { path: string; content: string } | undefined {
@@ -1294,10 +1308,22 @@ function renderHistoryEntryLines(
   // Skip null/primitive elements from corrupt persisted histories (#110).
   if (!entry || typeof entry !== "object") return [];
   const write = writeCallSource(entry);
+  const editPath = editCallPath(entry);
+  const path = write?.path ?? editPath;
+  const header = dim(`${historyLabel(entry)}:${path ? ` ${path}` : ""}`);
+
+  // The edit result carries the same display-oriented diff used by Pi's built-in
+  // edit renderer. Render it with Pi's native colors, line numbers, and
+  // intra-line highlighting instead of showing the raw replacement JSON.
+  if (entry.kind === "toolResult" && entry.toolName === "edit" && typeof entry.diff === "string") {
+    return [header, ...renderDiffLines(entry.diff, width, renderCache)];
+  }
+  if (editPath) return [header];
+
   const language = historyEntryLanguage(history, index);
   const text = write?.content ?? asText(entry.text);
   return [
-    dim(`${historyLabel(entry)}:${write ? ` ${write.path}` : ""}`),
+    header,
     ...(language
       ? renderCodeLines(text, language, width, markdownTheme, renderCache)
       : renderMarkdownLines(text, width, markdownTheme, renderCache)),
@@ -1360,6 +1386,19 @@ function renderMarkdownLines(
   const cached = renderCache?.get(key);
   if (cached) return cached;
   const lines = new Markdown(safeText, 0, 0, markdownTheme).render(renderWidth);
+  return renderCache?.set(key, lines, key.length + lines.reduce((sum, line) => sum + line.length, 0)) ?? lines;
+}
+
+/** Render Pi's display-oriented edit diff inside the navigator's bounded
+ * viewport while preserving its ANSI colors and intra-line highlights. */
+function renderDiffLines(diff: string, width: number, renderCache?: NavigatorTextRenderCache): string[] {
+  const renderWidth = Math.max(1, width);
+  const key = `diff:${renderWidth}:${diff}`;
+  const cached = renderCache?.get(key);
+  if (cached) return cached;
+  const lines = renderDiff(diff)
+    .split("\n")
+    .flatMap((line) => wrapTextWithAnsi(`  ${line}`, renderWidth));
   return renderCache?.set(key, lines, key.length + lines.reduce((sum, line) => sum + line.length, 0)) ?? lines;
 }
 
