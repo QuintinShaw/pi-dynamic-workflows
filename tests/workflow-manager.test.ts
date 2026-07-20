@@ -2991,7 +2991,7 @@ test(
 );
 
 test(
-  "eviction never removes a running or paused run's in-memory entry, however many terminal runs pile up around it",
+  "eviction never removes a running or paused run's in-memory entry, however many terminal runs pile up around it (separate managers, no queue pressure)",
   withTempCwd(async (cwd) => {
     const held = deferredAgent();
     // A dedicated manager for the long-running run so its agent (never
@@ -3022,6 +3022,139 @@ test(
 
     held.resolve();
     await runningPromise.catch(() => {});
+  }),
+);
+
+test(
+  "recordTerminalRun's status re-validation guard: a resumed (live, running) run survives an overflow triggered by its OWN stale queue entry",
+  withTempCwd(async (cwd) => {
+    // Repro for the guard's necessity (single manager, real queue pressure —
+    // unlike the cross-manager test above, which has no queue interaction at
+    // all and is structurally unable to catch this class of bug):
+    //
+    //  1. Run A fails (non-recoverable) -> terminalRunQueue = [A].
+    //  2. A is resumed -> a FRESH, live ManagedRun replaces the map entry for
+    //     "A" (status "running"), but the STALE "A" queue entry from step 1
+    //     is still sitting at the front of terminalRunQueue.
+    //  3. Run B terminates -> recordTerminalRun("B") pushes the queue over
+    //     maxTerminalRunsInMemory (1), so it shifts the front — the STALE "A"
+    //     entry — and must decide whether to evict.
+    //
+    // Without the guard (evict unconditionally on shift), the LIVE, still-
+    // running resumed run A is deleted from `runs` — its eventual settle
+    // then fails isCurrent(), silently skipping the final persist AND lease
+    // release (run stuck "running" on disk forever, lease leaked). With the
+    // guard, recordTerminalRun() re-reads the CURRENT entry for "A" at
+    // eviction time, sees status "running" (not terminal), and skips it.
+    let aAttempts = 0;
+    let resolveHang: ((v: unknown) => void) | undefined;
+    const agent = {
+      async run(prompt: string, options?: { onUsage?: (u: AgentUsage) => void }) {
+        if (prompt === "A1") {
+          aAttempts++;
+          if (aAttempts === 1) {
+            throw new WorkflowError("fatal agent error", WorkflowErrorCode.AGENT_EXECUTION_ERROR, {
+              recoverable: false,
+            });
+          }
+          // Second attempt (post-resume): hang so A stays "running" in
+          // memory while B's overflow fires — exactly the window the bug
+          // needs to matter.
+          return new Promise((resolve) => {
+            resolveHang = resolve;
+          });
+        }
+        options?.onUsage?.({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 });
+        return "ok";
+      },
+    };
+    const manager = new WorkflowManager({ cwd, agent, maxTerminalRunsInMemory: 1 });
+    manager.on("error", () => {});
+
+    const scriptA = `export const meta = { name: 'run_a', description: 'a' }
+const a = await agent('A1', { label: 'a' })
+return { a }`;
+    const scriptB = `export const meta = { name: 'run_b', description: 'b' }
+const b = await agent('B1', { label: 'b' })
+return { b }`;
+
+    // 1. A fails -> enqueued (terminal), still evictable in principle.
+    const { runId: runAId, promise: aPromise } = manager.startInBackground(scriptA);
+    await aPromise.catch(() => {});
+    assert.equal(manager.getRun(runAId)?.status, "failed");
+
+    // 2. Resume A: a fresh, live ManagedRun replaces the map entry; the old
+    // queue entry for "A" is now stale (still at the front of the queue).
+    const resumed = await manager.resume(runAId);
+    assert.equal(resumed, true);
+    assert.equal(manager.getRun(runAId)?.status, "running", "resumed run A is live and running (hung on attempt 2)");
+
+    // 3. B terminates -> overflows the cap (1), shifting the stale "A" entry.
+    const { promise: bPromise } = manager.startInBackground(scriptB);
+    await bPromise.catch(() => {});
+
+    // The guard must have refused to evict the LIVE, running resumed A.
+    assert.ok(manager.getRun(runAId), "the guard must protect the live resumed run A from its own stale queue entry");
+    assert.equal(manager.getRun(runAId)?.status, "running");
+
+    // Clean up the hung agent so nothing keeps the process alive, and prove
+    // the surviving entry settles normally afterward.
+    resolveHang?.("done");
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(manager.getRun(runAId)?.status, "completed", "the protected entry still settles correctly");
+  }),
+);
+
+test(
+  "paused-exclusion in executeRun's catch tail: a usage-limit pause must never create eviction pressure on an unrelated, genuinely-terminal run",
+  withTempCwd(async (cwd) => {
+    // A separate repro from the one above: here the mutation under test is
+    // the catch tail's `if (IN_MEMORY_TERMINAL_STATUSES.has(managed.status))`
+    // gate around recordTerminalRun() — NOT the guard inside recordTerminalRun
+    // itself. Reached via the usage-limit branch (not manual pause()), which
+    // is a distinct code path through executeRun's catch tail.
+    //
+    // Sequence with maxTerminalRunsInMemory 1:
+    //  1. T completes -> terminalRunQueue = [T], within the cap.
+    //  2. P pauses on a usage limit. If the catch tail's paused-exclusion gate
+    //     were removed, this would ALSO call recordTerminalRun("P"), pushing
+    //     the queue to [T, P] — over the cap — and evicting the FRONT entry,
+    //     T, purely because P paused (T is genuinely terminal so the
+    //     recordTerminalRun-internal guard would not save it). With the gate,
+    //     a paused settle never enqueues at all, so T is never touched.
+    const agent = {
+      async run(prompt: string, options?: { onUsage?: (u: AgentUsage) => void }) {
+        if (prompt === "P1") {
+          throw new WorkflowError(
+            "Codex usage limit reached (plus plan). Resets in ~3h.",
+            WorkflowErrorCode.PROVIDER_USAGE_LIMIT,
+            { recoverable: false, resetHint: "Resets in ~3h" },
+          );
+        }
+        options?.onUsage?.({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 });
+        return "ok";
+      },
+    };
+    const manager = new WorkflowManager({ cwd, agent, maxTerminalRunsInMemory: 1 });
+    manager.on("error", () => {});
+    manager.on("paused", () => {});
+
+    const scriptT = `export const meta = { name: 'run_t', description: 't' }
+const t = await agent('T1', { label: 't' })
+return { t }`;
+    const scriptP = `export const meta = { name: 'run_p', description: 'p' }
+const p = await agent('P1', { label: 'p' })
+return { p }`;
+
+    const t = await manager.runSync(scriptT);
+    const tId = t.runId as string;
+    assert.equal(manager.getRun(tId)?.status, "completed");
+
+    const { runId: pId, promise: pPromise } = manager.startInBackground(scriptP);
+    await pPromise.catch(() => {});
+    assert.equal(manager.getRun(pId)?.status, "paused");
+
+    assert.ok(manager.getRun(tId), "T must survive — a paused settle must never count against the terminal-run cap");
   }),
 );
 
@@ -3057,5 +3190,44 @@ test(
     assert.equal(resumed, true, "resume works purely from persisted state even though the in-memory copy is gone");
     await new Promise((r) => setTimeout(r, 50));
     assert.equal(manager2.listRuns().find((r) => r.runId === evictedRunId)?.status, "completed");
+  }),
+);
+
+test(
+  "stop() on an already-paused run marks it eviction-eligible (its own executeRun tail already settled at pause time, so no future tail ever will)",
+  withTempCwd(async (cwd) => {
+    const da = deferredAgent();
+    const manager = new WorkflowManager({ cwd, agent: da.runner, maxTerminalRunsInMemory: 1 });
+    manager.on("error", () => {});
+
+    const { runId: pausedId, promise } = manager.startInBackground(oneAgentScript);
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(manager.pause(pausedId), true);
+    assert.equal(manager.getRun(pausedId)?.status, "paused");
+
+    // Let pause()'s abort-triggered executeRun() tail fully settle BEFORE
+    // stopping — the realistic case the fix targets. By now the run's only
+    // executeRun() promise has already resolved once (as "paused", which is
+    // deliberately NOT enqueued for eviction — see IN_MEMORY_TERMINAL_STATUSES),
+    // so nothing will ever call recordTerminalRun() for it again except
+    // stop() itself.
+    da.resolve("done");
+    await promise.catch(() => {});
+    assert.equal(manager.getRun(pausedId)?.status, "paused", "still paused; the already-settled tail didn't change it");
+
+    assert.equal(manager.stop(pausedId), true);
+    assert.equal(manager.getRun(pausedId)?.status, "aborted");
+
+    // One more terminal run overflows the cap (1): the stopped run must be
+    // the one evicted — proving stop() itself recorded it terminal-eligible
+    // (without that, it would sit in `runs` forever: no pending tail left to
+    // ever call recordTerminalRun() for it).
+    const other = await manager.runSync(oneAgentScript);
+    assert.ok(manager.getRun(other.runId), "the newest terminal run is in memory");
+    assert.equal(
+      manager.getRun(pausedId),
+      undefined,
+      "stop() must have recorded the already-settled paused run as terminal-eligible, so it's evicted here",
+    );
   }),
 );

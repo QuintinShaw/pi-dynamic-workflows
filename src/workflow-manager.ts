@@ -1191,11 +1191,27 @@ export class WorkflowManager extends EventEmitter {
     const managed = this.runs.get(runId);
     if (managed) {
       if (managed.status !== "running" && managed.status !== "paused") return false;
+      // Whether this run's OWN executeRun() promise has already fully settled
+      // matters for whether stop() itself must be the one to call
+      // recordTerminalRun(): a "paused" run got there via pause() or a
+      // usage-limit checkpoint, both of which already ran executeRun()'s
+      // catch tail to completion at pause time (it deliberately skipped
+      // recordTerminalRun() then, since "paused" isn't terminal) — so there
+      // is no FUTURE tail left that will ever call it for this managed
+      // object. A "running" run, by contrast, still has that tail pending;
+      // it (not stop()) is what calls recordTerminalRun() once it actually
+      // settles to "aborted" — see the `runs` field doc comment's rule that
+      // eviction eligibility must wait for the real settle, not a request to
+      // abort. Without this, stopping an already-paused run left it in
+      // `runs` forever (no future tail to mark it eviction-eligible) — a
+      // small leak in exactly the class this manager otherwise bounds.
+      const hadNoPendingSettle = managed.status === "paused";
       managed.controller.abort();
       managed.status = "aborted";
       this.emit("stopped", { runId });
       this.persistRun(managed);
       this.releaseRunLease(managed);
+      if (hadNoPendingSettle) this.recordTerminalRun(runId);
       return true;
     }
 

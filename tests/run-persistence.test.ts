@@ -1,5 +1,14 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  type statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -619,17 +628,87 @@ test(
 );
 
 test(
-  "createRunPersistence retention: terminal runs beyond the cap are evicted oldest-first; running/paused are never touched",
+  "createRunPersistence list() re-parses when mtime+size are unchanged but the inode differs (closes the same-tick-rename false-positive)",
+  withTempCwd(async (cwd) => {
+    // A fully faked fs layer: real filesystems can't reliably produce two
+    // saves with identical mtime+size but different inodes on demand
+    // (mtime granularity is OS/filesystem dependent), so this simulates the
+    // exact scenario directly — two 400ms-throttled persists landing in the
+    // same coarse mtime tick (realistic on HFS+, many network mounts, and
+    // some Docker volume drivers) with coincidentally equal byte length
+    // ("paused" and "failed" are both 6 characters).
+    const runsDir = workflowProjectPaths(cwd).runsDir;
+    const filePath = join(runsDir, "r.json");
+
+    const makeContent = (status: string) =>
+      JSON.stringify({
+        runId: "r",
+        workflowName: "w",
+        script: "s",
+        status,
+        phases: [],
+        agents: [],
+        logs: [],
+        startedAt: "t",
+        updatedAt: "t",
+      });
+    const contentA = makeContent("paused");
+    const contentB = makeContent("failed");
+    assert.equal(contentA.length, contentB.length, "fixture must have equal byte length to isolate the ino signal");
+
+    let currentContent = contentA;
+    // Same mtime+size across both "generations" — only the inode differs,
+    // exactly as it would after tmp+rename replaces the file with a new one
+    // in the same tick on a coarse-mtime filesystem/mount.
+    const stat = { mtimeMs: 1_700_000_000_000, size: contentA.length, ino: 111 } as ReturnType<typeof statSync>;
+
+    const rp = createRunPersistence(cwd, {
+      existsSync: ((p: string) => p === runsDir || p === filePath) as typeof existsSync,
+      readdirSync: (() => ["r.json"]) as unknown as typeof readdirSync,
+      statSync: (() => stat) as unknown as typeof statSync,
+      readFileSync: (() => currentContent) as unknown as typeof readFileSync,
+    });
+
+    const first = rp.list();
+    assert.equal(first[0]?.status, "paused");
+
+    // Simulate a same-tick rename onto the same path: content changes,
+    // mtime and size stay identical, only the inode changes.
+    currentContent = contentB;
+    (stat as unknown as { ino: number }).ino = 222;
+
+    // Past the TTL so the next list() call actually re-scans.
+    await new Promise((r) => setTimeout(r, 400));
+    const second = rp.list();
+    assert.equal(
+      second[0]?.status,
+      "failed",
+      "a changed inode must be treated as a changed file, even with identical mtime+size — otherwise this would serve stale cached content forever",
+    );
+  }),
+);
+
+test(
+  "createRunPersistence retention: terminal runs beyond the cap are evicted oldest-first; running/paused survive purely because of the status filter, not save order",
   withTempCwd(async (cwd) => {
     const rp = createRunPersistence(cwd, undefined, { maxTerminalRunsOnDisk: 3 });
 
-    // 5 terminal runs, oldest to newest.
+    // Save running/paused FIRST: save() always overwrites `updatedAt` to
+    // "now" (see run-persistence.ts's save()), so saving these first gives
+    // them the OLDEST real updatedAt of everything in this test — deliberately
+    // the worst case for them. If enforceRetention()'s status filter were
+    // removed (evicting purely oldest-by-updatedAt regardless of status),
+    // these two would be among the very FIRST candidates evicted. Saving
+    // terminal runs LAST (as the earlier, accidentally-passing version of
+    // this test did) would let recency alone protect running/paused,
+    // masking whether the status filter does anything at all.
+    rp.save(baseRunState("still-running", "2023-01-01T00:00:00.000Z", "running"));
+    rp.save(baseRunState("still-paused", "2023-01-01T00:00:00.000Z", "paused"));
+
+    // Now enough terminal runs (saved after, so newer) to exceed the cap.
     for (let i = 0; i < 5; i++) {
       rp.save(baseRunState(`terminal-${i}`, `2024-01-0${i + 1}T00:00:00.000Z`, "completed"));
     }
-    // A running and a paused run — must survive retention regardless of age.
-    rp.save(baseRunState("still-running", "2023-01-01T00:00:00.000Z", "running"));
-    rp.save(baseRunState("still-paused", "2023-01-01T00:00:00.000Z", "paused"));
 
     const runIds = rp.list().map((r) => r.runId);
     const terminalKept = runIds.filter((id) => id.startsWith("terminal-"));
@@ -637,10 +716,16 @@ test(
     assert.deepEqual(
       new Set(terminalKept),
       new Set(["terminal-2", "terminal-3", "terminal-4"]),
-      "the oldest terminal runs are evicted first, newest are kept",
+      "the oldest terminal runs are evicted first among themselves, newest are kept",
     );
-    assert.ok(runIds.includes("still-running"), "a running run is never evicted by retention");
-    assert.ok(runIds.includes("still-paused"), "a paused run is never evicted by retention");
+    assert.ok(
+      runIds.includes("still-running"),
+      "a running run survives even though it has the OLDEST updatedAt of everything saved here",
+    );
+    assert.ok(
+      runIds.includes("still-paused"),
+      "a paused run survives even though it has the OLDEST updatedAt of everything saved here",
+    );
     assert.equal(rp.load("terminal-0"), null, "an evicted run's file is actually gone from disk");
   }),
 );

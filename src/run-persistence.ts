@@ -257,16 +257,28 @@ export function createRunPersistence(
     listCache = undefined;
   };
 
-  // Per-file mtime+size cache, keyed by absolute path: even once the
+  // Per-file mtime+size+ino cache, keyed by absolute path: even once the
   // TTL-level listCache above expires (the active panel polls roughly every
   // 300ms, i.e. faster than or comparable to the TTL), most run files on
   // disk haven't changed since the last recompute. Re-stat is cheap; re-read
   // + re-JSON.parse is not, and scales with total lifetime run history, not
-  // with what actually changed. A file whose (mtimeMs, size) matches what we
-  // last parsed is reused as-is instead of being re-read; entries for files
-  // that vanished between recomputes are pruned so this cache can't grow
-  // unbounded independent of what's actually on disk.
-  const fileStateCache = new Map<string, { mtimeMs: number; size: number; state: PersistedRunState }>();
+  // with what actually changed. A file whose (mtimeMs, size, ino) all match
+  // what we last parsed is reused as-is instead of being re-read; entries
+  // for files that vanished between recomputes are pruned so this cache
+  // can't grow unbounded independent of what's actually on disk.
+  //
+  // ino is load-bearing, not redundant with mtime+size: save() writes via
+  // tmp-write + rename (writeJsonAtomicWithBackup), and a rename onto an
+  // existing path allocates a NEW inode for the replacement file. Two
+  // consecutive saves landing in the same mtime tick (400ms-throttled
+  // progress persists vs. 1-2s mtime granularity on HFS+/many network
+  // mounts/some Docker volume drivers is entirely realistic) with
+  // coincidentally equal byte length (e.g. "paused" and "failed" are the
+  // same length) would otherwise be indistinguishable from "unchanged" by
+  // (mtimeMs, size) alone — serving stale, previously-cached content
+  // forever until something ELSE about the file changes. The inode always
+  // changes on such a rename, so adding it closes that hole for free.
+  const fileStateCache = new Map<string, { mtimeMs: number; size: number; ino: number; state: PersistedRunState }>();
 
   const removeStaleLegacyLock = (runId: string): boolean => {
     const lock = legacyLockPath(runId);
@@ -290,15 +302,17 @@ export function createRunPersistence(
         try {
           const stat = _statSync(path);
           const cached = fileStateCache.get(path);
-          // Reuse the last parse when the file is byte-identical (same mtime
-          // + size) to what produced it — the dominant case on every poll
-          // tick once a run goes terminal and stops changing.
-          if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+          // Reuse the last parse when the file is byte-identical (same
+          // mtime + size + inode) to what produced it — the dominant case
+          // on every poll tick once a run goes terminal and stops changing.
+          // ino is what actually rules out a false "unchanged" match on a
+          // coarse-mtime filesystem (see the field doc comment above).
+          if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size && cached.ino === stat.ino) {
             if (!byRunId.has(cached.state.runId)) byRunId.set(cached.state.runId, cached.state);
             continue;
           }
           const state = JSON.parse(_readFileSync(path, "utf-8")) as PersistedRunState;
-          fileStateCache.set(path, { mtimeMs: stat.mtimeMs, size: stat.size, state });
+          fileStateCache.set(path, { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino, state });
           if (!byRunId.has(state.runId)) byRunId.set(state.runId, state);
         } catch {
           // Skip corrupted/unreadable files; don't let a stale cache entry
