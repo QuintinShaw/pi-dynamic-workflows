@@ -669,9 +669,14 @@ test("a fan-out past maxAgents cancels queued agents instead of draining the res
 const xs = await parallel(Array.from({ length: ${fanout} }, (_, i) => () => agent('x' + i, { label: 'a' + i })))
 return xs`;
   const run = runWorkflow(script, { agent: runner, maxAgents, concurrency, persistLogs: false });
+  // The run now drains every in-flight agent() call (including these
+  // gate-blocked ones) before its own promise settles — see the run-fatal
+  // drain in runWorkflow's finally — so `run` will NOT reject until `gate`
+  // resolves. Release it concurrently instead of after awaiting the
+  // rejection (which would deadlock: nothing else ever calls release()).
+  const releaseSoon = new Promise<void>((r) => setTimeout(r, 20)).then(() => release());
   await assert.rejects(run, /limit/i);
-  release();
-  await new Promise((r) => setTimeout(r, 50)); // let any queued agents drain
+  await releaseSoon;
   // Deterministically exactly `concurrency`: the limiter runs the first
   // `concurrency` submissions' bodies synchronously during the reservation
   // pass (each immediately calls runner.run() and then suspends on `gate`);
@@ -1044,4 +1049,175 @@ return { escaped, arr, j, s }`;
   // ({}).constructor.constructor is the vm Function; its code runs in the vm realm
   // where Date.now is neutered -> blocked (the old host-object escape is closed).
   assert.match(r.result.escaped, /blocked/, "constructor escape via vm objects is closed");
+});
+
+// ── Run-fatal abort: a non-recoverable error that will fail the whole run
+// must stop in-flight siblings from continuing to spend, while preserving
+// parallel()'s null-on-recoverable-error contract and a script's own
+// try/catch around agent()/parallel(). ──
+
+/** An agent runner whose in-flight calls actually respect an abort signal. */
+function abortAwareAgent(delayMs: number) {
+  const state = { started: 0, completed: 0, aborted: 0 };
+  return {
+    state,
+    runner: {
+      async run(prompt: string, options: { signal?: AbortSignal } = {}) {
+        state.started++;
+        if (prompt === "failer") {
+          throw new WorkflowError("boom", WorkflowErrorCode.AGENT_EXECUTION_ERROR, { recoverable: false });
+        }
+        return await new Promise((resolve, reject) => {
+          const timer = setTimeout(() => {
+            state.completed++;
+            resolve(`done:${prompt}`);
+          }, delayMs);
+          options.signal?.addEventListener(
+            "abort",
+            () => {
+              clearTimeout(timer);
+              state.aborted++;
+              reject(new Error("aborted"));
+            },
+            { once: true },
+          );
+        });
+      },
+    },
+  };
+}
+
+test("a run-fatal error aborts in-flight parallel() siblings instead of letting them run to completion", async () => {
+  const { state, runner } = abortAwareAgent(200);
+  const script = `export const meta = { name: 'fatal_abort', description: 'sibling abort' }
+const xs = await parallel([
+  () => agent('failer', { label: 'failer' }),
+  () => agent('sib1', { label: 'sib1' }),
+  () => agent('sib2', { label: 'sib2' }),
+])
+return xs`;
+  await assert.rejects(runWorkflow(script, { agent: runner, persistLogs: false }), /boom/);
+  // Both in-flight siblings must have been aborted before their (200ms)
+  // delay would otherwise have let them complete and return a result.
+  assert.equal(state.started, 3, "all three agent() calls actually started");
+  assert.equal(state.aborted, 2, "both siblings were aborted once the run's fate was sealed");
+  assert.equal(state.completed, 0, "no sibling ran to completion on a run that's already failing");
+});
+
+test("a script's own try/catch around parallel() preserves in-flight siblings — no run-fatal abort", async () => {
+  const { state, runner } = abortAwareAgent(20);
+  const script = `export const meta = { name: 'fatal_abort_caught', description: 'sibling survives caught failure' }
+let caught = false
+try {
+  await parallel([
+    () => agent('failer', { label: 'failer' }),
+    () => agent('sib1', { label: 'sib1' }),
+  ])
+} catch (e) {
+  caught = true
+}
+// A later agent() call must still work normally — the run's fate was never
+// sealed because the script caught parallel()'s escaping error.
+const after = await agent('after', { label: 'after' })
+return { caught, after }`;
+  const result = await runWorkflow<{ caught: boolean; after: string }>(script, {
+    agent: runner,
+    persistLogs: false,
+  });
+  assert.equal(result.result.caught, true, "the script's own try/catch saw parallel()'s escaping error");
+  assert.equal(result.result.after, "done:after", "a later agent() call still runs normally, unaborted");
+  assert.equal(state.aborted, 0, "the caught sibling was never aborted — the run's fate was never sealed");
+  assert.equal(state.completed, 2, "the caught sibling and the later agent() both ran to completion");
+});
+
+test("parallel()'s recoverable-error-to-null contract does not seal the run's fate (siblings unaffected)", async () => {
+  const { state, runner } = abortAwareAgent(20);
+  // A plain (non-WorkflowError) throw from a thunk is classified recoverable by
+  // wrapError()'s default — parallel() must swallow it to null, not rethrow,
+  // and must NOT abort the sibling still in flight.
+  const script = `export const meta = { name: 'recoverable_null', description: 'recoverable swallowed' }
+const xs = await parallel([
+  () => { throw new Error('plain failure') },
+  () => agent('sib', { label: 'sib' }),
+])
+return xs`;
+  const result = await runWorkflow<Array<unknown>>(script, { agent: runner, persistLogs: false });
+  assert.deepEqual(result.result, [null, "done:sib"], "the thrown thunk resolves to null; the sibling still succeeds");
+  assert.equal(state.aborted, 0, "a recoverable, swallowed-to-null error must never trigger a run-fatal abort");
+  assert.equal(state.completed, 1);
+});
+
+// ── Un-awaited agent() calls must not outlive the run: the run drains every
+// spawned agent() call (awaited or not) before it is allowed to complete. ──
+
+test("an un-awaited agent() call is drained before the run completes", async () => {
+  let strayCompleted = false;
+  const runner = {
+    async run(prompt: string) {
+      if (prompt === "stray") {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        strayCompleted = true;
+        return "stray-done";
+      }
+      return "main-done";
+    },
+  };
+  const script = `export const meta = { name: 'stray_demo', description: 'un-awaited agent' }
+// Deliberately NOT awaited — a script bug the run must tolerate without
+// letting this call outlive the run's completion.
+agent('stray', { label: 'stray' })
+const main = await agent('main', { label: 'main' })
+return main`;
+  const journal: JournalEntry[] = [];
+  const result = await runWorkflow<string>(script, {
+    agent: runner,
+    persistLogs: false,
+    onAgentJournal: (entry) => journal.push(entry),
+  });
+  assert.equal(result.result, "main-done");
+  assert.equal(strayCompleted, true, "the run must not complete until the un-awaited agent has settled");
+  assert.ok(
+    journal.some((e) => e.result === "stray-done"),
+    "the stray agent's completion must be journaled before the run ends",
+  );
+});
+
+test("an un-awaited agent() call replays deterministically from the journal on resume", async () => {
+  const calls = { stray: 0, main: 0 };
+  const runner = {
+    async run(prompt: string) {
+      if (prompt === "stray") {
+        calls.stray++;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        return "stray-done";
+      }
+      calls.main++;
+      return "main-done";
+    },
+  };
+  const script = `export const meta = { name: 'stray_resume_demo', description: 'un-awaited agent replay' }
+agent('stray', { label: 'stray' })
+const main = await agent('main', { label: 'main' })
+return main`;
+  const journalEntries = new Map<number, JournalEntry>();
+  const first = await runWorkflow<string>(script, {
+    agent: runner,
+    persistLogs: false,
+    onAgentJournal: (entry) => journalEntries.set(entry.index, entry),
+  });
+  assert.equal(first.result, "main-done");
+  assert.equal(calls.stray, 1);
+  assert.equal(calls.main, 1);
+
+  const second = await runWorkflow<string>(script, {
+    agent: runner,
+    persistLogs: false,
+    resumeJournal: journalEntries,
+    resumeFromRunId: "prior-run",
+  });
+  assert.equal(second.result, "main-done");
+  // Resume replays BOTH cached calls (including the un-awaited 'stray') from
+  // the journal — neither runner.run() is invoked again.
+  assert.equal(calls.stray, 1, "the un-awaited agent's cached result must replay, not re-run, on resume");
+  assert.equal(calls.main, 1, "the awaited agent's cached result must replay, not re-run, on resume");
 });

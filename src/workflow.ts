@@ -83,6 +83,32 @@ export interface SharedRuntime {
   spent: number;
   tokenUsage: { input: number; output: number; total: number; cost: number; cacheRead: number; cacheWrite: number };
   depth: number;
+  /**
+   * Fires exactly once a run-fatal error is determined: an error that escaped
+   * the TOP-level script's own execution completely uncaught (see runWorkflow's
+   * catch below) — i.e. nothing anywhere in the call chain, at any nesting
+   * depth, caught it, so the run really is failing. Shared (not per-nesting-
+   * level) so a nested workflow()'s in-flight siblings wind down too, the
+   * instant the fate of the WHOLE run is sealed — not the instant any single
+   * fan-out rejects, which would break parallel()'s null-on-recoverable-error
+   * contract and a script's own try/catch around agent()/workflow(). Every
+   * agent() call (this level and any nested workflow()) links its per-attempt
+   * AbortController to this signal, alongside the caller's own options.signal,
+   * so already-in-flight sibling subagent sessions actually abort instead of
+   * running to completion on a run whose outcome is already decided. Wrapped
+   * in an AbortController (not a bare boolean) purely so workflow.ts never
+   * needs write access to the caller-owned options.signal/AbortController.
+   */
+  runFatalController: AbortController;
+  /**
+   * Every agent() promise spawned anywhere in this run (this level's script
+   * and any nested workflow()'s), added on call and removed on settle. Drained
+   * (awaited to completion) by the TOP-level runWorkflow's finally, before the
+   * SharedStore is disposed — so a script that forgets to `await agent(...)`
+   * can never have that call still mutating the store (or reporting results)
+   * after the run has been marked complete and torn down. See the drain below.
+   */
+  inFlight: Set<Promise<unknown>>;
 }
 
 /** Runtime instrumentation for workflow boundaries, quality helpers, and control attempts. */
@@ -180,8 +206,17 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   onPhase?: (title: string) => void;
   /** Runtime behavior trace used by diagnostics and comprehension evidence. */
   onRuntimeEvent?: (event: WorkflowRuntimeEvent) => void;
-  onAgentStart?: (event: { label: string; phase?: string; prompt: string; model?: string }) => void;
+  onAgentStart?: (event: { id: string; label: string; phase?: string; prompt: string; model?: string }) => void;
   onAgentEnd?: (event: {
+    /**
+     * Unique per agent() CALL (not per label — concurrent agents routinely
+     * share a label, e.g. parallel()'s default `"${phase} agent N"` labels or
+     * an author-supplied label reused across a fan-out). Stable across this
+     * call's start/end/history events. Callers must key any per-agent
+     * bookkeeping on this, never on label, to avoid misattributing a
+     * concurrent same-label agent's event to the wrong entry.
+     */
+    id: string;
     label: string;
     phase?: string;
     result: unknown;
@@ -193,7 +228,7 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
     errorCode?: WorkflowErrorCode;
     recoverable?: boolean;
   }) => void;
-  onAgentHistory?: (event: { label: string; phase?: string; history: AgentHistoryEntry[] }) => void;
+  onAgentHistory?: (event: { id: string; label: string; phase?: string; history: AgentHistoryEntry[] }) => void;
   onTokenUsage?: (usage: {
     input: number;
     output: number;
@@ -394,8 +429,17 @@ export async function runWorkflow<T = unknown>(
       ? { ...options.initialTokenUsage }
       : { input: 0, output: 0, total: 0, cost: 0, cacheRead: 0, cacheWrite: 0 },
     depth: 0,
+    runFatalController: new AbortController(),
+    inFlight: new Set<Promise<unknown>>(),
   };
   const limiter = shared.limiter;
+  // This frame created `shared` fresh (rather than inheriting a parent
+  // workflow()'s) — i.e. it's the true top-level run, the only frame allowed
+  // to declare the run's fate sealed (see SharedRuntime.runFatalController) or
+  // drain/dispose the SharedStore. A nested workflow() call always passes both
+  // sharedRuntime and sharedStore together (see workflowFn below), so this is
+  // equivalent to `!options.sharedStore` — used at both choke points below.
+  const isTopLevelRun = !options.sharedRuntime;
 
   // One store instance per run; nested workflow() calls inherit the parent's store
   // so all agents across nesting levels share the same key-value space.
@@ -437,13 +481,34 @@ export async function runWorkflow<T = unknown>(
       { recoverable: false },
     );
 
+  // True on an intentional external abort (pause/stop/Esc, via options.signal)
+  // OR once this run's fate has been sealed (shared.runFatalController — see
+  // its doc comment). Every abort check in this file goes through this so the
+  // two sources compose identically everywhere instead of only some call
+  // sites remembering to check the second one.
+  const isAborted = () => Boolean(options.signal?.aborted || shared.runFatalController.signal.aborted);
+
   const throwIfAborted = () => {
-    if (options.signal?.aborted) {
+    if (isAborted()) {
       throw new WorkflowError("workflow aborted", WorkflowErrorCode.WORKFLOW_ABORTED, { recoverable: true });
     }
   };
 
-  const agent = async (prompt: string, agentOptions: AgentOptions = {}) => {
+  const agent = (prompt: string, agentOptions: AgentOptions = {}): Promise<unknown> => {
+    // Track every call (awaited or not) so the top-level run can drain
+    // outstanding calls before completing (see SharedRuntime.inFlight and the
+    // drain in the finally below) — this is what stops a forgotten `await`
+    // from letting an agent mutate state after the run is torn down.
+    const call = agentImpl(prompt, agentOptions);
+    shared.inFlight.add(call);
+    // Attaching a handler here (independent of whatever the script itself does
+    // with the returned promise) also means an un-awaited call's eventual
+    // rejection never becomes a process-crashing unhandled rejection.
+    call.catch(() => {}).finally(() => shared.inFlight.delete(call));
+    return call;
+  };
+
+  const agentImpl = async (prompt: string, agentOptions: AgentOptions = {}) => {
     throwIfAborted();
 
     // Capture the enclosing parallel()/pipeline() fan-out's cancellation batch
@@ -542,8 +607,15 @@ export async function runWorkflow<T = unknown>(
     const hashMatches = cached != null && cached.hash === callHash;
     const cachedEmptyOutput = hashMatches && isEmptyTextAgentResult(cached.result, agentOptions.schema);
     if (hashMatches && !cachedEmptyOutput && callIndex < state.firstMiss) {
-      options.onAgentStart?.({ label, phase: assignedPhase, prompt, model: displayModel });
-      options.onAgentEnd?.({ label, phase: assignedPhase, result: cached.result, tokens: 0, model: displayModel });
+      options.onAgentStart?.({ id: deltaKey, label, phase: assignedPhase, prompt, model: displayModel });
+      options.onAgentEnd?.({
+        id: deltaKey,
+        label,
+        phase: assignedPhase,
+        result: cached.result,
+        tokens: 0,
+        model: displayModel,
+      });
       // Apply this agent's write delta so live agents later in the run see a
       // consistent store. Additive apply preserves parallel-agent writes that
       // came from higher-callIndex agents finishing before this one.
@@ -559,7 +631,7 @@ export async function runWorkflow<T = unknown>(
       const retryAttempts = normalizeAgentRetries(agentOptions.retries ?? options.agentRetries ?? 0);
       const maxAttempts = retryAttempts + 1;
 
-      options.onAgentStart?.({ label, phase: assignedPhase, prompt, model: displayModel });
+      options.onAgentStart?.({ id: deltaKey, label, phase: assignedPhase, prompt, model: displayModel });
 
       // Optional per-agent worktree isolation (deterministic name -> stable resume keys).
       // Precedence: explicit call-site isolation > agentDef isolation.
@@ -597,6 +669,7 @@ export async function runWorkflow<T = unknown>(
           usage = undefined;
           const externalSignal = options.signal;
           let onExternalAbort: (() => void) | undefined;
+          let onRunFatal: (() => void) | undefined;
           try {
             throwIfAborted();
             // This agent's own fan-out already breached maxAgents while this
@@ -607,16 +680,23 @@ export async function runWorkflow<T = unknown>(
             // Per-attempt abort: on timeout we abort THIS agent so its session is
             // disposed and its heavy state (messages, etc.) released, instead of
             // leaving it streaming in the background — retries would otherwise
-            // stack live sessions on top of each other (#109). Linked to the run's
-            // external signal so an outer abort still cancels the agent too; the
-            // link is torn down per attempt in finally so listeners don't accrue.
+            // stack live sessions on top of each other (#109). Linked to BOTH the
+            // run's external signal (outer abort — pause/stop/Esc) AND
+            // shared.runFatalController (this run's fate has been sealed by a
+            // sibling's non-recoverable error escaping the top-level script — see
+            // SharedRuntime.runFatalController) so an in-flight sibling actually
+            // winds down instead of running to completion on a doomed run. Both
+            // links are torn down per attempt in finally so listeners don't accrue.
             const agentController = new AbortController();
-            if (externalSignal) {
-              if (externalSignal.aborted) agentController.abort();
-              else {
+            if (isAborted()) {
+              agentController.abort();
+            } else {
+              if (externalSignal) {
                 onExternalAbort = () => agentController.abort();
                 externalSignal.addEventListener("abort", onExternalAbort, { once: true });
               }
+              onRunFatal = () => agentController.abort();
+              shared.runFatalController.signal.addEventListener("abort", onRunFatal, { once: true });
             }
             const runPromise = agentRunner.run(prompt, {
               label,
@@ -647,7 +727,7 @@ export async function runWorkflow<T = unknown>(
                 usage = u;
               },
               onHistory: (history: AgentHistoryEntry[]) => {
-                options.onAgentHistory?.({ label, phase: assignedPhase, history });
+                options.onAgentHistory?.({ id: deltaKey, label, phase: assignedPhase, history });
               },
             });
             // After a timeout the run() promise still settles later, rejecting with
@@ -672,6 +752,7 @@ export async function runWorkflow<T = unknown>(
               storeDelta: store.commitDelta(deltaKey),
             });
             options.onAgentEnd?.({
+              id: deltaKey,
               label,
               phase: assignedPhase,
               result,
@@ -682,7 +763,7 @@ export async function runWorkflow<T = unknown>(
             });
             return result;
           } catch (error) {
-            if (options.signal?.aborted) throw error;
+            if (isAborted()) throw error;
 
             const workflowError = wrapError(error, { agentLabel: label });
             logger.error(`agent ${label} attempt ${attempt}/${maxAttempts} failed: ${workflowError.message}`);
@@ -701,6 +782,7 @@ export async function runWorkflow<T = unknown>(
             }
 
             options.onAgentEnd?.({
+              id: deltaKey,
               label,
               phase: assignedPhase,
               result: null,
@@ -721,9 +803,11 @@ export async function runWorkflow<T = unknown>(
             }
             throw workflowError;
           } finally {
-            // Drop this attempt's external-abort listener so it doesn't accrue one
-            // entry per attempt on the run's signal for the whole run (#109 hygiene).
+            // Drop this attempt's abort listeners so they don't accrue one entry
+            // per attempt on the run's signal / runFatalController for the whole
+            // run (#109 hygiene).
             if (onExternalAbort) externalSignal?.removeEventListener("abort", onExternalAbort);
+            if (onRunFatal) shared.runFatalController.signal.removeEventListener("abort", onRunFatal);
           }
         }
         return null;
@@ -751,7 +835,7 @@ export async function runWorkflow<T = unknown>(
           try {
             return await thunk();
           } catch (error) {
-            if (options.signal?.aborted) throw error;
+            if (isAborted()) throw error;
             const workflowError = wrapError(error);
             // Non-recoverable failures (token budget / agent limit exhausted) must
             // halt the whole run, exactly like a directly-awaited agent() — not be
@@ -793,7 +877,7 @@ export async function runWorkflow<T = unknown>(
               value = await stage(value, item, index);
               throwIfAborted();
             } catch (error) {
-              if (options.signal?.aborted) throw error;
+              if (isAborted()) throw error;
               const workflowError = wrapError(error);
               // Non-recoverable failures halt the whole run (see parallel()).
               if (!workflowError.recoverable) {
@@ -1113,10 +1197,42 @@ export async function runWorkflow<T = unknown>(
       runId,
       tokenUsage: shared.tokenUsage,
     };
+  } catch (error) {
+    // This error just escaped THIS frame's own vm script execution completely
+    // uncaught. For the top-level frame that means nothing anywhere in the
+    // whole call chain (this script, any enclosing try/catch around a nested
+    // workflow()/parallel()/agent()) caught it — the run's fate is genuinely
+    // sealed now (see SharedRuntime.runFatalController). Sealing it here, not
+    // inside agent()/parallel(), is what preserves parallel()'s "a thrown
+    // thunk resolves to null without failing the others" contract and a
+    // script's own try/catch around agent()/workflow(): both those cases are
+    // swallowed well before an error would ever reach this catch. A NESTED
+    // frame reaching here does NOT seal anything — the parent script may still
+    // catch workflow()'s rejection and continue, so only isTopLevelRun acts.
+    // Idempotent: if this is already an intentional pause/stop (options.signal
+    // aborted) or a second escape after the fatal signal already fired,
+    // aborting an already-aborted controller is a no-op.
+    if (isTopLevelRun) shared.runFatalController.abort();
+    throw error;
   } finally {
-    // Dispose the store only when this run created it; nested runs inherit the
-    // parent's store and must not tear it down while the parent is still running.
-    if (!options.sharedStore) store.dispose();
+    // Only the top-level frame drains/disposes (see isTopLevelRun) — a nested
+    // workflow()'s in-flight agents are still tracked in this SAME shared set
+    // and get drained once, here, when the whole run finishes.
+    if (isTopLevelRun) {
+      // Wait out every agent() call spawned anywhere in this run — including
+      // ones the script never awaited — before the store goes away. Without
+      // this, a forgotten `await agent(...)` could keep mutating store/journal
+      // state after the run is marked complete/failed and torn down. Loop
+      // (not a single Promise.allSettled) because draining can itself let a
+      // still-running call schedule further work that adds to the set.
+      if (shared.inFlight.size > 0) {
+        log(`waiting for ${shared.inFlight.size} outstanding agent() call(s) to settle before this run completes`);
+      }
+      while (shared.inFlight.size > 0) {
+        await Promise.allSettled(Array.from(shared.inFlight));
+      }
+      store.dispose();
+    }
   }
 }
 

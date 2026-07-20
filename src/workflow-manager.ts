@@ -5,7 +5,7 @@
 import { EventEmitter } from "node:events";
 import type { ModelRegistry, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { WorkflowAgent } from "./agent.js";
-import { preview, type WorkflowSnapshot } from "./display.js";
+import { preview, type WorkflowAgentSnapshot, type WorkflowSnapshot } from "./display.js";
 import { isProviderUsageLimit, WorkflowError, WorkflowErrorCode } from "./errors.js";
 import {
   createRunPersistence,
@@ -67,6 +67,19 @@ export interface ManagedRun {
    * every agent with the run's startedAt / "now".
    */
   agentTimestamps: Map<number, { startedAt: string; endedAt?: string }>;
+  /**
+   * Live snapshot-agent lookup keyed by the agent CALL's unique id (see
+   * WorkflowRunOptions.onAgentStart/onAgentEnd/onAgentHistory's `id` field in
+   * workflow.ts — unique per call, never per label). onAgentEnd/onAgentHistory
+   * must resolve the snapshot entry to update through this map, never by
+   * scanning managed.snapshot.agents for a label match: two concurrent agents
+   * routinely share a label (e.g. parallel()'s default `"${phase} agent N"`
+   * labeling, or an author-supplied label reused across a fan-out), and a
+   * label+status scan would update whichever same-label entry it happens to
+   * find first — misattributing one agent's end/history event to a different,
+   * still-running sibling.
+   */
+  agentsById: Map<string, WorkflowAgentSnapshot>;
   /**
    * The run's cap on total agents (per-run value, else left undefined so
    * runWorkflow applies its own MAX_AGENTS_PER_RUN default), fixed at run
@@ -423,6 +436,7 @@ export class WorkflowManager extends EventEmitter {
       concurrency: exec.concurrency !== undefined ? exec.concurrency : this.concurrency,
       agentRetries: exec.agentRetries !== undefined ? exec.agentRetries : this.defaultAgentRetries,
       agentTimestamps: new Map(),
+      agentsById: new Map(),
     };
 
     this.runs.set(runId, managed);
@@ -524,6 +538,7 @@ export class WorkflowManager extends EventEmitter {
       journal: [],
       background: false,
       agentTimestamps: new Map(),
+      agentsById: new Map(),
     };
   }
 
@@ -649,14 +664,19 @@ export class WorkflowManager extends EventEmitter {
         },
         onAgentStart: (event) => {
           const id = managed.snapshot.agents.length + 1;
-          managed.snapshot.agents.push({
+          const agentSnapshot: WorkflowAgentSnapshot = {
             id,
             label: event.label,
             phase: event.phase,
             prompt: event.prompt,
             status: "running",
             model: event.model,
-          });
+          };
+          managed.snapshot.agents.push(agentSnapshot);
+          // Index by the call's unique id (never label — see agentsById's doc
+          // comment) so onAgentEnd/onAgentHistory can resolve back to exactly
+          // THIS entry even when a concurrent sibling shares its label.
+          managed.agentsById.set(event.id, agentSnapshot);
           // Real per-agent start time, captured the moment the agent actually
           // starts (not the run's startedAt) — see agentTimestamps.
           managed.agentTimestamps.set(id, { startedAt: new Date().toISOString() });
@@ -664,9 +684,7 @@ export class WorkflowManager extends EventEmitter {
           progress();
         },
         onAgentEnd: (event) => {
-          const agent = [...managed.snapshot.agents]
-            .reverse()
-            .find((a) => a.label === event.label && a.status === "running");
+          const agent = managed.agentsById.get(event.id);
           if (agent) {
             agent.status = event.result === null ? "error" : "done";
             agent.resultPreview = preview(event.result);
@@ -699,9 +717,7 @@ export class WorkflowManager extends EventEmitter {
           progress();
         },
         onAgentHistory: (event) => {
-          const agent = [...managed.snapshot.agents]
-            .reverse()
-            .find((a) => a.label === event.label && a.status === "running");
+          const agent = managed.agentsById.get(event.id);
           if (agent) {
             agent.history = event.history;
           }
@@ -1149,6 +1165,7 @@ export class WorkflowManager extends EventEmitter {
       // onAgentStart/onAgentEnd fire again for this attempt (see `agents: []`
       // above); the journal, not this map, is what makes replayed agents cheap.
       agentTimestamps: new Map(),
+      agentsById: new Map(),
     };
     this.runs.set(runId, managed);
     // Persist before notifying renderers: listRuns() is their source of truth for
