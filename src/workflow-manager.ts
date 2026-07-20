@@ -112,8 +112,12 @@ export interface ManagedRun {
 
 /** Per-execution options shared by sync, background, and resume runs. */
 export interface ExecOptions {
-  /** Replay these journaled agent results for the unchanged prefix (resume). */
-  resumeJournal?: Map<number, JournalEntry>;
+  /**
+   * Replay these journaled agent/checkpoint results for the unchanged prefix
+   * (resume), keyed by `${runId}:${index}` — see
+   * WorkflowRunOptions.resumeJournal in workflow.ts.
+   */
+  resumeJournal?: Map<string, JournalEntry>;
   /** Cap on total agents for this run. */
   maxAgents?: number;
   /** Per-agent timeout in milliseconds. null/omitted means no hard timeout. */
@@ -640,12 +644,16 @@ export class WorkflowManager extends EventEmitter {
           this.accumulateTokenUsage(managed, tokens);
         },
         onAgentJournal: (entry) => {
-          // Append (crash-safe-ish): keep the latest entry per index, then persist.
-          // This is the high-frequency progress persist (fires once per completed
-          // agent, can burst under concurrency) — throttled (trailing edge). Every
+          // Append (crash-safe-ish): keep the latest entry per (runId, index)
+          // pair, then persist. Matching on index ALONE would let a nested
+          // workflow()'s callIndex-0 entry evict the parent's own
+          // callIndex-0 entry (and vice versa) — they're only distinguished
+          // by runId (see JournalEntry.runId). This is the high-frequency
+          // progress persist (fires once per completed agent, can burst
+          // under concurrency) — throttled (trailing edge). Every
           // lifecycle-critical persist below (status transitions, run end,
           // pause/resume/stop) still calls persistRun() directly and flushes this.
-          managed.journal = managed.journal.filter((e) => e.index !== entry.index);
+          managed.journal = managed.journal.filter((e) => !(e.index === entry.index && e.runId === entry.runId));
           managed.journal.push(entry);
           this.schedulePersist(managed);
         },
@@ -1189,7 +1197,14 @@ export class WorkflowManager extends EventEmitter {
     // lifecycle status, while getRun() supplies the live in-memory snapshot.
     this.persistRun(managed);
 
-    const resumeJournal = new Map((persisted.journal ?? []).map((e) => [e.index, e] as const));
+    // Namespace by (runId, index) exactly like the live onAgentJournal dedup
+    // above and like SharedStore's deltaKey — see JournalEntry.runId. A
+    // legacy entry persisted before namespacing existed has no `runId`; it is
+    // assumed to belong to this run's own top-level runId (the only frame
+    // that existed before nested workflow() journaling was namespaced), so it
+    // still resume-hits for a top-level call and safely cache-misses (re-runs
+    // live, does not misapply) for what was actually a nested-run entry.
+    const resumeJournal = new Map((persisted.journal ?? []).map((e) => [`${e.runId ?? runId}:${e.index}`, e] as const));
     this.emit("resumed", { runId });
     // Run in the background; executeRun records status/errors on the managed run.
     // initialTokenUsage seeds the resumed execution's fresh SharedRuntime.spent

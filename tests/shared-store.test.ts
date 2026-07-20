@@ -262,6 +262,253 @@ test("nested workflow() concurrent with its parent does not collide on shared-st
   assert.ok(allDeltaKeys.includes("nestedKey"), "journal must contain a delta for nestedKey");
 });
 
+// ─── Nested workflow() journal-index collision (resume) ──────────────────────
+
+/** Agent runner that counts real invocations and echoes a per-call result. */
+function countingRunnerFor(calls: { count: number }) {
+  return {
+    async run(prompt: string) {
+      calls.count++;
+      return `ran:${prompt}`;
+    },
+  };
+}
+
+const nestedResumeScript = `
+  export const meta = { name: "nested-resume-outer", description: "outer" };
+  const inner = await workflow(\`
+    export const meta = { name: "nested-resume-inner", description: "inner" };
+    const x = await agent("inner-call", {});
+    return x;
+  \`, {});
+  const outer = await agent("outer-call", {});
+  return { inner, outer };
+`;
+
+test("resume after nested workflow(): parent and child journal entries cache-hit independently despite both indexing at 0", async () => {
+  // Regression test for the journal-index-collision bug: a nested workflow()
+  // call restarts its own callSeq at 0, so its journal entry's `index` equals
+  // the parent's own callIndex-0 entry. Before namespacing, the manager's
+  // per-index journal map meant whichever entry was recorded LAST clobbered
+  // the other, so a resume could never cache-hit both frames — often it could
+  // not correctly cache-hit either, since the hash of the surviving entry
+  // would only match one of the two calls.
+  const journal: import("../src/workflow.js").JournalEntry[] = [];
+  const firstCalls = { count: 0 };
+  const first = await runWorkflow<{ inner: string; outer: string }>(nestedResumeScript, {
+    agent: countingRunnerFor(firstCalls),
+    persistLogs: false,
+    runId: "nested-resume-run",
+    onAgentJournal: (e) => journal.push(e),
+  });
+  assert.equal(firstCalls.count, 2, "one live call for the child, one for the parent");
+  assert.equal(journal.length, 2);
+  // Both entries share callIndex 0 (each frame's own callSeq restarts at 0)
+  // but must carry DISTINCT runId — that's what makes them distinguishable.
+  assert.deepEqual(journal.map((e) => e.index).sort(), [0, 0]);
+  const runIds = new Set(journal.map((e) => e.runId));
+  assert.equal(runIds.size, 2, "the parent's and child's entries must carry distinct runId");
+
+  const resumeJournal = new Map(journal.map((e) => [`${e.runId}:${e.index}`, e] as const));
+  const secondCalls = { count: 0 };
+  const second = await runWorkflow<{ inner: string; outer: string }>(nestedResumeScript, {
+    agent: countingRunnerFor(secondCalls),
+    persistLogs: false,
+    runId: "nested-resume-run",
+    resumeJournal,
+  });
+  assert.equal(secondCalls.count, 0, "both the parent's AND the child's calls must cache-hit — neither re-runs live");
+  // JSON-compare (not assert.deepEqual): the two runs execute in separate vm
+  // realms, so their plain-object results have different (but structurally
+  // identical) prototypes — deepStrictEqual would spuriously fail on that.
+  assert.equal(JSON.stringify(second.result), JSON.stringify(first.result));
+});
+
+test("resume degrades gracefully (never corrupts) when replaying a pre-namespacing legacy journal", async () => {
+  // Simulate a journal persisted by a version before JournalEntry.runId
+  // existed: both the parent's and the child's index-0 entries have no
+  // `runId` field on disk, exactly like WorkflowManager's on-disk format did
+  // before this fix. WorkflowManager.resume() falls back to the run's own
+  // top-level runId for such entries (see its resumeJournal construction),
+  // which this test replicates directly against runWorkflow.
+  const journal: import("../src/workflow.js").JournalEntry[] = [];
+  const firstCalls = { count: 0 };
+  const first = await runWorkflow<{ inner: string; outer: string }>(nestedResumeScript, {
+    agent: countingRunnerFor(firstCalls),
+    persistLogs: false,
+    runId: "legacy-resume-run",
+    onAgentJournal: (e) => journal.push(e),
+  });
+
+  // Strip `runId`, as a legacy on-disk journal would lack it.
+  const legacyEntries = journal.map((e) => {
+    const { runId: _runId, ...rest } = e;
+    return rest as import("../src/workflow.js").JournalEntry;
+  });
+  const legacyResumeJournal = new Map(
+    legacyEntries.map((e) => [`${e.runId ?? "legacy-resume-run"}:${e.index}`, e] as const),
+  );
+  // The two legacy entries collapse onto the SAME map key ("legacy-resume-run:0"),
+  // since neither carries a runId to distinguish them — only one can survive
+  // (the child's is journaled first, so the parent's, journaled second,
+  // overwrites it in the Map).
+  assert.equal(legacyResumeJournal.size, 1, "both legacy entries collapse onto one key");
+
+  const secondCalls = { count: 0 };
+  const second = await runWorkflow<{ inner: string; outer: string }>(nestedResumeScript, {
+    agent: countingRunnerFor(secondCalls),
+    persistLogs: false,
+    runId: "legacy-resume-run",
+    resumeJournal: legacyResumeJournal,
+  });
+
+  // Graceful degradation, not corruption: the surviving legacy entry belongs
+  // to the parent's call (its hash matches "outer-call"'s hash under the
+  // collapsed key), so the parent cache-hits and the child — whose own entry
+  // was lost in the collapse — safely re-runs live instead of replaying the
+  // parent's (wrong) cached value. The end result is still correct.
+  assert.equal(secondCalls.count, 1, "the frame that lost its slot in the collapse re-runs live, not corrupted");
+  // JSON-compare — see the note in the previous test about cross-vm-realm
+  // prototypes tripping up assert.deepEqual.
+  assert.equal(
+    JSON.stringify(second.result),
+    JSON.stringify(first.result),
+    "no corruption: the final result still matches a live run's",
+  );
+});
+
+// ─── Retry-attempt store-delta isolation ──────────────────────────────────────
+
+test("a failed retry attempt's store writes are rolled back: absent from the recorded delta and from the live store", async () => {
+  // Regression test: all attempts of one agent() call share the same
+  // SharedStore deltaKey. A failed first attempt that writes to the store
+  // before throwing must not leave that write visible to the rest of the live
+  // run, and must not merge into the delta recorded for the eventual
+  // successful attempt. The failed and successful attempts deliberately write
+  // DIFFERENT keys ("poisonedOnly" vs "shared") — if they wrote the same key,
+  // the successful attempt's write would naturally overwrite the failed one's
+  // in both the live map and the delta, masking the leak entirely.
+  let callAttempts = 0;
+  const agent = {
+    async run(
+      prompt: string,
+      opts: { systemTools?: Array<{ name: string; execute: (id: string, p: unknown) => Promise<unknown> }> },
+    ) {
+      if (prompt === "call") {
+        callAttempts++;
+        if (callAttempts === 1) {
+          await opts.systemTools
+            ?.find((t) => t.name === "store_put")
+            ?.execute("", { key: "poisonedOnly", value: "should-never-survive" });
+          throw new Error("transient failure");
+        }
+        await opts.systemTools?.find((t) => t.name === "store_put")?.execute("", { key: "shared", value: "good" });
+        return "call-done";
+      }
+      // "check": read the live store from a SEPARATE, later agent() call —
+      // proves the failed attempt's write is gone from the LIVE store, not
+      // merely absent from the journaled delta.
+      const found = (await opts.systemTools
+        ?.find((t) => t.name === "store_get")
+        ?.execute("", {
+          key: "poisonedOnly",
+        })) as { details?: { found?: boolean } };
+      return found?.details?.found;
+    },
+  };
+  const journal: import("../src/workflow.js").JournalEntry[] = [];
+  const script = `export const meta = { name: 'retry-isolation', description: 'retry isolation' }
+  const r = await agent('call', {})
+  const check = await agent('check', {})
+  return { r, check }`;
+  const result = await runWorkflow<{ r: string; check: boolean }>(script, {
+    agent,
+    agentRetries: 1,
+    persistLogs: false,
+    onAgentJournal: (e) => journal.push(e),
+  });
+
+  assert.equal(callAttempts, 2, "first attempt fails, the retried second attempt succeeds");
+  assert.equal(result.result.r, "call-done");
+  assert.equal(
+    result.result.check,
+    false,
+    "the live store must NOT contain the failed attempt's key — it must be rolled back, not merely left uncommitted",
+  );
+  const callEntry = journal.find((e) => e.result === "call-done");
+  assert.deepEqual(
+    callEntry?.storeDelta,
+    { shared: "good" },
+    "the recorded delta must reflect only the successful attempt, not the failed one's poisoned key",
+  );
+});
+
+test("a failed retry attempt's rolled-back write matches what resume replay reconstructs", async () => {
+  // The live run and a later resume's replay must agree exactly: replaying
+  // the journal must additively reconstruct the SAME store state the live
+  // run ended up with — not a state polluted by a discarded failed attempt.
+  let callAttempts = 0;
+  const agent = {
+    async run(
+      prompt: string,
+      opts: { systemTools?: Array<{ name: string; execute: (id: string, p: unknown) => Promise<unknown> }> },
+    ) {
+      if (prompt === "call") {
+        callAttempts++;
+        if (callAttempts === 1) {
+          await opts.systemTools
+            ?.find((t) => t.name === "store_put")
+            ?.execute("", { key: "poisonedOnly", value: "should-never-survive" });
+          throw new Error("transient failure");
+        }
+        await opts.systemTools?.find((t) => t.name === "store_put")?.execute("", { key: "shared", value: "good" });
+        return "call-done";
+      }
+      const found = (await opts.systemTools
+        ?.find((t) => t.name === "store_get")
+        ?.execute("", {
+          key: "poisonedOnly",
+        })) as { details?: { found?: boolean } };
+      return found?.details?.found;
+    },
+  };
+  const journal: import("../src/workflow.js").JournalEntry[] = [];
+  const script = `export const meta = { name: 'retry-isolation-resume', description: 'retry isolation resume' }
+  const r = await agent('call', {})
+  const check = await agent('check', {})
+  return { r, check }`;
+  await runWorkflow(script, {
+    agent,
+    agentRetries: 1,
+    persistLogs: false,
+    runId: "retry-isolation-resume-run",
+    onAgentJournal: (e) => journal.push(e),
+  });
+
+  // Resume: replay everything from the journal (no live calls at all), and
+  // verify the "check" call's cached result — captured against the LIVE
+  // store during the original run — shows the poisoned key was never present.
+  const resumeJournal = new Map(journal.map((e) => [`${e.runId}:${e.index}`, e] as const));
+  let liveCallsOnResume = 0;
+  const second = await runWorkflow<{ r: string; check: boolean }>(script, {
+    agent: {
+      async run() {
+        liveCallsOnResume++;
+        return "should-not-run";
+      },
+    },
+    persistLogs: false,
+    runId: "retry-isolation-resume-run",
+    resumeJournal,
+  });
+  assert.equal(liveCallsOnResume, 0, "fully cached — resume must not re-run anything live");
+  assert.equal(
+    second.result.check,
+    false,
+    "replay must reconstruct the same rolled-back state as the live run (the poisoned key stays absent)",
+  );
+});
+
 // ─── Resume under fan-out (integration) ──────────────────────────────────────
 
 test("resume replays parallel-agent deltas additively so no writes are lost", async () => {
@@ -312,6 +559,7 @@ test("resume replays parallel-agent deltas additively so no writes are lost", as
   await runWorkflow(script, {
     agent,
     cwd: process.cwd(),
+    runId: "fan-out-resume-run",
     onAgentJournal: (e) => journal.push(e),
   });
 
@@ -327,11 +575,12 @@ test("resume replays parallel-agent deltas additively so no writes are lost", as
   // The get agents are intentionally absent so they run live against the rebuilt store,
   // which is how we verify the delta replay correctness.
   const resumeJournal = new Map(
-    journal.filter((e) => Object.keys(e.storeDelta ?? {}).length > 0).map((e) => [e.index, e]),
+    journal.filter((e) => Object.keys(e.storeDelta ?? {}).length > 0).map((e) => [`${e.runId}:${e.index}`, e] as const),
   );
   await runWorkflow(script, {
     agent,
     cwd: process.cwd(),
+    runId: "fan-out-resume-run",
     resumeJournal,
     onAgentJournal: () => {},
   });

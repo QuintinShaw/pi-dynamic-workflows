@@ -60,6 +60,19 @@ export interface WorkflowMeta {
 /** One cached agent() result, keyed by its deterministic call index. */
 export interface JournalEntry {
   index: number;
+  /**
+   * The runId of the frame (top-level run, or a nested workflow()'s own run)
+   * this entry's `index` is scoped to. A nested workflow() restarts its own
+   * callSeq at 0, so `index` alone collides between a parent's and a child's
+   * same-numbered calls — see `resumeJournal`'s key format, which namespaces
+   * on this the same way SharedStore's deltaKey already does. Absent on
+   * journal entries persisted before this field existed; such legacy entries
+   * are treated as belonging to the run's own top-level runId (see
+   * WorkflowManager.resume()) — a legacy entry that actually belonged to a
+   * nested frame simply cache-misses on resume (safe degradation: it re-runs
+   * live, it does not apply to the wrong call).
+   */
+  runId?: string;
   /** sha256 of the call's identity (prompt + model + phase + agentType + schema). */
   hash: string;
   result: unknown;
@@ -166,8 +179,15 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   persistLogs?: boolean;
   /** Run ID for persistence. Auto-generated if not provided. */
   runId?: string;
-  /** Resume: cached agent results keyed by deterministic call index. */
-  resumeJournal?: Map<number, JournalEntry>;
+  /**
+   * Resume: cached agent/checkpoint results keyed by `${runId}:${callIndex}`
+   * — the same namespacing SharedStore's deltaKey uses — so a nested
+   * workflow() call's callIndex-0 (its callSeq restarts at 0) can never
+   * collide with the parent's own callIndex-0 entry. A legacy entry with no
+   * `runId` (persisted before namespacing existed) is looked up under the
+   * run's own top-level runId only; see `JournalEntry.runId`.
+   */
+  resumeJournal?: Map<string, JournalEntry>;
   /** Resume: the run being resumed (informational; enables resume mode). */
   resumeFromRunId?: string;
   /** Called after each live agent completes so the caller can persist the journal. */
@@ -626,7 +646,11 @@ export async function runWorkflow<T = unknown>(
     // call. Once any call misses, it AND everything after it run live (matching
     // Claude Code's contract), so an edited upstream call never leaves stale
     // downstream results served from the journal.
-    const cached = options.resumeJournal?.get(callIndex);
+    // Namespaced the same way as SharedStore's deltaKey (deltaKey IS this
+    // exact `${runId}:${callIndex}` string) so a nested workflow()'s
+    // callIndex-0 can never accidentally replay the parent's callIndex-0
+    // entry, or vice versa (see JournalEntry.runId).
+    const cached = options.resumeJournal?.get(deltaKey);
     const hashMatches = cached != null && cached.hash === callHash;
     const cachedEmptyOutput = hashMatches && isEmptyTextAgentResult(cached.result, agentOptions.schema);
     if (hashMatches && !cachedEmptyOutput && callIndex < state.firstMiss) {
@@ -770,6 +794,7 @@ export async function runWorkflow<T = unknown>(
             const tokens = recordTokens(result);
             options.onAgentJournal?.({
               index: callIndex,
+              runId,
               hash: callHash,
               result,
               storeDelta: store.commitDelta(deltaKey),
@@ -791,6 +816,17 @@ export async function runWorkflow<T = unknown>(
             const workflowError = wrapError(error, { agentLabel: label });
             logger.error(`agent ${label} attempt ${attempt}/${maxAttempts} failed: ${workflowError.message}`);
             const tokens = recordTokens(null);
+            // This attempt's store writes must not survive it — a failed
+            // attempt shares this call's deltaKey with every other attempt
+            // (retried or not), so without rolling back here its writes would
+            // stay live in the store (visible to concurrently-running sibling
+            // agents) and merge into whatever a later, successful attempt
+            // commits — corrupting both the live run's state and the delta
+            // that resume replay reconstructs from. Unconditional: this
+            // covers the about-to-retry case AND the exhausted/non-recoverable
+            // case, since neither leaves behind a call that "produced" a
+            // result this attempt's writes should be attributed to.
+            store.discardDelta(deltaKey);
 
             if (workflowError.recoverable && attempt < maxAttempts) {
               log(
@@ -938,8 +974,17 @@ export async function runWorkflow<T = unknown>(
         sharedRuntime: shared,
         // Propagate the parent's store so nested agents share the same key-value space.
         sharedStore: store,
-        // A nested run is its own script; never reuse the parent's resume journal.
-        resumeJournal: undefined,
+        // Propagate the SAME resumeJournal Map down into the child frame. This
+        // is safe (and required for nested resume caching to work at all) now
+        // that entries are namespaced by runId: the child looks itself up
+        // under `${childRunId}:${index}`, which can never collide with the
+        // parent's `${runId}:${index}` entries in the same Map — see
+        // JournalEntry.runId. Previously this was unconditionally cleared to
+        // `undefined` specifically BECAUSE the un-namespaced Map made a
+        // shared journal unsafe to reuse across nesting levels; that
+        // workaround also meant a nested workflow() call could never cache-hit
+        // on resume at all, which this fix corrects.
+        resumeJournal: options.resumeJournal,
         resumeFromRunId: undefined,
         // shared.nestedCallSeq, not shared.depth — see its doc comment: depth
         // returns to 0 between sequential sibling calls, which would otherwise
@@ -1140,7 +1185,9 @@ export async function runWorkflow<T = unknown>(
     }
     const callIndex = state.callSeq++;
     const callHash = hashCheckpoint(promptText, checkpointOptions);
-    const cached = options.resumeJournal?.get(callIndex);
+    // Namespaced by runId like agent()'s deltaKey — see JournalEntry.runId.
+    const journalKey = `${runId}:${callIndex}`;
+    const cached = options.resumeJournal?.get(journalKey);
     if (cached != null && cached.hash === callHash && callIndex < state.firstMiss) {
       shared.agentCount++;
       return cached.result; // replay the journaled human reply
@@ -1161,7 +1208,7 @@ export async function runWorkflow<T = unknown>(
       reply = checkpointOptions.default ?? true;
     }
     throwIfAborted();
-    options.onAgentJournal?.({ index: callIndex, hash: callHash, result: reply });
+    options.onAgentJournal?.({ index: callIndex, runId, hash: callHash, result: reply });
     return reply;
   };
 
@@ -1428,12 +1475,32 @@ function defaultAgentLabel(phase: string | undefined, index: number): string {
   return phase ? `${phase} agent ${index}` : `agent ${index}`;
 }
 
-/** Stable identity hash for an agent() call — a cache miss on resume when anything changes. */
+/**
+ * Stable identity hash for a checkpoint() call — a cache miss on resume when
+ * anything that could change its outcome changes. Must cover every
+ * CheckpointOptions field that participates in the outcome, not just
+ * promptText/kind/choices:
+ *   - `default` and `headless` decide the reply in the headless (no `confirm`
+ *     threaded in) path — a script edited to change either must not resume
+ *     with the OLD default/behavior's stale journaled reply.
+ *   - `timeoutMs` bounds the interactive prompt; a host `confirm` may itself
+ *     fall back to `default` when the human doesn't answer in time, so it can
+ *     also affect the outcome and is included for the same reason.
+ * NOTE: widening this hash is a one-time invalidation of any checkpoint
+ * answers already persisted under the old (narrower) hash — on the first
+ * resume after upgrading, those checkpoints will cache-miss and re-prompt (or
+ * re-apply the default) once, live. That's intentional: a silently-stale
+ * cached decision from before the identity surface was fixed is worse than a
+ * one-time re-ask.
+ */
 function hashCheckpoint(promptText: string, options: CheckpointOptions): string {
   const identity = JSON.stringify({
     promptText,
     kind: options.kind ?? "confirm",
     choices: options.choices ?? null,
+    default: options.default ?? null,
+    headless: options.headless ?? "default",
+    timeoutMs: options.timeoutMs ?? null,
   });
   return createHash("sha256").update(identity).digest("hex");
 }

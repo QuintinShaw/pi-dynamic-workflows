@@ -345,6 +345,7 @@ test("resume replays cached results without re-running agents", async () => {
   const r1 = await runWorkflow(resumeScript, {
     agent: first.runner,
     persistLogs: false,
+    runId: "resume-run",
     onAgentJournal: (e) => journal.push(e),
   });
   assert.equal(first.state.calls, 2);
@@ -358,7 +359,8 @@ test("resume replays cached results without re-running agents", async () => {
   const r2 = await runWorkflow(resumeScript, {
     agent: second.runner,
     persistLogs: false,
-    resumeJournal: new Map(journal.map((e) => [e.index, e])),
+    runId: "resume-run",
+    resumeJournal: new Map(journal.map((e) => [`${e.runId}:${e.index}`, e])),
   });
   assert.equal(second.state.calls, 0, "no live runs on a full cache hit");
   assert.equal(JSON.stringify(r2.result), JSON.stringify(r1.result));
@@ -370,6 +372,7 @@ test("resume re-runs only the changed call (hash mismatch)", async () => {
   await runWorkflow(resumeScript, {
     agent: first.runner,
     persistLogs: false,
+    runId: "resume-run-2",
     onAgentJournal: (e) => journal.push(e),
   });
 
@@ -378,7 +381,8 @@ test("resume re-runs only the changed call (hash mismatch)", async () => {
   await runWorkflow(editedScript, {
     agent: second.runner,
     persistLogs: false,
-    resumeJournal: new Map(journal.map((e) => [e.index, e])),
+    runId: "resume-run-2",
+    resumeJournal: new Map(journal.map((e) => [`${e.runId}:${e.index}`, e])),
   });
   assert.equal(second.state.calls, 1, "only the edited call re-runs");
 });
@@ -395,6 +399,7 @@ test("resume re-runs the changed call AND everything after it (longest-unchanged
   await runWorkflow(threeCallScript, {
     agent: first.runner,
     persistLogs: false,
+    runId: "prefix-run",
     onAgentJournal: (e) => journal.push(e),
   });
   assert.equal(first.state.calls, 3);
@@ -407,7 +412,8 @@ test("resume re-runs the changed call AND everything after it (longest-unchanged
   await runWorkflow(editedScript, {
     agent: second.runner,
     persistLogs: false,
-    resumeJournal: new Map(journal.map((e) => [e.index, e])),
+    runId: "prefix-run",
+    resumeJournal: new Map(journal.map((e) => [`${e.runId}:${e.index}`, e])),
   });
   assert.equal(second.state.calls, 2, "edited call (1) + its suffix (2) re-run; only the prefix (0) is cached");
 });
@@ -427,6 +433,7 @@ test("resume in parallel(): editing one thunk re-runs that index and every later
   await runWorkflow(script("x"), {
     agent: first.runner,
     persistLogs: false,
+    runId: "par-prefix-run",
     onAgentJournal: (e) => journal.push(e),
   });
   assert.equal(first.state.calls, 3);
@@ -435,7 +442,8 @@ test("resume in parallel(): editing one thunk re-runs that index and every later
   await runWorkflow(script("x-edited"), {
     agent: second.runner,
     persistLogs: false,
-    resumeJournal: new Map(journal.map((e) => [e.index, e])),
+    runId: "par-prefix-run",
+    resumeJournal: new Map(journal.map((e) => [`${e.runId}:${e.index}`, e])),
   });
   assert.equal(second.state.calls, 2, "changed thunk (index 1) + later index (2) re-run; index 0 cached");
 });
@@ -1288,11 +1296,12 @@ test("an un-awaited agent() call replays deterministically from the journal on r
 agent('stray', { label: 'stray' })
 const main = await agent('main', { label: 'main' })
 return main`;
-  const journalEntries = new Map<number, JournalEntry>();
+  const journalEntries = new Map<string, JournalEntry>();
   const first = await runWorkflow<string>(script, {
     agent: runner,
     persistLogs: false,
-    onAgentJournal: (entry) => journalEntries.set(entry.index, entry),
+    runId: "prior-run",
+    onAgentJournal: (entry) => journalEntries.set(`${entry.runId}:${entry.index}`, entry),
   });
   assert.equal(first.result, "main-done");
   assert.equal(calls.stray, 1);
@@ -1301,6 +1310,7 @@ return main`;
   const second = await runWorkflow<string>(script, {
     agent: runner,
     persistLogs: false,
+    runId: "prior-run",
     resumeJournal: journalEntries,
     resumeFromRunId: "prior-run",
   });

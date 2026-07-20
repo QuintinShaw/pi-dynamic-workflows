@@ -70,8 +70,21 @@ export interface PersistedRunState {
     cacheRead?: number;
     cacheWrite?: number;
   };
-  /** Cached agent results for resume, keyed by deterministic call index. */
-  journal?: Array<{ index: number; hash: string; result: unknown }>;
+  /**
+   * Cached agent/checkpoint results for resume, keyed by deterministic call
+   * index. `runId` namespaces `index` (a nested workflow() call restarts its
+   * own callSeq at 0) — absent on journals persisted before that namespacing
+   * existed; see JournalEntry.runId in workflow.ts for the resume-time
+   * legacy-degradation behavior. `storeDelta` is this call's SharedStore
+   * write delta, replayed additively on resume.
+   */
+  journal?: Array<{
+    index: number;
+    runId?: string;
+    hash: string;
+    result: unknown;
+    storeDelta?: Record<string, unknown>;
+  }>;
   /**
    * Opt-out of auto-resume for this run (default true, i.e. eligible unless
    * explicitly set to false via ExecOptions.autoResume). Set once at run start
