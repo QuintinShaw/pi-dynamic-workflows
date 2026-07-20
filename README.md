@@ -233,6 +233,8 @@ Subagents are in-memory by default. Set `persistAgentSessions: true` to retain f
 
 Completed background runs persist their full result in the project run JSON. The conversation delivery includes a pointer to that file when the visible summary is shortened.
 
+Pi's `/reload` keeps the live workflow manager in-process when the installed extension version has not changed. Active background runs therefore continue streaming progress, remain controllable, and deliver their result through the freshly loaded extension; session-local `/effort` also survives the reload. If the package version changes, active runs are paused and a fresh manager loads, leaving them safely resumable through the journal instead of mixing extension versions. This handoff applies only to `/reload`. A process restart still uses the same durable journal path, recovering an interrupted running workflow as paused so it can be resumed safely.
+
 Finished runs (completed, failed, or aborted) are retained in full on disk, capped at the 300 most recent per project — older ones are evicted first, and a running or paused run is never touched. Only a smaller number (20 by default) also stay fully loaded in memory for instant access right after they finish; older finished runs still show up in `/workflows` and `workflow_control list`, just read back from disk instead of memory. Library embedders can tune both caps — `maxTerminalRunsInMemory` on `WorkflowManager` and `maxTerminalRunsOnDisk` on the run-persistence layer.
 
 </details>

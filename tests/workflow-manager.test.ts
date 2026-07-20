@@ -170,6 +170,19 @@ test(
 );
 
 test(
+  "reconfigureAfterReload refreshes defaults without replacing the live manager",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: delayedAgent(25), defaultAgentTimeoutMs: 5 });
+
+    manager.reconfigureAfterReload({ defaultAgentTimeoutMs: 100 });
+    const result = await manager.runSync(oneAgentScript);
+
+    assert.equal((result.result as { a: unknown }).a, "slow");
+    assert.equal(manager.listRuns()[0]?.agents[0]?.status, "done");
+  }),
+);
+
+test(
   "an agent timeout aborts the subagent so its session can be released (#109)",
   withTempCwd(async (cwd) => {
     // A subagent whose run() never resolves on its own — only an abort ends it.

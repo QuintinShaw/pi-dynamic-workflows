@@ -223,6 +223,21 @@ export interface WorkflowManagerOptions {
   maxTerminalRunsInMemory?: number;
 }
 
+/** Options that a fresh extension generation may safely refresh on a live
+ * manager handed across `/reload`. Execution identity (`cwd`, persistence,
+ * injected agent, and in-memory runs) is intentionally excluded. */
+export type WorkflowManagerReloadOptions = Pick<
+  WorkflowManagerOptions,
+  | "concurrency"
+  | "loadSavedWorkflow"
+  | "defaultAgentTimeoutMs"
+  | "defaultAgentRetries"
+  | "defaultTokenBudget"
+  | "toolsets"
+  | "excludeSubagentTools"
+  | "persistAgentSessions"
+>;
+
 /**
  * Statuses in which a run's execution has genuinely settled — no promise is
  * still pending, no lease is still held, nothing will asynchronously mutate
@@ -364,6 +379,23 @@ export class WorkflowManager extends EventEmitter {
     } catch {
       // Recovery is best-effort; never let it block manager construction.
     }
+  }
+
+  /**
+   * Refresh host configuration after Pi reloads the extension while retaining
+   * this manager's live runs, controllers, leases, and event listeners.
+   * Existing executions keep the options they captured at start; subsequent
+   * runs and resumes use these refreshed defaults.
+   */
+  reconfigureAfterReload(options: WorkflowManagerReloadOptions): void {
+    this.concurrency = options.concurrency ?? 8;
+    this.loadSavedWorkflow = options.loadSavedWorkflow;
+    this.defaultAgentTimeoutMs = options.defaultAgentTimeoutMs ?? null;
+    this.defaultAgentRetries = options.defaultAgentRetries ?? 0;
+    this.defaultTokenBudget = options.defaultTokenBudget ?? null;
+    this.toolsets = options.toolsets;
+    this.excludeSubagentTools = options.excludeSubagentTools;
+    this.persistAgentSessions = options.persistAgentSessions ?? false;
   }
 
   /** Set the session's main model (provider/id). Used to auto-tier explore agents. */

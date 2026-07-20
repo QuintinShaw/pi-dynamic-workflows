@@ -417,6 +417,23 @@ describe("installResultDelivery", () => {
     assert.equal(calls1.length, 0, "pi1 should not be used after refresh");
     assert.equal(calls2.length, 1, "pi2 should receive the delivery");
   });
+
+  it("refreshes the live delivery settings loader across reload generations", () => {
+    const pi1 = createMockPi();
+    const pi2 = createMockPi();
+    const manager = createMockManager(makeRun({ result: { result: { note: "z".repeat(200) } } }));
+
+    mod.installResultDelivery(pi1 as unknown as ExtensionAPI, manager, {
+      loadSettings: () => ({ deliveredResultMaxChars: 400 }),
+    });
+    mod.installResultDelivery(pi2 as unknown as ExtensionAPI, manager, {
+      loadSettings: () => ({ deliveredResultMaxChars: 40 }),
+    });
+    manager.emit("complete", { runId: "test-run-1" });
+
+    const content = (pi2 as unknown as { _calls: { content: string }[] })._calls[0]?.content ?? "";
+    assert.match(content, /truncated/, "the reused listener reads settings from the fresh generation");
+  });
 });
 
 // ─── installTaskPanel ─────────────────────────────────────────────────────────

@@ -19,6 +19,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it, mock } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { handoffWorkflowRuntime, takeWorkflowRuntime } from "../src/extension-reload.js";
 import { buildArmedWorkflowPrompt, WORKFLOW_TOOL_NAME, type WorkflowModeState } from "../src/workflow-editor.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
@@ -353,7 +354,7 @@ describe("installWorkflowKeywordArming - tool availability", () => {
 });
 
 describe("workflow extension - control tool availability", () => {
-  it("registers and activates workflow and workflow_control together", async () => {
+  it("registers both control tools and hands the live runtime across reload", async () => {
     const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-control-extension-"));
     try {
       await withFakeHomeAsync(fakeHome, async () => {
@@ -394,7 +395,28 @@ describe("workflow extension - control tool availability", () => {
 
         assert.ok(activeTools.includes("workflow"));
         assert.ok(activeTools.includes("workflow_control"));
-        handlers.session_shutdown?.[0]?.();
+
+        handlers.session_shutdown?.[0]?.({ reason: "reload" });
+        const staged = takeWorkflowRuntime(process.cwd());
+        assert.ok(staged, "session_shutdown(reload) stages the live manager for the next extension generation");
+        staged.effort.level = "high";
+        handoffWorkflowRuntime(staged);
+
+        const secondHandlers: Record<string, Array<(...args: any[]) => any>> = {};
+        const secondPi = {
+          ...pi,
+          on: (event: string, handler: (...args: any[]) => any) => {
+            if (!secondHandlers[event]) secondHandlers[event] = [];
+            secondHandlers[event].push(handler);
+          },
+        } as unknown as ExtensionAPI;
+        installExtension(secondPi);
+        assert.equal(takeWorkflowRuntime(process.cwd()), undefined, "the fresh factory consumes the staged runtime");
+
+        secondHandlers.session_shutdown?.[0]?.({ reason: "reload" });
+        const restaged = takeWorkflowRuntime(process.cwd());
+        assert.equal(restaged?.manager, staged.manager, "a compatible generation keeps the exact live manager");
+        assert.equal(restaged?.effort.level, "high", "session effort survives with the compatible runtime");
       });
     } finally {
       rmSync(fakeHome, { recursive: true, force: true });
