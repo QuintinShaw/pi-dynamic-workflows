@@ -84,6 +84,34 @@ export interface PersistedRunState {
    */
   toolset?: string;
   /**
+   * The run's resolved cap on total agents, fixed at start (per-run value,
+   * else undefined so runWorkflow applies its own MAX_AGENTS_PER_RUN default).
+   * Resume re-applies THIS value — never the manager's current default — same
+   * rationale as tokenBudget. Absent on legacy runs (resumed with no cap
+   * carried forward, i.e. runWorkflow's own default applies).
+   */
+  maxAgents?: number;
+  /**
+   * The run's resolved per-agent timeout, fixed at start (per-run value, else
+   * the manager default at the time). Absent on legacy runs — unlike
+   * tokenBudget, a legacy run's real timeout was never "no timeout" by
+   * omission; it was always the manager's default (pre-A1 resume always fell
+   * back to it), so resume applies the manager's CURRENT default for such
+   * runs rather than null, preserving both the run's original semantics and
+   * pre-fix resume behavior.
+   */
+  agentTimeoutMs?: number | null;
+  /**
+   * The run's resolved concurrency, fixed at start (per-run value, else the
+   * manager's concurrency at the time). Same rationale as tokenBudget.
+   */
+  concurrency?: number;
+  /**
+   * The run's resolved agent-retry count, fixed at start (per-run value, else
+   * the manager default at the time). Same rationale as tokenBudget.
+   */
+  agentRetries?: number;
+  /**
    * Auto-resume attempt counter for the current usage_limit pause-cycle, owned
    * and persisted by UsageLimitScheduler (best-effort). Absent/0 means no
    * auto-resume attempt has been recorded yet.

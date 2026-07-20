@@ -128,8 +128,40 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   resumeFromRunId?: string;
   /** Called after each live agent completes so the caller can persist the journal. */
   onAgentJournal?: (entry: JournalEntry) => void;
+  /**
+   * Called once per FAILED-AND-RETRIED attempt (not the final attempt of an
+   * agent() call, which reports its own tokens via onAgentEnd as before),
+   * with that attempt's token cost. recordTokens() already folds a retried
+   * attempt's spend into shared.spent/shared.tokenUsage (so the run-wide
+   * budget was never leaky) — but onAgentEnd only ever reports the FINAL
+   * attempt's tokens, so a caller accumulating a persisted total purely from
+   * onAgentEnd (see WorkflowManager) would under-count by exactly the
+   * wasted retried attempts' spend. This is a separate, silent channel
+   * specifically so retried-attempt spend can be accounted for without
+   * changing onAgentEnd's one-call-per-agent-call cadence (a contract other
+   * code depends on).
+   */
+  onRetrySpend?: (tokens: number) => void;
   /** Internal: shared runtime inherited by a nested workflow() call. */
   sharedRuntime?: SharedRuntime;
+  /**
+   * Seed the FRESH SharedRuntime's cumulative spend/tokenUsage counters from a
+   * previously-persisted total (resume()), instead of starting at zero. Used
+   * only on the fresh-SharedRuntime branch below — never applied when
+   * `sharedRuntime` is supplied (a nested workflow() call inherits the
+   * parent's live, already-correct counters and must not be re-seeded).
+   * Without this, a resumed run's tokenBudget cap silently resets: it would
+   * enforce the ceiling against only what THIS execution spends, ignoring
+   * whatever was already spent before the pause.
+   */
+  initialTokenUsage?: {
+    input: number;
+    output: number;
+    total: number;
+    cost: number;
+    cacheRead: number;
+    cacheWrite: number;
+  };
   /**
    * Shared store for this run. One instance is created per top-level run and
    * propagated into nested workflow() calls. Pass an existing instance to share
@@ -338,11 +370,29 @@ export async function runWorkflow<T = unknown>(
     options.concurrency ?? Math.max(1, (globalThis.navigator?.hardwareConcurrency ?? 8) - 2),
   );
   // Global caps + budget are shared with any nested workflow() so they hold across nesting.
+  // options.initialTokenUsage (resume() only) seeds spent/tokenUsage so the
+  // tokenBudget ceiling holds cumulatively across a pause/resume cycle instead
+  // of resetting to zero (see WorkflowRunOptions.initialTokenUsage). Deliberately
+  // NOT applied when options.sharedRuntime is supplied — that branch inherits a
+  // parent workflow()'s already-live counters, which must not be re-seeded.
+  //
+  // agentCount is NOT seeded here, unlike spent/tokenUsage — and doesn't need
+  // to be: resume() always replays the whole script from callIndex 0, and
+  // agent()'s `shared.agentCount++` fires unconditionally for every call
+  // (cache-hit replay or live) before the replay-vs-live branch runs. That
+  // replay alone reconstructs the correct cumulative count in this fresh
+  // SharedRuntime by the time any new live agent executes, so maxAgents stays
+  // a genuine cumulative cap across resume with no extra seeding. Token spend
+  // needs seeding precisely because its cache-hit branch deliberately does NOT
+  // re-run recordTokens() (to avoid double-counting already-spent tokens) —
+  // there is no replay-based reconstruction for it the way there is for count.
   const shared: SharedRuntime = options.sharedRuntime ?? {
     limiter: createLimiter(concurrency),
     agentCount: 0,
-    spent: 0,
-    tokenUsage: { input: 0, output: 0, total: 0, cost: 0, cacheRead: 0, cacheWrite: 0 },
+    spent: options.initialTokenUsage?.total ?? 0,
+    tokenUsage: options.initialTokenUsage
+      ? { ...options.initialTokenUsage }
+      : { input: 0, output: 0, total: 0, cost: 0, cacheRead: 0, cacheWrite: 0 },
     depth: 0,
   };
   const limiter = shared.limiter;
@@ -642,6 +692,11 @@ export async function runWorkflow<T = unknown>(
               log(
                 `agent "${label}" attempt ${attempt}/${maxAttempts} failed: ${workflowError.code} ${workflowError.message}; retrying`,
               );
+              // This attempt's spend already accrued into shared.spent/tokenUsage
+              // above (recordTokens) — but it will never reach onAgentEnd (only
+              // the final attempt does), so report it on the dedicated channel
+              // instead (see WorkflowRunOptions.onRetrySpend).
+              options.onRetrySpend?.(tokens);
               continue;
             }
 

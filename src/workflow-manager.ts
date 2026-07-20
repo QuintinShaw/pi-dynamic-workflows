@@ -67,6 +67,34 @@ export interface ManagedRun {
    * every agent with the run's startedAt / "now".
    */
   agentTimestamps: Map<number, { startedAt: string; endedAt?: string }>;
+  /**
+   * The run's cap on total agents (per-run value, else left undefined so
+   * runWorkflow applies its own MAX_AGENTS_PER_RUN default), fixed at run
+   * start/resume and carried through resume() — mirrors ManagedRun.tokenBudget
+   * exactly: a resumed run must keep the cap it started with, not silently
+   * regain the (much larger) default because ExecOptions.maxAgents isn't
+   * threaded through resume()'s executeRun() call.
+   */
+  maxAgents?: number;
+  /**
+   * The run's resolved per-agent timeout (per-run value, else the manager
+   * default at the time), fixed at run start/resume — same rationale as
+   * tokenBudget/maxAgents: resume() must not re-resolve against the manager's
+   * CURRENT defaultAgentTimeoutMs.
+   */
+  agentTimeoutMs?: number | null;
+  /**
+   * The run's resolved concurrency (per-run value, else the manager's
+   * concurrency at the time), fixed at run start/resume for the same reason
+   * as tokenBudget.
+   */
+  concurrency?: number;
+  /**
+   * The run's resolved agent-retry count (per-run value, else the manager
+   * default at the time), fixed at run start/resume for the same reason as
+   * tokenBudget.
+   */
+  agentRetries?: number;
 }
 
 /** Per-execution options shared by sync, background, and resume runs. */
@@ -109,6 +137,21 @@ export interface ExecOptions {
    * it too. See usage-limit-scheduler.ts.
    */
   autoResume?: boolean;
+  /**
+   * Seed for the execution's cumulative token counters — passed through to
+   * runWorkflow's WorkflowRunOptions.initialTokenUsage. Only resume() sets
+   * this (from the persisted run's tokenUsage-at-pause), so the resumed
+   * execution's fresh SharedRuntime starts counting from the already-spent
+   * total instead of zero (see A2 in workflow-manager's resume()).
+   */
+  initialTokenUsage?: {
+    input: number;
+    output: number;
+    total: number;
+    cost: number;
+    cacheRead: number;
+    cacheWrite: number;
+  };
 }
 
 export interface WorkflowManagerOptions {
@@ -290,6 +333,13 @@ export class WorkflowManager extends EventEmitter {
       // ManagedRun.tokenBudget) so resume keeps start-time semantics.
       tokenBudget: exec.tokenBudget !== undefined ? exec.tokenBudget : this.defaultTokenBudget,
       toolset: exec.toolset,
+      // Same freeze-at-start pattern as tokenBudget, for the same reason: a
+      // resumed run must keep these values, not re-resolve against the
+      // manager's current defaults (see ManagedRun doc comments).
+      maxAgents: exec.maxAgents,
+      agentTimeoutMs: exec.agentTimeoutMs !== undefined ? exec.agentTimeoutMs : this.defaultAgentTimeoutMs,
+      concurrency: exec.concurrency !== undefined ? exec.concurrency : this.concurrency,
+      agentRetries: exec.agentRetries !== undefined ? exec.agentRetries : this.defaultAgentRetries,
       agentTimestamps: new Map(),
     };
 
@@ -312,6 +362,10 @@ export class WorkflowManager extends EventEmitter {
         autoResume: managed.autoResume,
         tokenBudget: managed.tokenBudget,
         toolset: managed.toolset,
+        maxAgents: managed.maxAgents,
+        agentTimeoutMs: managed.agentTimeoutMs,
+        concurrency: managed.concurrency,
+        agentRetries: managed.agentRetries,
       });
     } catch (err) {
       this.releaseRunLease(managed);
@@ -344,6 +398,11 @@ export class WorkflowManager extends EventEmitter {
     managed.autoResume = exec.autoResume;
     managed.tokenBudget = exec.tokenBudget !== undefined ? exec.tokenBudget : this.defaultTokenBudget;
     managed.toolset = exec.toolset;
+    // Same freeze-at-start pattern as tokenBudget (see startInBackground/ManagedRun).
+    managed.maxAgents = exec.maxAgents;
+    managed.agentTimeoutMs = exec.agentTimeoutMs !== undefined ? exec.agentTimeoutMs : this.defaultAgentTimeoutMs;
+    managed.concurrency = exec.concurrency !== undefined ? exec.concurrency : this.concurrency;
+    managed.agentRetries = exec.agentRetries !== undefined ? exec.agentRetries : this.defaultAgentRetries;
     this.runs.set(managed.runId, managed);
     // Persist the initial state immediately so listRuns()/the task panel can see
     // the run the moment it starts, not only after the first agent journals.
@@ -403,10 +462,27 @@ export class WorkflowManager extends EventEmitter {
       agentRetries,
       confirm,
       tools,
+      initialTokenUsage,
     } = exec;
-    const resolvedAgentTimeoutMs = agentTimeoutMs !== undefined ? agentTimeoutMs : this.defaultAgentTimeoutMs;
-    const resolvedConcurrency = concurrency ?? this.concurrency;
-    const resolvedAgentRetries = agentRetries ?? this.defaultAgentRetries;
+    // maxAgents/agentTimeoutMs/concurrency/agentRetries were resolved (per-run
+    // value, else the manager default at the time) and frozen on the managed
+    // run at start/resume (see ManagedRun doc comments) — read them from there
+    // first, exactly like resolvedTokenBudget below, so a resumed run keeps the
+    // values it started with instead of re-resolving against the manager's
+    // CURRENT defaults. The exec.* fallbacks are a safety net for direct
+    // executeRun callers that skipped the start paths (same rationale as
+    // resolvedTokenBudget's tokenBudget fallback).
+    const resolvedMaxAgents = managed.maxAgents !== undefined ? managed.maxAgents : maxAgents;
+    const resolvedAgentTimeoutMs =
+      managed.agentTimeoutMs !== undefined
+        ? managed.agentTimeoutMs
+        : agentTimeoutMs !== undefined
+          ? agentTimeoutMs
+          : this.defaultAgentTimeoutMs;
+    const resolvedConcurrency =
+      managed.concurrency !== undefined ? managed.concurrency : (concurrency ?? this.concurrency);
+    const resolvedAgentRetries =
+      managed.agentRetries !== undefined ? managed.agentRetries : (agentRetries ?? this.defaultAgentRetries);
     // The budget was resolved (per-run value, else defaultTokenBudget) and frozen
     // on the managed run at start/resume — read it from there so a resumed run
     // keeps the budget it started with. exec.tokenBudget is a safety net for
@@ -416,7 +492,12 @@ export class WorkflowManager extends EventEmitter {
     // toolset tag (how a resumed /deep-research keeps its web tools); else the
     // agent layer's default coding tools.
     const resolvedTools = tools ?? (managed.toolset ? this.toolsets?.[managed.toolset]?.() : undefined);
-    const progress = () => onProgress?.(managed.snapshot);
+    // Gated the same way as this.emitLive() below (see isCurrent()) — a stale
+    // execution's progress callback would otherwise keep driving live UI
+    // (task panel, etc.) for a run that's been superseded or deleted.
+    const progress = () => {
+      if (this.isCurrent(managed)) onProgress?.(managed.snapshot);
+    };
     // Let a host abort (e.g. Esc during a blocking tool call) cancel this run.
     if (externalSignal) {
       if (externalSignal.aborted) managed.controller.abort();
@@ -438,7 +519,7 @@ export class WorkflowManager extends EventEmitter {
         signal: managed.controller.signal,
         concurrency: resolvedConcurrency,
         agentRetries: resolvedAgentRetries,
-        maxAgents,
+        maxAgents: resolvedMaxAgents,
         agentTimeoutMs: resolvedAgentTimeoutMs,
         tokenBudget: resolvedTokenBudget,
         tools: resolvedTools,
@@ -447,6 +528,20 @@ export class WorkflowManager extends EventEmitter {
         loadSavedWorkflow: this.loadSavedWorkflow,
         resumeJournal,
         resumeFromRunId: resumeJournal ? managed.runId : undefined,
+        // Seed the fresh SharedRuntime's spend counter from the persisted total
+        // (resume()) so the hard tokenBudget cap holds cumulatively across a
+        // pause/resume cycle instead of resetting to zero each time (see A2 —
+        // runWorkflow only applies this on the fresh-SharedRuntime branch, never
+        // overriding an inherited options.sharedRuntime from a nested workflow()).
+        initialTokenUsage,
+        // Retried-attempt spend (see WorkflowRunOptions.onRetrySpend and A2):
+        // recordTokens() in workflow.ts already folded this into
+        // shared.spent/tokenUsage, but onAgentEnd never sees a retried
+        // (non-final) attempt — fold it into the same persisted aggregate here
+        // so a run paused after a retry doesn't under-count against the budget.
+        onRetrySpend: (tokens) => {
+          this.accumulateTokenUsage(managed, tokens);
+        },
         onAgentJournal: (entry) => {
           // Append (crash-safe-ish): keep the latest entry per index, then persist.
           // This is the high-frequency progress persist (fires once per completed
@@ -459,7 +554,7 @@ export class WorkflowManager extends EventEmitter {
         },
         onLog: (message) => {
           managed.snapshot.logs.push(message);
-          this.emit("log", { runId: managed.runId, message });
+          this.emitLive(managed, "log", { runId: managed.runId, message });
           progress();
         },
         onPhase: (title) => {
@@ -467,7 +562,7 @@ export class WorkflowManager extends EventEmitter {
           if (!managed.snapshot.phases.includes(title)) {
             managed.snapshot.phases.push(title);
           }
-          this.emit("phase", { runId: managed.runId, title });
+          this.emitLive(managed, "phase", { runId: managed.runId, title });
           progress();
         },
         onAgentStart: (event) => {
@@ -483,7 +578,7 @@ export class WorkflowManager extends EventEmitter {
           // Real per-agent start time, captured the moment the agent actually
           // starts (not the run's startedAt) — see agentTimestamps.
           managed.agentTimestamps.set(id, { startedAt: new Date().toISOString() });
-          this.emit("agentStart", { runId: managed.runId, ...event });
+          this.emitLive(managed, "agentStart", { runId: managed.runId, ...event });
           progress();
         },
         onAgentEnd: (event) => {
@@ -504,7 +599,21 @@ export class WorkflowManager extends EventEmitter {
             const ts = managed.agentTimestamps.get(agent.id);
             if (ts) ts.endedAt = new Date().toISOString();
           }
-          this.emit("agentEnd", { runId: managed.runId, ...event });
+          // Progressive run-wide token aggregate (A2): workflow.ts's onTokenUsage
+          // callback below fires exactly once, only when the whole script finishes
+          // successfully (a deliberate, tested contract — see
+          // "agent() accumulates usage across multiple agents" in agent.test.ts,
+          // which asserts one final event, not one per agent). A run that
+          // pauses/aborts/fails mid-flight never reaches it, so without tracking
+          // it here too, a paused run's persisted tokenUsage would stay whatever
+          // it was (usually unset) — starving resume()'s spend-seeding of the
+          // very data it needs. Accumulate additively from every onAgentEnd
+          // instead: a cache-hit replay reports tokens: 0 (see agent()'s replay
+          // branch in workflow.ts), so replaying the unchanged prefix on resume
+          // is a no-op add here, matching the "already historically spent, don't
+          // double-count" semantics of journal replay.
+          this.accumulateTokenUsage(managed, event.tokens ?? 0, event.tokenUsage);
+          this.emitLive(managed, "agentEnd", { runId: managed.runId, ...event });
           progress();
         },
         onAgentHistory: (event) => {
@@ -514,23 +623,31 @@ export class WorkflowManager extends EventEmitter {
           if (agent) {
             agent.history = event.history;
           }
-          this.emit("agentHistory", { runId: managed.runId, ...event });
+          this.emitLive(managed, "agentHistory", { runId: managed.runId, ...event });
           progress();
         },
         onTokenUsage: (usage) => {
           managed.snapshot.tokenUsage = usage;
-          this.emit("tokenUsage", { runId: managed.runId, usage });
+          this.emitLive(managed, "tokenUsage", { runId: managed.runId, usage });
           progress();
         },
       });
 
       managed.status = "completed";
       managed.result = result;
-      this.emit("complete", { runId: managed.runId, result });
+      // Gated the same way as disk/lease below (see emitLive()): a stale
+      // execution's "complete" would otherwise still deliver a result for a
+      // run that's been superseded or deleted (e.g. background result
+      // delivery into the conversation) even though it's no longer current.
+      this.emitLive(managed, "complete", { runId: managed.runId, result });
 
-      // Persist final state
+      // Persist final state. persistRun()/writeRunToDisk() already no-op if
+      // `managed` has been superseded (resume()/deleteRun() took over this
+      // runId) — see isCurrent(). Guard the lease release the same way: a
+      // stale execution settling after resume() has already acquired a NEW
+      // lease for this runId must not touch that newer lease's bookkeeping.
       this.persistRun(managed);
-      this.releaseRunLease(managed);
+      if (this.isCurrent(managed)) this.releaseRunLease(managed);
 
       return result;
     } catch (error) {
@@ -558,8 +675,10 @@ export class WorkflowManager extends EventEmitter {
         managed.status = "failed";
       }
       managed.error = workflowError;
+      // Both branches gated via emitLive() (see its doc comment) — a stale
+      // execution's "paused"/"error" is equally misleading once superseded.
       if (usageLimitPaused) {
-        this.emit("paused", {
+        this.emitLive(managed, "paused", {
           runId: managed.runId,
           reason: "usage_limit",
           error: workflowError,
@@ -569,15 +688,85 @@ export class WorkflowManager extends EventEmitter {
         // Guarded: EventEmitter throws on an unlistened "error" emit, which
         // would abort this catch block mid-way — skipping the final persist,
         // the lease release, and the real error rethrow below.
-        this.emit("error", { runId: managed.runId, error: workflowError });
+        this.emitLive(managed, "error", { runId: managed.runId, error: workflowError });
       }
 
-      // Persist final state
+      // Persist final state (see the success-path comment above for the
+      // isCurrent() rationale — same guard, same reason).
       this.persistRun(managed);
-      this.releaseRunLease(managed);
+      if (this.isCurrent(managed)) this.releaseRunLease(managed);
 
       throw workflowError;
     }
+  }
+
+  /**
+   * True when `managed` is still the live, current entry for its runId in
+   * `this.runs` — false once resume() has replaced it with a new ManagedRun
+   * object for the same runId, or deleteRun() has removed it entirely. A
+   * superseded ManagedRun's async completion (executeRun's promise settling
+   * well after something else already took over or tore down that runId)
+   * must not write to disk or touch lease state on the newer execution's
+   * behalf — see writeRunToDisk() and executeRun()'s post-await persist calls.
+   */
+  private isCurrent(managed: ManagedRun): boolean {
+    return this.runs.get(managed.runId) === managed;
+  }
+
+  /**
+   * Emit an event on behalf of `managed`, but only while it's still the
+   * current entry for its runId (see isCurrent()) — mirrors the disk/lease
+   * guard for the observer-facing side of the same problem. A superseded
+   * execution's progress/terminal events (log, phase, agentStart/End,
+   * tokenUsage, complete, error, paused) are not just stale-but-harmless:
+   * "complete" in particular can drive background result delivery into the
+   * conversation, so letting a deleted/superseded run's stale settle still
+   * fire it would deliver a result for a run that, from the caller's POV, no
+   * longer exists (or has since been superseded by a newer execution whose
+   * own events already tell the true story). No event in this set has a
+   * legitimate reason to still reach listeners once superseded — unlike
+   * disk writes there's no "expected race, harmless no-op" nuance here, it's
+   * simply wrong to notify twice (or for a run that's gone). Events emitted
+   * directly by pause()/stop()/resume()/deleteRun() themselves are NOT routed
+   * through this helper — those methods own the transition and ARE current
+   * at the moment they fire, same precedent as their persist/lease calls.
+   */
+  private emitLive(managed: ManagedRun, event: string, payload: unknown): void {
+    if (this.isCurrent(managed)) this.emit(event, payload);
+  }
+
+  /**
+   * Additively fold one agent-call's token cost into the run-wide persisted
+   * aggregate (managed.snapshot.tokenUsage), seeded (on resume) from the
+   * persisted total-at-pause — see A2. Shared by onAgentEnd (a completed or
+   * finally-failed agent call) and onRetrySpend (a failed attempt that WILL
+   * be retried, whose cost recordTokens() already folded into
+   * shared.spent/tokenUsage in workflow.ts, but which onAgentEnd never sees —
+   * see WorkflowRunOptions.onRetrySpend for why that needs its own channel).
+   */
+  private accumulateTokenUsage(
+    managed: ManagedRun,
+    tokens: number,
+    tokenUsage?: { input: number; output: number; cost: number; cacheRead: number; cacheWrite: number },
+  ): void {
+    const prior = managed.snapshot.tokenUsage;
+    const usage = {
+      input: prior?.input ?? 0,
+      output: prior?.output ?? 0,
+      total: prior?.total ?? 0,
+      cost: prior?.cost ?? 0,
+      cacheRead: prior?.cacheRead ?? 0,
+      cacheWrite: prior?.cacheWrite ?? 0,
+    };
+    usage.total += tokens;
+    if (tokenUsage) {
+      usage.input += tokenUsage.input;
+      usage.output += tokenUsage.output;
+      usage.cost += tokenUsage.cost;
+      usage.cacheRead += tokenUsage.cacheRead;
+      usage.cacheWrite += tokenUsage.cacheWrite;
+    }
+    managed.snapshot.tokenUsage = usage;
   }
 
   private releaseRunLease(managed: ManagedRun): void {
@@ -623,6 +812,13 @@ export class WorkflowManager extends EventEmitter {
    * pause()/resume()/stop().
    */
   private persistRun(managed: ManagedRun): void {
+    // A superseded execution's persist call must not touch the CURRENT
+    // execution's pending-timer bookkeeping for this runId (see isCurrent()).
+    // writeRunToDisk() below re-checks this too (it's the sole choke point
+    // schedulePersist()'s deferred timer also funnels through), so this is a
+    // belt-and-suspenders early-out specifically for the timer-clearing side
+    // effect, which writeRunToDisk() alone wouldn't prevent.
+    if (!this.isCurrent(managed)) return;
     const timer = this.persistTimers.get(managed.runId);
     if (timer) {
       clearTimeout(timer);
@@ -632,6 +828,14 @@ export class WorkflowManager extends EventEmitter {
   }
 
   private writeRunToDisk(managed: ManagedRun) {
+    // The sole choke point for every disk write (both persistRun()'s direct
+    // calls and schedulePersist()'s deferred timer funnel through here) — skip
+    // silently when `managed` is no longer the current entry for its runId
+    // (see isCurrent()). This is an expected race outcome (resume() replaced
+    // it, or deleteRun() removed it), not an error: writing anyway would
+    // resurrect a torn-down run's file, or clobber a newer execution's
+    // in-progress/completed state with this stale one's.
+    if (!this.isCurrent(managed)) return;
     try {
       this.persistence.save({
         runId: managed.runId,
@@ -650,6 +854,10 @@ export class WorkflowManager extends EventEmitter {
         // Start-time execution context, re-read by resume() (see ManagedRun).
         tokenBudget: managed.tokenBudget,
         toolset: managed.toolset,
+        maxAgents: managed.maxAgents,
+        agentTimeoutMs: managed.agentTimeoutMs,
+        concurrency: managed.concurrency,
+        agentRetries: managed.agentRetries,
         // Why a usage-limit pause happened, so the navigator / a future cold start
         // can show it and (eventually) re-arm resume after the budget refills.
         pauseReason: managed.status === "paused" && isProviderUsageLimit(managed.error) ? "usage_limit" : undefined,
@@ -738,6 +946,20 @@ export class WorkflowManager extends EventEmitter {
     const script = opts?.script ?? persisted.script;
     const args = opts?.args !== undefined ? opts.args : persisted.args;
 
+    // Normalize the persisted total-at-pause once: PersistedRunState.tokenUsage
+    // has optional cost/cacheRead/cacheWrite (legacy runs may lack them), but
+    // both the seeded snapshot and initialTokenUsage need concrete numbers.
+    const priorTokenUsage = persisted.tokenUsage
+      ? {
+          input: persisted.tokenUsage.input,
+          output: persisted.tokenUsage.output,
+          total: persisted.tokenUsage.total,
+          cost: persisted.tokenUsage.cost ?? 0,
+          cacheRead: persisted.tokenUsage.cacheRead ?? 0,
+          cacheWrite: persisted.tokenUsage.cacheWrite ?? 0,
+        }
+      : undefined;
+
     const controller = new AbortController();
     const managed: ManagedRun = {
       runId,
@@ -751,6 +973,11 @@ export class WorkflowManager extends EventEmitter {
         runningCount: 0,
         doneCount: 0,
         errorCount: 0,
+        // Seed the live snapshot's aggregate from the persisted total-at-pause
+        // (see A2) so a pause that lands before this resume's first agent
+        // completes doesn't lose the prior spend — onAgentEnd accumulates on
+        // top of this rather than starting from scratch.
+        tokenUsage: priorTokenUsage,
       },
       controller,
       startedAt: new Date(),
@@ -770,6 +997,30 @@ export class WorkflowManager extends EventEmitter {
       // re-resolves so e.g. a resumed /deep-research keeps its web tools.
       tokenBudget: persisted.tokenBudget !== undefined ? persisted.tokenBudget : null,
       toolset: persisted.toolset,
+      // Restore the same start-time execution context for the other four
+      // per-run knobs (see ManagedRun doc comments) — same rationale as
+      // tokenBudget: never re-resolve against the manager's CURRENT defaults.
+      // maxAgents: legacy/never-set runs resume with no cap carried forward
+      // (runWorkflow's own MAX_AGENTS_PER_RUN default applies), exactly as if
+      // maxAgents had never been passed at all.
+      maxAgents: persisted.maxAgents,
+      // agentTimeoutMs: unlike tokenBudget, a legacy run's real timeout at
+      // start was never "no timeout" by omission — it was always
+      // this.defaultAgentTimeoutMs, because pre-A1 resume() never threaded
+      // agentTimeoutMs through at all and unconditionally fell back to the
+      // manager default (see executeRun's resolvedAgentTimeoutMs fallback
+      // chain). Falling back to null here would change what a legacy run's
+      // resume actually does versus both its original start AND pre-fix
+      // resume behavior. So — deliberately unlike tokenBudget's null
+      // fallback — legacy runs resume with the manager's CURRENT default,
+      // matching the only semantics such a run ever had.
+      agentTimeoutMs: persisted.agentTimeoutMs !== undefined ? persisted.agentTimeoutMs : this.defaultAgentTimeoutMs,
+      // concurrency/agentRetries have no "explicit opt-out sentinel" the way
+      // tokenBudget's null does — a legacy run without a persisted value falls
+      // back to the manager's current values, matching how this execution
+      // resolved unset concurrency/agentRetries before this fix ever existed.
+      concurrency: persisted.concurrency !== undefined ? persisted.concurrency : this.concurrency,
+      agentRetries: persisted.agentRetries !== undefined ? persisted.agentRetries : this.defaultAgentRetries,
       // Fresh per-resume: agents (and any prior timing) are rebuilt live as
       // onAgentStart/onAgentEnd fire again for this attempt (see `agents: []`
       // above); the journal, not this map, is what makes replayed agents cheap.
@@ -783,7 +1034,19 @@ export class WorkflowManager extends EventEmitter {
     const resumeJournal = new Map((persisted.journal ?? []).map((e) => [e.index, e] as const));
     this.emit("resumed", { runId });
     // Run in the background; executeRun records status/errors on the managed run.
-    void this.executeRun(managed, script, args, { resumeJournal }).catch(() => {});
+    // initialTokenUsage seeds the resumed execution's fresh SharedRuntime.spent
+    // (A2) from the persisted total-at-pause, so the tokenBudget cap holds
+    // cumulatively instead of resetting to zero. Note: shared.agentCount is
+    // deliberately NOT seeded the same way — it doesn't need to be. Unlike
+    // token spend (whose cache-hit replay branch skips recordTokens() to avoid
+    // double-counting already-spent tokens), agent()'s shared.agentCount++
+    // fires unconditionally for EVERY call, cache-hit or live, before the
+    // replay check runs (see workflow.ts). Because resume() always replays the
+    // whole script from callIndex 0, that replay alone reconstructs the
+    // correct cumulative count inside this fresh SharedRuntime by the time any
+    // new live agent runs — so maxAgents (via A1) is already a genuine
+    // cumulative cap across resume with no extra seeding required.
+    void this.executeRun(managed, script, args, { resumeJournal, initialTokenUsage: priorTokenUsage }).catch(() => {});
     return true;
   }
 
@@ -859,10 +1122,29 @@ export class WorkflowManager extends EventEmitter {
 
   /**
    * Delete a persisted run.
+   *
+   * If `runId` is still live in this process (running or paused-in-memory),
+   * abort its controller FIRST, before any teardown below — a live run left
+   * un-aborted would otherwise keep executing in the background indefinitely
+   * (burning API calls/tokens/holding a worktree) after its record is gone.
+   * Aborting first, while `managed` is still `this.runs.get(runId)`, costs
+   * nothing extra: the abort signal is fire-and-forget (cooperative — the
+   * execution winds down on its own schedule), so the exact instant we flip
+   * `this.runs`/release the lease/delete files relative to it doesn't matter
+   * for correctness. What DOES matter is that once this method returns, the
+   * aborted execution's eventual settle (executeRun's success/catch path,
+   * asynchronously, possibly much later) must be a harmless no-op rather than
+   * a resurrection — that's what isCurrent() guarantees: `this.runs.delete()`
+   * below means executeRun's later persistRun()/releaseRunLease() calls on
+   * this same `managed` object find `this.runs.get(runId) !== managed` (in
+   * fact `undefined`, since the entry is gone) and skip writing/releasing.
    */
   deleteRun(runId: string): boolean {
     const managed = this.runs.get(runId);
-    if (managed) this.releaseRunLease(managed);
+    if (managed) {
+      if (!managed.controller.signal.aborted) managed.controller.abort();
+      this.releaseRunLease(managed);
+    }
     this.runs.delete(runId);
     // Cancel any pending throttled write so a deferred persist can't fire after
     // deletion and resurrect the run's file on disk.
