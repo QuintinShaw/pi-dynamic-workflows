@@ -1,6 +1,7 @@
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { BUILTIN_WORKFLOW_NAMES, resolveWorkflowInvocation } from "./builtin-workflows.js";
 import {
   createToolUpdateWorkflowDisplay,
   createWorkflowSnapshot,
@@ -23,20 +24,30 @@ export const WORKFLOW_GATE_GUIDELINE =
   "The `workflow` tool runs multi-agent orchestration — it fans decomposable work out across subagents, and fits tasks shaped like: repo-wide inspection, independent parallel research/checks, multi-perspective review, or fan-out/fan-in synthesis. ONLY call it when the user explicitly opts in — via the workflow trigger word, `/workflows run`, or their own words (e.g. 'run a workflow', 'fan this out', '并行审一遍'). For any other task — even one that would clearly benefit — do not call it; you may briefly offer it (with a rough cost) as an option instead.";
 
 const workflowToolSchema = Type.Object({
-  script: Type.String({
-    description: [
-      "Required raw JavaScript workflow script, with no Markdown fences.",
-      "First statement: export const meta = { name: 'short_snake_case', description: 'non-empty description' }. Add phases: [{ title: 'Phase' }] only when the workflow has named phases, and declare only phases it will use. With multiple phases, call phase('Exact Title') before each phase's work or set `phase` in the agent options.",
-      "Use `await workflow(savedName, childArgs)` to run a saved workflow inline; nesting is limited to one level and shares the parent run's concurrency, agent, and token limits.",
-      "Optional quality helpers include verify(), judgePanel(), loopUntilDry(), and completenessCheck().",
-      "Optional control helpers include retry() and gate(); budget exposes total, spent(), and remaining(), and phase('Name', { budget: N }) sets a phase token limit.",
-      "The optional `agentType` option selects a named user or project definition that can bind tools, a model, and role instructions; use it only when its name and purpose are provided in context. Its bound model overrides `tier`; an explicit `model` overrides both.",
-      "Use plain JavaScript only; imports, require(), filesystem modules, Date.now(), Math.random(), and new Date() are unavailable.",
-      "Use phase('Name'), agent(prompt, opts), parallel(arrayOfFunctions), pipeline(items, ...stages), log(message), args, cwd, process.cwd(), and budget. The workflow must call agent() at least once.",
-      "parallel() requires functions, not promises, and returns results in input order: await parallel(items.map(item => () => agent(...))).",
-      "pipeline(items, ...stages) runs stages sequentially for each item while items proceed concurrently; each stage receives (previousValue, originalItem, index).",
-    ].join(" "),
-  }),
+  script: Type.Optional(
+    Type.String({
+      description: [
+        "Raw JavaScript workflow script, with no Markdown fences. Required unless `name` is given.",
+        "First statement: export const meta = { name: 'short_snake_case', description: 'non-empty description' }. Add phases: [{ title: 'Phase' }] only when the workflow has named phases, and declare only phases it will use. With multiple phases, call phase('Exact Title') before each phase's work or set `phase` in the agent options.",
+        "Use `await workflow(savedName, childArgs)` to run a saved workflow inline; nesting is limited to one level and shares the parent run's concurrency, agent, and token limits.",
+        "Optional quality helpers include verify(), judgePanel(), loopUntilDry(), and completenessCheck().",
+        "Optional control helpers include retry() and gate(); budget exposes total, spent(), and remaining(), and phase('Name', { budget: N }) sets a phase token limit.",
+        "The optional `agentType` option selects a named user or project definition that can bind tools, a model, and role instructions; use it only when its name and purpose are provided in context. Its bound model overrides `tier`; an explicit `model` overrides both.",
+        "Use plain JavaScript only; imports, require(), filesystem modules, Date.now(), Math.random(), and new Date() are unavailable.",
+        "Use phase('Name'), agent(prompt, opts), parallel(arrayOfFunctions), pipeline(items, ...stages), log(message), args, cwd, process.cwd(), and budget. The workflow must call agent() at least once.",
+        "parallel() requires functions, not promises, and returns results in input order: await parallel(items.map(item => () => agent(...))).",
+        "pipeline(items, ...stages) runs stages sequentially for each item while items proceed concurrently; each stage receives (previousValue, originalItem, index).",
+      ].join(" "),
+    }),
+  ),
+  name: Type.Optional(
+    Type.String({
+      description:
+        "Run a saved or built-in workflow by name instead of `script`; its args go in `args`. " +
+        `Built-ins: ${BUILTIN_WORKFLOW_NAMES.join(", ")} — see the workflow-patterns skill for each one's args. ` +
+        "A same-named saved workflow wins. Not combinable with resumeFromRunId.",
+    }),
+  ),
   args: Type.Optional(
     Type.Any({ description: "Optional JSON value exposed to the workflow script as global `args`." }),
   ),
@@ -88,7 +99,8 @@ const workflowToolSchema = Type.Object({
 });
 
 export type WorkflowToolInput = {
-  script: string;
+  script?: string;
+  name?: string;
   args?: unknown;
   background?: boolean;
   maxAgents?: number;
@@ -143,7 +155,35 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       return normalizeWorkflowToolArgs(args);
     },
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      const script = normalizeWorkflowScript(params.script);
+      // `name` resolves through the same registry the built-in slash commands
+      // and saved-workflow commands use (see builtin-workflows.ts /
+      // workflow-saved.ts): a project/user saved workflow of that name wins on
+      // a collision, else one of the 5 curated built-in patterns. This lets the
+      // model reach a curated pattern by name instead of having to author an
+      // equivalent script from scratch (and, for patterns that need it, the
+      // right exec context — e.g. deep-research's web tools — travels with it).
+      let invocationTools: ToolDefinition[] | undefined;
+      let invocationToolset: string | undefined;
+      let script: string;
+      if (params.name) {
+        if (params.resumeFromRunId) {
+          throw new Error(
+            "workflow: `name` cannot be combined with `resumeFromRunId` — resume with an edited `script` instead.",
+          );
+        }
+        const resolved = resolveWorkflowInvocation(params.name, params.args, { storage, cwd });
+        if (!resolved) {
+          throw new Error(
+            `workflow: no saved or built-in workflow named "${params.name}". Built-in names: ${BUILTIN_WORKFLOW_NAMES.join(", ")}.`,
+          );
+        }
+        script = normalizeWorkflowScript(resolved.script);
+        invocationTools = resolved.tools;
+        invocationToolset = resolved.toolset;
+      } else {
+        if (!params.script) throw new Error("workflow requires either `script` or `name`");
+        script = normalizeWorkflowScript(params.script);
+      }
       const parsed = parseWorkflowScript(script);
 
       // Iteration / cached-prefix reuse: resume a prior run with THIS (edited)
@@ -185,6 +225,8 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           agentRetries: params.agentRetries,
           agentTimeoutMs: params.agentTimeoutMs,
           tokenBudget: params.tokenBudget,
+          tools: invocationTools,
+          toolset: invocationToolset,
         });
         return {
           content: [{ type: "text", text: backgroundStartedText(parsed.meta.name, runId) }],
@@ -212,6 +254,8 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           agentRetries: params.agentRetries,
           agentTimeoutMs: params.agentTimeoutMs,
           tokenBudget: params.tokenBudget,
+          tools: invocationTools,
+          toolset: invocationToolset,
           confirm,
           externalSignal: signal,
           onProgress(live) {
@@ -385,9 +429,25 @@ export function resumeFailureText(manager: WorkflowManager, runId: string): stri
 }
 
 function normalizeWorkflowToolArgs(args: unknown): WorkflowToolInput {
-  if (!args || typeof args !== "object") throw new Error("workflow requires an object argument with a script string");
+  if (!args || typeof args !== "object")
+    throw new Error("workflow requires an object argument with a `script` string or a `name`");
   const value = args as Record<string, unknown>;
-  if (typeof value.script !== "string") throw new Error("workflow requires `script` to be a string");
+  // `name` resolves a saved/built-in workflow at execute() time, so `script` is
+  // optional here — but if `script` is present at all it must still be a
+  // string (same requirement as the script-only path below), so a caller
+  // passing a malformed `script` alongside `name` gets a clear error instead
+  // of it being silently dropped.
+  if (typeof value.name === "string" && value.name.trim()) {
+    if (value.script !== undefined && typeof value.script !== "string") {
+      throw new Error("workflow's `script` must be a string when provided alongside `name`");
+    }
+    return {
+      ...value,
+      name: value.name.trim(),
+      script: typeof value.script === "string" ? normalizeWorkflowScript(value.script) : undefined,
+    } as WorkflowToolInput;
+  }
+  if (typeof value.script !== "string") throw new Error("workflow requires either `script` or `name` to be a string");
   return { ...value, script: normalizeWorkflowScript(value.script) } as WorkflowToolInput;
 }
 

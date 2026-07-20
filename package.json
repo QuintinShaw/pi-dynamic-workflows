@@ -68,7 +68,8 @@
       "extensions/workflow.ts"
     ],
     "skills": [
-      "skills/workflow-authoring"
+      "skills/workflow-authoring",
+      "skills/workflow-patterns"
     ],
     "image": "https://raw.githubusercontent.com/QuintinShaw/pi-dynamic-workflows/main/assets/readme/package-cover.png"
   },

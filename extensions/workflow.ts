@@ -63,7 +63,7 @@ export default function extension(pi: ExtensionAPI) {
   const effort = createEffortState();
   registerWorkflowCommands(pi, manager, { storage, cwd, effort });
   registerWorkflowModelsCommand(pi);
-  registerBuiltinWorkflows(pi, { cwd, manager });
+  registerBuiltinWorkflows(pi, { cwd, manager, storage });
   registerAllSavedWorkflows(pi, cwd, storage, manager);
   registerEffortCommand(pi, effort);
   // "Workflows mode": type `workflow(s)` to arm a forced workflow at submit

@@ -27,16 +27,31 @@ test("workflow context measurement reports Pi-rendered prompt and provider tool 
   const artifact = measureWorkflowContextSurfaces(ROOT);
   assert.deepEqual(JSON.parse(renderWorkflowContextMeasurement()), artifact);
 
-  assert.equal(artifact.formatVersion, 2);
+  assert.equal(artifact.formatVersion, 3);
   assert.equal(artifact.encoding, "utf8");
-  assert.deepEqual(artifact.sources, ["src/workflow-tool.ts", "skills/workflow-authoring"]);
+  assert.deepEqual(artifact.sources, ["src/workflow-tool.ts", "skills/workflow-authoring", "package.json#pi.skills"]);
   assert.equal(artifact.surfaces.permanentWorkflowPrompt.serialization, "UTF-8 bytes of LF-joined Pi prompt lines");
   assert.equal(
     artifact.surfaces.providerVisibleWorkflowToolDefinition.serialization,
     "UTF-8 bytes of JSON.stringify({ name, description, parameters })",
   );
-  assert.match(artifact.surfaces.workflowAuthoringSkillDiscovery.serialization, /package-relative location/i);
-  assert.ok(artifact.surfaces.workflowAuthoringSkillDiscovery.bytes > 0);
+  // Every skill in package.json's pi.skills contributes to the always-on
+  // discovery tally — not just workflow-authoring — so adding a new skill
+  // can't silently go untracked (see the workflow-patterns skill).
+  assert.match(artifact.surfaces.registeredSkillsDiscovery.serialization, /pi\.skills/i);
+  assert.ok(artifact.surfaces.registeredSkillsDiscovery.bytes > 0);
+  assert.deepEqual(
+    artifact.surfaces.registeredSkillsDiscovery.skills.map(({ root }) => root).sort(),
+    [...packageJson.pi.skills].sort(),
+  );
+  assert.equal(
+    artifact.surfaces.registeredSkillsDiscovery.bytes,
+    artifact.surfaces.registeredSkillsDiscovery.skills.reduce((sum, skill) => sum + skill.bytes, 0),
+    "the total must be the exact sum of each registered skill's own discovery bytes",
+  );
+  for (const skill of artifact.surfaces.registeredSkillsDiscovery.skills) {
+    assert.ok(skill.bytes > 0, `${skill.root} should report a positive discovery byte count`);
+  }
   assert.equal(artifact.surfaces.workflowAuthoringSkillCorpus.files, 27);
   assert.ok(artifact.surfaces.workflowAuthoringSkillCorpus.bytes > 0);
   assert.equal(artifact.surfaces.representativeAuthoringProfiles.profiles.length, 6);
@@ -89,7 +104,9 @@ test("context freshness command prints both current byte counts", () => {
 
   assert.match(output, /Permanent workflow prompt: \d+ bytes/);
   assert.match(output, /Provider-visible workflow tool definition: \d+ bytes/);
-  assert.match(output, /Workflow-authoring skill discovery: \d+ bytes/);
+  assert.match(output, /Registered skills discovery \(all \d+\): \d+ bytes/);
+  assert.match(output, /- skills\/workflow-authoring: \d+ bytes/);
+  assert.match(output, /- skills\/workflow-patterns: \d+ bytes/);
   assert.match(output, /Workflow-authoring skill corpus: \d+ bytes across \d+ files/);
   assert.match(output, /Representative authoring profile median: \d+(?:\.5)? bytes/);
   assert.match(output, /measurement is fresh/i);

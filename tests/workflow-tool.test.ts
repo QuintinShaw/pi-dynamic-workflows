@@ -4,8 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { AgentUsage } from "../src/agent.js";
+import { BUILTIN_WORKFLOW_NAMES } from "../src/builtin-workflows.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
+import { createWorkflowStorage } from "../src/workflow-saved.js";
 import { backgroundStartedText, createWorkflowTool, WORKFLOW_GATE_GUIDELINE } from "../src/workflow-tool.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
@@ -188,6 +190,10 @@ test("createWorkflowTool invalid args throws descriptive error", () => {
     const prepare = tool.prepareArguments as (args: unknown) => unknown;
     assert.throws(() => prepare({ script: 123 }), /script.*string/);
     assert.throws(() => prepare("not-an-object"), /object argument/);
+    assert.throws(() => prepare({}), /script.*name/i, "neither `script` nor `name` should throw clearly");
+    // A malformed `script` alongside `name` must not be silently coerced away
+    // — it should throw the same way a malformed script-only call does.
+    assert.throws(() => prepare({ name: "deep-research", script: 123 }), /script.*string/i);
   }
 });
 
@@ -299,11 +305,16 @@ function withToolTempCwd(fn: (cwd: string) => Promise<void>) {
   };
 }
 
-test("workflowToolSchema exposes resumeFromRunId as optional; script stays required", () => {
+test("workflowToolSchema exposes resumeFromRunId, script, and name as optional at the schema level", () => {
   const tool = createWorkflowTool();
   const schema = tool.parameters as { properties: Record<string, unknown>; required?: string[] };
   assert.ok(schema.properties.resumeFromRunId, "resumeFromRunId should be a schema property");
-  assert.ok((schema.required ?? []).includes("script"), "script stays required");
+  assert.ok(schema.properties.name, "name should be a schema property");
+  // Neither `script` nor `name` is in the schema's `required` list — exactly one
+  // is required at runtime (normalizeWorkflowToolArgs enforces it), because
+  // TypeBox's flat object schema can't express an either/or constraint.
+  assert.ok(!(schema.required ?? []).includes("script"), "script is schema-optional (name is the alternative)");
+  assert.ok(!(schema.required ?? []).includes("name"), "name is schema-optional (script is the alternative)");
   assert.ok(!(schema.required ?? []).includes("resumeFromRunId"), "resumeFromRunId is optional");
 });
 
@@ -433,5 +444,134 @@ return { a, b }`;
     assert.ok(during.includes("SECOND-EDITED"), "edited agent 2 re-runs live");
     // No extra run created — resume reuses the same id.
     assert.equal(manager.listRuns().length, 1, "resume does not create a second run");
+  }),
+);
+
+// ─── `name`: reach a saved or built-in workflow without writing a script ───────
+
+const validArgsByBuiltinName: Record<string, unknown> = {
+  "deep-research": { question: "what is pi?" },
+  "adversarial-review": { task: "investigate this" },
+  "code-review": { diff: "some diff" },
+  "multi-perspective": { topic: "a topic" },
+  "codebase-audit": { scope: "src/", checks: ["security"] },
+};
+
+test(
+  "workflow tool: `name` resolves each of the 5 built-in patterns and starts a run",
+  withToolTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: toolFakeAgent("ok") });
+    manager.on("error", () => {});
+    const tool = createWorkflowTool({ cwd, manager });
+
+    for (const name of BUILTIN_WORKFLOW_NAMES) {
+      const res = await tool.execute(
+        `name-${name}`,
+        { name, args: validArgsByBuiltinName[name] },
+        undefined,
+        undefined,
+        undefined,
+      );
+      const details = res.details as { runId?: string; background?: boolean };
+      const runId = details.runId;
+      assert.ok(runId, `${name} should start a run`);
+      assert.equal(details.background, true);
+      const managed = manager.getRun(runId);
+      assert.ok(managed, `${name} run should be tracked by the manager`);
+    }
+    // Let the fire-and-forget background runs settle before the test tears down.
+    await new Promise((r) => setTimeout(r, 50));
+  }),
+);
+
+test(
+  "workflow tool: `name` carries deep-research's web-research exec context through the run",
+  withToolTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: toolFakeAgent("ok") });
+    manager.on("error", () => {});
+    const tool = createWorkflowTool({ cwd, manager });
+    const res = await tool.execute(
+      "name-deep-research",
+      { name: "deep-research", args: { question: "what is pi?" } },
+      undefined,
+      undefined,
+      undefined,
+    );
+    const details = res.details as { runId?: string };
+    const runId = details.runId;
+    assert.ok(runId, "deep-research should start a run");
+    const managed = manager.getRun(runId);
+    assert.equal(managed?.toolset, "web-research", "the run should carry the web-research toolset tag");
+    await new Promise((r) => setTimeout(r, 50));
+  }),
+);
+
+test(
+  "workflow tool: a saved workflow of the same name takes precedence over a built-in",
+  withToolTempCwd(async (cwd) => {
+    const storage = createWorkflowStorage(cwd);
+    const customScript = "export const meta = { name: 'custom_deep_research', description: 'override' }\nreturn 1";
+    storage.save({ name: "deep-research", description: "custom override", script: customScript });
+    const manager = new WorkflowManager({ cwd, agent: toolFakeAgent("ok") });
+    manager.on("error", () => {});
+    const tool = createWorkflowTool({ cwd, manager, storage });
+
+    const res = await tool.execute(
+      "name-precedence",
+      { name: "deep-research", args: { question: "irrelevant here" } },
+      undefined,
+      undefined,
+      undefined,
+    );
+    const details = res.details as { runId?: string };
+    const runId = details.runId;
+    assert.ok(runId, "the run should start");
+    const managed = manager.getRun(runId);
+    assert.equal(managed?.snapshot.name, "custom_deep_research", "the saved workflow should win, not the built-in");
+    assert.equal(managed?.toolset, undefined, "the saved workflow does not carry the built-in's exec context");
+    await new Promise((r) => setTimeout(r, 50));
+  }),
+);
+
+test(
+  "workflow tool: an unknown `name` throws a clear error naming the built-ins",
+  withToolTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: toolFakeAgent("ok") });
+    const tool = createWorkflowTool({ cwd, manager });
+    await assert.rejects(
+      () => tool.execute("bad-name", { name: "not-a-real-workflow" }, undefined, undefined, undefined),
+      /no saved or built-in workflow named "not-a-real-workflow"/,
+    );
+  }),
+);
+
+test(
+  "workflow tool: invalid args for a built-in surface a descriptive error",
+  withToolTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: toolFakeAgent("ok") });
+    const tool = createWorkflowTool({ cwd, manager });
+    await assert.rejects(
+      () => tool.execute("bad-args", { name: "deep-research", args: {} }, undefined, undefined, undefined),
+      /question/,
+    );
+  }),
+);
+
+test(
+  "workflow tool: `name` cannot be combined with `resumeFromRunId`",
+  withToolTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: toolFakeAgent("ok") });
+    const tool = createWorkflowTool({ cwd, manager });
+    await assert.rejects(
+      () =>
+        tool.execute(
+          "bad-combo",
+          { name: "deep-research", args: { question: "q" }, resumeFromRunId: "some-run" },
+          undefined,
+          undefined,
+          undefined,
+        ),
+      /cannot be combined with `resumeFromRunId`/,
+    );
   }),
 );

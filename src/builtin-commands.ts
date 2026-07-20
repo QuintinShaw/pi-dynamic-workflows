@@ -12,17 +12,13 @@
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import {
-  createCodingTools,
-  type ExtensionAPI,
-  type ExtensionCommandContext,
-  type ToolDefinition,
-} from "@earendil-works/pi-coding-agent";
-import { generateAdversarialReviewWorkflow, generateMultiPerspectiveWorkflow } from "./adversarial-review.js";
-import { generateCodeReviewWorkflow, MAX_DIFF_CHARS } from "./code-review.js";
-import { generateCodebaseAuditWorkflow, generateDeepResearchWorkflow } from "./deep-research.js";
-import { createWebTools } from "./web-tools.js";
+import type { ExtensionAPI, ExtensionCommandContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { BuiltinWorkflowInvocation } from "./builtin-workflows.js";
+import { findBuiltinWorkflow } from "./builtin-workflows.js";
+import { MAX_DIFF_CHARS } from "./code-review.js";
+import { parseCommandArgs } from "./saved-commands.js";
 import type { WorkflowManager } from "./workflow-manager.js";
+import { createWorkflowStorage, type WorkflowStorage } from "./workflow-saved.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -79,27 +75,88 @@ function startBackground(
   }
 }
 
-export function registerBuiltinWorkflows(pi: ExtensionAPI, opts: { cwd: string; manager: WorkflowManager }): void {
+/**
+ * Look up a built-in descriptor by its fixed, hardcoded name. Every call site
+ * below passes one of the 5 literal names in BUILTIN_WORKFLOWS, so this can
+ * only throw if that registry and this file's command names fall out of sync
+ * — a programming error, not a user-input problem (tests pin the names stay
+ * in sync, see builtin-commands.test.ts).
+ */
+function requireBuiltin(name: string) {
+  const found = findBuiltinWorkflow(name);
+  if (!found) throw new Error(`internal error: no built-in workflow registered for "${name}"`);
+  return found;
+}
+
+/**
+ * Resolve a built-in's script/exec context for the given args, surfacing an
+ * invalid-args error (e.g. a whitespace-only string that passes the handler's
+ * cheap `!value` check but fails the registry's real validation) as the same
+ * kind of warning notify the handlers already use for their own validation,
+ * rather than an uncaught rejection.
+ */
+function resolveBuiltinOrNotify(
+  name: string,
+  cwd: string,
+  args: unknown,
+  ctx: ExtensionCommandContext,
+): BuiltinWorkflowInvocation | undefined {
+  try {
+    return requireBuiltin(name).resolve(cwd, args);
+  } catch (error) {
+    ctx.ui.notify(`/${name}: ${error instanceof Error ? error.message : String(error)}`, "warning");
+    return undefined;
+  }
+}
+
+export function registerBuiltinWorkflows(
+  pi: ExtensionAPI,
+  opts: { cwd: string; manager: WorkflowManager; storage?: WorkflowStorage },
+): void {
   const { cwd, manager } = opts;
+  const storage = opts.storage ?? createWorkflowStorage(cwd);
+
+  /**
+   * A project/user saved workflow always takes precedence over a built-in of
+   * the same name — on every path, not just the `workflow` tool's `name`
+   * input. Builtins are registered as commands before saved workflows
+   * (registerAllSavedWorkflows skips a name that's already registered), so
+   * without this dynamic check a same-named saved workflow would silently
+   * never run from its slash command. Checking here, at invocation time
+   * rather than registration time, makes "saved wins" hold regardless of
+   * registration order. Mirrors registerSavedWorkflow's own handler exactly
+   * (same parseCommandArgs call, same startBackground path, no builtin exec
+   * context) so a shadowed command behaves identically to how it would if the
+   * saved workflow itself had been registered under this name.
+   */
+  function runSavedShadowIfPresent(name: string, rawArgs: string, ctx: ExtensionCommandContext): boolean {
+    const saved = storage.load(name);
+    if (!saved) return false;
+    startBackground(manager, ctx, name, saved.script, parseCommandArgs(rawArgs, saved.parameters));
+    return true;
+  }
 
   if (!alreadyRegistered(pi, "deep-research")) {
     pi.registerCommand("deep-research", {
       description: "Research a question across the web with cross-checked sources",
       async handler(args: string, ctx: ExtensionCommandContext) {
+        if (runSavedShadowIfPresent("deep-research", args, ctx)) return;
         const question = args.trim();
         if (!question) return ctx.ui.notify("Usage: /deep-research <question>", "warning");
-        // Research agents need real web access on top of the coding tools.
-        // `tools` covers this execution even on a manager without the toolset
-        // registered; the "web-research" tag is what a resume re-resolves.
+        // Resolve through the shared builtin registry (builtin-workflows.ts) so
+        // this command and the workflow tool's `name` input always run the exact
+        // same generated script and exec context (tools/toolset) for this pattern.
+        const resolved = resolveBuiltinOrNotify("deep-research", cwd, { question }, ctx);
+        if (!resolved) return;
         startBackground(
           manager,
           ctx,
           "deep-research",
-          generateDeepResearchWorkflow(),
+          resolved.script,
           { question },
           {
-            tools: [...createCodingTools(cwd), ...createWebTools()],
-            toolset: "web-research",
+            tools: resolved.tools,
+            toolset: resolved.toolset,
           },
         );
       },
@@ -110,9 +167,12 @@ export function registerBuiltinWorkflows(pi: ExtensionAPI, opts: { cwd: string; 
     pi.registerCommand("adversarial-review", {
       description: "Investigate a task, then cross-check each finding with skeptical reviewers",
       async handler(args: string, ctx: ExtensionCommandContext) {
+        if (runSavedShadowIfPresent("adversarial-review", args, ctx)) return;
         const task = args.trim();
         if (!task) return ctx.ui.notify("Usage: /adversarial-review <task or question>", "warning");
-        startBackground(manager, ctx, "adversarial-review", generateAdversarialReviewWorkflow(), { task });
+        const resolved = resolveBuiltinOrNotify("adversarial-review", cwd, { task }, ctx);
+        if (!resolved) return;
+        startBackground(manager, ctx, "adversarial-review", resolved.script, { task });
       },
     });
   }
@@ -122,6 +182,7 @@ export function registerBuiltinWorkflows(pi: ExtensionAPI, opts: { cwd: string; 
       description:
         "Multi-angle parallel code review: 7 specialized finders (correctness, reuse, simplification, efficiency, altitude) + verify pass → ranked findings",
       async handler(args: string, ctx: ExtensionCommandContext) {
+        if (runSavedShadowIfPresent("code-review", args, ctx)) return;
         const input = args.trim();
         let diffSource = "git diff HEAD";
         let diff = "";
@@ -182,7 +243,9 @@ export function registerBuiltinWorkflows(pi: ExtensionAPI, opts: { cwd: string; 
           );
         }
 
-        startBackground(manager, ctx, "code-review", generateCodeReviewWorkflow(), { diff, diffSource });
+        const resolved = resolveBuiltinOrNotify("code-review", cwd, { diff, diffSource }, ctx);
+        if (!resolved) return;
+        startBackground(manager, ctx, "code-review", resolved.script, { diff, diffSource });
       },
     });
   }
@@ -191,14 +254,16 @@ export function registerBuiltinWorkflows(pi: ExtensionAPI, opts: { cwd: string; 
     pi.registerCommand("multi-perspective", {
       description: "Analyze a topic from several independent perspectives in parallel, then synthesize",
       async handler(args: string, ctx: ExtensionCommandContext) {
+        if (runSavedShadowIfPresent("multi-perspective", args, ctx)) return;
         const [topic, ...rest] = tokenizeArgs(args);
         if (!topic) {
           return ctx.ui.notify('Usage: /multi-perspective "<topic>" [perspective1] [perspective2] …', "warning");
         }
-        // Fall back to a broadly-useful default set when fewer than two are given.
-        const perspectives =
-          rest.length >= 2 ? rest : ["technical", "product", "security", "user experience", "maintainability"];
-        startBackground(manager, ctx, "multi-perspective", generateMultiPerspectiveWorkflow(topic, perspectives));
+        // resolve() falls back to a broadly-useful default set when fewer than
+        // two perspectives are given (see builtin-workflows.ts).
+        const resolved = resolveBuiltinOrNotify("multi-perspective", cwd, { topic, perspectives: rest }, ctx);
+        if (!resolved) return;
+        startBackground(manager, ctx, "multi-perspective", resolved.script);
       },
     });
   }
@@ -207,11 +272,14 @@ export function registerBuiltinWorkflows(pi: ExtensionAPI, opts: { cwd: string; 
     pi.registerCommand("codebase-audit", {
       description: "Run parallel checks against a codebase scope, then cross-validate and report",
       async handler(args: string, ctx: ExtensionCommandContext) {
+        if (runSavedShadowIfPresent("codebase-audit", args, ctx)) return;
         const [scope, ...checks] = tokenizeArgs(args);
         if (!scope || checks.length === 0) {
           return ctx.ui.notify('Usage: /codebase-audit <scope> "<check1>" ["<check2>" …]', "warning");
         }
-        startBackground(manager, ctx, "codebase-audit", generateCodebaseAuditWorkflow(scope, checks));
+        const resolved = resolveBuiltinOrNotify("codebase-audit", cwd, { scope, checks }, ctx);
+        if (!resolved) return;
+        startBackground(manager, ctx, "codebase-audit", resolved.script);
       },
     });
   }
