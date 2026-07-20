@@ -128,6 +128,20 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   resumeFromRunId?: string;
   /** Called after each live agent completes so the caller can persist the journal. */
   onAgentJournal?: (entry: JournalEntry) => void;
+  /**
+   * Called once per FAILED-AND-RETRIED attempt (not the final attempt of an
+   * agent() call, which reports its own tokens via onAgentEnd as before),
+   * with that attempt's token cost. recordTokens() already folds a retried
+   * attempt's spend into shared.spent/shared.tokenUsage (so the run-wide
+   * budget was never leaky) — but onAgentEnd only ever reports the FINAL
+   * attempt's tokens, so a caller accumulating a persisted total purely from
+   * onAgentEnd (see WorkflowManager) would under-count by exactly the
+   * wasted retried attempts' spend. This is a separate, silent channel
+   * specifically so retried-attempt spend can be accounted for without
+   * changing onAgentEnd's one-call-per-agent-call cadence (a contract other
+   * code depends on).
+   */
+  onRetrySpend?: (tokens: number) => void;
   /** Internal: shared runtime inherited by a nested workflow() call. */
   sharedRuntime?: SharedRuntime;
   /**
@@ -678,6 +692,11 @@ export async function runWorkflow<T = unknown>(
               log(
                 `agent "${label}" attempt ${attempt}/${maxAttempts} failed: ${workflowError.code} ${workflowError.message}; retrying`,
               );
+              // This attempt's spend already accrued into shared.spent/tokenUsage
+              // above (recordTokens) — but it will never reach onAgentEnd (only
+              // the final attempt does), so report it on the dedicated channel
+              // instead (see WorkflowRunOptions.onRetrySpend).
+              options.onRetrySpend?.(tokens);
               continue;
             }
 
