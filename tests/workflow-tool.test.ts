@@ -144,6 +144,30 @@ test("createWorkflowTool keeps script syntax in the parameter schema", () => {
   assert.doesNotMatch(guidance, /each stage receives.*previousValue.*originalItem.*index/i);
 });
 
+test("createWorkflowTool declares `args` as an explicitly typed object, not a typeless Type.Any() schema", () => {
+  // Regression test: `args` used to be `Type.Any()`, which compiles to a
+  // schema with no "type" keyword at all (just `{ description }`). At least
+  // one MCP/tool-calling bridge does not treat a typeless property as
+  // "accept any JSON value" — it coerces/flattens the value before the
+  // handler ever sees it, so every named built-in pattern's required args
+  // field (e.g. `args.scope` for codebase-audit, `args.question` for
+  // deep-research) silently arrives as `undefined`, regardless of what the
+  // caller actually sent — making name-based invocation of every built-in
+  // pattern fail on that bridge. Every built-in pattern's `args` is a JSON
+  // object at the top level, so it must be declared `type: "object"`.
+  const tool = createWorkflowTool();
+  const parameters = tool.parameters as { properties: Record<string, unknown> };
+  const argsSchema = parameters.properties.args as Record<string, unknown> | undefined;
+
+  assert.ok(argsSchema, "tool.parameters.properties.args should exist");
+  assert.equal(argsSchema?.type, "object", "args schema must declare an explicit object type");
+  assert.equal(
+    typeof argsSchema?.description,
+    "string",
+    "args schema should keep its description alongside the explicit type",
+  );
+});
+
 test("createWorkflowTool keeps background behavior in the parameter schema", () => {
   const tool = createWorkflowTool();
   const description = parameterDescription(tool, "background");

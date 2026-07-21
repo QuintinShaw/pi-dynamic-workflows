@@ -38,7 +38,21 @@ const RENDERED_PROMPT_BUDGET_BYTES = 800;
 // approximately 349 (this tool definition) + 593 (skill discovery) ≈ 942
 // bytes — well short of loading the skill's full body, which only happens
 // on demand.
-const TOOL_DEFINITION_BUDGET_BYTES = 4_267;
+//
+// `args` was `Type.Any()`, which TypeBox compiles to a schema with no
+// "type" keyword at all (just `{ description }`). At least one MCP/tool-
+// calling bridge does not treat a typeless property as "accept any JSON
+// value" — it coerces/flattens the value before the handler sees it, so
+// every named built-in pattern's required `args` field (e.g. `args.scope`
+// for codebase-audit) silently arrives as `undefined` regardless of what
+// the caller sent, making `name`-based invocation of all 5 built-in
+// patterns unusable end-to-end on that bridge. Every built-in pattern's
+// `args` is a JSON object at the top level, so `args` is now declared
+// `Type.Unsafe<Record<string, unknown>>({ type: "object", description })`
+// — an explicit, minimal, JSON-Schema-valid object type (additional
+// properties are allowed by default without needing to spell that out) —
+// increasing this compact definition from 4,267 to 4,283 bytes (+16).
+const TOOL_DEFINITION_BUDGET_BYTES = 4_283;
 
 test("rendered workflow prompt contribution stays within its accepted size", async () => {
   await withRenderedWorkflow(async ({ systemPrompt, promptLines }) => {
