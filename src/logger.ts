@@ -21,8 +21,8 @@ export interface WorkflowLoggerOptions {
   cwd?: string;
   /** Whether to persist logs to disk. */
   persist?: boolean;
-  /** Callback for each log entry. */
-  onLog?: (message: string) => void;
+  /** Callback for each log entry. Observer failures are diagnostic-only. */
+  onLog?: (message: string) => void | PromiseLike<void>;
 }
 
 export function createWorkflowLogger(options: WorkflowLoggerOptions = {}): WorkflowLogger {
@@ -37,7 +37,12 @@ export function createWorkflowLogger(options: WorkflowLoggerOptions = {}): Workf
     const timestamp = new Date().toISOString();
     const entry = `[${timestamp}] [${level}] ${message}`;
     logs.push(entry);
-    options.onLog?.(message);
+    try {
+      const callbackResult = options.onLog?.(message);
+      if (callbackResult !== undefined) void Promise.resolve(callbackResult).catch(() => undefined);
+    } catch {
+      // Logging observers are never allowed to replace the workflow outcome.
+    }
 
     if (persistLogs && logFile) {
       try {

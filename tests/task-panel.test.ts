@@ -99,6 +99,45 @@ describe("installResultDelivery", () => {
     assert.ok(calls[0].content.includes("1.5s"), "should contain 1.5s");
   });
 
+  it("delivers cleanup warnings without retaining hostile caller labels", () => {
+    const hostileLabel =
+      "/tmp/customer-secret\ncontrol\u0001 C:\\Users\\private\\checkout api-key=delivery-label-secret";
+    const run = makeRun({
+      snapshot: {
+        ...makeRun().snapshot,
+        logs: [`worktree cleanup failed for "${hostileLabel}" at worktree_remove`],
+      },
+      worktreeCleanupFailures: [
+        {
+          stage: "worktree_remove",
+          message: `Cleanup failed at worktree_remove; recovery ID ${"a".repeat(64)}`,
+          identity: { recoveryId: "a".repeat(64), branchRef: "refs/heads/pi/wf/work", baseSha: "b".repeat(40) },
+        },
+      ],
+      result: {
+        ...makeRun().result,
+        worktreeCleanupFailures: [
+          {
+            stage: "worktree_remove",
+            message: `Cleanup failed at worktree_remove; recovery ID ${"a".repeat(64)}`,
+            identity: { recoveryId: "a".repeat(64), branchRef: "refs/heads/pi/wf/work", baseSha: "b".repeat(40) },
+          },
+        ],
+      },
+    });
+    const pi = createMockPi();
+    const manager = createMockManager(run);
+
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    manager.emit("complete", { runId: "test-run-1" });
+
+    const content = (pi as unknown as { _calls: { content: string }[] })._calls[0].content;
+    assert.match(content, /cleanup warning/i);
+    for (const fragment of ["customer-secret", "control", "Users", "private", "api-key", "delivery-label-secret"]) {
+      assert.equal(content.includes(fragment), false, `delivery omits raw cleanup label fragment ${fragment}`);
+    }
+  });
+
   it("shows the fresh/cache split and cost in the delivery line", () => {
     const pi = createMockPi();
     // A caching model: little fresh input+output, most of the tokens are cheap cache reads.
@@ -872,9 +911,48 @@ describe("installTaskPanel mode selection", () => {
 // ─── deliverText: pointer + truncation threshold ─────────────────────────────────
 
 describe("deliverText", () => {
-  function makeResult(result: unknown) {
-    return { snapshot: { name: "wf", agentCount: 1 }, result: { agentCount: 1, result } };
+  function makeResult(
+    result: unknown,
+    worktreeCleanupFailures?: Array<{
+      stage: "identity_verification" | "worktree_remove" | "branch_delete" | "cleanup_dispatch";
+      message: string;
+      identity: { recoveryId: string; branchRef: string; baseSha: string };
+    }>,
+  ) {
+    return {
+      snapshot: { name: "wf", agentCount: 1 },
+      result: { agentCount: 1, result, worktreeCleanupFailures },
+      worktreeCleanupFailures,
+    };
   }
+
+  it("warns on background and cold/resumed completion cleanup failures without changing the result", async () => {
+    const { deliverText } = await import("../src/task-panel.js");
+    const failure = {
+      stage: "worktree_remove" as const,
+      message: "bounded path-free failure",
+      identity: { recoveryId: "a".repeat(64), branchRef: "refs/heads/pi/wf/warning", baseSha: "b".repeat(40) },
+    };
+    const live = makeResult({ verdict: "COMPLETED" }, [failure]);
+    const liveText = deliverText(live as never);
+    assert.match(liveText, /COMPLETED/);
+    assert.match(liveText, /warning/i);
+    assert.match(liveText, /1.*cleanup/i);
+    assert.match(liveText, /worktree_remove/);
+    assert.equal(liveText.startsWith("✓"), false, "cleanup-warning delivery is not unconditional success");
+
+    const cold = makeResult({ verdict: "RESUMED COMPLETION" });
+    cold.result.worktreeCleanupFailures = undefined;
+    cold.worktreeCleanupFailures = [failure];
+    const coldText = deliverText(cold as never);
+    assert.match(coldText, /RESUMED COMPLETION/);
+    assert.match(coldText, /warning/i);
+    assert.match(coldText, /worktree_remove/);
+
+    const cleanText = deliverText(makeResult({ verdict: "CLEAN" }) as never);
+    assert.ok(cleanText.startsWith("✓"));
+    assert.doesNotMatch(cleanText, /cleanup warning/i);
+  });
 
   it("appends the Full result pointer to a verdict result without altering it", async () => {
     const { deliverText } = await import("../src/task-panel.js");

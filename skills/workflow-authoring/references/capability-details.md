@@ -19,6 +19,8 @@ Every exact fact below is projected from the installed extension's capability co
 - `model`: string (optional; highest-priority exact model selector)
 - `tier`: string (optional; configured route name; dynamic reference: model-routes)
 - `isolation`: "worktree" (optional)
+- `retainWorktree`: boolean (optional; default: false; requires resolved worktree isolation)
+- `worktree`: opaque retained-worktree handle (optional; cannot be combined with isolation or retainWorktree: true)
 - `agentType`: string (optional; must come from provided context; dynamic reference: agent-types)
 - `timeoutMs`: number | null (optional; default: run timeout; null disables)
 - `retries`: number (optional; default: run retry count; finite values are floored and clamped to 0..3)
@@ -29,6 +31,15 @@ Every exact fact below is projected from the installed extension's capability co
 - Constraint: selector priority is explicit model > agentType model > tier > phase model > metadata model > implicit medium > session default
 - Constraint: if the selected model or route is unavailable, execution falls directly to the session default rather than trying lower-priority selectors
 - Constraint: worktree isolation is best-effort; failure logs that isolation was ignored and continues without an isolated working directory
+
+<a id="releaseworktree"></a>
+## releaseWorktree
+
+- Classification: `runtime-global`
+- Support: `supported`
+- Signature: `releaseWorktree(handle) => Promise<void>`
+- Constraint: accepts only opaque handles issued by the current root run
+- Constraint: closes consumer admission, waits admitted consumers, and is idempotent after success
 
 <a id="parallel"></a>
 ## parallel

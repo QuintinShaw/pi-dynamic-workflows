@@ -112,6 +112,7 @@ export interface RuntimeBindingAssembly {
 /** Project-owned implementations required to assemble the workflow VM context. */
 export interface WorkflowRuntimeImplementations {
   agent: unknown;
+  releaseWorktree: unknown;
   parallel: unknown;
   pipeline: unknown;
   workflow: unknown;
@@ -180,6 +181,10 @@ const AGENT_OPTIONS: OptionShape = {
     option("model", "string", true, null, ["highest-priority exact model selector"]),
     option("tier", "string", true, null, ["configured route name"], "model-routes"),
     option("isolation", '"worktree"', true),
+    option("retainWorktree", "boolean", true, "false", ["requires resolved worktree isolation"]),
+    option("worktree", "opaque retained-worktree handle", true, null, [
+      "cannot be combined with isolation or retainWorktree: true",
+    ]),
     option("agentType", "string", true, null, ["must come from provided context"], "agent-types"),
     option("timeoutMs", "number | null", true, "run timeout; null disables"),
     option("retries", "number", true, "run retry count", ["finite values are floored and clamped to 0..3"]),
@@ -313,6 +318,14 @@ const capabilities: readonly CapabilityDescriptor[] = [
       "worktree isolation is best-effort; failure logs that isolation was ignored and continues without an isolated working directory",
     ],
     evidence: ["tests/workflow-runtime.test.ts", "tests/agent-registry.test.ts", "tests/structured-output.test.ts"],
+  }),
+  runtimeGlobal("releaseWorktree", {
+    signature: "releaseWorktree(handle) => Promise<void>",
+    constraints: [
+      "accepts only opaque handles issued by the current root run",
+      "closes consumer admission, waits admitted consumers, and is idempotent after success",
+    ],
+    evidence: ["tests/retained-worktree.test.ts"],
   }),
   runtimeGlobal("parallel", {
     signature: "parallel(thunks) => Promise<Array<unknown | null>>",

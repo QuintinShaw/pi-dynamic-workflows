@@ -8,14 +8,17 @@ import type { WorkflowAgent } from "./agent.js";
 import { preview, type WorkflowAgentSnapshot, type WorkflowSnapshot } from "./display.js";
 import { isProviderUsageLimit, WorkflowError, WorkflowErrorCode } from "./errors.js";
 import {
+  boundWorktreeCleanupFailure,
   createRunPersistence,
   generateRunId,
+  mergeWorktreeCleanupFailures,
   type PersistedRunState,
   type RunLease,
   type RunPersistence,
   type RunStatus,
 } from "./run-persistence.js";
 import { type JournalEntry, parseWorkflowScript, runWorkflow, type WorkflowRunResult } from "./workflow.js";
+import type { WorktreeCleanupFailure, WorktreeOperations } from "./worktree.js";
 
 export interface ManagedRun {
   runId: string;
@@ -32,6 +35,10 @@ export interface ManagedRun {
   journal: JournalEntry[];
   /** Cross-process execution lease for this run, when it is actively executing. */
   lease?: RunLease;
+  /** Active execution retained for compatibility and safe lifecycle fencing. */
+  execution?: Promise<WorkflowRunResult>;
+  /** Settlement of this execution generation. */
+  settlement?: Promise<WorkflowRunResult>;
   /**
    * True when the run was started in the background (or resumed) and the caller is
    * not awaiting its result inline. Only background runs deliver their result back
@@ -108,6 +115,8 @@ export interface ManagedRun {
    * tokenBudget.
    */
   agentRetries?: number;
+  /** Bounded cleanup recovery diagnostics for retained worktrees. */
+  worktreeCleanupFailures?: WorktreeCleanupFailure[];
 }
 
 /** Per-execution options shared by sync, background, and resume runs. */
@@ -194,6 +203,8 @@ export interface WorkflowManagerOptions {
   defaultAgentRetries?: number;
   /** Default hard token budget when a run does not pass tokenBudget. null/omitted means no budget. */
   defaultTokenBudget?: number | null;
+  /** Internal/injectable retained-worktree filesystem operations. */
+  worktreeOperations?: WorktreeOperations;
   /**
    * Named toolsets resolvable by ExecOptions.toolset — e.g.
    * `{ "web-research": () => [...createCodingTools(cwd), ...createWebTools()] }`.
@@ -330,6 +341,7 @@ export class WorkflowManager extends EventEmitter {
   private toolsets?: Record<string, () => ToolDefinition[]>;
   private excludeSubagentTools?: string[];
   private persistAgentSessions: boolean;
+  private worktreeOperations?: WorktreeOperations;
 
   constructor(options: WorkflowManagerOptions = {}) {
     super();
@@ -346,6 +358,7 @@ export class WorkflowManager extends EventEmitter {
     this.toolsets = options.toolsets;
     this.excludeSubagentTools = options.excludeSubagentTools;
     this.persistAgentSessions = options.persistAgentSessions ?? false;
+    this.worktreeOperations = options.worktreeOperations;
     this.maxTerminalRunsInMemory = options.maxTerminalRunsInMemory ?? DEFAULT_MAX_TERMINAL_RUNS_IN_MEMORY;
     this.persistence = createRunPersistence(this.cwd);
     this.recoverStaleRuns();
@@ -511,6 +524,8 @@ export class WorkflowManager extends EventEmitter {
     // already records status/event/persist, but the promise still rejects.
     // The original promise is returned so callers can await it in try/catch.
     const promise = this.executeRun(managed, script, args, exec);
+    managed.execution = promise;
+    managed.settlement = promise;
     promise.catch(() => {});
 
     return { runId, promise };
@@ -539,7 +554,10 @@ export class WorkflowManager extends EventEmitter {
     // Persist the initial state immediately so listRuns()/the task panel can see
     // the run the moment it starts, not only after the first agent journals.
     this.persistRun(managed);
-    return this.executeRun(managed, script, args, exec);
+    const execution = this.executeRun(managed, script, args, exec);
+    managed.execution = execution;
+    managed.settlement = execution;
+    return execution;
   }
 
   /** Build a fresh managed run with an empty snapshot. */
@@ -597,6 +615,7 @@ export class WorkflowManager extends EventEmitter {
       tools,
       initialTokenUsage,
     } = exec;
+    const priorCleanupFailures = managed.worktreeCleanupFailures?.map((failure) => structuredClone(failure));
     // maxAgents/agentTimeoutMs/concurrency/agentRetries were resolved (per-run
     // value, else the manager default at the time) and frozen on the managed
     // run at start/resume (see ManagedRun doc comments) — read them from there
@@ -661,6 +680,12 @@ export class WorkflowManager extends EventEmitter {
         loadSavedWorkflow: this.loadSavedWorkflow,
         resumeJournal,
         resumeFromRunId: resumeJournal ? managed.runId : undefined,
+        worktreeOperations: this.worktreeOperations,
+        onWorktreeCleanupFailure: (failure) => {
+          if (!this.isCurrent(managed)) return;
+          managed.worktreeCleanupFailures = mergeWorktreeCleanupFailures(managed.worktreeCleanupFailures, [failure]);
+          this.persistRun(managed);
+        },
         // Seed the fresh SharedRuntime's spend counter from the persisted total
         // (resume()) so the hard tokenBudget cap holds cumulatively across a
         // pause/resume cycle instead of resetting to zero each time (see A2 —
@@ -691,7 +716,7 @@ export class WorkflowManager extends EventEmitter {
         },
         onLog: (message) => {
           managed.snapshot.logs.push(message);
-          this.emitLive(managed, "log", { runId: managed.runId, message });
+          this.emitNonMaskingLive(managed, "log", { runId: managed.runId, message });
           progress();
         },
         onPhase: (title) => {
@@ -775,6 +800,22 @@ export class WorkflowManager extends EventEmitter {
         },
       });
 
+      const cleanupFailures = mergeWorktreeCleanupFailures(
+        priorCleanupFailures,
+        managed.worktreeCleanupFailures,
+        result.worktreeCleanupFailures,
+      );
+      managed.worktreeCleanupFailures = cleanupFailures;
+      result.worktreeCleanupFailures = cleanupFailures;
+      if (priorCleanupFailures?.length && cleanupFailures?.length) {
+        const stages = [...new Set(cleanupFailures.map((failure) => failure.stage))].join(", ");
+        const warning = `Cleanup warning: ${cleanupFailures.length} retained worktree cleanup failure(s) at stage(s): ${stages}. Workflow computation still completed.`;
+        if (!managed.snapshot.logs.includes(warning)) {
+          managed.snapshot.logs.push(warning);
+          this.emitNonMaskingLive(managed, "log", { runId: managed.runId, message: warning });
+          progress();
+        }
+      }
       managed.status = "completed";
       managed.result = result;
       // Gated the same way as disk/lease below (see emitLive()): a stale
@@ -890,6 +931,18 @@ export class WorkflowManager extends EventEmitter {
    */
   private emitLive(managed: ManagedRun, event: string, payload: unknown): void {
     if (this.isCurrent(managed)) this.emit(event, payload);
+  }
+
+  private emitNonMaskingLive(managed: ManagedRun, event: string, payload: unknown): void {
+    if (!this.isCurrent(managed)) return;
+    for (const listener of this.rawListeners(event)) {
+      try {
+        const result = Reflect.apply(listener, this, [payload]) as unknown;
+        if (result !== undefined) void Promise.resolve(result).catch(() => undefined);
+      } catch {
+        // Cleanup/log observers never replace the workflow outcome.
+      }
+    }
   }
 
   /**
@@ -1101,6 +1154,7 @@ export class WorkflowManager extends EventEmitter {
         updatedAt: new Date().toISOString(),
         completedAt: managed.status === "completed" ? new Date().toISOString() : undefined,
         durationMs: managed.result?.durationMs,
+        worktreeCleanupFailures: managed.worktreeCleanupFailures?.map((failure) => structuredClone(failure)),
       });
     } catch (err) {
       // Persistence is best-effort: the run is still healthy in memory.
@@ -1235,6 +1289,7 @@ export class WorkflowManager extends EventEmitter {
       // above); the journal, not this map, is what makes replayed agents cheap.
       agentTimestamps: new Map(),
       agentsById: new Map(),
+      worktreeCleanupFailures: persisted.worktreeCleanupFailures?.map((failure) => structuredClone(failure)),
     };
     this.runs.set(runId, managed);
     // Persist before notifying renderers: listRuns() is their source of truth for
@@ -1263,7 +1318,10 @@ export class WorkflowManager extends EventEmitter {
     // correct cumulative count inside this fresh SharedRuntime by the time any
     // new live agent runs — so maxAgents (via A1) is already a genuine
     // cumulative cap across resume with no extra seeding required.
-    void this.executeRun(managed, script, args, { resumeJournal, initialTokenUsage: priorTokenUsage }).catch(() => {});
+    const execution = this.executeRun(managed, script, args, { resumeJournal, initialTokenUsage: priorTokenUsage });
+    managed.execution = execution;
+    managed.settlement = execution;
+    void execution.catch(() => {});
     return true;
   }
 
@@ -1328,11 +1386,32 @@ export class WorkflowManager extends EventEmitter {
     return true;
   }
 
-  /**
-   * Get status of a specific run.
-   */
+  /** Get live/in-memory status for a run owned by this manager instance. */
   getRun(runId: string): ManagedRun | undefined {
     return this.runs.get(runId);
+  }
+
+  /** Canonical execution cwd owned by this manager. */
+  getCwd(): string {
+    return this.cwd;
+  }
+
+  /** Bounded persisted metadata, including cold terminal cleanup diagnostics. */
+  getRunMetadata(runId: string): PersistedRunState | undefined {
+    const state = this.persistence.load(runId);
+    if (!state) return undefined;
+    return {
+      ...state,
+      worktreeCleanupFailures: state.worktreeCleanupFailures?.map((failure) => boundWorktreeCleanupFailure(failure)),
+    };
+  }
+
+  /** Bounded cross-session persisted metadata. */
+  listRunMetadata(): PersistedRunState[] {
+    return this.persistence.list().map((state) => ({
+      ...state,
+      worktreeCleanupFailures: state.worktreeCleanupFailures?.map((failure) => boundWorktreeCleanupFailure(failure)),
+    }));
   }
 
   /**

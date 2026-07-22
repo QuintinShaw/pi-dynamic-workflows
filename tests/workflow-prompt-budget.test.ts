@@ -52,7 +52,9 @@ const RENDERED_PROMPT_BUDGET_BYTES = 800;
 // — an explicit, minimal, JSON-Schema-valid object type (additional
 // properties are allowed by default without needing to spell that out) —
 // increasing this compact definition from 4,267 to 4,283 bytes (+16).
-const TOOL_DEFINITION_BUDGET_BYTES = 4_283;
+// C-19457 adds the retained producer/consumer/release contract to the
+// discoverable script schema without expanding the always-on prompt.
+const TOOL_DEFINITION_BUDGET_BYTES = 4_551;
 
 test("rendered workflow prompt contribution stays within its accepted size", async () => {
   await withRenderedWorkflow(async ({ systemPrompt, promptLines }) => {

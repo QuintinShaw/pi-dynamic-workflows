@@ -16,8 +16,57 @@ import {
   writeJsonAtomicWithBackup,
 } from "./fs-persistence.js";
 import { workflowProjectPaths } from "./workflow-paths.js";
+import {
+  sanitizeRetainedWorktreeCapabilitiesForPersistence,
+  sanitizeWorktreeCleanupFailure,
+  type WorktreeCleanupFailure,
+} from "./worktree.js";
 
 export type RunStatus = "pending" | "running" | "paused" | "completed" | "failed" | "aborted";
+
+export const MAX_WORKTREE_CLEANUP_FAILURES = 20;
+
+/** Bound and redact durable/public cleanup diagnostics while preserving opaque recovery identity. */
+export function boundWorktreeCleanupFailure(failure: WorktreeCleanupFailure): WorktreeCleanupFailure {
+  return sanitizeWorktreeCleanupFailure(failure);
+}
+
+export function mergeWorktreeCleanupFailures(
+  ...groups: ReadonlyArray<readonly WorktreeCleanupFailure[] | undefined>
+): WorktreeCleanupFailure[] | undefined {
+  const merged: WorktreeCleanupFailure[] = [];
+  const seen = new Set<string>();
+  for (const group of groups) {
+    for (const failure of group ?? []) {
+      const bounded = boundWorktreeCleanupFailure(failure);
+      const key = JSON.stringify([
+        bounded.stage,
+        bounded.message,
+        bounded.identity.recoveryId,
+        bounded.identity.branchRef,
+        bounded.identity.baseSha,
+      ]);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      merged.push(bounded);
+      if (merged.length === MAX_WORKTREE_CLEANUP_FAILURES) return merged;
+    }
+  }
+  return merged.length > 0 ? merged : undefined;
+}
+
+export function boundedWorktreeCleanupFailures(
+  failures: readonly WorktreeCleanupFailure[] | undefined,
+): WorktreeCleanupFailure[] | undefined {
+  return mergeWorktreeCleanupFailures(failures);
+}
+
+export function worktreeCleanupWarning(failures: readonly WorktreeCleanupFailure[] | undefined): string | undefined {
+  const bounded = boundedWorktreeCleanupFailures(failures);
+  if (!bounded) return undefined;
+  const stages = [...new Set(bounded.map((failure) => failure.stage))].join(", ");
+  return `Cleanup warning: ${bounded.length} retained worktree cleanup failure(s) at stage(s): ${stages}. Workflow computation still completed.`;
+}
 
 export interface PersistedAgentState {
   id: number;
@@ -142,6 +191,8 @@ export interface PersistedRunState {
    * auto-resume attempt has been recorded yet.
    */
   autoResumeAttempts?: number;
+  /** Bounded retained-worktree cleanup recovery diagnostics; never contains a handle. */
+  worktreeCleanupFailures?: WorktreeCleanupFailure[];
 }
 
 export interface RunPersistence {
@@ -383,10 +434,11 @@ export function createRunPersistence(
       ensureDir();
       state.updatedAt = new Date().toISOString();
       const path = primaryRunPath(state.runId);
+      const persistenceSafeState = sanitizeRetainedWorktreeCapabilitiesForPersistence(state) as PersistedRunState;
       // Atomic write: a crash mid-write can't corrupt the live file (tmp+rename is
       // atomic on the same filesystem). A .bak from the previous good save is the
       // recovery fallback if the primary is somehow truncated.
-      writeJsonAtomicWithBackup(fs, path, state);
+      writeJsonAtomicWithBackup(fs, path, persistenceSafeState);
       invalidateListCache();
       // Only a terminal write can grow the terminal-run count, so only check
       // the cap then — a "running"/"paused" save is on the hot path (every

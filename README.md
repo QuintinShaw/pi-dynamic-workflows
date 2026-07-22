@@ -91,7 +91,8 @@ The installed extension generates this compact index from its executable capabil
 <!-- BEGIN GENERATED SUPPORTED WORKFLOW CAPABILITIES -->
 | Name | Classification | Signature | Options and defaults |
 | --- | --- | --- | --- |
-| agent | runtime-global | `agent(prompt, options?) => Promise<string \| structured value \| null>` | `label`: string (optional; default: derived from phase and call count)<br>`phase`: string (optional; default: current phase)<br>`schema`: plain JSON Schema (optional)<br>`model`: string (optional)<br>`tier`: string (optional)<br>`isolation`: "worktree" (optional)<br>`agentType`: string (optional)<br>`timeoutMs`: number \| null (optional; default: run timeout; null disables)<br>`retries`: number (optional; default: run retry count) |
+| agent | runtime-global | `agent(prompt, options?) => Promise<string \| structured value \| null>` | `label`: string (optional; default: derived from phase and call count)<br>`phase`: string (optional; default: current phase)<br>`schema`: plain JSON Schema (optional)<br>`model`: string (optional)<br>`tier`: string (optional)<br>`isolation`: "worktree" (optional)<br>`retainWorktree`: boolean (optional; default: false)<br>`worktree`: opaque retained-worktree handle (optional)<br>`agentType`: string (optional)<br>`timeoutMs`: number \| null (optional; default: run timeout; null disables)<br>`retries`: number (optional; default: run retry count) |
+| releaseWorktree | runtime-global | `releaseWorktree(handle) => Promise<void>` | — |
 | parallel | runtime-global | `parallel(thunks) => Promise<Array<unknown \| null>>` | — |
 | pipeline | runtime-global | `pipeline(items, ...stages) => Promise<Array<unknown \| null>>` | — |
 | workflow | runtime-global | `workflow(savedName, childArgs?) => Promise<unknown>` | — |
@@ -185,6 +186,7 @@ Agent details use a compact summary by default: completed agents show their fina
 | `loopUntilDry` / `completenessCheck` | Repeat discovery until no new findings remain |
 | `workflow(name, args)` | Run a saved workflow inline |
 | `checkpoint(prompt, opts)` | Add a journaled human-approval gate |
+| `releaseWorktree(handle)` | Idempotently release a runtime-issued retained worktree |
 | `budget` | Inspect real tokens spent and remaining |
 
 | Agent option | Description |
@@ -193,6 +195,8 @@ Agent details use a compact summary by default: completed agents show their fina
 | `model` | Exact `provider/modelId` or `provider/modelId:thinking`; overrides `tier` |
 | `agentType` | Named role, tool, and model definition |
 | `isolation` | Use `"worktree"` for conflict-free parallel edits |
+| `retainWorktree` | With worktree isolation, return `{ result, worktree }` and retain it for later steps |
+| `worktree` | Bind to a retained producer's opaque handle; cannot be combined with isolation or `retainWorktree: true` |
 | `schema` | JSON Schema for a validated structured result |
 | `label` / `phase` | Display label and phase override |
 | `timeoutMs` / `retries` | Optional per-agent timeout and recoverable-failure retries |
@@ -277,6 +281,22 @@ The default `workflow` also matches `workflows`; a custom word matches exactly. 
 Workflow scripts run in a Node `vm` sandbox. `Date.now()`, `Math.random()`, `new Date()`, `require`, `import`, filesystem access, and network access are unavailable inside the orchestration script. Subagents use their assigned tools; keeping the orchestrator deterministic is what makes journal replay reliable.
 
 Journal replay — including edit-and-resume via `resumeFromRunId` — matches cached agent results by **positional call index** (the order in which `agent()` calls execute), the same contract Claude Code uses. Editing an `agent()` prompt in place reuses the cache up to that call and re-runs it and everything after. Inserting, removing, or reordering an `agent()` call before others shifts their positions and invalidates the cache from that point on (mismatched calls simply re-run — no crash). To preserve the cached prefix, keep the earlier still-good `agent()` calls unchanged and in the same order.
+
+Retained worktrees are root-run-owned, in-memory capabilities. A producer uses `{ isolation: "worktree", retainWorktree: true }` and returns `{ result, worktree }`; consumers pass only that opaque handle as `{ worktree: handle }`. Consumers are FIFO-exclusive. `releaseWorktree(handle)` closes admission, waits already-admitted consumers, and removes the runtime-created checkout; successful repeated release is a no-op. Root settlement performs fallback cleanup after success, failure, abort, stop, or provider-limit pause. Producer and consumer calls are noncacheable, and nested retained use invalidates its dependent parent suffix on resume.
+
+Cleanup uses proof-bound checkout, Git-registration, branch, and repository identities plus a cross-process repository-operation lock. Identity mismatches fail closed instead of deleting an unverified path. Cleanup failures never replace the workflow result or original error: direct and managed successful results expose a bounded, path-free `worktreeCleanupFailures` list, and persistence replaces issued handles with inert scalar markers. Handles, paths, private registration markers, and process-local descriptor proofs are never serialized as reusable capabilities.
+
+```js
+const produced = await agent("Edit the generated client.", {
+  isolation: "worktree",
+  retainWorktree: true,
+})
+const verified = await agent("Test those uncommitted edits.", {
+  worktree: produced.worktree,
+})
+await releaseWorktree(produced.worktree)
+return { generated: produced.result, verified }
+```
 
 ## Upgrading to 3.0
 

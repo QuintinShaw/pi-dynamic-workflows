@@ -118,6 +118,10 @@ test("createWorkflowTool keeps script syntax in the parameter schema", () => {
   assert.match(description, /multiple phases.*phase\('Exact Title'\).*agent options/i);
   assert.match(description, /await workflow\(savedName, childArgs\).*saved workflow inline/i);
   assert.match(description, /nesting.*one level.*parent run's concurrency, agent, and token limits/i);
+  assert.match(description, /retainWorktree.*true/i);
+  assert.match(description, /opaque worktree handle/i);
+  assert.match(description, /releaseWorktree\(handle\)/i);
+  assert.match(description, /root settlement.*fallback cleanup/i);
   assert.match(
     description,
     /Optional quality helpers include verify\(\), judgePanel\(\), loopUntilDry\(\), and completenessCheck\(\)/i,

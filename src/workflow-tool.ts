@@ -14,6 +14,7 @@ import {
   type WorkflowSnapshot,
 } from "./display.js";
 import { WorkflowError, WorkflowErrorCode } from "./errors.js";
+import { boundedWorktreeCleanupFailures, worktreeCleanupWarning } from "./run-persistence.js";
 import { parseWorkflowScript, type WorkflowRunResult } from "./workflow.js";
 import { WorkflowManager } from "./workflow-manager.js";
 import { createWorkflowStorage, type WorkflowStorage } from "./workflow-saved.js";
@@ -34,7 +35,8 @@ const workflowToolSchema = Type.Object({
         "Optional control helpers include retry() and gate(); budget exposes total, spent(), and remaining(), and phase('Name', { budget: N }) sets a phase token limit.",
         "The optional `agentType` option selects a named user or project definition that can bind tools, a model, and role instructions; use it only when its name and purpose are provided in context. Its bound model overrides `tier`; an explicit `model` overrides both.",
         "Use plain JavaScript only; imports, require(), filesystem modules, Date.now(), Math.random(), and new Date() are unavailable.",
-        "Use phase('Name'), agent(prompt, opts), parallel(arrayOfFunctions), pipeline(items, ...stages), log(message), args, cwd, process.cwd(), and budget. The workflow must call agent() at least once.",
+        "Use phase('Name'), agent(prompt, opts), releaseWorktree(handle), parallel(arrayOfFunctions), pipeline(items, ...stages), log(message), args, cwd, process.cwd(), and budget. The workflow must call agent() at least once.",
+        "For a retained handoff, call agent(..., { isolation: 'worktree', retainWorktree: true }), pass only its opaque worktree handle to a consumer as { worktree: handle }, and call releaseWorktree(handle). Root settlement provides fallback cleanup.",
         "parallel() requires functions, not promises, and returns results in input order: await parallel(items.map(item => () => agent(...))).",
         "pipeline(items, ...stages) runs stages sequentially for each item while items proceed concurrently; each stage receives (previousValue, originalItem, index).",
       ].join(" "),
@@ -313,12 +315,15 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
 
       const formattedResult =
         result.result !== undefined ? `\n\`\`\`json\n${JSON.stringify(result.result, null, 2)}\n\`\`\`` : "";
+      const cleanupFailures = boundedWorktreeCleanupFailures(result.worktreeCleanupFailures);
+      const cleanupWarning = worktreeCleanupWarning(cleanupFailures);
+      const cleanupInfo = cleanupWarning ? `\n\n> **Warning:** ${cleanupWarning}` : "";
 
       return {
         content: [
           {
             type: "text",
-            text: `Workflow **${result.meta.name}** completed with **${result.agentCount}** agent(s).${tokenInfo}\n\n## Result${formattedResult}\n\n${reviseHint(result.runId)}`,
+            text: `Workflow **${result.meta.name}** completed with **${result.agentCount}** agent(s).${cleanupInfo}${tokenInfo}\n\n## Result${formattedResult}\n\n${reviseHint(result.runId)}`,
           },
         ],
         details: {
@@ -329,6 +334,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           result: result.result,
           durationMs: result.durationMs,
           tokenUsage: result.tokenUsage,
+          worktreeCleanupFailures: cleanupFailures,
           runId: result.runId,
         },
       };

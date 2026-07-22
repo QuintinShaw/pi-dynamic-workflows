@@ -19,6 +19,7 @@ import {
   type WorkflowAgentSnapshot,
   type WorkflowSnapshot,
 } from "./display.js";
+import { boundedWorktreeCleanupFailures, worktreeCleanupWarning } from "./run-persistence.js";
 import type { ManagedRun, WorkflowManager } from "./workflow-manager.js";
 import type { WorkflowStorage } from "./workflow-saved.js";
 import type { WorkflowSettings } from "./workflow-settings.js";
@@ -106,8 +107,13 @@ export function deliverText(run: ManagedRun, opts: { resultPath?: string; maxCha
   const tokens = `${segment ? ` · ${segment}` : ""}${cost}`;
   const agents = run.result?.agentCount ?? run.snapshot.agentCount;
   const duration = run.result?.durationMs ? ` · ${(run.result.durationMs / 1000).toFixed(1)}s` : "";
+  const cleanupFailures = boundedWorktreeCleanupFailures(
+    run.worktreeCleanupFailures ?? run.result?.worktreeCleanupFailures,
+  );
+  const cleanupWarning = worktreeCleanupWarning(cleanupFailures);
   const lines = [
-    `✓ Background workflow "${run.snapshot.name}" finished (${agents} agents${tokens}${duration}).`,
+    `${cleanupWarning ? "⚠" : "✓"} Background workflow "${run.snapshot.name}" finished (${agents} agents${tokens}${duration}).`,
+    ...(cleanupWarning ? [cleanupWarning] : []),
     "",
     summary,
   ];
