@@ -33,6 +33,54 @@ test("compactAgentHistory captures user, assistant, tool call, and tool result e
   );
 });
 
+test("compactAgentHistory stores write source without its raw JSON envelope", () => {
+  const history = compactAgentHistory(
+    [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            name: "write",
+            arguments: { path: "src/example.rs", content: `fn main() {\n${"x".repeat(100)}\n}` },
+          },
+        ],
+      },
+    ],
+    { maxTextChars: 50 },
+  );
+
+  assert.equal(history[0]?.path, "src/example.rs");
+  assert.match(history[0]?.text ?? "", /^fn main/);
+  assert.match(history[0]?.text ?? "", /truncated/);
+  assert.doesNotMatch(history[0]?.text ?? "", /"content":/);
+});
+
+test("compactAgentHistory preserves edit paths and Pi's result diff", () => {
+  const history = compactAgentHistory([
+    {
+      role: "assistant",
+      content: [
+        {
+          type: "toolCall",
+          name: "edit",
+          arguments: { path: "src/example.ts", edits: [{ oldText: "old", newText: "new" }] },
+        },
+      ],
+    },
+    {
+      role: "toolResult",
+      toolName: "edit",
+      content: [{ type: "text", text: "Successfully replaced 1 block(s)" }],
+      details: { diff: "-1 old\n+1 new" },
+      isError: false,
+    },
+  ]);
+
+  assert.equal(history[0]?.path, "src/example.ts");
+  assert.equal(history[1]?.diff, "-1 old\n+1 new");
+});
+
 test("compactAgentHistory records assistant and tool errors", () => {
   const history = compactAgentHistory([
     {

@@ -706,6 +706,7 @@ export class WorkflowManager extends EventEmitter {
           const id = managed.snapshot.agents.length + 1;
           const agentSnapshot: WorkflowAgentSnapshot = {
             id,
+            callId: event.id,
             label: event.label,
             phase: event.phase,
             prompt: event.prompt,
@@ -727,6 +728,9 @@ export class WorkflowManager extends EventEmitter {
           const agent = managed.agentsById.get(event.id);
           if (agent) {
             agent.status = event.result === null ? "error" : "done";
+            // Keep the full value for the interactive pager; compact surfaces
+            // continue to use resultPreview.
+            agent.result = event.result;
             agent.resultPreview = preview(event.result);
             agent.error = event.error;
             agent.errorCode = event.errorCode;
@@ -761,7 +765,7 @@ export class WorkflowManager extends EventEmitter {
           if (agent) {
             agent.history = event.history;
           }
-          this.emitLive(managed, "agentHistory", { runId: managed.runId, ...event });
+          this.emitLive(managed, "agentHistory", { runId: managed.runId, agentId: agent?.id, ...event });
           progress();
         },
         onTokenUsage: (usage) => {
@@ -1034,6 +1038,10 @@ export class WorkflowManager extends EventEmitter {
     // gate) reintroduces a producer for it.
     if (!this.isCurrent(managed)) return;
     try {
+      // Resumable states need their journal; completed/aborted states need rich
+      // agent details. Persist exactly one full copy of each agent result instead
+      // of writing it to both agents[].result and journal[].result.
+      const keepsResumeJournal = managed.status !== "completed" && managed.status !== "aborted";
       this.persistence.save({
         runId: managed.runId,
         workflowName: managed.snapshot.name,
@@ -1042,7 +1050,7 @@ export class WorkflowManager extends EventEmitter {
         script: managed.script,
         args: managed.args,
         sessionId: this.sessionId,
-        journal: managed.journal,
+        journal: keepsResumeJournal ? managed.journal : undefined,
         status: managed.status,
         // Persisted every write (not just at pause) so a stale read during the
         // "paused" event race (see UsageLimitScheduler) is still correct — this
@@ -1066,9 +1074,13 @@ export class WorkflowManager extends EventEmitter {
         // own startedAt or "now" stamped onto every agent on every write. A
         // still-running agent is persisted with no endedAt.
         agents: managed.snapshot.agents.map((a) => {
+          const { result, ...summary } = a;
           const ts = managed.agentTimestamps.get(a.id);
           return {
-            ...a,
+            ...summary,
+            // Live runs keep the rich value in memory. Cold resumable runs use
+            // the journal and retain resultPreview until replay reconstructs it.
+            ...(keepsResumeJournal || result === undefined ? {} : { result }),
             startedAt: ts?.startedAt,
             endedAt: ts?.endedAt,
           };

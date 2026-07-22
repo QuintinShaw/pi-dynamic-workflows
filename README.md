@@ -171,6 +171,8 @@ Pi can manage background runs directly with the `workflow_control` tool instead 
 
 In the navigator: `↑/↓` select · `enter/→` open · `esc/←` back · `p` pause · `x` stop · `r` restart · `s` save · `q` quit.
 
+Agent details use a compact summary by default: completed agents show their final result, while active agents show the prompt and two latest history events. Press `enter` to open the full syntax-highlighted pager. In the pager, use `j/k` or `↑/↓` for lines, `PgUp/PgDn` for pages, `g/G` for the ends, and `t` to toggle live tail mode.
+
 ## Runtime reference
 
 | Global | What it does |

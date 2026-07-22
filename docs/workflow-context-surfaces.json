@@ -13,7 +13,7 @@
     },
     "providerVisibleWorkflowToolDefinition": {
       "serialization": "UTF-8 bytes of JSON.stringify({ name, description, parameters })",
-      "bytes": 4267
+      "bytes": 4283
     },
     "registeredSkillsDiscovery": {
       "serialization": "sum of UTF-8 bytes of normalized Pi skill XML (name + description + location) across every root in package.json's pi.skills",
@@ -33,7 +33,7 @@
     },
     "ordinaryWorkflowOwnedAlwaysOn": {
       "serialization": "sum of permanent prompt, provider-visible tool definition, and every registered skill's discovery bytes",
-      "bytes": 5940
+      "bytes": 5956
     },
     "workflowAuthoringSkillCorpus": {
       "serialization": "sum of UTF-8 bytes for every file under skills/workflow-authoring",

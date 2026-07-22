@@ -543,6 +543,7 @@ test("detail view scrolls within a fixed viewport and does not collapse", () => 
   state.drill(model); // phases -> agents
   state.drill(model); // agents -> detail
   assert.equal(state.kind, "detail");
+  state.togglePager();
 
   const vp = 14;
   const top = renderNavigator(state, model, 40, undefined, vp);
@@ -601,7 +602,8 @@ test("keyToAction maps keys per view and itemKind", () => {
   assert.deepEqual(keyToAction("up", "runs"), { type: "move", delta: -1 });
   assert.deepEqual(keyToAction("j", "agents"), { type: "move", delta: 1 });
   assert.deepEqual(keyToAction("enter", "runs"), { type: "drill" });
-  assert.deepEqual(keyToAction("enter", "detail"), { type: "none" });
+  assert.deepEqual(keyToAction("enter", "detail"), { type: "togglePager" });
+  assert.deepEqual(keyToAction("right", "detail"), { type: "openPager" });
   assert.deepEqual(keyToAction("right", "runs"), { type: "drill" });
   assert.deepEqual(keyToAction("escape", "phases"), { type: "back" });
   assert.deepEqual(keyToAction("left", "agents"), { type: "back" });
@@ -673,22 +675,28 @@ test("renderNavigator shows agents view", () => {
   assert.match(text, /enter open/);
 });
 
-test("renderNavigator shows agent detail view", () => {
+test("completed agent detail defaults to result and can open the full pager", () => {
   const model = new NavigatorModel(fakeManager());
   const state = new NavigatorState();
   state.drill(model);
   state.drill(model);
   state.drill(model);
-  const lines = renderNavigator(state, model, 80);
-  const text = lines.join("\n");
-  assert.match(text, /Prompt:/);
-  assert.match(text, /scan the code/);
-  assert.match(text, /Result:/);
-  assert.match(text, /found 2/);
-  assert.match(text, /Status:/);
-  assert.match(text, /Model:/);
-  assert.match(text, /model/); // shortModel strips provider prefix
-  assert.match(text, /j\/k scroll/); // detail view footer
+
+  const summary = renderNavigator(state, model, 80).join("\n");
+  assert.match(summary, /Result:/);
+  assert.match(summary, /found 2/);
+  assert.doesNotMatch(summary, /scan the code/);
+  assert.match(summary, /enter open pager/);
+
+  state.togglePager();
+  const pager = renderNavigator(state, model, 80).join("\n");
+  assert.match(pager, /Prompt:/);
+  assert.match(pager, /scan the code/);
+  assert.match(pager, /Result:/);
+  assert.match(pager, /Status:/);
+  assert.match(pager, /Model:/);
+  assert.match(pager, /model/);
+  assert.match(pager, /PgUp\/PgDn page/);
 });
 
 test("renderNavigator shows agent error diagnostics in detail view", () => {
@@ -703,9 +711,9 @@ test("renderNavigator shows agent error diagnostics in detail view", () => {
   assert.match(text, /Subagent produced no assistant output/);
   assert.match(text, /Error code:/);
   assert.match(text, /AGENT_EMPTY_OUTPUT \(recoverable\)/);
-  assert.match(text, /History:/);
-  assert.match(text, /assistant tool read: \{"file":"README.md"\}/);
-  assert.match(text, /tool read: README content/);
+  assert.match(text, /Recent activity:/);
+  assert.match(text, /assistant tool read:\n\s+\{"file":"README.md"\}/);
+  assert.match(text, /tool read:\nREADME content/);
 });
 
 test("renderNavigator shows model info in agent rows", () => {
@@ -730,8 +738,11 @@ test("renderNavigator shows correct footer hint per view", () => {
   state.drill(model);
   state.drill(model);
   state.drill(model);
-  const detailLines = renderNavigator(state, model, 80);
-  assert.match(detailLines.join("\n"), /j\/k scroll/);
+  const summaryLines = renderNavigator(state, model, 80);
+  assert.match(summaryLines.join("\n"), /enter open pager/);
+  state.togglePager();
+  const pagerLines = renderNavigator(state, model, 80);
+  assert.match(pagerLines.join("\n"), /PgUp\/PgDn page/);
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -828,7 +839,7 @@ test("renderNavigator shows saved detail view", () => {
   assert.match(text, /Location:/);
   assert.match(text, /Script:/);
   assert.match(text, /Saved at:/);
-  assert.match(text, /j\/k scroll/);
+  assert.match(text, /PgUp\/PgDn page/);
   assert.match(text, /esc back/);
 });
 
@@ -894,6 +905,33 @@ test("renderNavigator footer hint changes based on item under cursor", () => {
   const savedText = renderNavigator(state, model, 80).join("\n");
   assert.notEqual(savedText.indexOf("x delete"), -1, "saved item should show x delete");
   assert.equal(savedText.indexOf("x stop"), -1, "saved item should NOT show x stop");
+});
+
+test("navigator shares one persisted run read across a render frame", () => {
+  let listCalls = 0;
+  const manager = {
+    listRuns: () => {
+      listCalls++;
+      return [
+        {
+          runId: "frame-cache",
+          workflowName: "cached",
+          status: "completed",
+          phases: ["Build"],
+          agents: [{ id: 1, label: "builder", phase: "Build", prompt: "build", status: "done" }],
+          logs: [],
+        } as unknown as PersistedRunState,
+      ];
+    },
+    getRun: () => undefined,
+  };
+  const model = new NavigatorModel(manager);
+  const state = new NavigatorState();
+  state.drill(model);
+  listCalls = 0;
+
+  renderNavigator(state, model, 100);
+  assert.equal(listCalls, 1, "header, phases, agents, and footer reuse the same persisted snapshot");
 });
 
 // ═══════════════════════════════════════════════════════════════════════════

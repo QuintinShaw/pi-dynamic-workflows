@@ -7,6 +7,10 @@ export interface AgentHistoryEntry {
   kind: AgentHistoryKind;
   text: string;
   toolName?: string;
+  /** Source path for file-oriented tool calls rendered specially by the pager. */
+  path?: string;
+  /** Pi's display-oriented edit diff, preserved from EditToolDetails. */
+  diff?: string;
   isError?: boolean;
   timestamp?: number;
 }
@@ -46,11 +50,21 @@ export function compactAgentHistory(messages: unknown[], options: AgentHistoryOp
         if (block.type === "text" && typeof block.text === "string" && block.text.trim()) {
           entries.push({ role: "assistant", kind: "text", text: block.text, timestamp });
         } else if (block.type === "toolCall" && typeof block.name === "string") {
+          const args = asRecord(block.arguments);
+          const filePath =
+            (block.name === "write" || block.name === "edit") && typeof args?.path === "string" ? args.path : undefined;
+          const writeContent =
+            block.name === "write" && filePath && typeof args?.content === "string" ? args.content : undefined;
           entries.push({
             role: "assistant",
             kind: "toolCall",
             toolName: block.name,
-            text: stringifyCompact(block.arguments ?? {}),
+            // A write's JSON envelope is both noisy and likely to be truncated
+            // into invalid JSON. Preserve its source directly so the pager can
+            // render it as code. Edit calls retain their path so the pager can
+            // pair the compact call header with the result's native Pi diff.
+            text: writeContent ?? stringifyCompact(block.arguments ?? {}),
+            path: filePath,
             timestamp,
           });
         }
@@ -64,11 +78,14 @@ export function compactAgentHistory(messages: unknown[], options: AgentHistoryOp
     if (role === "toolResult") {
       const toolName = typeof message.toolName === "string" ? message.toolName : undefined;
       const text = textFromContent(message.content) || "(no text output)";
+      const details = asRecord(message.details);
+      const diff = toolName === "edit" && typeof details?.diff === "string" ? details.diff : undefined;
       entries.push({
         role: "tool",
         kind: message.isError ? "error" : "toolResult",
         toolName,
         text,
+        diff,
         isError: Boolean(message.isError),
         timestamp,
       });
@@ -90,9 +107,16 @@ function fitEntries(
   for (const entry of entries.slice(-maxEntries).reverse()) {
     const remaining = maxTotalChars - total;
     if (remaining <= 0) break;
-    const text = truncateText(entry.text, Math.min(maxTextChars, remaining));
-    fitted.unshift({ ...entry, text });
-    total += text.length;
+
+    // Treat an edit diff as the entry's primary display payload. Keeping it
+    // within the same per-entry and total bounds prevents EditToolDetails from
+    // bypassing history compaction with a large changed file.
+    let entryBudget = Math.min(maxTextChars, remaining);
+    const diff = entry.diff ? truncateText(entry.diff, entryBudget) : undefined;
+    entryBudget -= diff?.length ?? 0;
+    const text = truncateText(entry.text, entryBudget);
+    fitted.unshift({ ...entry, text, diff });
+    total += text.length + (diff?.length ?? 0);
   }
 
   return fitted;
