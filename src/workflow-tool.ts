@@ -49,7 +49,23 @@ const workflowToolSchema = Type.Object({
     }),
   ),
   args: Type.Optional(
-    Type.Any({ description: "Optional JSON value exposed to the workflow script as global `args`." }),
+    // Must be an explicitly typed object schema, not Type.Any(). Type.Any()
+    // compiles to a schema with no "type" keyword at all (just
+    // `{ description }`), and at least one MCP/tool-calling bridge observed
+    // in the wild does not treat a typeless property as "accept any JSON
+    // value" — it coerces/flattens it before the handler ever sees it, so
+    // `args.scope` (etc.) arrives as `undefined` and every built-in pattern
+    // that requires an args field fails validation regardless of what the
+    // caller actually sent. Every built-in pattern's `args` is a JSON object
+    // at the top level, so declaring `type: "object"` is lossless and fixes
+    // the coercion. Type.Unsafe keeps the emitted schema minimal (no
+    // `properties`/`additionalProperties` boilerplate — JSON Schema already
+    // allows additional properties by default) to stay inside the
+    // provider-visible tool definition's byte budget.
+    Type.Unsafe<Record<string, unknown>>({
+      type: "object",
+      description: "Optional JSON value exposed to the workflow script as global `args`.",
+    }),
   ),
   background: Type.Optional(
     Type.Boolean({
@@ -101,7 +117,7 @@ const workflowToolSchema = Type.Object({
 export type WorkflowToolInput = {
   script?: string;
   name?: string;
-  args?: unknown;
+  args?: Record<string, unknown>;
   background?: boolean;
   maxAgents?: number;
   concurrency?: number;
