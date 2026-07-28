@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { createFauxCore, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
-import { ModelRegistry, ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { type CreateAgentSessionOptions, ModelRegistry, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { AgentRunOptions, AgentUsage } from "../src/agent.js";
 import {
@@ -27,6 +27,9 @@ type WorkflowAgentPrivates = {
   lastAssistantText(messages: unknown[]): string;
   finalAssistantText(messages: unknown[]): string;
   createSessionManager(): { isPersisted(): boolean; getCwd(): string };
+  resolveThinkingLevel(
+    routed: CreateAgentSessionOptions["thinkingLevel"] | undefined,
+  ): CreateAgentSessionOptions["thinkingLevel"] | undefined;
 };
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -144,28 +147,107 @@ test("resolveAgentModelSpec: tier resolves from config when no explicit model", 
   assert.equal(resolveAgentModelSpec({ tier: "big" }, "main/model", loadCfg), "vendor/big");
 });
 
-test("resolveAgentModelSpec: unconfigured tier falls back to the main model", () => {
-  assert.equal(resolveAgentModelSpec({ tier: "small" }, "main/model", noCfg), "main/model");
-  assert.equal(resolveAgentModelSpec({ tier: "unknown-tier" }, "main/model", loadCfg), "main/model");
+test("resolveAgentModelSpec: unavailable explicit tier falls through to persisted Pi default", () => {
+  let warned = "";
+  assert.equal(
+    resolveAgentModelSpec({ tier: "small" }, "main/model", noCfg, (tier) => {
+      warned = tier;
+    }),
+    undefined,
+  );
+  assert.equal(warned, "small");
+  assert.equal(resolveAgentModelSpec({ tier: "unknown-tier" }, "main/model", loadCfg), undefined);
 });
 
-test("resolveAgentModelSpec: untagged agent defaults to the configured medium tier", () => {
-  // The "set tier but nothing changed" fix: an agent with no model and no tier
-  // falls back to the user's medium tier when a config exists.
-  assert.equal(resolveAgentModelSpec({}, "main/model", loadCfg), "vendor/medium");
+test("resolveAgentModelSpec: untagged agent inherits the active parent before configured medium", () => {
+  assert.equal(resolveAgentModelSpec({}, "main/model", loadCfg), "main/model");
 });
 
-test("resolveAgentModelSpec: untagged agent with NO config falls through to session default", () => {
-  assert.equal(resolveAgentModelSpec({}, "main/model", noCfg), undefined);
+test("resolveAgentModelSpec: untagged agent with NO config still inherits the active parent", () => {
+  assert.equal(resolveAgentModelSpec({}, "main/model", noCfg), "main/model");
 });
 
-test("resolveAgentModelSpec: untagged agent with a config lacking a medium tier => session default", () => {
+test("resolveAgentModelSpec: embedder without a parent retains configured medium fallback", () => {
+  assert.equal(resolveAgentModelSpec({}, undefined, loadCfg), "vendor/medium");
+});
+
+test("resolveAgentModelSpec: no parent and no medium falls through to persisted Pi default", () => {
   const noMedium = () => ({ tiers: { small: "vendor/small" } });
-  assert.equal(resolveAgentModelSpec({}, "main/model", noMedium), undefined);
+  assert.equal(resolveAgentModelSpec({}, undefined, noMedium), undefined);
 });
 
 test("resolveAgentModelSpec: tier with no main model and no config yields undefined", () => {
   assert.equal(resolveAgentModelSpec({ tier: "small" }, undefined, noCfg), undefined);
+});
+
+test("WorkflowAgent thinking precedence is route > session override > active parent", () => {
+  const inherited = new WorkflowAgent({ cwd: "/tmp", mainThinkingLevel: "high" });
+  assert.equal((inherited as unknown as WorkflowAgentPrivates).resolveThinkingLevel(undefined), "high");
+
+  const sessionOverride = new WorkflowAgent({
+    cwd: "/tmp",
+    mainThinkingLevel: "high",
+    session: { thinkingLevel: "xhigh" },
+  });
+  assert.equal((sessionOverride as unknown as WorkflowAgentPrivates).resolveThinkingLevel(undefined), "xhigh");
+  assert.equal((sessionOverride as unknown as WorkflowAgentPrivates).resolveThinkingLevel("low"), "low");
+});
+
+test("WorkflowAgent.run(): untagged agent uses the active parent provider over configured medium", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-parent-model-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-parent-model-cwd-"));
+  const mediumCore = createFauxCore({
+    provider: "faux-medium",
+    models: [{ id: "medium-model", name: "Medium", contextWindow: 128000, maxTokens: 4096 }],
+  });
+  const parentCore = createFauxCore({
+    provider: "faux-parent",
+    models: [{ id: "parent-model", name: "Parent", contextWindow: 128000, maxTokens: 4096 }],
+  });
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const tiersDir = join(home, ".pi", "workflows");
+      mkdirSync(tiersDir, { recursive: true });
+      writeFileSync(
+        join(tiersDir, "model-tiers.json"),
+        JSON.stringify({ tiers: { medium: "faux-medium/medium-model" } }),
+      );
+
+      const runtime = await ModelRuntime.create({ authPath: join(home, "auth.json"), modelsPath: null });
+      for (const core of [mediumCore, parentCore]) {
+        runtime.registerProvider(core.provider, {
+          name: core.provider,
+          baseUrl: "http://127.0.0.1:9/faux",
+          apiKey: "faux-dummy-key-not-used",
+          api: core.api,
+          streamSimple: core.streamSimple as never,
+          models: core.models.map((model) => ({
+            id: model.id,
+            name: model.name ?? model.id,
+            reasoning: false,
+            input: ["text"] as ("text" | "image")[],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: model.contextWindow ?? 128000,
+            maxTokens: model.maxTokens ?? 4096,
+          })),
+        });
+      }
+      mediumCore.setResponses([fauxAssistantMessage("wrong-medium-provider", { stopReason: "stop" })]);
+      parentCore.setResponses([fauxAssistantMessage("inherited-parent-provider", { stopReason: "stop" })]);
+
+      const agent = new WorkflowAgent({
+        cwd,
+        modelRegistry: new ModelRegistry(runtime),
+        mainModel: "faux-parent/parent-model",
+      });
+      const result = await agent.run("inherit the parent", { label: "parent-probe" });
+      assert.ok(result.includes("inherited-parent-provider"));
+      assert.ok(!result.includes("wrong-medium-provider"));
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
 });
 
 // ═══════════════════════════════════════════════════════════════════════════

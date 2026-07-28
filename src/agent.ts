@@ -169,14 +169,14 @@ export async function resolveStructuredOutput<T>(
  * specific first:
  *   1. options.model — an explicit per-agent model (also carries agentType /
  *      phase model, which the workflow layer folds into options.model).
- *   2. options.tier  — resolved via the model-tiers config, falling back to the
- *      session's main model when the tier has no configured entry.
- *   3. DEFAULT TIER — when neither is set but the user has a model-tiers config,
- *      untagged agents default to the "medium" tier so a configured tier set
- *      actually affects the whole workflow (not just agents the script tagged).
- *      Fresh-install medium == the session model, so this is a no-op until the
- *      user customizes tiers via /workflows-models.
- * Returns undefined when nothing applies, so the session default is used.
+ *   2. options.tier  — resolved via the model-tiers config. An unavailable
+ *      explicit tier falls through to the persisted Pi default.
+ *   3. PARENT MODEL — when neither selector is set, inherit the active parent
+ *      Pi session's provider/model. This keeps an untagged workflow on the model
+ *      the user is actually using, even when a configured medium tier differs.
+ *   4. DEFAULT TIER — embedders without a parent model retain the configured
+ *      medium-tier fallback for backward compatibility.
+ * Returns undefined when nothing applies, so the persisted Pi default is used.
  *
  * `loadConfig` is injectable for testing; it defaults to reading from disk.
  */
@@ -189,12 +189,15 @@ export function resolveAgentModelSpec(
   if (options.model) return options.model;
   const config = loadConfig();
   if (options.tier) {
-    // Tier requested but unconfigured → it silently falls back to mainModel.
-    // Let the caller surface that (once) so the no-op is discoverable.
+    // A requested tier is an explicit route. If it is unavailable, fall through
+    // to the persisted Pi default rather than trying lower-priority selectors.
     if (!config) onTierWithoutConfig?.(options.tier);
-    return (config ? resolveTierModel(options.tier, config) : undefined) ?? mainModel;
+    return config ? resolveTierModel(options.tier, config) : undefined;
   }
-  // Untagged agent: default to the configured medium tier when one exists.
+  // Untagged agent: inherit the active parent Pi model before consulting
+  // the configured medium tier. A tier only overrides the parent when the
+  // workflow author explicitly requests it above.
+  if (mainModel) return mainModel;
   if (config) {
     const medium = resolveTierModel("medium", config);
     if (medium) return medium;
@@ -218,12 +221,12 @@ export interface WorkflowAgentOptions {
   /** Extra system guidance prepended to every subagent task. */
   instructions?: string;
   /**
-   * The session's main model (`provider/modelId`). Used as a fallback when
-   * resolving opts.tier and no model-tiers.json config exists. Without this,
-   * a workflow using `{ tier: "small" }` would log a warning and fall through
-   * to the session default when no config is saved yet.
+   * The active parent session model (`provider/modelId`) inherited by untagged
+   * agents. Explicit routing remains authoritative.
    */
   mainModel?: string;
+  /** The active parent Pi session's effective thinking level. */
+  mainThinkingLevel?: CreateAgentSessionOptions["thinkingLevel"];
   /**
    * Shared model registry from the host Pi session. When provided, subagents
    * resolve tier/model specs against the same registry the main session uses,
@@ -334,10 +337,10 @@ export function listAvailableModelSpecs(registry?: ModelRegistry): string[] {
 }
 
 /**
- * Emitted at most once per process: when an agent asks for a tier but no
- * model-tiers.json exists, the tier silently falls back to the session model.
- * Surface that once (with the mapping the user would get by configuring) so the
- * no-op is discoverable. Diagnostics only — never lets a failure break a run.
+ * Emitted at most once per process when an agent asks for a tier but no
+ * model-tiers.json exists. The explicit route is unavailable and execution uses
+ * Pi's persisted default; surface that plus the suggested mapping so the miss is
+ * discoverable. Diagnostics only — never lets a failure break a run.
  */
 let warnedTierUnconfigured = false;
 function warnTierUnconfiguredOnce(mainModel: string | undefined, registry: ModelRegistry): void {
@@ -426,8 +429,8 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
   /**
    * Model tier name (e.g. "small", "medium", "big"). When set (and no explicit
    * `model` is given), the model is resolved from the user's model-tiers.json
-   * config before `run()` starts, falling back to the session's main model when
-   * the tier has no configured entry. An explicit `model` always takes priority,
+   * config before `run()` starts. An unavailable explicit tier falls through to
+   * the persisted Pi default. An explicit `model` always takes priority,
    * so workflow scripts can use `{ tier: "small" }` for coarse routing without
    * caring which concrete model backs that tier.
    */
@@ -507,6 +510,7 @@ export class WorkflowAgent {
   private readonly persistAgentSessions: boolean;
   private readonly instructions?: string;
   private readonly mainModel?: string;
+  private readonly mainThinkingLevel?: CreateAgentSessionOptions["thinkingLevel"];
   /** Shared registry from the host session, when provided. */
   private readonly sharedRegistry?: ModelRegistry;
   /** Lazily built once; shares the SDK's agentDir/auth so resolved models are authed. */
@@ -531,6 +535,7 @@ export class WorkflowAgent {
     this.persistAgentSessions = options.persistAgentSessions ?? false;
     this.instructions = options.instructions;
     this.mainModel = options.mainModel;
+    this.mainThinkingLevel = options.mainThinkingLevel;
     this.sharedRegistry = options.modelRegistry;
   }
 
@@ -579,6 +584,13 @@ export class WorkflowAgent {
       });
     }
     return this.sharedResourceLoaderPromise;
+  }
+
+  /** Route suffix > injected session override > active parent thinking. */
+  private resolveThinkingLevel(
+    routed: CreateAgentSessionOptions["thinkingLevel"] | undefined,
+  ): CreateAgentSessionOptions["thinkingLevel"] | undefined {
+    return routed ?? this.sessionOptions.thinkingLevel ?? this.mainThinkingLevel;
   }
 
   /**
@@ -741,6 +753,8 @@ export class WorkflowAgent {
       }
     }
 
+    const effectiveThinkingLevel = this.resolveThinkingLevel(resolvedThinkingLevel);
+
     const agentDir = getAgentDir();
     // The runtime behind the resolved registry, handed to the subagent session
     // below so it shares the host session's exact catalog and auth.
@@ -772,7 +786,7 @@ export class WorkflowAgent {
       ...this.sessionOptions,
       // Per-call model/thinking wins over any sessionOptions defaults.
       ...(resolvedModel ? { model: resolvedModel } : {}),
-      ...(resolvedThinkingLevel ? { thinkingLevel: resolvedThinkingLevel } : {}),
+      ...(effectiveThinkingLevel ? { thinkingLevel: effectiveThinkingLevel } : {}),
       // Deny recursive-orchestration tools in the subagent (#107). Placed after
       // the sessionOptions spread so it always applies; folds in any denylist
       // the caller set on sessionOptions rather than dropping it.

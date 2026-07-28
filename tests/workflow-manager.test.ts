@@ -891,16 +891,35 @@ test(
 );
 
 test(
-  "setMainModel sets the main model used for default agents",
+  "parent model and thinking changes affect subsequent runs, not an in-flight snapshot",
   withTempCwd(async (cwd) => {
-    const manager = new WorkflowManager({ cwd, agent: fakeAgent() });
-    manager.setMainModel("anthropic/claude-sonnet-4");
-    const script = `export const meta = { name: 'mm_test', description: 'main model test' }
-const a = await agent('test', { label: 'a' })
-return { a }`;
-    await manager.runSync(script);
-    const run = manager.listRuns().find((r) => r.workflowName === "mm_test");
-    assert.ok(run, "run should exist");
+    const da = deferredAgent();
+    const manager = new WorkflowManager({ cwd, agent: da.runner });
+    manager.setMainModel("provider/parent-a", "low");
+    const first = manager.startInBackground(oneAgentScript);
+    assert.deepEqual(manager.getRun(first.runId)?.parentSessionDefaults, {
+      model: "provider/parent-a",
+      thinkingLevel: "low",
+    });
+
+    manager.setMainModel("provider/parent-b", "high");
+    assert.deepEqual(manager.getRun(first.runId)?.parentSessionDefaults, {
+      model: "provider/parent-a",
+      thinkingLevel: "low",
+    });
+    assert.deepEqual(manager.getParentSessionDefaults(), {
+      model: "provider/parent-b",
+      thinkingLevel: "high",
+    });
+
+    da.resolve("done");
+    await first.promise;
+    const second = manager.startInBackground(oneAgentScript);
+    assert.deepEqual(manager.getRun(second.runId)?.parentSessionDefaults, {
+      model: "provider/parent-b",
+      thinkingLevel: "high",
+    });
+    await second.promise;
   }),
 );
 

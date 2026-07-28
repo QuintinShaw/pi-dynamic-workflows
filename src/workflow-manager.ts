@@ -3,7 +3,7 @@
  */
 
 import { EventEmitter } from "node:events";
-import type { ModelRegistry, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { CreateAgentSessionOptions, ModelRegistry, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { WorkflowAgent } from "./agent.js";
 import { preview, type WorkflowAgentSnapshot, type WorkflowSnapshot } from "./display.js";
 import { isProviderUsageLimit, WorkflowError, WorkflowErrorCode } from "./errors.js";
@@ -16,6 +16,11 @@ import {
   type RunStatus,
 } from "./run-persistence.js";
 import { type JournalEntry, parseWorkflowScript, runWorkflow, type WorkflowRunResult } from "./workflow.js";
+
+export interface ParentSessionDefaults {
+  model?: string;
+  thinkingLevel?: CreateAgentSessionOptions["thinkingLevel"];
+}
 
 export interface ManagedRun {
   runId: string;
@@ -39,6 +44,8 @@ export interface ManagedRun {
    * result, so re-delivering would duplicate it.
    */
   background: boolean;
+  /** Parent defaults snapshotted when this execution started. */
+  parentSessionDefaults: ParentSessionDefaults;
   /**
    * Auto-resume eligibility for this run (see ExecOptions.autoResume). Set once
    * at creation and carried through resume() so it survives pause/resume cycles.
@@ -178,8 +185,10 @@ export interface WorkflowManagerOptions {
   loadSavedWorkflow?: (name: string) => string | undefined;
   /** Inject a custom agent runner (tests); defaults to a real subagent session. */
   agent?: Pick<WorkflowAgent, "run">;
-  /** The session's main model (provider/id), for auto-tiering explore agents. */
+  /** The active parent session's model (provider/id). */
   mainModel?: string;
+  /** The active parent session's effective thinking level. */
+  mainThinkingLevel?: CreateAgentSessionOptions["thinkingLevel"];
   /**
    * The host Pi session's model registry. When provided, workflow subagents
    * resolve models against the same registry as the main session, including
@@ -318,8 +327,9 @@ export class WorkflowManager extends EventEmitter {
   private concurrency: number;
   private loadSavedWorkflow?: (name: string) => string | undefined;
   private agent?: Pick<WorkflowAgent, "run">;
-  /** The session's main model (provider/id), for auto-tiering explore agents. */
+  /** The active parent session defaults inherited by untagged agents. */
   private mainModel?: string;
+  private mainThinkingLevel?: CreateAgentSessionOptions["thinkingLevel"];
   /** The host Pi session's model registry, shared with subagents. */
   private modelRegistry?: ModelRegistry;
   /** The current pi session id; runs are stamped with it and listRuns() filters by it. */
@@ -338,6 +348,7 @@ export class WorkflowManager extends EventEmitter {
     this.loadSavedWorkflow = options.loadSavedWorkflow;
     this.agent = options.agent;
     this.mainModel = options.mainModel;
+    this.mainThinkingLevel = options.mainThinkingLevel;
     this.modelRegistry = options.modelRegistry;
     this.sessionId = options.sessionId;
     this.defaultAgentTimeoutMs = options.defaultAgentTimeoutMs ?? null;
@@ -398,9 +409,20 @@ export class WorkflowManager extends EventEmitter {
     this.persistAgentSessions = options.persistAgentSessions ?? false;
   }
 
-  /** Set the session's main model (provider/id). Used to auto-tier explore agents. */
-  setMainModel(spec: string | undefined): void {
+  /** Atomically refresh the active parent provider/model and thinking defaults. */
+  setMainModel(spec: string | undefined, thinkingLevel?: CreateAgentSessionOptions["thinkingLevel"]): void {
     this.mainModel = spec;
+    this.mainThinkingLevel = thinkingLevel;
+  }
+
+  /** Refresh only the active parent thinking level. */
+  setMainThinkingLevel(thinkingLevel: CreateAgentSessionOptions["thinkingLevel"]): void {
+    this.mainThinkingLevel = thinkingLevel;
+  }
+
+  /** Return a defensive snapshot of the defaults used by the next execution. */
+  getParentSessionDefaults(): ParentSessionDefaults {
+    return { model: this.mainModel, thinkingLevel: this.mainThinkingLevel };
   }
 
   /** Set the host session's model registry so subagents resolve models consistently. */
@@ -458,6 +480,7 @@ export class WorkflowManager extends EventEmitter {
       args,
       journal: [],
       background: true,
+      parentSessionDefaults: this.getParentSessionDefaults(),
       lease,
       autoResume: exec.autoResume,
       // Resolve the budget once at start and freeze it on the run (see
@@ -573,6 +596,7 @@ export class WorkflowManager extends EventEmitter {
       args,
       journal: [],
       background: false,
+      parentSessionDefaults: this.getParentSessionDefaults(),
       agentTimestamps: new Map(),
       agentsById: new Map(),
     };
@@ -646,7 +670,8 @@ export class WorkflowManager extends EventEmitter {
         // path would surface a non-resumable id to the model.
         runId: managed.runId,
         agent: this.agent,
-        mainModel: this.mainModel,
+        mainModel: managed.parentSessionDefaults.model,
+        mainThinkingLevel: managed.parentSessionDefaults.thinkingLevel,
         modelRegistry: this.modelRegistry,
         persistAgentSessions: this.persistAgentSessions,
         signal: managed.controller.signal,
@@ -1196,6 +1221,7 @@ export class WorkflowManager extends EventEmitter {
       args,
       journal: persisted.journal ?? [],
       background: true,
+      parentSessionDefaults: this.getParentSessionDefaults(),
       lease,
       // Carry the original opt-out forward across resumes; it's fixed at
       // run-start and persistRun() re-persists it on every subsequent write.

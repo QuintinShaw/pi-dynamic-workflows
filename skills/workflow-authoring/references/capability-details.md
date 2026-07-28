@@ -26,8 +26,8 @@ Every exact fact below is projected from the installed extension's capability co
 - Constraint: schema noncompliance after bounded structured-output repair is nonrecoverable and bypasses agent retries
 - Constraint: per-agent retries override invocation retries; retries are floored and clamped to 0..3
 - Constraint: resume replays only the longest unchanged prefix; the first miss and every later call execute live
-- Constraint: selector priority is explicit model > agentType model > tier > phase model > metadata model > implicit medium > session default
-- Constraint: if the selected model or route is unavailable, execution falls directly to the session default rather than trying lower-priority selectors
+- Constraint: selector priority is explicit model > agentType model > tier > phase model > metadata model > active parent model > implicit medium > persisted Pi default
+- Constraint: if the selected model or route is unavailable, execution falls directly to the persisted Pi default rather than trying lower-priority selectors
 - Constraint: worktree isolation is best-effort; failure logs that isolation was ignored and continues without an isolated working directory
 
 <a id="parallel"></a>

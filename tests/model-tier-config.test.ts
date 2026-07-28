@@ -334,7 +334,7 @@ describe("model-tier-config", () => {
   });
 
   describe("formatTierFallbackNotice", () => {
-    it("names the fallback model and includes the suggested mapping", async () => {
+    it("names the unavailable route and persisted default, with a suggested mapping", async () => {
       const { formatTierFallbackNotice } = await loadModule();
       const notice = formatTierFallbackNotice("openai/gpt-4.1", [
         { spec: "v/small", costOutput: 1 },
@@ -342,17 +342,19 @@ describe("model-tier-config", () => {
         { spec: "v/big", costOutput: 20 },
       ]);
       assert.match(notice, /no model-tiers\.json/);
-      assert.match(notice, /fall back to openai\/gpt-4\.1/);
+      assert.match(notice, /route is unavailable/);
+      assert.match(notice, /persisted default/);
       assert.match(notice, /\/workflows-models/);
       assert.match(notice, /small=v\/small/);
       assert.match(notice, /medium=v\/mid/);
       assert.match(notice, /big=v\/big/);
     });
 
-    it("uses a generic phrase when no session model is known", async () => {
+    it("still provides a suggested mapping when no parent model is known", async () => {
       const { formatTierFallbackNotice } = await loadModule();
       const notice = formatTierFallbackNotice(undefined, specs("only-model"));
-      assert.match(notice, /the session default model/);
+      assert.match(notice, /persisted default/);
+      assert.match(notice, /small=only-model/);
     });
   });
 

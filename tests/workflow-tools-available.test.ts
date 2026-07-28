@@ -360,6 +360,7 @@ describe("workflow extension - control tool availability", () => {
       await withFakeHomeAsync(fakeHome, async () => {
         const registeredTools: string[] = [];
         const activeTools = ["bash", "read"];
+        let activeThinkingLevel = "low";
         const handlers: Record<string, Array<(...args: any[]) => any>> = {};
         const pi = {
           registerTool: (tool: { name: string }) => registeredTools.push(tool.name),
@@ -370,6 +371,7 @@ describe("workflow extension - control tool availability", () => {
             handlers[event].push(handler);
           },
           getActiveTools: () => [...activeTools],
+          getThinkingLevel: () => activeThinkingLevel,
           setActiveTools: (tools: string[]) => {
             activeTools.splice(0, activeTools.length, ...tools);
           },
@@ -384,7 +386,7 @@ describe("workflow extension - control tool availability", () => {
         handlers.session_start[0](
           {},
           {
-            model: undefined,
+            model: { provider: "provider-a", id: "model-a" },
             modelRegistry: {},
             sessionManager: { getSessionId: () => "session-1" },
             ui: {
@@ -399,6 +401,10 @@ describe("workflow extension - control tool availability", () => {
         handlers.session_shutdown?.[0]?.({ reason: "reload" });
         const staged = takeWorkflowRuntime(process.cwd());
         assert.ok(staged, "session_shutdown(reload) stages the live manager for the next extension generation");
+        assert.deepEqual(staged.manager.getParentSessionDefaults(), {
+          model: "provider-a/model-a",
+          thinkingLevel: "low",
+        });
         staged.effort.level = "high";
         handoffWorkflowRuntime(staged);
 
@@ -412,11 +418,20 @@ describe("workflow extension - control tool availability", () => {
         } as unknown as ExtensionAPI;
         installExtension(secondPi);
         assert.equal(takeWorkflowRuntime(process.cwd()), undefined, "the fresh factory consumes the staged runtime");
+        assert.equal(secondHandlers.model_select.length, 1);
+        assert.equal(secondHandlers.thinking_level_select.length, 1);
+        activeThinkingLevel = "high";
+        secondHandlers.model_select[0]({ model: { provider: "provider-b", id: "model-b" } });
+        secondHandlers.thinking_level_select[0]({ level: "xhigh" });
 
         secondHandlers.session_shutdown?.[0]?.({ reason: "reload" });
         const restaged = takeWorkflowRuntime(process.cwd());
         assert.equal(restaged?.manager, staged.manager, "a compatible generation keeps the exact live manager");
         assert.equal(restaged?.effort.level, "high", "session effort survives with the compatible runtime");
+        assert.deepEqual(restaged?.manager.getParentSessionDefaults(), {
+          model: "provider-b/model-b",
+          thinkingLevel: "xhigh",
+        });
       });
     } finally {
       rmSync(fakeHome, { recursive: true, force: true });
@@ -435,6 +450,7 @@ describe("workflow extension - control tool availability", () => {
           registerTool: () => {},
           registerCommand: () => {},
           getCommands: () => [],
+          getThinkingLevel: () => "low",
           on: (event: string, handler: (...args: any[]) => any) => {
             if (!handlers[event]) handlers[event] = [];
             handlers[event].push(handler);
