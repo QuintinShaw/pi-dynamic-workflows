@@ -779,10 +779,11 @@ export class WorkflowAgent {
       if (resolved.warning) console.warn(`[workflow] ${resolved.warning}`);
       if (!resolved.model) {
         if (isExplicitRequest) {
-          const detail = resolved.error ? ` (${resolved.error})` : "";
+          // The resolver's error already names the spec and the remedy; the tier
+          // branch swaps in its own message so the config source is named too.
           const message = options.model
-            ? `Model "${modelSpec}" not found. Use /workflows-models to choose an available model.${detail}`
-            : `tier "${options.tier}" from model-tiers.json resolves to "${modelSpec}", which is not available. Use /workflows-models to choose an available model.${detail}`;
+            ? (resolved.error ?? `Model "${modelSpec}" not found. Use /workflows-models to choose an available model.`)
+            : `tier "${options.tier}" from model-tiers.json resolves to "${modelSpec}", which is not available. Use /workflows-models to choose an available model.`;
           throw new WorkflowError(message, WorkflowErrorCode.MODEL_NOT_FOUND, {
             recoverable: false,
             agentLabel: options.label,
