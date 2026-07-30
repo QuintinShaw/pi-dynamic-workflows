@@ -178,6 +178,17 @@ test("escape closes the pager before leaving agent detail", () => {
   assert.equal(state.kind, "agents");
 });
 
+test("pager footer labels escape as back instead of duplicating the summary hint (#130)", () => {
+  const model = modelForAgent({ id: 1, label: "worker", phase: "Work", prompt: "work", status: "running" });
+  const state = enterAgentDetail(model);
+  state.togglePager();
+
+  const footer = renderNavigator(state, model, 80, undefined, 20, plainMarkdownTheme).join("\n");
+  assert.match(footer, /enter summary/);
+  assert.match(footer, /esc back/);
+  assert.doesNotMatch(footer, /esc summary/);
+});
+
 test("raw read results inherit syntax highlighting from the requested path", () => {
   const history: AgentHistoryEntry[] = [
     { role: "assistant", kind: "toolCall", toolName: "read", text: '{"path":"src/example.ts"}' },

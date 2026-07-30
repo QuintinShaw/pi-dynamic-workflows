@@ -1341,7 +1341,7 @@ function footerHint(state: NavigatorState, model: NavigatorModel, theme: ThemeLi
           "g/G ends",
           `t tail:${state.tailing ? "on" : "off"}`,
           "enter summary",
-          "esc summary",
+          "esc back",
         );
       } else {
         parts.push("enter open pager", "t tail", "esc back");
