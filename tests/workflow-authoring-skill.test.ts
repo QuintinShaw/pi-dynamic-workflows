@@ -46,6 +46,7 @@ const REQUIRED_RESOURCES = [
   `${SKILL_ROOT}/examples/bounded-semantic-retry.js`,
   `${SKILL_ROOT}/examples/validated-gate.js`,
   `${SKILL_ROOT}/examples/structured-output.js`,
+  `${SKILL_ROOT}/examples/defensive-json-parsing.js`,
 ] as const;
 
 function requiredSchemaFields(schema?: Record<string, unknown>): unknown[] {
@@ -326,7 +327,8 @@ test("generated helper facts expose exact callback, option, result, and failure 
 
   assert.match(pipeline?.constraints.join(" ") ?? "", /null.*next stage/i);
   assert.match(agent?.constraints.join(" ") ?? "", /schema noncompliance.*nonrecoverable/i);
-  assert.match(agent?.constraints.join(" ") ?? "", /selected.*unavailable.*session default/i);
+  assert.match(agent?.constraints.join(" ") ?? "", /explicit model.*unavailable.*throws MODEL_NOT_FOUND/i);
+  assert.match(agent?.constraints.join(" ") ?? "", /implicit default medium tier.*session default when unavailable/i);
   assert.match(agent?.constraints.join(" ") ?? "", /worktree isolation.*best-effort/i);
   assert.match(background?.constraints.join(" ") ?? "", /background workflows are headless/i);
   assert.match(background?.constraints.join(" ") ?? "", /checkpoint.*foreground confirmation/i);
@@ -877,5 +879,41 @@ test("structured-output recipe requires schema validation before consuming field
     ],
   );
   assert.deepEqual(Array.from(result.result.missing), ["beta"]);
+  assert.doesNotThrow(() => JSON.stringify(result.result));
+});
+
+test("defensive-json-parsing recipe flags unparseable text instead of reading undefined fields", async () => {
+  const script = readFileSync(join(ROOT, SKILL_ROOT, "examples/defensive-json-parsing.js"), "utf8");
+  const responses: Record<string, string | null> = {
+    "defensive:0:alpha": '```json\n{"verdict": "pass", "reason": "looks fine"}\n```',
+    "defensive:1:beta": "Sure, this passes the review.", // not JSON at all
+    "defensive:2:gamma": null,
+  };
+  const result = await runWorkflow<{
+    outputs: Array<{ id: string; status: string; verdict: string | null }>;
+    missing: string[];
+    unparseable: string[];
+    complete: boolean;
+  }>(script, {
+    args: { work: [{ id: "alpha" }, { id: "beta" }, { id: "gamma" }] },
+    persistLogs: false,
+    agent: {
+      async run(_prompt: string, { label }: { label?: string }) {
+        return responses[label ?? ""];
+      },
+    },
+  });
+
+  assert.deepEqual(
+    Array.from(result.result.outputs, ({ id, status, verdict }) => ({ id, status, verdict })),
+    [
+      { id: "alpha", status: "complete", verdict: "pass" },
+      { id: "beta", status: "unparseable", verdict: null },
+      { id: "gamma", status: "missing", verdict: null },
+    ],
+  );
+  assert.deepEqual(Array.from(result.result.unparseable), ["beta"]);
+  assert.deepEqual(Array.from(result.result.missing), ["gamma"]);
+  assert.equal(result.result.complete, false);
   assert.doesNotThrow(() => JSON.stringify(result.result));
 });

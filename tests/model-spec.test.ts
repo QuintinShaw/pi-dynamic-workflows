@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
+import { type ModelRegistry, type ModelRuntime, resolveCliModel } from "@earendil-works/pi-coding-agent";
 import fc from "fast-check";
 import {
   formatModelSpecWithThinking,
@@ -16,6 +16,21 @@ function model(provider: string, id: string, name = id): Model<Api> {
 
 function registry(models: Model<Api>[]): Pick<ModelRegistry, "getAll"> {
   return { getAll: () => models } as Pick<ModelRegistry, "getAll">;
+}
+
+/**
+ * A minimal stand-in for pi's real `ModelRuntime` that satisfies exactly the two
+ * members `resolveCliModel` reads (`getModels()` / `hasConfiguredAuth()`). We call
+ * pi's ACTUAL exported `resolveCliModel` (not a copy) so the cross-check test below
+ * exercises real pi-coding-agent code; the cast is required only because
+ * `ModelRuntime` has a private constructor, so an object literal can never
+ * nominally satisfy it, though it satisfies every member the function reads.
+ */
+function fakeModelRuntime(models: Model<Api>[], authenticatedProviders?: Set<string>): ModelRuntime {
+  return {
+    getModels: () => models,
+    hasConfiguredAuth: (providerId: string) => authenticatedProviders?.has(providerId) ?? true,
+  } as unknown as ModelRuntime;
 }
 
 const letters = "abcdefghijklmnopqrstuvwxyz".split("");
@@ -167,5 +182,151 @@ describe("model spec thinking suffixes", () => {
       }),
       { numRuns: 150 },
     );
+  });
+});
+
+describe("resolveModelSpecWithThinking parity with pi CLI's real resolveCliModel (#131)", () => {
+  // resolveModelSpecWithThinking is a manual port of pi-coding-agent's
+  // resolveCliModel — this cross-check calls pi's ACTUAL export against the same
+  // fuzzed catalogs/specs so a future pi upgrade that changes the CLI's own
+  // `--model` grammar is caught here immediately, instead of silently drifting
+  // (which is exactly how #131's bare-id gap went unnoticed).
+  const compoundIdSegment = fc.array(segment, { minLength: 1, maxLength: 2 }).map((parts) => parts.join("/"));
+
+  it("property: resolves identically to pi's resolveCliModel across ambiguous vendor/provider collisions", () => {
+    fc.assert(
+      fc.property(
+        providerSpec,
+        providerSpec,
+        compoundIdSegment,
+        compoundIdSegment,
+        (providerA, providerB, idA, idB) => {
+          fc.pre(providerA !== providerB);
+          // providerA doubles as both a real registered provider name AND the
+          // vendor prefix of an id cataloged under providerB — the exact shape
+          // that triggers #131 (bare "moonshotai/kimi-k3" when "moonshotai" is
+          // also a real, separately-registered provider).
+          const models = [model(providerA, idA), model(providerB, `${providerA}/${idB}`)];
+          const spec = `${providerA}/${idB}`;
+
+          const ours = resolveModelSpecWithThinking(spec, { getAll: () => models });
+          const pi = resolveCliModel({ cliModel: spec, modelRuntime: fakeModelRuntime(models) });
+
+          assert.deepEqual(ours.model, pi.model, `model mismatch for spec "${spec}"`);
+          assert.equal(ours.thinkingLevel, pi.thinkingLevel);
+          assert.equal(Boolean(ours.error), Boolean(pi.error));
+        },
+      ),
+      { numRuns: 200 },
+    );
+  });
+
+  it("property: activates the auth-preference branch and still agrees with pi's real resolveCliModel", () => {
+    // The previous cross-check ("ambiguous vendor/provider collisions") never
+    // actually reaches the auth-preference branch: candidatesA's pattern (idB)
+    // essentially never exact-matches idA, so `model` stays undefined there and
+    // the match instead comes from the inferredProvider fallback further down —
+    // and neither side supplied hasConfiguredAuth, so even if it HAD reached
+    // that branch, both `ours.hasConfiguredAuth` (absent → branch skipped) and
+    // pi's `hasConfiguredAuth` (defaults to true → its own guard short-circuits)
+    // would no-op. This test forces the exact shape that lands in the branch:
+    // providerA has a LITERAL exact-id model (so `model` resolves inside
+    // providerA's own candidate list, not via the later fallback), providerA is
+    // UNAUTHENTICATED, and the identical full string is also a literal id under
+    // an AUTHENTICATED otherProvider.
+    fc.assert(
+      fc.property(providerSpec, providerSpec, segment, (providerA, otherProvider, idB) => {
+        fc.pre(providerA !== otherProvider);
+        const models = [model(providerA, idB), model(otherProvider, `${providerA}/${idB}`)];
+        const spec = `${providerA}/${idB}`;
+        const authenticated = new Set([otherProvider]);
+
+        const ours = resolveModelSpecWithThinking(spec, {
+          getAll: () => models,
+          hasConfiguredAuth: (m) => authenticated.has(m.provider),
+        });
+        const pi = resolveCliModel({ cliModel: spec, modelRuntime: fakeModelRuntime(models, authenticated) });
+
+        assert.deepEqual(ours.model, pi.model, `model mismatch for spec "${spec}"`);
+        assert.equal(ours.thinkingLevel, pi.thinkingLevel);
+        // Sanity check that the branch under test was actually exercised: the
+        // authenticated compound match won, not the unauthenticated exact one.
+        assert.equal(ours.model?.provider, otherProvider, "the auth-preference branch must have fired");
+      }),
+      { numRuns: 200 },
+    );
+  });
+
+  it("property: agrees with pi on plain provider/model[:thinking] specs", () => {
+    fc.assert(
+      fc.property(
+        providerSpec,
+        modelIdSpec,
+        fc.option(thinkingSpec, { nil: undefined }),
+        (provider, modelId, thinking) => {
+          const models = [model(provider, modelId)];
+          const spec = formatModelSpecWithThinking(`${provider}/${modelId}`, thinking);
+
+          const ours = resolveModelSpecWithThinking(spec, { getAll: () => models });
+          const pi = resolveCliModel({ cliModel: spec, modelRuntime: fakeModelRuntime(models) });
+
+          assert.deepEqual(ours.model, pi.model);
+          assert.equal(ours.thinkingLevel, pi.thinkingLevel);
+        },
+      ),
+      { numRuns: 150 },
+    );
+  });
+});
+
+describe("resolveModelSpecWithThinking auth-aware raw-id preference (#131)", () => {
+  it("prefers an authenticated aggregator's literal compound id over an unauthenticated native provider match", () => {
+    // "moonshotai" is a real, unauthenticated native provider that also happens
+    // to literally catalog "kimi-k3"; "openrouter" is authenticated and catalogs
+    // the same string as a vendor-prefixed compound id. Without the auth
+    // preference this used to silently resolve to the unauthenticated native
+    // provider — deleting the preference block must turn this test red.
+    const moonshotaiNative = model("moonshotai", "kimi-k3");
+    const openrouterCompound = model("openrouter", "moonshotai/kimi-k3");
+    const reg = {
+      getAll: () => [moonshotaiNative, openrouterCompound],
+      hasConfiguredAuth: (m: Model<Api>) => m.provider === "openrouter",
+    };
+
+    const resolved = resolveModelSpecWithThinking(
+      "moonshotai/kimi-k3",
+      reg as unknown as Pick<ModelRegistry, "getAll">,
+    );
+
+    assert.equal(resolved.model, openrouterCompound);
+    assert.equal(resolved.resolvedSpec, "openrouter/moonshotai/kimi-k3");
+  });
+
+  it("keeps the native-provider match when no hasConfiguredAuth capability is supplied (backward compatible)", () => {
+    const moonshotaiNative = model("moonshotai", "kimi-k3");
+    const openrouterCompound = model("openrouter", "moonshotai/kimi-k3");
+
+    const resolved = resolveModelSpecWithThinking(
+      "moonshotai/kimi-k3",
+      registry([moonshotaiNative, openrouterCompound]),
+    );
+
+    assert.equal(resolved.model, moonshotaiNative, "without auth info, the first provider-scoped match still wins");
+  });
+
+  it("keeps the native-provider match when it IS authenticated (no reason to prefer anything else)", () => {
+    const moonshotaiNative = model("moonshotai", "kimi-k3");
+    const openrouterCompound = model("openrouter", "moonshotai/kimi-k3");
+    const reg = {
+      getAll: () => [moonshotaiNative, openrouterCompound],
+      hasConfiguredAuth: () => true,
+    };
+
+    const resolved = resolveModelSpecWithThinking(
+      "moonshotai/kimi-k3",
+      reg as unknown as Pick<ModelRegistry, "getAll">,
+    );
+
+    assert.equal(resolved.model, moonshotaiNative);
   });
 });

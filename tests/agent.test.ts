@@ -324,6 +324,175 @@ test("WorkflowAgent.run() rejects a non-object top-level schema before touching 
   );
 });
 
+// ═══════════════════════════════════════════════════════════════════════════
+// WorkflowAgent.run(): an unresolvable `model` spec must fail loud (#131) — no
+// more silent fallback to the session default with only a console.warn.
+// ═══════════════════════════════════════════════════════════════════════════
+
+test("WorkflowAgent.run() throws MODEL_NOT_FOUND for an unresolvable model spec instead of silently using the session default", async () => {
+  const registry = {
+    getAll: () => [{ provider: "openrouter", id: "anthropic/claude-opus-4-8", name: "Claude" } as any],
+    getAvailable: () => [],
+    find: () => undefined,
+  } as any;
+
+  const agent = new WorkflowAgent({ cwd: "/tmp", modelRegistry: registry });
+  await assert.rejects(
+    agent.run("task", { model: "totally-unknown/does-not-exist", label: "pin" }),
+    (error: unknown) => {
+      assert.ok(error instanceof WorkflowError);
+      assert.equal(error.code, WorkflowErrorCode.MODEL_NOT_FOUND);
+      assert.equal(error.recoverable, false, "a bad pin is deterministic — retrying it is pointless");
+      assert.match(error.message, /totally-unknown\/does-not-exist/);
+      assert.equal(error.agentLabel, "pin");
+      return true;
+    },
+  );
+});
+
+test("WorkflowAgent.run() still resolves a known model spec normally (no regression)", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-model-pin-ok-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-model-pin-ok-cwd-"));
+  const core = createFauxCore({
+    provider: "fauxtest-pin",
+    models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 4096 }],
+  });
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const runtime = await ModelRuntime.create({ authPath: join(home, "auth.json"), modelsPath: null });
+      runtime.registerProvider("fauxtest-pin", {
+        name: "Faux Test Pin",
+        baseUrl: "http://127.0.0.1:9/faux",
+        apiKey: "faux-dummy-key-not-used",
+        api: core.api,
+        streamSimple: core.streamSimple as never,
+        models: core.models.map((m) => ({
+          id: m.id,
+          name: m.name ?? m.id,
+          reasoning: false,
+          input: ["text"] as ("text" | "image")[],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: m.contextWindow ?? 128000,
+          maxTokens: m.maxTokens ?? 4096,
+        })),
+      });
+      const registry = new ModelRegistry(runtime);
+      core.setResponses([fauxAssistantMessage("pinned-model-answer", { stopReason: "stop" })]);
+
+      const agent = new WorkflowAgent({ cwd, modelRegistry: registry });
+      const text = await agent.run("task", { model: "fauxtest-pin/faux-model", label: "pin-ok" });
+      assert.ok(text.includes("pinned-model-answer"));
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WorkflowAgent.run(): asymmetric fail-loud behavior for a tier that resolves
+// to an unavailable model (#131 follow-up) —
+//   - an EXPLICIT tier (script wrote `tier: "x"`) is just as loud as an
+//     explicit model pin: MODEL_NOT_FOUND, naming the tier and what it
+//     resolved to.
+//   - the IMPLICIT default "medium" tier an UNTAGGED agent (no model, no
+//     tier) gets routed through never asked for that model, so it degrades
+//     to the session default instead — but only after firing onModelFallback
+//     so the degrade is still visible in the run's own log stream, not a
+//     silent continuation.
+// ═══════════════════════════════════════════════════════════════════════════
+
+test("WorkflowAgent.run() throws MODEL_NOT_FOUND naming the tier when an EXPLICIT tier resolves to an unavailable model", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-tier-dead-explicit-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-tier-dead-explicit-cwd-"));
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const tiersDir = join(home, ".pi", "workflows");
+      mkdirSync(tiersDir, { recursive: true });
+      writeFileSync(join(tiersDir, "model-tiers.json"), JSON.stringify({ tiers: { big: "deadprov/ghost-model" } }));
+
+      const registry = {
+        getAll: () => [{ provider: "fauxtest", id: "faux-model", name: "faux-model" } as any],
+      } as any;
+
+      const agent = new WorkflowAgent({ cwd, modelRegistry: registry });
+      await assert.rejects(agent.run("task", { tier: "big", label: "explicit-tier" }), (error: unknown) => {
+        assert.ok(error instanceof WorkflowError);
+        assert.equal(error.code, WorkflowErrorCode.MODEL_NOT_FOUND);
+        assert.equal(error.recoverable, false);
+        assert.match(error.message, /tier "big"/);
+        assert.match(error.message, /model-tiers\.json/);
+        assert.match(error.message, /deadprov\/ghost-model/);
+        assert.equal(error.agentLabel, "explicit-tier");
+        return true;
+      });
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("WorkflowAgent.run(): an untagged agent's IMPLICIT default medium tier degrades to the session default (not a throw) when it resolves to an unavailable model, and fires onModelFallback at most once per instance", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-tier-dead-implicit-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-tier-dead-implicit-cwd-"));
+  const core = createFauxCore({
+    provider: "fauxtest-implicit",
+    models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 4096 }],
+  });
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const tiersDir = join(home, ".pi", "workflows");
+      mkdirSync(tiersDir, { recursive: true });
+      // "medium" (the implicit default) resolves to a dead spec; the run must
+      // still complete by falling back to the session default (the only
+      // registered/available model here: fauxtest-implicit/faux-model).
+      writeFileSync(join(tiersDir, "model-tiers.json"), JSON.stringify({ tiers: { medium: "deadprov/ghost-model" } }));
+
+      const runtime = await ModelRuntime.create({ authPath: join(home, "auth.json"), modelsPath: null });
+      runtime.registerProvider("fauxtest-implicit", {
+        name: "Faux Test Implicit",
+        baseUrl: "http://127.0.0.1:9/faux",
+        apiKey: "faux-dummy-key-not-used",
+        api: core.api,
+        streamSimple: core.streamSimple as never,
+        models: core.models.map((m) => ({
+          id: m.id,
+          name: m.name ?? m.id,
+          reasoning: false,
+          input: ["text"] as ("text" | "image")[],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: m.contextWindow ?? 128000,
+          maxTokens: m.maxTokens ?? 4096,
+        })),
+      });
+      const registry = new ModelRegistry(runtime);
+      core.setResponses([
+        fauxAssistantMessage("untagged-first", { stopReason: "stop" }),
+        fauxAssistantMessage("untagged-second", { stopReason: "stop" }),
+      ]);
+
+      const fallbacks: Array<{ tier: string; requestedSpec: string }> = [];
+      const agent = new WorkflowAgent({ cwd, modelRegistry: registry });
+      const onModelFallback = (info: { tier: string; requestedSpec: string }) => fallbacks.push(info);
+
+      const first = await agent.run("task one", { label: "untagged-1", onModelFallback });
+      const second = await agent.run("task two", { label: "untagged-2", onModelFallback });
+
+      assert.ok(first.includes("untagged-first"), "first untagged agent should still complete via session default");
+      assert.ok(second.includes("untagged-second"), "second untagged agent should still complete via session default");
+      assert.deepEqual(
+        fallbacks,
+        [{ tier: "medium", requestedSpec: "deadprov/ghost-model" }],
+        "onModelFallback fires exactly once across both run() calls on the same instance",
+      );
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("WorkflowAgent.run() still completes with a normal object schema (no regression)", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-dw-schema-ok-home-"));
   const cwd = mkdtempSync(join(tmpdir(), "pi-dw-schema-ok-cwd-"));

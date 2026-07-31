@@ -2,7 +2,7 @@
 name: workflow-authoring
 description: Guidance for writing, editing, reviewing, and debugging JavaScript workflow code for pi-dynamic-workflows. Use when authoring or changing workflow scripts; not for merely running an existing workflow.
 metadata:
-  version: "3.4.1"
+  version: "3.5.0"
 ---
 
 # Workflow authoring

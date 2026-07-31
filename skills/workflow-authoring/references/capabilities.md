@@ -2,7 +2,7 @@
 # Workflow capability index
 
 Contract format: `1.0.0`<br>
-Contract content / skill / extension: `3.4.1`
+Contract content / skill / extension: `3.5.0`
 
 This compact generated index covers supported runtime globals and workflow-tool inputs. For constraints, compatibility behavior, internal boundaries, and dynamic-reference ownership, follow the [exhaustive generated facts](capability-details.md).
 

@@ -2,7 +2,7 @@
 # Exhaustive workflow capability facts
 
 Contract format: `1.0.0`<br>
-Contract content / skill / extension: `3.4.1`
+Contract content / skill / extension: `3.5.0`
 
 Every exact fact below is projected from the installed extension's capability contract. Explanatory judgment belongs in the hand-written references next to this file.
 
@@ -27,7 +27,8 @@ Every exact fact below is projected from the installed extension's capability co
 - Constraint: per-agent retries override invocation retries; retries are floored and clamped to 0..3
 - Constraint: resume replays only the longest unchanged prefix; the first miss and every later call execute live
 - Constraint: selector priority is explicit model > agentType model > tier > phase model > metadata model > implicit medium > session default
-- Constraint: if the selected model or route is unavailable, execution falls directly to the session default rather than trying lower-priority selectors
+- Constraint: an explicit model, agentType model, tier, or phase model that resolves to an unavailable model throws MODEL_NOT_FOUND naming the source (e.g. the tier and what it resolved to) instead of falling back
+- Constraint: only the implicit default medium tier (no explicit model, tier, agentType, or phase model requested) degrades to the session default when unavailable, logging a one-time run-visible warning instead of throwing
 - Constraint: worktree isolation is best-effort; failure logs that isolation was ignored and continues without an isolated working directory
 
 <a id="parallel"></a>

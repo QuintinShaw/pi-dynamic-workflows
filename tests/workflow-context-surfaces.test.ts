@@ -52,7 +52,7 @@ test("workflow context measurement reports Pi-rendered prompt and provider tool 
   for (const skill of artifact.surfaces.registeredSkillsDiscovery.skills) {
     assert.ok(skill.bytes > 0, `${skill.root} should report a positive discovery byte count`);
   }
-  assert.equal(artifact.surfaces.workflowAuthoringSkillCorpus.files, 27);
+  assert.equal(artifact.surfaces.workflowAuthoringSkillCorpus.files, 28);
   assert.ok(artifact.surfaces.workflowAuthoringSkillCorpus.bytes > 0);
   assert.equal(artifact.surfaces.representativeAuthoringProfiles.profiles.length, 6);
   assert.deepEqual(
