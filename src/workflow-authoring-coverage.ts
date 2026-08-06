@@ -37,7 +37,7 @@ export const WORKFLOW_AUTHORING_FROZEN_FILES = [
   },
   {
     path: "skills/workflow-authoring/references/runtime.md",
-    sha256: "13b710424bc262a3951e9ad8f7387cdf4d630b89f27c07bbcbc6b47c37e24242",
+    sha256: "9c4a693f6916330462450a8b031866409f234ffe29b4e9f9a4d221d46997a209",
   },
   {
     path: "skills/workflow-authoring/references/helpers.md",
@@ -126,6 +126,13 @@ const CAPABILITY_SCENARIOS: Readonly<Record<string, readonly string[]>> = {
 };
 
 const FROZEN_GUIDANCE_BY_CAPABILITY: Readonly<Record<string, readonly ProtectedGuidanceSurface[]>> = {
+  "workflow.runtime.agent": [
+    {
+      path: RUNTIME_PATH,
+      requiredText:
+        'Use `agent(prompt, { thread: "implementer" })` when the same subagent must receive a later follow-up with its complete conversation intact, such as implementer → separate reviewer → implementer revision. Reuse a thread name sequentially; never put same-thread calls in one `parallel()` batch. Threads exist only during the current uninterrupted workflow invocation, cannot use worktree isolation, and restart from the beginning after pause/resume because threaded results are not journaled.',
+    },
+  ],
   "workflow.runtime.pipeline": [
     {
       path: RUNTIME_PATH,
