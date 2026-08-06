@@ -18,6 +18,8 @@ The runtime supplies `agent`, `parallel`, `pipeline`, `workflow`, quality/contro
 
 Call `agent(prompt, { label, schema? })`; it returns text, a schema-validated value, or recoverable `null`. Nonrecoverable limit, validation, and budget failures throw. Record each intended work ID before filtering. A `null` means missing coverage, never a negative finding.
 
+Use `agent(prompt, { thread: "implementer" })` when the same subagent must receive a later follow-up with its complete conversation intact, such as implementer → separate reviewer → implementer revision. Reuse a thread name sequentially; never put same-thread calls in one `parallel()` batch. Nested workflows share thread names with their parent. Threads exist only during the current uninterrupted workflow invocation, cannot use worktree isolation, and restart from the beginning after pause/resume because threaded results are not journaled.
+
 When JavaScript reads fields, pass a small plain JSON Schema. Schema noncompliance after repair throws and bypasses agent retries. Catch it only to return an explicit incomplete outcome without reading missing fields. Return objects, arrays, strings, numbers, booleans, and `null`—not functions, promises, cycles, `BigInt`, or runtime handles.
 
 ## Routing and support
