@@ -678,6 +678,45 @@ return { first, nested, last }`;
   });
 });
 
+test("a nested threaded call invalidates later parent journal entries", async () => {
+  const script = `export const meta = { name: 'parent_resume_barrier', description: 'propagate child barrier' }
+const before = await agent('before')
+await workflow('child')
+const after = await agent('after')
+const confirmed = await checkpoint('confirm', { default: false })
+return { before, after, confirmed }`;
+  const child = `export const meta = { name: 'child_resume_barrier', description: 'thread barrier' }
+return await agent('threaded child', { thread: 'implementer' })`;
+  const journal: JournalEntry[] = [];
+  await runWorkflow(script, {
+    agent: countingAgent().runner,
+    runId: "nested-thread-barrier",
+    persistLogs: false,
+    loadSavedWorkflow: (name) => (name === "child" ? child : undefined),
+    confirm: async () => true,
+    onAgentJournal: (entry) => journal.push(entry),
+  });
+
+  const resumed = countingAgent();
+  let confirmations = 0;
+  const result = await runWorkflow<{ before: string; after: string; confirmed: boolean }>(script, {
+    agent: resumed.runner,
+    runId: "nested-thread-barrier",
+    persistLogs: false,
+    loadSavedWorkflow: (name) => (name === "child" ? child : undefined),
+    resumeJournal: new Map(journal.map((entry) => [`${entry.runId}:${entry.index}`, entry])),
+    resumeFromRunId: "nested-thread-barrier",
+    confirm: async () => {
+      confirmations++;
+      return false;
+    },
+  });
+
+  assert.equal(resumed.state.calls, 2, "the child thread and later parent agent both run live");
+  assert.equal(confirmations, 1, "the later parent checkpoint also runs live");
+  assert.equal(result.result.confirmed, false);
+});
+
 test("workflow() nesting is one level deep (second level throws)", async () => {
   const map: Record<string, string> = {
     gc: `export const meta = { name: 'gc', description: 'g' }

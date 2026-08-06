@@ -142,6 +142,8 @@ export interface SharedRuntime {
   inFlight: Set<Promise<unknown>>;
   /** Named conversations currently executing anywhere in this run tree. */
   activeThreads: Set<string>;
+  /** Whether a threaded call has invalidated journal replay for the remaining run tree. */
+  resumeBarrierReached: boolean;
 }
 
 /** Runtime instrumentation for workflow boundaries, quality helpers, and control attempts. */
@@ -479,6 +481,7 @@ export async function runWorkflow<T = unknown>(
     runFatalController: new AbortController(),
     inFlight: new Set<Promise<unknown>>(),
     activeThreads: new Set<string>(),
+    resumeBarrierReached: false,
   };
   const limiter = shared.limiter;
   // This frame created `shared` fresh (rather than inheriting a parent
@@ -687,10 +690,11 @@ export async function runWorkflow<T = unknown>(
     // exact `${runId}:${callIndex}` string) so a nested workflow()'s
     // callIndex-0 can never accidentally replay the parent's callIndex-0
     // entry, or vice versa (see JournalEntry.runId).
+    if (agentOptions.thread) shared.resumeBarrierReached = true;
     const cached = agentOptions.thread ? undefined : options.resumeJournal?.get(deltaKey);
     const hashMatches = cached != null && cached.hash === callHash;
     const cachedEmptyOutput = hashMatches && isEmptyTextAgentResult(cached.result, agentOptions.schema);
-    if (hashMatches && !cachedEmptyOutput && callIndex < state.firstMiss) {
+    if (!shared.resumeBarrierReached && hashMatches && !cachedEmptyOutput && callIndex < state.firstMiss) {
       options.onAgentStart?.({ id: deltaKey, label, phase: assignedPhase, prompt, model: displayModel });
       options.onAgentEnd?.({
         id: deltaKey,
@@ -1252,7 +1256,7 @@ export async function runWorkflow<T = unknown>(
     // Namespaced by runId like agent()'s deltaKey — see JournalEntry.runId.
     const journalKey = `${runId}:${callIndex}`;
     const cached = options.resumeJournal?.get(journalKey);
-    if (cached != null && cached.hash === callHash && callIndex < state.firstMiss) {
+    if (!shared.resumeBarrierReached && cached != null && cached.hash === callHash && callIndex < state.firstMiss) {
       shared.agentCount++;
       return cached.result; // replay the journaled human reply
     }
