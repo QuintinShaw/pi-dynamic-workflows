@@ -55,6 +55,28 @@ describe("model spec thinking suffixes", () => {
     assert.equal(resolved.resolvedSpec, "openai-codex/gpt-5.5:xhigh");
   });
 
+  it("prefers the active provider for an unqualified fuzzy workflow model", () => {
+    const gatewayLuna = model("vercel-ai-gateway", "openai/gpt-5.6-luna");
+    const openrouterLunaPro = model("openrouter", "openai/gpt-5.6-luna-pro");
+
+    const resolved = resolveModelSpecWithThinking("gpt-5.6-luna", registry([gatewayLuna, openrouterLunaPro]), {
+      preferredProvider: "vercel-ai-gateway",
+    });
+
+    assert.equal(resolved.model, gatewayLuna);
+    assert.equal(resolved.resolvedSpec, "vercel-ai-gateway/openai/gpt-5.6-luna");
+  });
+
+  it("uses global fuzzy matching when the preferred provider has no match", () => {
+    const openrouterLunaPro = model("openrouter", "openai/gpt-5.6-luna-pro");
+
+    const resolved = resolveModelSpecWithThinking("gpt-5.6-luna", registry([openrouterLunaPro]), {
+      preferredProvider: "vercel-ai-gateway",
+    });
+
+    assert.equal(resolved.model, openrouterLunaPro);
+  });
+
   it("resolves max as a Pi thinking level instead of a synthetic model id", () => {
     const gpt56 = model("openai-codex", "gpt-5.6-sol");
     const resolved = resolveModelSpecWithThinking("openai-codex/gpt-5.6-sol:max", registry([gpt56]));

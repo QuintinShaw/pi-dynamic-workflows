@@ -127,7 +127,11 @@ function findExactModelReferenceMatch(modelReference: string, availableModels: M
   return idMatches.length === 1 ? idMatches[0] : undefined;
 }
 
-function tryMatchModel(modelPattern: string, availableModels: Model<Api>[]): Model<Api> | undefined {
+function tryMatchModel(
+  modelPattern: string,
+  availableModels: Model<Api>[],
+  preferredProvider?: string,
+): Model<Api> | undefined {
   const exactMatch = findExactModelReferenceMatch(modelPattern, availableModels);
   if (exactMatch) return exactMatch;
 
@@ -136,15 +140,19 @@ function tryMatchModel(modelPattern: string, availableModels: Model<Api>[]): Mod
     (model) =>
       model.id.toLowerCase().includes(normalizedPattern) || model.name?.toLowerCase().includes(normalizedPattern),
   );
-  if (matches.length === 0) return undefined;
+  const preferredMatches = preferredProvider
+    ? matches.filter((model) => model.provider.toLowerCase() === preferredProvider.toLowerCase())
+    : [];
+  const rankedMatches = preferredMatches.length > 0 ? preferredMatches : matches;
+  if (rankedMatches.length === 0) return undefined;
 
-  const aliases = matches.filter((model) => isAlias(model.id));
+  const aliases = rankedMatches.filter((model) => isAlias(model.id));
   if (aliases.length > 0) {
     aliases.sort((a, b) => b.id.localeCompare(a.id));
     return aliases[0];
   }
 
-  const datedVersions = matches.filter((model) => !isAlias(model.id));
+  const datedVersions = rankedMatches.filter((model) => !isAlias(model.id));
   datedVersions.sort((a, b) => b.id.localeCompare(a.id));
   return datedVersions[0];
 }
@@ -152,9 +160,9 @@ function tryMatchModel(modelPattern: string, availableModels: Model<Api>[]): Mod
 function parseModelPattern(
   pattern: string,
   availableModels: Model<Api>[],
-  options?: ParseModelPatternOptions,
+  options?: ParseModelPatternOptions & { preferredProvider?: string },
 ): ParsedModelPattern {
-  const exactMatch = tryMatchModel(pattern, availableModels);
+  const exactMatch = tryMatchModel(pattern, availableModels, options?.preferredProvider);
   if (exactMatch) return { model: exactMatch };
 
   const lastColonIndex = pattern.lastIndexOf(":");
@@ -206,6 +214,7 @@ function buildFallbackModel(provider: string, modelId: string, availableModels: 
 export function resolveModelSpecWithThinking(
   spec: string,
   modelRegistry: Pick<ModelRegistry, "getAll"> & Partial<Pick<ModelRegistry, "hasConfiguredAuth">>,
+  options?: { preferredProvider?: string },
 ): ResolvedModelSpec {
   const requestedSpec = spec.trim();
   if (!requestedSpec) return { requestedSpec, error: "No model spec provided." };
@@ -247,6 +256,7 @@ export function resolveModelSpecWithThinking(
   const candidates = provider ? availableModels.filter((model) => model.provider === provider) : availableModels;
   const { model, thinkingLevel, warning } = parseModelPattern(pattern, candidates, {
     allowInvalidThinkingLevelFallback: false,
+    ...(provider === undefined ? { preferredProvider: options?.preferredProvider } : {}),
   });
   if (model) {
     // The provider was inferred from a slash prefix (e.g. "moonshotai/kimi-k3"),
@@ -286,6 +296,7 @@ export function resolveModelSpecWithThinking(
 
     const fallback = parseModelPattern(requestedSpec, availableModels, {
       allowInvalidThinkingLevelFallback: false,
+      preferredProvider: options?.preferredProvider,
     });
     if (fallback.model) {
       return {

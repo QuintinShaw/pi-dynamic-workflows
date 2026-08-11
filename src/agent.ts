@@ -775,7 +775,9 @@ export class WorkflowAgent {
     let resolvedModel: Model<any> | undefined;
     let resolvedThinkingLevel: CreateAgentSessionOptions["thinkingLevel"] | undefined;
     if (modelSpec) {
-      const resolved = resolveModelSpecWithThinking(modelSpec, modelRegistry);
+      const resolved = resolveModelSpecWithThinking(modelSpec, modelRegistry, {
+        preferredProvider: this.mainModel?.split("/", 1)[0],
+      });
       if (resolved.warning) console.warn(`[workflow] ${resolved.warning}`);
       if (!resolved.model) {
         if (isExplicitRequest) {
