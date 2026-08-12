@@ -1,6 +1,15 @@
 import assert from "node:assert/strict";
-import test from "node:test";
-import { captureCommandPrefix, registerBuiltinWorkflows } from "../src/builtin-commands.js";
+import { execFileSync } from "node:child_process";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import test, { type TestContext } from "node:test";
+import {
+  captureCommandPrefix,
+  classifyCodeReviewArtifact,
+  parseDiffNumstat,
+  registerBuiltinWorkflows,
+} from "../src/builtin-commands.js";
 import { MAX_DIFF_CHARS } from "../src/code-review.js";
 import { parseWorkflowScript } from "../src/workflow.js";
 import type { WorkflowManager } from "../src/workflow-manager.js";
@@ -51,6 +60,34 @@ function makeFakeManager() {
   return { manager, started };
 }
 
+function git(repo: string, args: string[]): string {
+  return execFileSync("git", args, { cwd: repo, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+}
+
+async function writeRepoFile(repo: string, path: string, content: string | Uint8Array): Promise<void> {
+  const target = join(repo, path);
+  await mkdir(dirname(target), { recursive: true });
+  await writeFile(target, content);
+}
+
+async function makeGitRepo(t: TestContext, files: Record<string, string | Uint8Array>): Promise<string> {
+  const repo = await mkdtemp(join(tmpdir(), "pi-code-review-auto-scope-"));
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  git(repo, ["init", "-q"]);
+  for (const [path, content] of Object.entries(files)) await writeRepoFile(repo, path, content);
+  git(repo, ["add", "-A"]);
+  git(repo, [
+    "-c",
+    "user.name=Workflow Tests",
+    "-c",
+    "user.email=workflow-tests@example.invalid",
+    "commit",
+    "-qm",
+    "initial",
+  ]);
+  return repo;
+}
+
 test("captureCommandPrefix streams output beyond the legacy 64 MiB capture limit", async () => {
   const chunkChars = 1024 * 1024;
   const chunkCount = 65;
@@ -77,6 +114,114 @@ test("captureCommandPrefix streams output beyond the legacy 64 MiB capture limit
   assert.equal(captured.totalChars, chunkChars * chunkCount);
   assert.equal(captured.stdout.length, MAX_DIFF_CHARS);
   assert.equal(captured.stdout, "x".repeat(MAX_DIFF_CHARS));
+});
+
+test("parseDiffNumstat preserves NUL-delimited unusual paths and binary markers", () => {
+  assert.deepEqual(parseDiffNumstat("3\t4\tsrc/a\tname\nfile.ts\0-\t-\tpublic/image.png\0"), [
+    { path: "src/a\tname\nfile.ts", addedLines: 3, deletedLines: 4, binary: false },
+    { path: "public/image.png", addedLines: null, deletedLines: null, binary: true },
+  ]);
+  assert.throws(() => parseDiffNumstat("1\t2\tsrc/a.ts"), /NUL-terminated/);
+  assert.throws(() => parseDiffNumstat("1\tx\tsrc/a.ts\0"), /invalid line counts/);
+  assert.throws(() => parseDiffNumstat("1\t2\t\0"), /unsupported path/);
+});
+
+test("classifyCodeReviewArtifact excludes only high-confidence generated paths", () => {
+  assert.equal(classifyCodeReviewArtifact("graphify-out/cache/a.json"), "graph index output");
+  assert.equal(classifyCodeReviewArtifact("packages/app/node_modules/pkg/index.js"), "dependency output");
+  assert.equal(classifyCodeReviewArtifact("cypress/screenshots/home.png"), "browser capture");
+  assert.equal(classifyCodeReviewArtifact("dist/app.min.js"), "compiled bundle");
+  assert.equal(classifyCodeReviewArtifact("src/schema.generated.ts"), "generated file");
+  assert.equal(classifyCodeReviewArtifact("build/cache.tsbuildinfo"), "compiler state");
+
+  assert.equal(classifyCodeReviewArtifact(".claude/commands/review.md"), undefined);
+  assert.equal(classifyCodeReviewArtifact("dist/manual.js"), undefined);
+  assert.equal(classifyCodeReviewArtifact("public/data.json"), undefined);
+  assert.equal(classifyCodeReviewArtifact("fixtures/large-output.log"), undefined);
+  assert.equal(classifyCodeReviewArtifact("src/generator.ts"), undefined);
+});
+
+test("bare code-review auto-scopes artifacts and safely includes unusual source paths", {
+  skip: process.platform === "win32",
+}, async (t) => {
+  const initial: Record<string, string> = {
+    "src/real.ts": "export const value = 'before';\n",
+    "dist/manual.js": "export const manual = 'before';\n",
+    "src/space name.ts": "export const space = 'before';\n",
+    "src/:literal[1].ts": "export const colon = 'before';\n",
+    "-leading.ts": "export const leading = 'before';\n",
+    "src/line\nbreak.ts": "export const newline = 'before';\n",
+    "src/tab\tname.ts": "export const tab = 'before';\n",
+    "src/你好.ts": "export const unicode = 'before';\n",
+    "src/$(echo-pwn).ts": "export const shell = 'before';\n",
+    ".playwright-mcp/capture.yml": "capture-before\n",
+    "graphify-out/cache/a.json": '{"artifact":"before"}\n',
+    "supabase/.temp/version": "before\n",
+  };
+  const repo = await makeGitRepo(t, initial);
+  const markers: Record<string, string> = {
+    "src/real.ts": "AUTO_SCOPE_REAL",
+    "dist/manual.js": "AUTO_SCOPE_UNCERTAIN_DIST",
+    "src/space name.ts": "AUTO_SCOPE_SPACE",
+    "src/:literal[1].ts": "AUTO_SCOPE_COLON",
+    "-leading.ts": "AUTO_SCOPE_LEADING",
+    "src/line\nbreak.ts": "AUTO_SCOPE_NEWLINE",
+    "src/tab\tname.ts": "AUTO_SCOPE_TAB",
+    "src/你好.ts": "AUTO_SCOPE_UNICODE",
+    "src/$(echo-pwn).ts": "AUTO_SCOPE_SHELL",
+    ".playwright-mcp/capture.yml": "AUTO_SCOPE_PLAYWRIGHT_ARTIFACT",
+    "graphify-out/cache/a.json": "AUTO_SCOPE_GRAPH_ARTIFACT",
+    "supabase/.temp/version": "AUTO_SCOPE_SUPABASE_ARTIFACT",
+  };
+  for (const [path, marker] of Object.entries(markers)) await writeRepoFile(repo, path, `${marker}\n`);
+
+  const { pi, commands } = makeCommandRegistryPi();
+  const { manager, started } = makeFakeManager();
+  registerBuiltinWorkflows(pi, { cwd: repo, manager, storage: makeFakeStorage({}) });
+  const handler = commands.find((command) => command.name === "code-review")?.handler;
+  assert.ok(handler);
+  const { ctx, notified } = makeNotifyCtx();
+
+  await handler("   ", ctx);
+
+  assert.equal(started.length, 1);
+  const autoArgs = started[0].args as { diff: string; diffSource: string };
+  for (const marker of Object.values(markers).filter((value) => !value.endsWith("_ARTIFACT"))) {
+    assert.match(autoArgs.diff, new RegExp(marker));
+  }
+  assert.doesNotMatch(autoArgs.diff, /AUTO_SCOPE_(?:PLAYWRIGHT|GRAPH|SUPABASE)_ARTIFACT/);
+  assert.match(autoArgs.diffSource, /auto-scope: 9 included, 3 artifacts skipped/);
+  const scopeNotice = notified.find((entry) => entry.message.startsWith("Auto-scope:"));
+  assert.ok(scopeNotice);
+  assert.equal(scopeNotice.type, "info");
+  assert.match(scopeNotice.message, /reviewing 9 tracked files/);
+  assert.match(scopeNotice.message, /skipped 3 high-confidence artifacts/);
+
+  await handler("graphify-out/cache/a.json", ctx);
+  assert.equal(started.length, 2, "an explicit artifact path must bypass auto-scope");
+  const explicitArgs = started[1].args as { diff: string; diffSource: string };
+  assert.match(explicitArgs.diff, /AUTO_SCOPE_GRAPH_ARTIFACT/);
+  assert.equal(explicitArgs.diffSource, "git diff HEAD -- graphify-out/cache/a.json");
+});
+
+test("bare code-review stops cleanly when only generated artifacts changed", async (t) => {
+  const repo = await makeGitRepo(t, { "graphify-out/cache/a.json": "before\n" });
+  await writeRepoFile(repo, "graphify-out/cache/a.json", "after\n");
+
+  const { pi, commands } = makeCommandRegistryPi();
+  const { manager, started } = makeFakeManager();
+  registerBuiltinWorkflows(pi, { cwd: repo, manager, storage: makeFakeStorage({}) });
+  const handler = commands.find((command) => command.name === "code-review")?.handler;
+  assert.ok(handler);
+  const { ctx, notified } = makeNotifyCtx();
+
+  await handler("", ctx);
+
+  assert.equal(started.length, 0);
+  assert.equal(notified.length, 1);
+  assert.equal(notified[0].type, "warning");
+  assert.match(notified[0].message, /skipped all 1 tracked changes/);
+  assert.match(notified[0].message, /review one explicitly/);
 });
 
 test("registerBuiltinWorkflows registers all five built-in workflow commands", () => {
