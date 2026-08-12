@@ -10,8 +10,7 @@
  * whole session until the workflow finished (#104).
  */
 
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
+import { spawn } from "node:child_process";
 import type { ExtensionAPI, ExtensionCommandContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { BuiltinWorkflowInvocation } from "./builtin-workflows.js";
 import { findBuiltinWorkflow } from "./builtin-workflows.js";
@@ -20,16 +19,68 @@ import { parseCommandArgs } from "./saved-commands.js";
 import type { WorkflowManager } from "./workflow-manager.js";
 import { createWorkflowStorage, type WorkflowStorage } from "./workflow-saved.js";
 
-const execFileAsync = promisify(execFile);
+const COMMAND_ERROR_MAX_CHARS = 32_000;
+
+export interface CapturedCommandPrefix {
+  stdout: string;
+  totalChars: number;
+}
 
 /**
- * Cap on the diff-source exec's stdout+stderr buffer. Node's default (1 MB)
- * throws on anything but a small diff — `gh pr diff` on a sizeable PR routinely
- * exceeds it. 64 MB comfortably covers any realistic diff while still bounding
- * worst-case memory; the prompt-side cap (code-review.ts's MAX_DIFF_CHARS) is
- * what actually protects the review from a huge diff, not this buffer.
+ * Stream command output while retaining only the prefix the review can use.
+ * This keeps memory bounded by MAX_DIFF_CHARS without imposing a child-process
+ * maxBuffer that rejects large diffs before the review's own truncation policy
+ * can run. stdout is decoded incrementally so split UTF-8 sequences are counted
+ * the same way as JavaScript String.length.
  */
-const DIFF_EXEC_MAX_BUFFER = 64 * 1024 * 1024;
+export function captureCommandPrefix(
+  command: string,
+  args: string[],
+  options: { cwd: string; maxChars: number },
+): Promise<CapturedCommandPrefix> {
+  if (!Number.isSafeInteger(options.maxChars) || options.maxChars < 1) {
+    return Promise.reject(new Error("captureCommandPrefix: maxChars must be a positive safe integer"));
+  }
+
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd: options.cwd,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+
+    let stdout = "";
+    let totalChars = 0;
+    let stderr = "";
+    let stderrTruncated = false;
+
+    child.stdout.on("data", (chunk: string) => {
+      totalChars += chunk.length;
+      const remaining = options.maxChars - stdout.length;
+      if (remaining > 0) stdout += chunk.slice(0, remaining);
+    });
+    child.stderr.on("data", (chunk: string) => {
+      const remaining = COMMAND_ERROR_MAX_CHARS - stderr.length;
+      if (remaining > 0) stderr += chunk.slice(0, remaining);
+      if (chunk.length > remaining) stderrTruncated = true;
+    });
+
+    child.once("error", reject);
+    child.stdout.once("error", reject);
+    child.stderr.once("error", reject);
+    child.once("close", (code, signal) => {
+      if (code === 0) {
+        resolve({ stdout, totalChars });
+        return;
+      }
+      const reason = signal ? `signal ${signal}` : `exit code ${code ?? "unknown"}`;
+      const detail = stderr.trim();
+      const truncationNote = stderrTruncated ? " [stderr truncated]" : "";
+      reject(new Error(`${command} failed with ${reason}${detail ? `: ${detail}${truncationNote}` : ""}`));
+    });
+  });
+}
 
 function alreadyRegistered(pi: ExtensionAPI, name: string): boolean {
   try {
@@ -199,6 +250,7 @@ export function registerBuiltinWorkflows(
         const input = args.trim();
         let diffSource = "git diff HEAD";
         let diff = "";
+        let originalLength = 0;
 
         try {
           let cmd: string;
@@ -220,35 +272,26 @@ export function registerBuiltinWorkflows(
             cmd = "git";
             cmdArgs = ["diff", "HEAD", "--", input];
           }
-          // execFile (not exec/shell) + array args: input can't break out into a
-          // shell command. maxBuffer raised well past Node's 1MB default so a
-          // large `gh pr diff` doesn't throw ERR_CHILD_PROCESS_STDOUT_MAXBUFFER.
-          const { stdout } = await execFileAsync(cmd, cmdArgs, { cwd: getCwd(), maxBuffer: DIFF_EXEC_MAX_BUFFER });
-          diff = stdout;
+          // spawn (not a shell) + array args: input cannot break out into a shell
+          // command. Stream the complete output for an accurate size warning while
+          // retaining only the prefix the review can consume.
+          const captured = await captureCommandPrefix(cmd, cmdArgs, {
+            cwd: getCwd(),
+            maxChars: MAX_DIFF_CHARS,
+          });
+          diff = captured.stdout;
+          originalLength = captured.totalChars;
           if (!diff.trim()) {
             return ctx.ui.notify(`No diff output from: ${diffSource}`, "warning");
           }
         } catch (err) {
-          const code = (err as NodeJS.ErrnoException | undefined)?.code;
-          if (code === "ERR_CHILD_PROCESS_STDOUT_MAXBUFFER") {
-            return ctx.ui.notify(
-              `Diff from ${diffSource} exceeds the ${Math.floor(DIFF_EXEC_MAX_BUFFER / (1024 * 1024))}MB capture limit — ` +
-                `narrow the target (e.g. a specific file or path) and try again.`,
-              "error",
-            );
-          }
           return ctx.ui.notify(
             `Failed to get diff (${diffSource}): ${err instanceof Error ? err.message : err}`,
             "error",
           );
         }
 
-        // The workflow itself also caps prompt size (MAX_DIFF_CHARS), but truncating
-        // here lets us tell the user clearly rather than have it happen silently deep
-        // inside the generated script.
-        const originalLength = diff.length;
         if (originalLength > MAX_DIFF_CHARS) {
-          diff = diff.slice(0, MAX_DIFF_CHARS);
           ctx.ui.notify(
             `Diff is ${originalLength.toLocaleString()} characters — truncated to the first ` +
               `${MAX_DIFF_CHARS.toLocaleString()} for the review. Findings past the cut are not covered.`,

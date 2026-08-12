@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { registerBuiltinWorkflows } from "../src/builtin-commands.js";
+import { captureCommandPrefix, registerBuiltinWorkflows } from "../src/builtin-commands.js";
+import { MAX_DIFF_CHARS } from "../src/code-review.js";
 import { parseWorkflowScript } from "../src/workflow.js";
 import type { WorkflowManager } from "../src/workflow-manager.js";
 import type { SavedWorkflow, WorkflowStorage } from "../src/workflow-saved.js";
@@ -49,6 +50,34 @@ function makeFakeManager() {
   } as unknown as WorkflowManager;
   return { manager, started };
 }
+
+test("captureCommandPrefix streams output beyond the legacy 64 MiB capture limit", async () => {
+  const chunkChars = 1024 * 1024;
+  const chunkCount = 65;
+  const childScript = `
+    const chunk = "x".repeat(${chunkChars});
+    let remaining = ${chunkCount};
+    function write() {
+      while (remaining > 0) {
+        remaining -= 1;
+        if (!process.stdout.write(chunk)) {
+          process.stdout.once("drain", write);
+          return;
+        }
+      }
+    }
+    write();
+  `;
+
+  const captured = await captureCommandPrefix(process.execPath, ["-e", childScript], {
+    cwd: process.cwd(),
+    maxChars: MAX_DIFF_CHARS,
+  });
+
+  assert.equal(captured.totalChars, chunkChars * chunkCount);
+  assert.equal(captured.stdout.length, MAX_DIFF_CHARS);
+  assert.equal(captured.stdout, "x".repeat(MAX_DIFF_CHARS));
+});
 
 test("registerBuiltinWorkflows registers all five built-in workflow commands", () => {
   const { pi, commands } = makeCommandRegistryPi();
