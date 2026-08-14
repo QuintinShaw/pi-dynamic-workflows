@@ -1944,7 +1944,18 @@ export function openWorkflowNavigator(
       const rerender = () => tui.requestRender();
       const markdownTheme = getMarkdownTheme();
       const renderCache = new NavigatorTextRenderCache();
-      const events = ["agentStart", "agentEnd", "phase", "log", "complete", "error", "stopped", "paused", "resumed"];
+      const events = [
+        "agentStart",
+        "agentEnd",
+        "phase",
+        "log",
+        "tokenUsage",
+        "complete",
+        "error",
+        "stopped",
+        "paused",
+        "resumed",
+      ];
       const onEvent = () => {
         if (state.kind === "runs") state.noteManagerEvent(model.visible(state.filter));
         rerender();

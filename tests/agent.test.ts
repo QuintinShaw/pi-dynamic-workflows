@@ -371,6 +371,84 @@ test("WorkflowAgent.run(): tier routing resolves correctly through the real (non
   }
 });
 
+test("WorkflowAgent.run() reports in-flight usage without changing terminal onUsage semantics", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-live-usage-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-live-usage-cwd-"));
+  const core = createFauxCore({
+    provider: "fauxtest-live-usage",
+    models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 4096 }],
+    tokenSize: { min: 1, max: 1 },
+    tokensPerSecond: 200,
+  });
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const runtime = await ModelRuntime.create({ authPath: join(home, "auth.json"), modelsPath: null });
+      runtime.registerProvider("fauxtest-live-usage", {
+        name: "Faux Test Live Usage",
+        baseUrl: "http://127.0.0.1:9/faux",
+        apiKey: "faux-dummy-key-not-used",
+        api: core.api,
+        streamSimple: core.streamSimple,
+        models: core.models.map((model) => ({
+          id: model.id,
+          name: model.name ?? model.id,
+          reasoning: false,
+          input: ["text" as const],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: model.contextWindow ?? 128000,
+          maxTokens: model.maxTokens ?? 4096,
+        })),
+      });
+      core.setResponses([fauxAssistantMessage("streaming output proves this agent is active", { stopReason: "stop" })]);
+
+      const registry = new ModelRegistry(runtime);
+      const agent = new WorkflowAgent({
+        cwd,
+        modelRegistry: registry,
+        mainModel: "fauxtest-live-usage/faux-model",
+      });
+      let settled = false;
+      let terminalCalls = 0;
+      let resolveFirstProgress: (usage: AgentUsage) => void = () => {};
+      const firstProgress = new Promise<AgentUsage>((resolve) => {
+        resolveFirstProgress = resolve;
+      });
+
+      const run = agent
+        .run("respond slowly", {
+          onUsageProgress: (usage) => {
+            if (usage.total > 0) {
+              resolveFirstProgress(usage);
+            }
+          },
+          onUsage: () => {
+            terminalCalls++;
+          },
+        })
+        .finally(() => {
+          settled = true;
+        });
+      let progressTimeout: ReturnType<typeof setTimeout> | undefined;
+      const missingProgress = new Promise<never>((resolve, reject) => {
+        void resolve;
+        progressTimeout = setTimeout(() => reject(new Error("No in-flight usage was reported")), 30_000);
+      });
+      const progress = await Promise.race([firstProgress, missingProgress]);
+      if (progressTimeout) {
+        clearTimeout(progressTimeout);
+      }
+
+      assert.equal(settled, false, "progress must arrive before the subagent settles");
+      assert.ok(progress.output > 0, "streaming text should produce a positive output estimate");
+      await run;
+      assert.equal(terminalCalls, 1, "onUsage remains a once-only terminal callback");
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 // ═══════════════════════════════════════════════════════════════════════════
 // WorkflowAgent.run(): opts.schema must be a top-level JSON object schema
 // (#330 audit) — a non-object schema (e.g. array/primitive) would otherwise

@@ -73,7 +73,7 @@ function watchRun(manager: WorkflowManager, pi: ExtensionAPI, ctx: ExtensionComm
     if (!e || e.runId === id) update();
   };
   let settled = false;
-  const progressEvents = ["agentStart", "agentEnd", "phase", "log"];
+  const progressEvents = ["agentStart", "agentEnd", "phase", "log", "tokenUsage"];
   const finalEvents = ["complete", "error", "stopped", "paused"];
   const finish = (e: { runId?: string }) => {
     if (e && e.runId !== id) return;

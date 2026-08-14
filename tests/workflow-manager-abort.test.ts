@@ -28,20 +28,50 @@ function fakeAgent(usage: Partial<AgentUsage> = {}, result: unknown = "ok") {
   };
 }
 
-/** Agent that stays running until a deferred resolve is called externally. */
+/** Agent that stays running until resolved externally or its attempt is aborted. */
 function deferredAgent() {
-  let deferredResolve: ((value: unknown) => void) | null = null;
-  let deferredReject: ((err: Error) => void) | null = null;
-  const promise = new Promise((resolve, reject) => {
-    deferredResolve = resolve;
-    deferredReject = reject;
-  });
+  interface PendingAttempt {
+    resolve: (value: unknown) => void;
+    reject: (error: Error) => void;
+    signal?: AbortSignal;
+    onAbort: () => void;
+  }
+
+  const pendingAttempts = new Set<PendingAttempt>();
+  const settleAttempt = (attempt: PendingAttempt, settle: () => void) => {
+    attempt.signal?.removeEventListener("abort", attempt.onAbort);
+    pendingAttempts.delete(attempt);
+    settle();
+  };
   return {
-    resolve: (value: unknown = "done") => deferredResolve?.(value),
-    reject: (err: Error) => deferredReject?.(err),
+    resolve: (value: unknown = "done") => {
+      for (const attempt of [...pendingAttempts]) {
+        settleAttempt(attempt, () => attempt.resolve(value));
+      }
+    },
+    reject: (error: Error) => {
+      for (const attempt of [...pendingAttempts]) {
+        settleAttempt(attempt, () => attempt.reject(error));
+      }
+    },
     runner: {
-      async run(_prompt: string, _options?: { onUsage?: (u: AgentUsage) => void }) {
-        return promise;
+      async run(prompt: string, options?: { onUsage?: (usage: AgentUsage) => void; signal?: AbortSignal }) {
+        void prompt;
+        return new Promise((resolve, reject) => {
+          const attempt: PendingAttempt = {
+            resolve,
+            reject,
+            signal: options?.signal,
+            onAbort: () => {},
+          };
+          attempt.onAbort = () => settleAttempt(attempt, () => reject(new Error("deferred agent aborted")));
+          pendingAttempts.add(attempt);
+          if (attempt.signal?.aborted) {
+            attempt.onAbort();
+          } else {
+            attempt.signal?.addEventListener("abort", attempt.onAbort, { once: true });
+          }
+        });
       },
     },
   };
@@ -480,12 +510,10 @@ test(
     const { runId, promise } = manager.startInBackground(oneAgentScript);
     await new Promise((r) => setTimeout(r, 20));
     manager.pause(runId);
-
-    assert.ok(pausedEvent, "paused event should fire");
-    assert.equal(pausedEvent?.runId, runId);
-
-    da.resolve("done");
     await promise.catch(() => {});
+
+    assert.ok(pausedEvent, "paused event should fire after the paused execution settles");
+    assert.equal(pausedEvent?.runId, runId);
   }),
 );
 
@@ -604,6 +632,10 @@ return { a, b }`;
       // Resume
       const resumed = await manager.resume(runId);
       assert.equal(resumed, true);
+      while ((manager.getRun(runId)?.snapshot.agents.length ?? 0) < 2) {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+      da.resolve("second-result");
 
       // Wait for resumed run to complete (agent 1 replayed from journal, agent 2 live)
       await new Promise((r) => setTimeout(r, 50));

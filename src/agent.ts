@@ -3,6 +3,7 @@ import { unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { AssistantMessage, Model, TextContent } from "@earendil-works/pi-ai";
 import {
+  type AgentSessionEvent,
   type CreateAgentSessionOptions,
   createAgentSession,
   createCodingTools,
@@ -17,6 +18,10 @@ import {
 import type { Static, TSchema } from "typebox";
 import { Check, Convert } from "typebox/value";
 import { type AgentHistoryEntry, compactAgentHistory } from "./agent-history.js";
+import { type AgentUsage, agentUsageEquals, createEmptyAgentUsage, sumAgentUsage } from "./agent-usage.js";
+
+export type { AgentUsage } from "./agent-usage.js";
+
 import { applyToolPolicy } from "./agent-registry.js";
 import { classifyProviderLimit, WorkflowError, WorkflowErrorCode } from "./errors.js";
 import { canonicalModelSpec, resolveModelSpecWithThinking } from "./model-spec.js";
@@ -28,6 +33,8 @@ import {
   resolveTierModel,
 } from "./model-tier-config.js";
 import { createStructuredOutputTool, type StructuredOutputCapture } from "./structured-output.js";
+
+const LIVE_USAGE_EMIT_INTERVAL_MS = 250;
 
 /**
  * Find a JSON object/array in free-form text: a fenced ```json block if present,
@@ -365,16 +372,6 @@ function warnPersistSecretsOnce(sessionDir: string): void {
   );
 }
 
-/** Real token/cost usage for a single subagent run, read from the SDK session. */
-export interface AgentUsage {
-  input: number;
-  output: number;
-  cacheRead: number;
-  cacheWrite: number;
-  total: number;
-  cost: number;
-}
-
 /**
  * Map session stats to an AgentUsage, or undefined when the provider reported
  * no usage at all (all-zero stats). Returning undefined — instead of a zero
@@ -397,6 +394,57 @@ export function usageFromStats(stats: {
   };
 }
 
+function estimateStreamingAssistantUsage(event: AgentSessionEvent): AgentUsage | undefined {
+  if (event.type !== "message_update" && event.type !== "message_end") {
+    return undefined;
+  }
+  if (event.message.role !== "assistant") {
+    return undefined;
+  }
+
+  const reported = event.message.usage;
+  const reportedTotal = reported.input + reported.output + reported.cacheRead + reported.cacheWrite;
+  if (reportedTotal > 0 || reported.cost.total > 0) {
+    return {
+      input: reported.input,
+      output: reported.output,
+      cacheRead: reported.cacheRead,
+      cacheWrite: reported.cacheWrite,
+      total: reportedTotal,
+      cost: reported.cost.total,
+    };
+  }
+
+  let streamedCharacters = 0;
+  for (const content of event.message.content) {
+    if (content.type === "text") {
+      streamedCharacters += content.text.length;
+    } else if (content.type === "thinking") {
+      streamedCharacters += content.thinking.length;
+    } else if (content.type === "toolCall") {
+      streamedCharacters += JSON.stringify(content.arguments).length;
+    }
+  }
+  if (streamedCharacters === 0) {
+    return undefined;
+  }
+
+  const estimatedOutput = Math.max(1, Math.ceil(streamedCharacters / 4));
+  return { input: 0, output: estimatedOutput, cacheRead: 0, cacheWrite: 0, total: estimatedOutput, cost: 0 };
+}
+
+function usageFromSessionProgress(
+  stats: Parameters<typeof usageFromStats>[0],
+  event: AgentSessionEvent,
+): AgentUsage | undefined {
+  const persisted = usageFromStats(stats);
+  const streaming = estimateStreamingAssistantUsage(event);
+  if (!streaming) {
+    return persisted;
+  }
+  return sumAgentUsage(persisted ?? createEmptyAgentUsage(), streaming);
+}
+
 export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefined> {
   label?: string;
   /**
@@ -410,13 +458,14 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
   tools?: ToolDefinition[];
   instructions?: string;
   signal?: AbortSignal;
-  /**
-   * Called once with this subagent's real usage, read from the session right
-   * before disposal. Fires on both the success and error paths so partial
-   * usage is never lost — but NOT when the provider reported no usage at all
-   * (all-zero stats), so consumers keep their scalar fallback.
-   */
+  /** Called once before disposal with exact cumulative provider usage, when reported. */
   onUsage?: (usage: AgentUsage) => void;
+  /**
+   * Called with cumulative progress while the subagent runs. The current
+   * streaming response uses an output-token estimate until the provider's exact
+   * terminal usage replaces it.
+   */
+  onUsageProgress?: (usage: AgentUsage) => void;
   /**
    * Model spec for this subagent: either `provider/modelId` (unambiguous) or a
    * bare `modelId`, parsed with the same grammar as Pi CLI's `--model`. When it
@@ -925,6 +974,9 @@ export class WorkflowAgent {
     let removeTurnListener: (() => void) | undefined;
     let lastHistoryEmit = 0;
     let threadTurnSucceeded = false;
+    let removeSessionListener: (() => void) | undefined;
+    let lastUsageProgressEmit = 0;
+    let lastProgressUsage: AgentUsage | undefined;
     const emitHistory = () => options.onHistory?.(compactAgentHistory(session.messages));
     const maybeEmitHistory = () => {
       if (!options.onHistory) return;
@@ -933,6 +985,34 @@ export class WorkflowAgent {
       lastHistoryEmit = now;
       emitHistory();
     };
+    const emitUsageProgress = (event: AgentSessionEvent) => {
+      if (!options.onUsageProgress) {
+        return;
+      }
+      const now = Date.now();
+      if (
+        event.type === "message_update" &&
+        lastProgressUsage &&
+        now - lastUsageProgressEmit < LIVE_USAGE_EMIT_INTERVAL_MS
+      ) {
+        return;
+      }
+      const usage = usageFromSessionProgress(session.getSessionStats(), event);
+      if (!usage || (lastProgressUsage && agentUsageEquals(lastProgressUsage, usage))) {
+        return;
+      }
+      lastUsageProgressEmit = now;
+      lastProgressUsage = usage;
+      options.onUsageProgress(usage);
+    };
+    const emitSessionProgress = (event: AgentSessionEvent) => {
+      maybeEmitHistory();
+      try {
+        emitUsageProgress(event);
+      } catch {
+        // Usage progress is best-effort; never let stats failure interrupt the agent.
+      }
+    };
     try {
       if (options.signal?.aborted) throw new Error("Subagent was aborted");
       if (options.signal) {
@@ -940,8 +1020,8 @@ export class WorkflowAgent {
         options.signal.addEventListener("abort", onAbort, { once: true });
         removeAbortListener = () => options.signal?.removeEventListener("abort", onAbort);
       }
-      if (options.onHistory) {
-        removeHistoryListener = session.subscribe(() => maybeEmitHistory());
+      if (options.onHistory || options.onUsageProgress) {
+        removeSessionListener = session.subscribe(emitSessionProgress);
       }
       removeTurnListener = session.subscribe((event) => {
         if (event.type === "message_end") turnMessages.push(event.message);
@@ -984,6 +1064,7 @@ export class WorkflowAgent {
       removeAbortListener?.();
       removeHistoryListener?.();
       removeTurnListener?.();
+      removeSessionListener?.();
       try {
         emitHistory();
       } catch {

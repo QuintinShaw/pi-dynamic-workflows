@@ -5,6 +5,7 @@
 import { EventEmitter } from "node:events";
 import type { ModelRegistry, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { WorkflowAgent } from "./agent.js";
+import { type AgentUsage, createEmptyAgentUsage, sumAgentUsage } from "./agent-usage.js";
 import { MAX_AGENTS_PER_RUN } from "./config.js";
 import { preview, type WorkflowAgentSnapshot, type WorkflowSnapshot } from "./display.js";
 import { isProviderUsageLimit, WorkflowError, WorkflowErrorCode } from "./errors.js";
@@ -28,6 +29,25 @@ interface LifecycleControl {
 /** Per-execution identity for an abort received from the host/tool signal. */
 interface ExternalAbort {
   abortReason: object;
+}
+
+const PAUSED_EXECUTION_SETTLE_TIMEOUT_MS = 1_000;
+
+async function waitForPausedExecutionSettlement(execution: Promise<unknown>): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const settled = execution.then(
+    () => true,
+    () => true,
+  );
+  const timeout = new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => resolve(false), PAUSED_EXECUTION_SETTLE_TIMEOUT_MS);
+    timer.unref?.();
+  });
+  const didSettle = await Promise.race([settled, timeout]);
+  if (timer) {
+    clearTimeout(timer);
+  }
+  return didSettle;
 }
 
 export interface ManagedRun {
@@ -170,6 +190,7 @@ export interface ExecOptions {
    * WorkflowRunOptions.resumeJournal in workflow.ts.
    */
   resumeJournal?: Map<string, JournalEntry>;
+
   /** Cap on total agents for this run. */
   maxAgents?: number;
   /** Per-agent timeout in milliseconds. null/omitted means no hard timeout. */
@@ -213,14 +234,7 @@ export interface ExecOptions {
    * execution's fresh SharedRuntime starts counting from the already-spent
    * total instead of zero (see A2 in workflow-manager's resume()).
    */
-  initialTokenUsage?: {
-    input: number;
-    output: number;
-    total: number;
-    cost: number;
-    cacheRead: number;
-    cacheWrite: number;
-  };
+  initialTokenUsage?: AgentUsage;
 }
 
 export interface WorkflowManagerOptions {
@@ -365,6 +379,9 @@ export class WorkflowManager extends EventEmitter {
    */
   private terminalRunQueue: string[] = [];
   private maxTerminalRunsInMemory: number;
+
+  /** Executions by managed run, so pause/resume can wait for settlement before overlapping. */
+  private readonly executions = new WeakMap<ManagedRun, Promise<WorkflowRunResult>>();
   private persistence: RunPersistence;
   private cwd: string;
   private concurrency: number;
@@ -625,6 +642,7 @@ export class WorkflowManager extends EventEmitter {
     // already records status/event/persist, but the promise still rejects.
     // The original promise is returned so callers can await it in try/catch.
     const promise = this.executeRun(managed, script, args, exec);
+    this.executions.set(managed, promise);
     promise.catch(() => {});
 
     return { runId, promise };
@@ -653,7 +671,9 @@ export class WorkflowManager extends EventEmitter {
     // Persist the initial state immediately so listRuns()/the task panel can see
     // the run the moment it starts, not only after the first agent journals.
     this.persistRun(managed);
-    return this.executeRun(managed, script, args, exec);
+    const execution = this.executeRun(managed, script, args, exec);
+    this.executions.set(managed, execution);
+    return execution;
   }
 
   /** Build a fresh managed run with an empty snapshot. */
@@ -746,6 +766,8 @@ export class WorkflowManager extends EventEmitter {
     const progress = () => {
       if (this.isCurrent(managed)) onProgress?.(managed.snapshot);
     };
+    // Live per-call display updates are keyed by the same unique `id` upstream
+    // events carry (see managed.agentsById) — the manager keeps no separate map.
     // Let a host abort (e.g. Esc during a blocking tool call) cancel this run.
     // Own this listener for exactly this executeRun() invocation: a reused host
     // signal must not retain a settled manager/run closure or abort it later.
@@ -797,14 +819,6 @@ export class WorkflowManager extends EventEmitter {
         // runWorkflow only applies this on the fresh-SharedRuntime branch, never
         // overriding an inherited options.sharedRuntime from a nested workflow()).
         initialTokenUsage,
-        // Retried-attempt spend (see WorkflowRunOptions.onRetrySpend and A2):
-        // recordTokens() in workflow.ts already folded this into
-        // shared.spent/tokenUsage, but onAgentEnd never sees a retried
-        // (non-final) attempt — fold it into the same persisted aggregate here
-        // so a run paused after a retry doesn't under-count against the budget.
-        onRetrySpend: (tokens) => {
-          this.accumulateTokenUsage(managed, tokens);
-        },
         onAgentJournal: (entry) => {
           // Append (crash-safe-ish): keep the latest entry per (runId, index)
           // pair, then persist. Matching on index ALONE would let a nested
@@ -845,13 +859,31 @@ export class WorkflowManager extends EventEmitter {
           };
           managed.snapshot.agents.push(agentSnapshot);
           // Index by the call's unique id (never label — see agentsById's doc
-          // comment) so onAgentEnd/onAgentHistory can resolve back to exactly
-          // THIS entry even when a concurrent sibling shares its label.
+          // comment) so onAgentEnd/onAgentHistory/onAgentUsage can resolve back
+          // to exactly THIS entry even when a concurrent sibling shares its
+          // label.
           managed.agentsById.set(event.id, agentSnapshot);
           // Real per-agent start time, captured the moment the agent actually
           // starts (not the run's startedAt) — see agentTimestamps.
           managed.agentTimestamps.set(id, { startedAt: new Date().toISOString() });
           this.emitLive(managed, "agentStart", { runId: managed.runId, ...event });
+          progress();
+        },
+        onAgentUsage: (event) => {
+          const agent = managed.agentsById.get(event.id);
+          if (!agent) {
+            return;
+          }
+
+          agent.tokens = event.tokenUsage.total;
+          agent.tokenUsage = event.tokenUsage;
+          if (event.committedUsage) {
+            this.commitFinalizedAgentUsage(managed, event.committedUsage);
+          }
+          this.emitLive(managed, "agentUsage", { runId: managed.runId, ...event });
+          // Detailed displays aggregate live per-agent usage; this event triggers
+          // their refresh without committing estimates into persisted run totals.
+          this.emitLive(managed, "tokenUsage", { runId: managed.runId, usage: managed.snapshot.tokenUsage });
           progress();
         },
         onAgentEnd: (event) => {
@@ -865,28 +897,17 @@ export class WorkflowManager extends EventEmitter {
             agent.error = event.error;
             agent.errorCode = event.errorCode;
             agent.recoverable = event.recoverable;
-            agent.tokens = event.tokens;
-            if (event.tokenUsage) agent.tokenUsage = event.tokenUsage;
+            agent.tokens = Math.max(agent.tokens ?? 0, event.tokens ?? 0);
+            if (!agent.tokenUsage && event.tokenUsage) {
+              agent.tokenUsage = event.tokenUsage;
+            }
             if (event.model) agent.model = event.model;
             // Real per-agent end time — only terminal agents get one; a still-
             // running agent's entry keeps endedAt undefined.
             const ts = managed.agentTimestamps.get(agent.id);
             if (ts) ts.endedAt = new Date().toISOString();
+            managed.agentsById.delete(event.id);
           }
-          // Progressive run-wide token aggregate (A2): workflow.ts's onTokenUsage
-          // callback below fires exactly once, only when the whole script finishes
-          // successfully (a deliberate, tested contract — see
-          // "agent() accumulates usage across multiple agents" in agent.test.ts,
-          // which asserts one final event, not one per agent). A run that
-          // pauses/aborts/fails mid-flight never reaches it, so without tracking
-          // it here too, a paused run's persisted tokenUsage would stay whatever
-          // it was (usually unset) — starving resume()'s spend-seeding of the
-          // very data it needs. Accumulate additively from every onAgentEnd
-          // instead: a cache-hit replay reports tokens: 0 (see agent()'s replay
-          // branch in workflow.ts), so replaying the unchanged prefix on resume
-          // is a no-op add here, matching the "already historically spent, don't
-          // double-count" semantics of journal replay.
-          this.accumulateTokenUsage(managed, event.tokens ?? 0, event.tokenUsage);
           this.emitLive(managed, "agentEnd", { runId: managed.runId, ...event });
           progress();
         },
@@ -1107,38 +1128,20 @@ export class WorkflowManager extends EventEmitter {
     }
   }
 
-  /**
-   * Additively fold one agent-call's token cost into the run-wide persisted
-   * aggregate (managed.snapshot.tokenUsage), seeded (on resume) from the
-   * persisted total-at-pause — see A2. Shared by onAgentEnd (a completed or
-   * finally-failed agent call) and onRetrySpend (a failed attempt that WILL
-   * be retried, whose cost recordTokens() already folded into
-   * shared.spent/tokenUsage in workflow.ts, but which onAgentEnd never sees —
-   * see WorkflowRunOptions.onRetrySpend for why that needs its own channel).
-   */
-  private accumulateTokenUsage(
-    managed: ManagedRun,
-    tokens: number,
-    tokenUsage?: { input: number; output: number; cost: number; cacheRead: number; cacheWrite: number },
-  ): void {
+  /** Add one settled logical agent's exact usage to the persisted run aggregate. */
+  private commitFinalizedAgentUsage(managed: ManagedRun, usage: AgentUsage): void {
     const prior = managed.snapshot.tokenUsage;
-    const usage = {
-      input: prior?.input ?? 0,
-      output: prior?.output ?? 0,
-      total: prior?.total ?? 0,
-      cost: prior?.cost ?? 0,
-      cacheRead: prior?.cacheRead ?? 0,
-      cacheWrite: prior?.cacheWrite ?? 0,
-    };
-    usage.total += tokens;
-    if (tokenUsage) {
-      usage.input += tokenUsage.input;
-      usage.output += tokenUsage.output;
-      usage.cost += tokenUsage.cost;
-      usage.cacheRead += tokenUsage.cacheRead;
-      usage.cacheWrite += tokenUsage.cacheWrite;
-    }
-    managed.snapshot.tokenUsage = usage;
+    const priorUsage: AgentUsage = prior
+      ? {
+          input: prior.input,
+          output: prior.output,
+          total: prior.total,
+          cost: prior.cost ?? 0,
+          cacheRead: prior.cacheRead ?? 0,
+          cacheWrite: prior.cacheWrite ?? 0,
+        }
+      : createEmptyAgentUsage();
+    managed.snapshot.tokenUsage = sumAgentUsage(priorUsage, usage);
   }
 
   /** Abort this execution for a host/tool signal, retaining provenance so a
@@ -1336,8 +1339,9 @@ export class WorkflowManager extends EventEmitter {
     managed.status = "paused";
     this.abortForLifecycleControl(managed, "pause");
     this.emit("paused", { runId });
+    // Persist the requested lifecycle state immediately, but retain the lease
+    // until executeRun settles and writes exact abort-teardown usage.
     this.persistRun(managed);
-    this.releaseRunLease(managed);
     return true;
   }
 
@@ -1347,9 +1351,10 @@ export class WorkflowManager extends EventEmitter {
    *
    * `opts.script` lets the orchestrating model resume with an EDITED script
    * (cached-prefix reuse / iteration): unchanged agent() calls whose content
-   * hash still matches the journal entry at their positional callIndex replay
-   * from cache, while the first changed or newly inserted call — and everything
-   * after it — re-runs live. When `opts.script` is omitted, resume behaves
+   * hash still matches the journal entry at their run-qualified call identity
+   * replay from cache, while the first changed or newly inserted call — including
+   * downstream nested workflows — and everything after it re-runs live. When
+   * `opts.script` is omitted, resume behaves
    * exactly as before and uses the persisted script (auto-resume, TUI resume);
    * this keeps the existing single-arg `resume(runId)` callers (e.g. the
    * UsageLimitScheduler) unchanged. `opts.args` overrides the persisted args
@@ -1361,6 +1366,17 @@ export class WorkflowManager extends EventEmitter {
     const active = this.runs.get(runId);
     if (active?.status === "running") return false;
     if (active?.status === "aborted") return false;
+
+    const settlingExecution = active ? this.executions.get(active) : undefined;
+    if (settlingExecution) {
+      if (!(await waitForPausedExecutionSettlement(settlingExecution))) {
+        return false;
+      }
+      const current = this.runs.get(runId);
+      if (current !== active || current?.status === "aborted") {
+        return false;
+      }
+    }
 
     const persisted = this.persistence.load(runId);
     if (!persisted?.script || persisted.status === "completed" || persisted.status === "aborted") return false;
@@ -1418,8 +1434,8 @@ export class WorkflowManager extends EventEmitter {
         errorCount: 0,
         // Seed the live snapshot's aggregate from the persisted total-at-pause
         // (see A2) so a pause that lands before this resume's first agent
-        // completes doesn't lose the prior spend — onAgentEnd accumulates on
-        // top of this rather than starting from scratch.
+        // completes doesn't lose the prior spend — committed onAgentUsage
+        // deltas accumulate on top of this rather than starting from scratch.
         tokenUsage: priorTokenUsage,
       },
       controller,
@@ -1482,7 +1498,6 @@ export class WorkflowManager extends EventEmitter {
     // Persist before notifying renderers: listRuns() is their source of truth for
     // lifecycle status, while getRun() supplies the live in-memory snapshot.
     this.persistRun(managed);
-
     // Namespace by (runId, index) exactly like the live onAgentJournal dedup
     // above and like SharedStore's deltaKey — see JournalEntry.runId. A
     // legacy entry persisted before namespacing existed has no `runId`; it is
@@ -1497,7 +1512,7 @@ export class WorkflowManager extends EventEmitter {
     // (A2) from the persisted total-at-pause, so the tokenBudget cap holds
     // cumulatively instead of resetting to zero. Note: shared.agentCount is
     // deliberately NOT seeded the same way — it doesn't need to be. Unlike
-    // token spend (whose cache-hit replay branch skips recordTokens() to avoid
+    // token spend (whose cache-hit replay branch skips committing usage to avoid
     // double-counting already-spent tokens), agent()'s shared.agentCount++
     // fires unconditionally for EVERY call, cache-hit or live, before the
     // replay check runs (see workflow.ts). Because resume() always replays the
@@ -1505,7 +1520,12 @@ export class WorkflowManager extends EventEmitter {
     // correct cumulative count inside this fresh SharedRuntime by the time any
     // new live agent runs — so maxAgents (via A1) is already a genuine
     // cumulative cap across resume with no extra seeding required.
-    void this.executeRun(managed, script, args, { resumeJournal, initialTokenUsage: priorTokenUsage }).catch(() => {});
+    const execution = this.executeRun(managed, script, args, {
+      resumeJournal,
+      initialTokenUsage: priorTokenUsage,
+    });
+    this.executions.set(managed, execution);
+    void execution.catch(() => {});
     return true;
   }
 
