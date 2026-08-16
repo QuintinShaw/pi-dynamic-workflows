@@ -12,11 +12,13 @@ import {
   type WorkflowReloadRuntime,
 } from "../src/extension-reload.js";
 import {
+  bindSessionDelivery,
   createEffortState,
   createWebTools,
   createWorkflowControlTool,
   createWorkflowStorage,
   createWorkflowTool,
+  dropSessionDelivery,
   type EffortState,
   installResultDelivery,
   installTaskPanel,
@@ -27,7 +29,6 @@ import {
   registerEffortCommand,
   registerWorkflowCommands,
   registerWorkflowModelsCommand,
-  resumeResultDelivery,
   saveWorkflowSettingsForCwd,
   suspendResultDelivery,
   UsageLimitScheduler,
@@ -153,11 +154,10 @@ export default function extension(pi: ExtensionAPI) {
   const getCwd = () => cwd;
   const getStorage = () => storage;
 
-  // Install delivery listeners once. Keep suspended until session_start —
-  // factory runs before Pi bindCore(), so sendMessage is still the
-  // "runtime not initialized" stub. Flushing here would re-queue forever.
+  // Install delivery listeners once. Delivery is fail-closed until
+  // session_start binds a per-session endpoint (no "latest pi wins"). Completions
+  // that race before bind leave a disk pending marker and flush on bind.
   installResultDelivery(pi, manager, { loadSettings: () => loadWorkflowSettings({ cwd: getCwd() }) });
-  suspendResultDelivery(manager);
 
   const workflowTool = createWorkflowTool({
     getManager,
@@ -186,6 +186,7 @@ export default function extension(pi: ExtensionAPI) {
     // lost). Replacement reasons stage the runtime for the next generation
     // only when the destination is the same project; quit/unknown/cross-project
     // pause in-flight runs onto the journal path.
+    const outgoingSessionId = manager.getSessionId?.();
     suspendResultDelivery(manager);
 
     const reason = event?.reason;
@@ -210,6 +211,7 @@ export default function extension(pi: ExtensionAPI) {
         if (targetCwd !== cwd) {
           pauseStrandedWorkflowRuntime(runtime);
           discardWorkflowRuntime(cwd, runtime);
+          dropSessionDelivery(outgoingSessionId);
           return;
         }
         handoffWorkflowRuntime(runtime);
@@ -220,6 +222,7 @@ export default function extension(pi: ExtensionAPI) {
         if (targetCwd && targetCwd !== cwd) {
           pauseStrandedWorkflowRuntime(runtime);
           discardWorkflowRuntime(cwd, runtime);
+          dropSessionDelivery(outgoingSessionId);
           return;
         }
         handoffWorkflowRuntime(runtime);
@@ -231,6 +234,7 @@ export default function extension(pi: ExtensionAPI) {
 
     pauseStrandedWorkflowRuntime(runtime);
     discardWorkflowRuntime(cwd, runtime);
+    dropSessionDelivery(outgoingSessionId);
   });
 
   registerWorkflowCommands(pi, getManager, {
@@ -304,21 +308,32 @@ export default function extension(pi: ExtensionAPI) {
     const missing = workflowTools.filter((name) => !active.includes(name));
     if (missing.length) pi.setActiveTools([...active, ...missing]);
 
-    // Bind + adopt before resuming delivery so a flushed completion is tagged
-    // with this session and visible in its panel.
+    // Bind + adopt before binding delivery so a flushed completion is tagged
+    // with this session and visible in its panel. Capture the previous id first
+    // so completed-with-pending can be re-homed across /new / fork / switch.
     let sessionId: string | undefined;
     try {
       sessionId = ctx.sessionManager?.getSessionId();
     } catch {
       // sessionManager may be unavailable — fall back to global history.
     }
+    const previousSessionId = manager.getSessionId();
+    manager.adoptLiveRunsToSession(sessionId, previousSessionId);
     manager.setSessionId(sessionId);
-    manager.adoptLiveRunsToSession(sessionId);
 
-    // Runtime is bound now (session_start fires after bindCore). Unsuspend and
-    // flush anything queued while the previous ctx was dying or this factory
-    // was still loading.
-    resumeResultDelivery(manager);
+    // Runtime is bound now (session_start fires after bindCore). Register a
+    // session-stable delivery endpoint for THIS session only, then flush any
+    // disk/memory pending for this sessionId (parallel siblings never share it).
+    if (sessionId) {
+      bindSessionDelivery(sessionId, pi, {
+        loadSettings: () => loadWorkflowSettings({ cwd: getCwd() }),
+        manager,
+        sessionManager: ctx.sessionManager,
+      });
+      if (previousSessionId && previousSessionId !== sessionId) {
+        dropSessionDelivery(previousSessionId);
+      }
+    }
 
     installTaskPanel(pi, manager, ctx.ui, {
       storage,
@@ -335,12 +350,14 @@ export default function extension(pi: ExtensionAPI) {
       armingInstalled = true;
     }
   });
+}
+)
 
-  // Keep mainModel in sync with mid-session /model (and cycle/restore). Without
-  // this, workflow subagents that fall through to mainModel keep the frozen
-  // session_start value for the rest of the process lifetime.
-  pi.on("model_select", (event) => {
-    const m = event.model;
-    manager.setMainModel(m ? `${m.provider}/${m.id}` : undefined);
-  });
+// Keep mainModel in sync with mid-session /model (and cycle/restore). Without
+// this, workflow subagents that fall through to mainModel keep the frozen
+// session_start value for the rest of the process lifetime.
+pi.on("model_select", (event) => {
+  const m = event.model;
+  manager.setMainModel(m ? `${m.provider}/${m.id}` : undefined);
+});
 }

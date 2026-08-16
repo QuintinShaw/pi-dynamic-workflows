@@ -142,7 +142,20 @@ export interface PersistedRunState {
    * auto-resume attempt has been recorded yet.
    */
   autoResumeAttempts?: number;
+  /**
+   * Undelivered background-result payload waiting for the originating session's
+   * delivery endpoint. Written before the send attempt (fail-closed); cleared
+   * only after a successful session-routed delivery. `complete` recomputes text
+   * from the persisted result on flush so we don't retain a second full copy.
+   */
+  pendingDelivery?: PendingDeliveryMarker;
 }
+
+/**
+ * Disk/memory marker for a background result that still needs conversation
+ * delivery. Kept small on purpose — never store full agent transcripts here.
+ */
+export type PendingDeliveryMarker = { kind: "complete" } | { kind: "text"; text: string };
 
 export interface RunPersistence {
   /** Save current run state. */

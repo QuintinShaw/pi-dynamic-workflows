@@ -5,12 +5,13 @@
 import { EventEmitter } from "node:events";
 import type { ModelRegistry, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { WorkflowAgent } from "./agent.js";
-import { MAX_AGENTS_PER_RUN } from "./config.js";
+import { MAX_AGENTS_PER_RUN, MAX_AGENTS_PER_RUN } from "./config.js";
 import { preview, type WorkflowAgentSnapshot, type WorkflowSnapshot } from "./display.js";
 import { isProviderUsageLimit, WorkflowError, WorkflowErrorCode } from "./errors.js";
 import {
   createRunPersistence,
   generateRunId,
+  type PendingDeliveryMarker,
   type PersistedRunState,
   type RunLease,
   type RunPersistence,
@@ -48,6 +49,12 @@ export interface ManagedRun {
    * the run and hide it from stranded-pause / the originating session's panel.
    */
   sessionId?: string;
+  /**
+   * Background result still waiting for session-routed conversation delivery.
+   * Set before the send attempt and cleared only after a successful deliver so a
+   * missing/suspended endpoint cannot lose the result (see task-panel delivery).
+   */
+  pendingDelivery?: PendingDeliveryMarker;
   /**
    * Auto-resume eligibility for this run (see ExecOptions.autoResume). Set once
    * at creation and carried through resume() so it survives pause/resume cycles.
@@ -366,6 +373,11 @@ export class WorkflowManager extends EventEmitter {
     this.sessionId = id;
   }
 
+  /** Currently bound pi session id (set on session_start), if any. */
+  getSessionId(): string | undefined {
+    return this.sessionId;
+  }
+
   /** Project cwd this manager was constructed for (persistence + agent tools). */
   getCwd(): string {
     return this.cwd;
@@ -381,21 +393,43 @@ export class WorkflowManager extends EventEmitter {
   }
 
   /**
-   * After an in-process session replacement keeps this manager, re-home every
-   * still-running (or paused-in-memory) run onto the new session so the panel,
-   * workflow_control, and a later stranded-pause all see them. Completed runs
-   * keep their original sessionId so history stays with the session that ran
-   * them. No-op when `sessionId` is undefined.
+   * After an in-process session replacement keeps this manager, re-home work
+   * that still needs this conversation onto `sessionId`:
+   *  - still-running / paused-in-memory runs (panel, workflow_control, stranded-pause)
+   *  - any run (live or disk-only) with an undelivered `pendingDelivery` marker
+   *
+   * Terminal runs *without* pending keep their original sessionId so history
+   * stays with the session that ran them. `previousSessionId` scopes disk-only
+   * pending re-home so a parallel sibling in the same runsDir cannot steal
+   * another session's undelivered work. No-op when `sessionId` is undefined.
    */
-  adoptLiveRunsToSession(sessionId: string | undefined): number {
+  adoptLiveRunsToSession(sessionId: string | undefined, previousSessionId?: string): number {
     if (!sessionId) return 0;
+    const prev = previousSessionId !== undefined ? previousSessionId : this.sessionId;
     let adopted = 0;
     for (const managed of this.runs.values()) {
-      if (managed.status !== "running" && managed.status !== "paused") continue;
+      const active = managed.status === "running" || managed.status === "paused";
+      const undelivered = managed.pendingDelivery != null;
+      if (!active && !undelivered) continue;
       if (managed.sessionId === sessionId) continue;
       managed.sessionId = sessionId;
       this.persistRun(managed);
       adopted++;
+    }
+    // Disk-only undelivered rows (terminal runs already evicted from memory).
+    // Re-home markers tagged with the previous session id; never claim foreign
+    // or null sessionIds here (null live rows are claimed at bind flush).
+    try {
+      for (const state of this.persistence.list()) {
+        if (!state.pendingDelivery) continue;
+        if (this.runs.has(state.runId)) continue;
+        if (state.sessionId === sessionId) continue;
+        if (prev == null || state.sessionId !== prev) continue;
+        this.persistence.save({ ...state, sessionId });
+        adopted++;
+      }
+    } catch {
+      // best-effort — live adopt above is the critical path
     }
     return adopted;
   }
@@ -1098,6 +1132,8 @@ export class WorkflowManager extends EventEmitter {
         // setSessionId() (session replacement) must not re-home a still-running
         // run out from under stranded-pause / the originating panel.
         sessionId: managed.sessionId,
+        // Fail-closed delivery marker — survives endpoint gaps / process restart.
+        pendingDelivery: managed.pendingDelivery,
         journal: keepsResumeJournal ? managed.journal : undefined,
         status: managed.status,
         // Persisted every write (not just at pause) so a stale read during the
@@ -1265,6 +1301,9 @@ export class WorkflowManager extends EventEmitter {
       // Prefer the frozen owner on disk; fall back to the manager's current
       // session only for legacy runs that predate per-run sessionId.
       sessionId: persisted.sessionId ?? this.sessionId,
+      // Carry any undelivered conversation payload across resume so session_start
+      // flush can still re-inject after a pause/restart gap.
+      pendingDelivery: persisted.pendingDelivery,
       lease,
       // Carry the original opt-out forward across resumes; it's fixed at
       // run-start and persistRun() re-persists it on every subsequent write.

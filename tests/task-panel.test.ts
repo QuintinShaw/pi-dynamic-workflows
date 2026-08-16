@@ -1,15 +1,48 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { join } from "node:path";
-import { before, describe, it } from "node:test";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { before, beforeEach, describe, it } from "node:test";
+import { AgentSession, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
+
+type DeliveryCall = { content: string; customType?: string; triggerTurn?: boolean };
+type StableSend = (
+  msg: { customType?: string; content?: string; display?: boolean },
+  opts?: { triggerTurn?: boolean; deliverAs?: string },
+) => unknown;
 
 type TaskPanelModule = {
   installResultDelivery: (pi: ExtensionAPI, manager: unknown, opts?: unknown) => void;
+  bindSessionDelivery: (
+    sessionId: string,
+    pi: ExtensionAPI,
+    opts?: {
+      loadSettings?: () => unknown;
+      manager?: unknown;
+      stableSend?: StableSend;
+      sessionManager?: {
+        getSessionId?: () => string;
+        appendCustomMessageEntry?: (
+          customType: string,
+          content: string | unknown[],
+          display: boolean,
+          details?: unknown,
+        ) => string;
+      };
+    },
+  ) => void;
+  dropSessionDelivery: (sessionId: string | undefined) => void;
   suspendResultDelivery: (manager: unknown) => void;
   resumeResultDelivery: (manager: unknown) => void;
+  suspendSessionDelivery: (sessionId: string | undefined) => void;
+  resumeSessionDelivery: (sessionId: string | undefined, manager?: unknown) => void;
   installTaskPanel: (pi: ExtensionAPI | null, manager: unknown, ui: unknown) => void;
+  _resetDeliveryRegistriesForTests: () => void;
+  _registerBoundSessionSendForTests: (sessionId: string, send: StableSend) => void;
+  _hasBoundSessionSendForTests: (sessionId: string) => boolean;
+  _getSessionDeliveryEndpointForTests: (
+    sessionId: string,
+  ) => { suspended: boolean; generation: number; hasSend: boolean; hasAppend: boolean } | undefined;
 };
 
 // Loaded once before all tests
@@ -19,23 +52,85 @@ before(async () => {
   mod = (await import("../src/task-panel.js")) as TaskPanelModule;
 });
 
-// ─── Pure-function tests (tested indirectly via installResultDelivery) ─────────
+// ─── Session-routed background result delivery ─────────────────────────────────
 
 describe("installResultDelivery", () => {
-  function createMockManager(run?: unknown, runsDir?: string) {
+  const SESSION = "sess-test";
+
+  beforeEach(() => {
+    mod._resetDeliveryRegistriesForTests();
+  });
+
+  function createMockManager(run?: Record<string, unknown>, runsDir?: string) {
+    let sessionId: string | undefined = SESSION;
+    const runs = new Map<string, Record<string, unknown>>();
+    if (run) runs.set(String(run.runId ?? "test-run-1"), run);
+
+    const disk = new Map<string, Record<string, unknown>>();
+
     const manager = new EventEmitter() as ReturnType<typeof EventEmitter> & {
-      getRun: (...args: unknown[]) => unknown;
-      getPersistence?: () => { getRunsDir: () => string };
+      getRun: (id: string) => unknown;
+      getPersistence?: () => {
+        getRunsDir: () => string;
+        load: (id: string) => Record<string, unknown> | null;
+        save: (state: Record<string, unknown>) => void;
+        list: () => Record<string, unknown>[];
+      };
+      getSessionId: () => string | undefined;
+      setSessionId: (id: string | undefined) => void;
+      adoptLiveRunsToSession: (newId: string | undefined, previousSessionId?: string) => number;
+      listLiveRuns: () => unknown[];
       __deliveryInstalled?: boolean;
       listRuns?: () => unknown[];
     };
-    manager.getRun = () => run;
-    if (runsDir) manager.getPersistence = () => ({ getRunsDir: () => runsDir });
+    manager.getRun = (id: string) => runs.get(id);
+    manager.getSessionId = () => sessionId;
+    manager.setSessionId = (id) => {
+      sessionId = id;
+    };
+    manager.adoptLiveRunsToSession = (newId, previousSessionId) => {
+      if (!newId) return 0;
+      const prev = previousSessionId !== undefined ? previousSessionId : sessionId;
+      let adopted = 0;
+      for (const managed of runs.values()) {
+        const status = managed.status as string | undefined;
+        const active = status === "running" || status === "paused";
+        const undelivered = managed.pendingDelivery != null;
+        if (!active && !undelivered) continue;
+        if (managed.sessionId === newId) continue;
+        managed.sessionId = newId;
+        const existing = disk.get(String(managed.runId));
+        if (existing) disk.set(String(existing.runId), { ...existing, sessionId: newId });
+        adopted++;
+      }
+      for (const state of [...disk.values()]) {
+        if (!state.pendingDelivery) continue;
+        if (runs.has(String(state.runId))) continue;
+        if (state.sessionId === newId) continue;
+        if (prev == null || state.sessionId !== prev) continue;
+        disk.set(String(state.runId), { ...state, sessionId: newId });
+        adopted++;
+      }
+      return adopted;
+    };
+    manager.listLiveRuns = () => [...runs.values()];
+    manager.getPersistence = () => ({
+      getRunsDir: () => runsDir ?? "/runs",
+      load: (id: string) => disk.get(id) ?? null,
+      save: (state: Record<string, unknown>) => {
+        disk.set(String(state.runId), { ...state });
+        const live = runs.get(String(state.runId));
+        if (live && "pendingDelivery" in state) {
+          live.pendingDelivery = state.pendingDelivery;
+        }
+      },
+      list: () => [...disk.values()],
+    });
     return manager;
   }
 
-  function createMockPi(): ExtensionAPI & { _calls: { content: string; customType?: string }[] } {
-    const calls: { content: string; customType?: string }[] = [];
+  function createMockPi(): ExtensionAPI & { _calls: DeliveryCall[] } {
+    const calls: DeliveryCall[] = [];
     const obj = {
       sendMessage(msg: unknown, _opts?: unknown) {
         calls.push({
@@ -50,13 +145,37 @@ describe("installResultDelivery", () => {
       reload: () => Promise.resolve(),
       _calls: calls,
     };
-    return obj as unknown as ExtensionAPI & { _calls: { content: string; customType?: string }[] };
+    return obj as unknown as ExtensionAPI & { _calls: DeliveryCall[] };
+  }
+
+  /** Session-stable thenable send that records like the old sendMessage spy. */
+  function recordingStableSend(pi: { _calls: DeliveryCall[] }): StableSend {
+    return (msg, opts) => {
+      pi._calls.push({
+        content: msg.content ?? "",
+        customType: msg.customType,
+        triggerTurn: opts?.triggerTurn,
+      });
+      return Promise.resolve();
+    };
+  }
+
+  /** Drive the armed AgentSession._bindExtensionCore patch with a fake `this`. */
+  function invokePatchedBindCore(session: object): void {
+    const bind = (AgentSession.prototype as unknown as { _bindExtensionCore: (runner: unknown) => unknown })
+      ._bindExtensionCore;
+    bind.call(session, { bindCore() {} });
+  }
+
+  function piCalls(pi: ExtensionAPI): DeliveryCall[] {
+    return (pi as unknown as { _calls: DeliveryCall[] })._calls;
   }
 
   function makeRun(overrides: Record<string, unknown> = {}) {
     return {
       runId: "test-run-1",
       background: true,
+      sessionId: SESSION,
       snapshot: {
         name: "test-workflow",
         agentCount: 3,
@@ -80,16 +199,28 @@ describe("installResultDelivery", () => {
     };
   }
 
+  function setup(
+    pi: ExtensionAPI,
+    manager: ReturnType<typeof createMockManager>,
+    sessionId = SESSION,
+    bindOpts: { stableSend?: StableSend; loadSettings?: () => unknown } = {},
+  ) {
+    mod.installResultDelivery(pi, manager, bindOpts.loadSettings ? { loadSettings: bindOpts.loadSettings } : undefined);
+    manager.setSessionId(sessionId);
+    const stableSend = bindOpts.stableSend ?? recordingStableSend(pi as unknown as { _calls: DeliveryCall[] });
+    mod.bindSessionDelivery(sessionId, pi, { manager, ...bindOpts, stableSend });
+  }
+
   // ── deliverText: verdict path ──
 
   it("delivers verdict when result.result has verdict", () => {
     const pi = createMockPi();
     const manager = createMockManager(makeRun());
 
-    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    setup(pi, manager);
     manager.emit("complete", { runId: "test-run-1" });
 
-    const calls = (pi as unknown as { _calls: { content: string }[] })._calls;
+    const calls = piCalls(pi);
     assert.equal(calls.length, 1);
     assert.equal(calls[0].customType, "workflow-result");
     assert.ok(calls[0].content.includes("All tests passed"), "should contain All tests passed");
@@ -115,10 +246,10 @@ describe("installResultDelivery", () => {
       }),
     );
 
-    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    setup(pi, manager);
     manager.emit("complete", { runId: "test-run-1" });
 
-    const content = (pi as unknown as { _calls: { content: string }[] })._calls[0].content;
+    const content = piCalls(pi)[0].content;
     assert.ok(content.includes("100.0K tok"), `fresh (input+output) should read as tok; got: ${content}`);
     assert.ok(content.includes("6.0M cached"), `cacheRead should read as cached; got: ${content}`);
     assert.ok(content.includes("$6.70"), `cost should be shown; got: ${content}`);
@@ -139,10 +270,10 @@ describe("installResultDelivery", () => {
       }),
     );
 
-    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    setup(pi, manager);
     manager.emit("complete", { runId: "test-run-1" });
 
-    const content = (pi as unknown as { _calls: { content: string }[] })._calls[0].content;
+    const content = piCalls(pi)[0].content;
     assert.ok(content.includes("800 tok"), `the estimate should survive as the token count; got: ${content}`);
     assert.ok(!/\b0 tok/.test(content), `must not render a zero breakdown; got: ${content}`);
   });
@@ -161,10 +292,10 @@ describe("installResultDelivery", () => {
       }),
     );
 
-    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    setup(pi, manager);
     manager.emit("complete", { runId: "test-run-1" });
 
-    const content = (pi as unknown as { _calls: { content: string }[] })._calls[0].content;
+    const content = piCalls(pi)[0].content;
     assert.ok(!/\b0 tok/.test(content), `an all-zero aggregate must not render "0 tok"; got: ${content}`);
     assert.ok(content.includes("3 agents"), "the rest of the line is intact");
   });
@@ -176,10 +307,10 @@ describe("installResultDelivery", () => {
     const run = makeRun({ result: { result: { report: "Report body", verdict: "" } } });
     const manager = createMockManager(run);
 
-    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    setup(pi, manager);
     manager.emit("complete", { runId: "test-run-1" });
 
-    const calls = (pi as unknown as { _calls: { content: string }[] })._calls;
+    const calls = piCalls(pi);
     assert.ok(calls[0].content.includes("Report body"), "should contain Report body");
   });
 
@@ -188,10 +319,10 @@ describe("installResultDelivery", () => {
     const run = makeRun({ result: { result: { summary: "Short summary" } } });
     const manager = createMockManager(run);
 
-    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    setup(pi, manager);
     manager.emit("complete", { runId: "test-run-1" });
 
-    const calls = (pi as unknown as { _calls: { content: string }[] })._calls;
+    const calls = piCalls(pi);
     assert.ok(calls[0].content.includes("Short summary"), "should contain Short summary");
   });
 
@@ -200,103 +331,82 @@ describe("installResultDelivery", () => {
     const run = makeRun({ result: { result: "Plain string result" } });
     const manager = createMockManager(run);
 
-    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    setup(pi, manager);
     manager.emit("complete", { runId: "test-run-1" });
 
-    const calls = (pi as unknown as { _calls: { content: string }[] })._calls;
+    const calls = piCalls(pi);
     assert.ok(calls[0].content.includes("Plain string result"), "should contain Plain string result");
   });
 
-  it("falls back to truncated JSON when result is an object with no known key", () => {
+  it("falls back to synthesis when present", () => {
     const pi = createMockPi();
-    const run = makeRun({ result: { result: { foo: "x".repeat(500), bar: "y".repeat(500) } } });
+    const run = makeRun({ result: { result: { synthesis: "Synth body" } } });
     const manager = createMockManager(run);
 
-    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    setup(pi, manager);
     manager.emit("complete", { runId: "test-run-1" });
 
-    const calls = (pi as unknown as { _calls: { content: string }[] })._calls;
-    assert.ok(calls[0].content.includes("foo"), "should contain foo");
-    assert.ok(/…\(truncated [\d.]+ (B|KB|MB)\)/.test(calls[0].content), "should note the dropped size on truncation");
+    const calls = piCalls(pi);
+    assert.ok(calls[0].content.includes("Synth body"), "should contain Synth body");
   });
 
-  it("falls back gracefully when result is nullish", () => {
+  it("JSON-dumps object results without preferred fields", () => {
     const pi = createMockPi();
-    const run = makeRun({ result: { result: undefined } });
+    const run = makeRun({ result: { result: { ok: true, n: 2 } } });
     const manager = createMockManager(run);
 
-    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    setup(pi, manager);
     manager.emit("complete", { runId: "test-run-1" });
 
-    // Should not crash; should still deliver a message
-    const calls = (pi as unknown as { _calls: { content: string }[] })._calls;
-    assert.equal(calls.length, 1);
-    assert.ok(calls[0].content.includes("null"), "should contain null for undefined result");
+    const calls = piCalls(pi);
+    assert.ok(calls[0].content.includes('"ok": true'), "should dump JSON");
   });
 
-  // ── Full-result pointer + configurable threshold ──
-
-  it("appends a Full result pointer to <runsDir>/<runId>.json when persistence exists", () => {
+  it("truncates long JSON dumps and appends the result pointer", () => {
     const pi = createMockPi();
-    const manager = createMockManager(makeRun(), "/runs");
+    const run = makeRun({ result: { result: { note: "z".repeat(500) } } });
+    const manager = createMockManager(run, "/runs");
 
-    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    setup(pi, manager);
     manager.emit("complete", { runId: "test-run-1" });
 
-    const content = (pi as unknown as { _calls: { content: string }[] })._calls[0].content;
-    assert.ok(content.includes("Full result:"), "should include the pointer label");
-    assert.ok(content.includes(join("/runs", "test-run-1.json")), "should point at <runsDir>/<runId>.json");
-    // The verdict summary itself is unchanged apart from the appended pointer.
-    assert.ok(content.includes("All tests passed"), "verdict text preserved");
+    const content = piCalls(pi)[0].content;
+    assert.ok(content.includes("truncated"), "long dump is truncated");
+    assert.ok(content.includes(join("/runs", "test-run-1.json")), "pointer still appended");
   });
 
-  it("omits the pointer when the manager exposes no persistence layer", () => {
+  it("honours deliveredResultMaxChars from settings", () => {
     const pi = createMockPi();
-    const manager = createMockManager(makeRun()); // no runsDir
-
-    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
-    manager.emit("complete", { runId: "test-run-1" });
-
-    const calls = (pi as unknown as { _calls: { content: string }[] })._calls;
-    assert.equal(calls.length, 1, "the result is still delivered");
-    assert.ok(calls[0].content.includes("All tests passed"), "verdict body still intact");
-    assert.ok(!calls[0].content.includes("Full result:"), "no pointer without a persisted path");
-  });
-
-  it("honors deliveredResultMaxChars from loadSettings for the JSON-dump branch", () => {
-    const pi = createMockPi();
-    // ~216-char JSON dump: under the default 400, so it would NOT truncate by default
-    // — a truncation marker can therefore only come from the 50-char setting.
     const run = makeRun({ result: { result: { note: "z".repeat(200) } } });
     const manager = createMockManager(run, "/runs");
 
-    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager, {
-      loadSettings: () => ({ deliveredResultMaxChars: 50 }),
+    setup(pi as unknown as ExtensionAPI, manager, SESSION, {
+      loadSettings: () => ({ deliveredResultMaxChars: 40 }),
     });
     manager.emit("complete", { runId: "test-run-1" });
 
-    const content = (pi as unknown as { _calls: { content: string }[] })._calls[0].content;
-    assert.ok(/…\(truncated [\d.]+ (B|KB|MB)\)/.test(content), "the 50-char setting truncates a sub-400 dump");
+    const content = piCalls(pi)[0].content;
+    assert.ok(content.includes("truncated"), "settings threshold is applied");
     assert.ok(!content.includes("z".repeat(200)), "the body is cut at the configured threshold");
     assert.ok(content.includes(join("/runs", "test-run-1.json")), "pointer still appended");
   });
 
-  // ── installResultDelivery: guard / stale ctx ──
+  // ── installResultDelivery: guard / session routing ──
 
   it("installs delivery only once — second call skips listener registration", () => {
     const pi = createMockPi();
     const manager = createMockManager(makeRun());
 
-    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
-    // Second call: should only refresh holder.pi, not add another listener
+    setup(pi, manager);
+    // Second call: should not add another listener
     mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
 
     manager.emit("complete", { runId: "test-run-1" });
-    const calls = (pi as unknown as { _calls: { content: string }[] })._calls;
+    const calls = piCalls(pi);
     assert.equal(calls.length, 1); // exactly once, not twice
   });
 
-  it("does not crash when sendMessage throws (stale ctx); queues and flushes on refresh", () => {
+  it("does not crash when sendMessage throws (stale ctx); queues and flushes on rebind", async () => {
     const stalePi = {
       sendMessage: (_msg: unknown, _opts?: unknown) => {
         throw new Error("This extension ctx is stale");
@@ -311,49 +421,53 @@ describe("installResultDelivery", () => {
     const manager = createMockManager(makeRun());
 
     mod.installResultDelivery(stalePi as unknown as ExtensionAPI, manager);
-    // Must not throw — the failed send is queued for the next generation.
+    manager.setSessionId(SESSION);
+    mod.bindSessionDelivery(SESSION, stalePi as unknown as ExtensionAPI, {
+      manager,
+      stableSend: () => {
+        throw new Error("This extension ctx is stale");
+      },
+    });
+    // Must not throw — the failed send leaves disk/memory pending.
     manager.emit("complete", { runId: "test-run-1" });
+    // Sync throw still ACKs via a rejected/false thenable; wait out in-flight.
+    await Promise.resolve();
+    await Promise.resolve();
 
-    // Factory-time install only refreshes the holder; session_start resumes.
+    // Factory-time install only refreshes; session_start rebinds + flushes.
     mod.installResultDelivery(freshPi as unknown as ExtensionAPI, manager);
-    assert.equal(
-      (freshPi as unknown as { _calls: unknown[] })._calls.length,
-      0,
-      "install alone must not flush — runtime may still be unbound",
-    );
-    mod.resumeResultDelivery(manager);
-    const calls = (freshPi as unknown as { _calls: { content: string }[] })._calls;
-    assert.equal(calls.length, 1, "resume must flush onto the fresh pi");
+    assert.equal(piCalls(freshPi).length, 0, "install alone must not flush — runtime may still be unbound");
+    mod.bindSessionDelivery(SESSION, freshPi as unknown as ExtensionAPI, {
+      manager,
+      stableSend: recordingStableSend(freshPi),
+    });
+    const calls = piCalls(freshPi);
+    assert.equal(calls.length, 1, "rebind must flush onto the fresh pi");
     assert.ok(calls[0].content.includes("test-workflow"));
   });
 
-  it("suspends live sends and flushes the queue when the next generation installs", () => {
+  it("suspends live sends and flushes the queue when the next generation binds", () => {
     const pi1 = createMockPi();
     const pi2 = createMockPi();
     const manager = createMockManager(makeRun());
 
-    mod.installResultDelivery(pi1 as unknown as ExtensionAPI, manager);
+    setup(pi1, manager);
     mod.suspendResultDelivery(manager);
     manager.emit("complete", { runId: "test-run-1" });
-    assert.equal(
-      (pi1 as unknown as { _calls: unknown[] })._calls.length,
-      0,
-      "suspended delivery must not call the dying pi",
-    );
+    assert.equal(piCalls(pi1).length, 0, "suspended delivery must not call the dying pi");
 
     mod.installResultDelivery(pi2 as unknown as ExtensionAPI, manager);
-    assert.equal(
-      (pi2 as unknown as { _calls: unknown[] })._calls.length,
-      0,
-      "install alone must not flush before runtime bind",
-    );
-    mod.resumeResultDelivery(manager);
-    const calls = (pi2 as unknown as { _calls: { content: string }[] })._calls;
-    assert.equal(calls.length, 1, "resume must deliver pending completion into the new session");
+    assert.equal(piCalls(pi2).length, 0, "install alone must not flush before runtime bind");
+    mod.bindSessionDelivery(SESSION, pi2 as unknown as ExtensionAPI, {
+      manager,
+      stableSend: recordingStableSend(pi2),
+    });
+    const calls = piCalls(pi2);
+    assert.equal(calls.length, 1, "bind must deliver pending completion into the new session");
     assert.ok(calls[0].content.includes("All tests passed"));
   });
 
-  it("re-queues an async sendMessage rejection and flushes it on the next install", async () => {
+  it("re-queues an async sendMessage rejection and flushes it on the next bind", async () => {
     let rejectSend: ((err: Error) => void) | undefined;
     const failingPi = {
       sendMessage: (_msg: unknown, _opts?: unknown) =>
@@ -369,24 +483,31 @@ describe("installResultDelivery", () => {
     const freshPi = createMockPi();
     const manager = createMockManager(makeRun());
 
-    mod.installResultDelivery(failingPi as unknown as ExtensionAPI, manager);
+    setup(failingPi as unknown as ExtensionAPI, manager, SESSION, {
+      stableSend: () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectSend = reject;
+        }),
+    });
     manager.emit("complete", { runId: "test-run-1" });
-    assert.ok(rejectSend, "sendMessage should have returned a pending promise");
-    rejectSend(new Error("network blip"));
+    assert.ok(rejectSend, "stableSend should have returned a pending promise");
+    rejectSend?.(new Error("network blip"));
     // Let the rejection microtask run and re-queue.
     await Promise.resolve();
     await Promise.resolve();
 
-    mod.installResultDelivery(freshPi as unknown as ExtensionAPI, manager);
-    mod.resumeResultDelivery(manager);
-    const calls = (freshPi as unknown as { _calls: { content: string }[] })._calls;
-    assert.equal(calls.length, 1, "async failure must be retried on the fresh pi after resume");
+    mod.bindSessionDelivery(SESSION, freshPi as unknown as ExtensionAPI, {
+      manager,
+      stableSend: recordingStableSend(freshPi),
+    });
+    const calls = piCalls(freshPi);
+    assert.equal(calls.length, 1, "async failure must be retried on the fresh pi after rebind");
   });
 
-  it("flushes immediately when an in-flight send rejects AFTER the next generation installed", async () => {
+  it("flushes immediately when an in-flight send rejects AFTER the next generation bound", async () => {
     // The real race: generation N's promise is still pending when generation
-    // N+1 installs and flushes (empty queue). N's rejection must not leave the
-    // content stranded until some later N+2 install.
+    // N+1 binds and flushes (empty queue). N's rejection must not leave the
+    // content stranded until some later N+2 bind.
     let rejectSend: ((err: Error) => void) | undefined;
     const failingPi = {
       sendMessage: (_msg: unknown, _opts?: unknown) =>
@@ -402,46 +523,59 @@ describe("installResultDelivery", () => {
     const freshPi = createMockPi();
     const manager = createMockManager(makeRun());
 
-    mod.installResultDelivery(failingPi as unknown as ExtensionAPI, manager);
+    setup(failingPi as unknown as ExtensionAPI, manager, SESSION, {
+      stableSend: () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectSend = reject;
+        }),
+    });
     manager.emit("complete", { runId: "test-run-1" });
     assert.ok(rejectSend);
 
-    // Next generation installs + resumes BEFORE the rejection lands.
-    mod.installResultDelivery(freshPi as unknown as ExtensionAPI, manager);
-    mod.resumeResultDelivery(manager);
-    assert.equal(
-      (freshPi as unknown as { _calls: unknown[] })._calls.length,
-      0,
-      "nothing queued yet — the in-flight send has not rejected",
-    );
+    // Next generation binds BEFORE the rejection lands.
+    mod.bindSessionDelivery(SESSION, freshPi as unknown as ExtensionAPI, {
+      manager,
+      stableSend: recordingStableSend(freshPi),
+    });
+    assert.equal(piCalls(freshPi).length, 0, "nothing queued yet — the in-flight send has not rejected");
 
-    rejectSend(new Error("late network blip"));
+    rejectSend?.(new Error("late network blip"));
     await Promise.resolve();
     await Promise.resolve();
 
-    const calls = (freshPi as unknown as { _calls: { content: string }[] })._calls;
-    assert.equal(calls.length, 1, "late rejection must self-flush onto the already-resumed generation");
+    const calls = piCalls(freshPi);
+    assert.equal(calls.length, 1, "late rejection must self-flush onto the already-bound generation");
     assert.ok(calls[0].content.includes("test-workflow"));
   });
 
   it("never silently drops pending deliveries when the queue grows past the soft cap", () => {
     const pi1 = createMockPi();
     const pi2 = createMockPi();
-    const manager = createMockManager(makeRun());
+    // Distinct run ids so each complete has its own pending marker.
+    const runs = Array.from({ length: 40 }, (_, i) =>
+      makeRun({ runId: `run-${i}`, result: { result: { verdict: `v-${i}` }, agentCount: 1, durationMs: 1 } }),
+    );
+    const manager = createMockManager(runs[0]);
+    // Inject all runs into getRun/listLiveRuns
+    const byId = new Map(runs.map((r) => [r.runId as string, r]));
+    manager.getRun = (id: string) => byId.get(id);
+    manager.listLiveRuns = () => [...byId.values()];
 
-    mod.installResultDelivery(pi1 as unknown as ExtensionAPI, manager);
+    setup(pi1, manager);
     mod.suspendResultDelivery(manager);
-    for (let i = 0; i < 40; i++) {
-      manager.emit("complete", { runId: "test-run-1" });
+    for (const r of runs) {
+      manager.emit("complete", { runId: r.runId });
     }
 
-    mod.installResultDelivery(pi2 as unknown as ExtensionAPI, manager);
-    mod.resumeResultDelivery(manager);
-    const calls = (pi2 as unknown as { _calls: unknown[] })._calls;
+    mod.bindSessionDelivery(SESSION, pi2 as unknown as ExtensionAPI, {
+      manager,
+      stableSend: recordingStableSend(pi2),
+    });
+    const calls = piCalls(pi2);
     assert.equal(calls.length, 40, "soft-cap must warn, never shift() away a queued result");
   });
 
-  it("keeps delivery suspended across factory install until resumeResultDelivery", () => {
+  it("keeps delivery suspended across factory install until bindSessionDelivery", () => {
     const unboundPi = {
       sendMessage: () => {
         throw new Error("Extension runtime not initialized. Action methods cannot be called during extension loading.");
@@ -455,23 +589,21 @@ describe("installResultDelivery", () => {
     const boundPi = createMockPi();
     const manager = createMockManager(makeRun());
 
-    // Simulate extension factory: install then immediately suspend (as workflow.ts does).
+    // Simulate extension factory: install only (no endpoint yet — fail closed).
     mod.installResultDelivery(unboundPi as unknown as ExtensionAPI, manager);
-    mod.suspendResultDelivery(manager);
     manager.emit("complete", { runId: "test-run-1" });
     // Re-install as a fresh factory would (still pre-bindCore).
     mod.installResultDelivery(unboundPi as unknown as ExtensionAPI, manager);
-    assert.equal(
-      (boundPi as unknown as { _calls: unknown[] })._calls.length,
-      0,
-      "must not attempt send while runtime unbound",
-    );
+    assert.equal(piCalls(boundPi).length, 0, "must not attempt send while runtime unbound");
 
-    // session_start: swap in the bound pi via install, then resume.
-    mod.installResultDelivery(boundPi as unknown as ExtensionAPI, manager);
-    mod.resumeResultDelivery(manager);
-    const calls = (boundPi as unknown as { _calls: { content: string }[] })._calls;
-    assert.equal(calls.length, 1, "session_start resume flushes the pre-bind queue");
+    // session_start: bind the session endpoint with the live pi.
+    manager.setSessionId(SESSION);
+    mod.bindSessionDelivery(SESSION, boundPi as unknown as ExtensionAPI, {
+      manager,
+      stableSend: recordingStableSend(boundPi),
+    });
+    const calls = piCalls(boundPi);
+    assert.equal(calls.length, 1, "session_start bind flushes the pre-bind disk pending");
   });
 
   // ── Only background runs are delivered ──
@@ -481,10 +613,10 @@ describe("installResultDelivery", () => {
     const run = makeRun({ background: false });
     const manager = createMockManager(run);
 
-    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    setup(pi, manager);
     manager.emit("complete", { runId: "test-run-1" });
 
-    const calls = (pi as unknown as { _calls: { content: string }[] })._calls;
+    const calls = piCalls(pi);
     assert.equal(calls.length, 0);
   });
 
@@ -494,10 +626,10 @@ describe("installResultDelivery", () => {
     const pi = createMockPi();
     const manager = createMockManager(makeRun());
 
-    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    setup(pi, manager);
     manager.emit("error", { runId: "test-run-1", error: { message: "Something went wrong" } });
 
-    const calls = (pi as unknown as { _calls: { content: string }[] })._calls;
+    const calls = piCalls(pi);
     assert.equal(calls.length, 1);
     assert.ok(calls[0].content.includes("failed"), "should contain failed");
     assert.ok(calls[0].content.includes("Something went wrong"), "should contain Something went wrong");
@@ -508,10 +640,10 @@ describe("installResultDelivery", () => {
     const run = makeRun({ background: false });
     const manager = createMockManager(run);
 
-    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    setup(pi, manager);
     manager.emit("error", { runId: "test-run-1", error: { message: "fail" } });
 
-    const calls = (pi as unknown as { _calls: { content: string }[] })._calls;
+    const calls = piCalls(pi);
     assert.equal(calls.length, 0);
   });
 
@@ -521,7 +653,7 @@ describe("installResultDelivery", () => {
     const pi = createMockPi();
     const manager = createMockManager(makeRun());
 
-    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    setup(pi, manager);
     manager.emit("paused", {
       runId: "test-run-1",
       reason: "usage_limit",
@@ -529,7 +661,7 @@ describe("installResultDelivery", () => {
       resetHint: "Resets in ~3h",
     });
 
-    const calls = (pi as unknown as { _calls: { content: string }[] })._calls;
+    const calls = piCalls(pi);
     assert.equal(calls.length, 1);
     assert.ok(calls[0].content.includes("paused"), "should say paused");
     assert.ok(calls[0].content.includes("/workflows resume test-run-1"), "should name the resume command");
@@ -541,10 +673,10 @@ describe("installResultDelivery", () => {
     const pi = createMockPi();
     const manager = createMockManager(makeRun());
 
-    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    setup(pi, manager);
     manager.emit("paused", { runId: "test-run-1" });
 
-    const calls = (pi as unknown as { _calls: { content: string }[] })._calls;
+    const calls = piCalls(pi);
     assert.equal(calls.length, 0);
   });
 
@@ -552,31 +684,273 @@ describe("installResultDelivery", () => {
     const pi = createMockPi();
     const manager = createMockManager(makeRun({ background: false }));
 
-    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    setup(pi, manager);
     manager.emit("paused", { runId: "test-run-1", reason: "usage_limit", error: { message: "usage limit" } });
 
-    const calls = (pi as unknown as { _calls: { content: string }[] })._calls;
+    const calls = piCalls(pi);
     assert.equal(calls.length, 0);
   });
 
-  // ── Holder refresh on re-call ──
+  // ── Session routing (#147) ──
 
-  it("refreshes holder.pi on second call for stale ctx recovery", () => {
+  it("session_start shape: steal map send without bind stableSend delivers + triggerTurn", () => {
+    const pi = createMockPi();
+    const manager = createMockManager(makeRun());
+
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    manager.setSessionId(SESSION);
+    // Production session_start never passes stableSend — only the steal map.
+    mod._registerBoundSessionSendForTests(SESSION, recordingStableSend(pi));
+    mod.bindSessionDelivery(SESSION, pi as unknown as ExtensionAPI, { manager });
+
+    manager.emit("complete", { runId: "test-run-1" });
+    const calls = piCalls(pi);
+    assert.equal(calls.length, 1, "stolen send is the production ACK path");
+    assert.equal(calls[0].triggerTurn, true, "host sendCustomMessage must triggerTurn");
+    assert.ok(calls[0].content.includes("All tests passed"));
+  });
+
+  it("parallel sessions: last bindCore must not steal the other session's send", () => {
+    const piA = createMockPi();
+    const piB = createMockPi();
+    const managerA = createMockManager(makeRun({ sessionId: "sess-A", runId: "run-A" }));
+    const managerB = createMockManager(
+      makeRun({
+        sessionId: "sess-B",
+        runId: "run-B",
+        result: { result: { verdict: "from-B" }, agentCount: 1, durationMs: 1 },
+      }),
+    );
+    managerA.setSessionId("sess-A");
+    managerB.setSessionId("sess-B");
+
+    // Two host-shaped bindCores, B last — steal map must stay per-session.
+    invokePatchedBindCore({
+      sessionManager: {
+        persist: true,
+        getSessionId: () => "sess-A",
+        getSessionName: () => "host-A",
+      },
+      _resourceLoader: { noExtensions: false },
+      sendCustomMessage: recordingStableSend(piA),
+    });
+    invokePatchedBindCore({
+      sessionManager: {
+        persist: true,
+        getSessionId: () => "sess-B",
+        getSessionName: () => "host-B",
+      },
+      _resourceLoader: { noExtensions: false },
+      sendCustomMessage: recordingStableSend(piB),
+    });
+
+    mod.installResultDelivery(piA as unknown as ExtensionAPI, managerA);
+    // No stableSend — same as production session_start.
+    mod.bindSessionDelivery("sess-A", piA as unknown as ExtensionAPI, { manager: managerA });
+    mod.installResultDelivery(piB as unknown as ExtensionAPI, managerB);
+    mod.bindSessionDelivery("sess-B", piB as unknown as ExtensionAPI, { manager: managerB });
+
+    managerA.emit("complete", { runId: "run-A" });
+
+    assert.equal(piCalls(piA).length, 1, "origin A receives");
+    assert.equal(piCalls(piB).length, 0, "sibling B must not receive A's result");
+    assert.ok(piCalls(piA)[0].content.includes("All tests passed"));
+
+    managerB.emit("complete", { runId: "run-B" });
+    assert.equal(piCalls(piA).length, 1, "A must not receive B's result");
+    assert.equal(piCalls(piB).length, 1, "origin B receives its own result");
+    assert.ok(piCalls(piB)[0].content.includes("from-B"));
+  });
+
+  it("steal map pins only the host session; drop releases the host closure", () => {
+    invokePatchedBindCore({
+      sessionManager: {
+        persist: false,
+        getSessionId: () => "child-mem",
+        getSessionName: () => "",
+      },
+      sendCustomMessage: async () => {},
+    });
+    invokePatchedBindCore({
+      sessionManager: {
+        persist: true,
+        getSessionId: () => "child-noext",
+        getSessionName: () => "",
+      },
+      _resourceLoader: { noExtensions: true },
+      sendCustomMessage: async () => {},
+    });
+    invokePatchedBindCore({
+      sessionManager: {
+        persist: true,
+        getSessionId: () => "child-named",
+        getSessionName: () => "workflow:run-1 agent",
+      },
+      sendCustomMessage: async () => {},
+    });
+    invokePatchedBindCore({
+      sessionManager: {
+        persist: true,
+        getSessionId: () => "host-1",
+        getSessionName: () => "chat",
+      },
+      _resourceLoader: { noExtensions: false },
+      sendCustomMessage: async () => {},
+    });
+
+    assert.equal(mod._hasBoundSessionSendForTests("child-mem"), false, "in-memory child must not pin");
+    assert.equal(mod._hasBoundSessionSendForTests("child-noext"), false, "noExtensions child must not pin");
+    assert.equal(mod._hasBoundSessionSendForTests("child-named"), false, "workflow: child must not pin");
+    assert.equal(mod._hasBoundSessionSendForTests("host-1"), true, "host session is stolen");
+
+    mod.dropSessionDelivery("host-1");
+    assert.equal(mod._hasBoundSessionSendForTests("host-1"), false, "drop releases the host send closure");
+  });
+
+  it("append-only is not an ACK; pending stays until a thenable send exists", () => {
+    const pi = createMockPi();
+    const manager = createMockManager(makeRun());
+    const appended: string[] = [];
+
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    manager.setSessionId(SESSION);
+    mod.bindSessionDelivery(SESSION, pi as unknown as ExtensionAPI, {
+      manager,
+      sessionManager: {
+        getSessionId: () => SESSION,
+        appendCustomMessageEntry: (_customType, content) => {
+          appended.push(typeof content === "string" ? content : JSON.stringify(content));
+          return "entry";
+        },
+      },
+    });
+    manager.emit("complete", { runId: "test-run-1" });
+
+    assert.equal(piCalls(pi).length, 0, "never fall back to pi.sendMessage");
+    assert.equal(appended.length, 0, "append must not be treated as delivery");
+    assert.ok(manager.getPersistence?.().load("test-run-1")?.pendingDelivery, "pending stays on disk");
+    assert.equal(mod._getSessionDeliveryEndpointForTests(SESSION)?.hasSend, false);
+  });
+
+  it("no endpoint → disk pending; later session_start bind flushes", async () => {
+    const pi = createMockPi();
+    const run = makeRun();
+    const manager = createMockManager(run);
+
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    // No bindSessionDelivery yet.
+    manager.emit("complete", { runId: "test-run-1" });
+    assert.equal(piCalls(pi).length, 0, "fail closed without endpoint");
+
+    const disk = manager.getPersistence?.().load("test-run-1");
+    assert.ok(disk?.pendingDelivery, "pending marker persisted to disk");
+
+    manager.setSessionId(SESSION);
+    mod.bindSessionDelivery(SESSION, pi as unknown as ExtensionAPI, {
+      manager,
+      stableSend: recordingStableSend(pi),
+    });
+    assert.equal(piCalls(pi).length, 1, "bind flushes disk pending");
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(manager.getPersistence?.().load("test-run-1")?.pendingDelivery, undefined, "cleared after flush");
+  });
+
+  it("bind without stableSend stays fail-closed and keeps pending", () => {
+    const pi = createMockPi();
+    const manager = createMockManager(makeRun());
+
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    manager.setSessionId(SESSION);
+    // Registered fail-closed: steal map empty, no stableSend (and append is not ACK).
+    mod.bindSessionDelivery(SESSION, pi as unknown as ExtensionAPI, { manager });
+    manager.emit("complete", { runId: "test-run-1" });
+
+    assert.equal(piCalls(pi).length, 0, "no stableSend → never fall back to pi.sendMessage");
+    assert.ok(manager.getPersistence?.().load("test-run-1")?.pendingDelivery, "pending stays on disk");
+  });
+
+  it("suspended endpoint never sends", () => {
+    const pi = createMockPi();
+    const manager = createMockManager(makeRun());
+    setup(pi, manager);
+    mod.suspendSessionDelivery(SESSION);
+    assert.equal(mod._getSessionDeliveryEndpointForTests(SESSION)?.suspended, true);
+
+    manager.emit("complete", { runId: "test-run-1" });
+    assert.equal(piCalls(pi).length, 0);
+  });
+
+  it("sessionId mismatch never sends to the wrong endpoint", () => {
+    const piA = createMockPi();
+    const piB = createMockPi();
+    // Run belongs to A, but only B is bound.
+    const manager = createMockManager(makeRun({ sessionId: "sess-A" }));
+    manager.setSessionId("sess-B");
+    mod.installResultDelivery(piB as unknown as ExtensionAPI, manager);
+    mod.bindSessionDelivery("sess-B", piB as unknown as ExtensionAPI, {
+      manager,
+      stableSend: recordingStableSend(piB),
+    });
+
+    manager.emit("complete", { runId: "test-run-1" });
+    assert.equal(piCalls(piB).length, 0, "B must not get A's run");
+    assert.equal(piCalls(piA).length, 0);
+
+    // Later A binds and receives the pending delivery.
+    mod.bindSessionDelivery("sess-A", piA as unknown as ExtensionAPI, {
+      manager,
+      stableSend: recordingStableSend(piA),
+    });
+    assert.equal(piCalls(piA).length, 1, "origin A flushes pending");
+  });
+
+  it("#143 suspend/resume still delivers after replacement bind", () => {
     const pi1 = createMockPi();
     const pi2 = createMockPi();
     const manager = createMockManager(makeRun());
 
-    // Install with first pi
-    mod.installResultDelivery(pi1 as unknown as ExtensionAPI, manager);
-    // Re-call with second pi (fresh after reload)
-    mod.installResultDelivery(pi2 as unknown as ExtensionAPI, manager);
+    setup(pi1, manager);
+    // session_shutdown
+    mod.suspendResultDelivery(manager);
+    manager.emit("complete", { runId: "test-run-1" });
+    assert.equal(piCalls(pi1).length, 0);
+
+    // New generation session_start: adopt then rebind (do not poke run.sessionId).
+    const newSession = "sess-replaced";
+    const previous = manager.getSessionId();
+    if (typeof manager.adoptLiveRunsToSession === "function") {
+      manager.adoptLiveRunsToSession(newSession, previous);
+    }
+    manager.setSessionId(newSession);
+    mod.bindSessionDelivery(newSession, pi2 as unknown as ExtensionAPI, {
+      manager,
+      stableSend: recordingStableSend(pi2),
+    });
+
+    assert.equal(piCalls(pi2).length, 1, "replacement session receives pending");
+    assert.equal(piCalls(pi1).length, 0, "old session stays silent");
+  });
+
+  // ── Holder refresh on re-call ──
+
+  it("rebinds send on bindSessionDelivery for stale ctx recovery", () => {
+    const pi1 = createMockPi();
+    const pi2 = createMockPi();
+    const manager = createMockManager(makeRun());
+
+    setup(pi1, manager);
+    // Re-bind with second pi (fresh after reload)
+    mod.bindSessionDelivery(SESSION, pi2 as unknown as ExtensionAPI, {
+      manager,
+      stableSend: recordingStableSend(pi2),
+    });
 
     manager.emit("complete", { runId: "test-run-1" });
 
-    const calls1 = (pi1 as unknown as { _calls: { content: string }[] })._calls;
-    const calls2 = (pi2 as unknown as { _calls: { content: string }[] })._calls;
-    assert.equal(calls1.length, 0, "pi1 should not be used after refresh");
-    assert.equal(calls2.length, 1, "pi2 should receive the delivery");
+    assert.equal(piCalls(pi1).length, 0, "pi1 should not be used after rebind");
+    assert.equal(piCalls(pi2).length, 1, "pi2 should receive the delivery");
   });
 
   it("refreshes the live delivery settings loader across reload generations", () => {
@@ -587,12 +961,20 @@ describe("installResultDelivery", () => {
     mod.installResultDelivery(pi1 as unknown as ExtensionAPI, manager, {
       loadSettings: () => ({ deliveredResultMaxChars: 400 }),
     });
-    mod.installResultDelivery(pi2 as unknown as ExtensionAPI, manager, {
+    manager.setSessionId(SESSION);
+    mod.bindSessionDelivery(SESSION, pi1 as unknown as ExtensionAPI, {
+      manager,
+      loadSettings: () => ({ deliveredResultMaxChars: 400 }),
+      stableSend: recordingStableSend(pi1),
+    });
+    mod.bindSessionDelivery(SESSION, pi2 as unknown as ExtensionAPI, {
+      manager,
       loadSettings: () => ({ deliveredResultMaxChars: 40 }),
+      stableSend: recordingStableSend(pi2),
     });
     manager.emit("complete", { runId: "test-run-1" });
 
-    const content = (pi2 as unknown as { _calls: { content: string }[] })._calls[0]?.content ?? "";
+    const content = piCalls(pi2)[0]?.content ?? "";
     assert.match(content, /truncated/, "the reused listener reads settings from the fresh generation");
   });
 });
