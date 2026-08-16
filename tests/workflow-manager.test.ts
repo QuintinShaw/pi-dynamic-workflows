@@ -350,19 +350,19 @@ return { a, b, synthesis }`;
       new RegExp(`resumeFromRunId="${runId}".*same script.*maxAgents: N \\(N>2\\)`),
       "AGENT_LIMIT text must include the concrete resume recipe",
     );
-    const failed = manager.getPersistence().load(runId!);
+    const failed = manager.getPersistence().load(runId);
     assert.equal(failed?.status, "failed");
     assert.equal(failed?.maxAgents, 2);
     assert.ok((failed?.journal?.length ?? 0) >= 2, "workers should be journaled before the cap error");
     const liveBeforeResume = livePrompts.length;
     assert.equal(liveBeforeResume, 2, "only the two workers should have run live");
 
-    assert.equal(await manager.resume(runId!, { maxAgents: 3 }), true);
-    for (let i = 0; i < 200 && manager.getRun(runId!)?.status === "running"; i++) {
+    assert.equal(await manager.resume(runId, { maxAgents: 3 }), true);
+    for (let i = 0; i < 200 && manager.getRun(runId)?.status === "running"; i++) {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
 
-    const done = manager.getPersistence().load(runId!);
+    const done = manager.getPersistence().load(runId);
     assert.equal(done?.status, "completed", "raised ceiling must let synthesis finish");
     assert.equal(done?.maxAgents, 3, "raised maxAgents must persist for later resumes");
     assert.deepEqual(
@@ -372,7 +372,7 @@ return { a, b, synthesis }`;
     );
 
     // Omit override → keep raised cap; a lower request must not shrink it.
-    const again = manager.getPersistence().load(runId!);
+    const again = manager.getPersistence().load(runId);
     assert.equal(again?.maxAgents, 3);
     // Build a fresh failed-at-cap run to assert a non-raise is refused.
     livePrompts.length = 0;
@@ -381,8 +381,8 @@ return { a, b, synthesis }`;
     await secondManager.runSync(script, undefined, { maxAgents: 2 }).catch(() => {});
     const runId2 = secondManager.listRuns().find((r) => r.workflowName === "raise_cap")?.runId;
     assert.ok(runId2);
-    assert.equal(await secondManager.resume(runId2!, { maxAgents: 1 }), false);
-    const notLowered = secondManager.getPersistence().load(runId2!);
+    assert.equal(await secondManager.resume(runId2, { maxAgents: 1 }), false);
+    const notLowered = secondManager.getPersistence().load(runId2);
     assert.equal(notLowered?.maxAgents, 2, "resume must never lower the persisted ceiling");
     assert.equal(notLowered?.status, "failed", "non-raise resume is refused; run stays failed at the old cap");
 

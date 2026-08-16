@@ -5,8 +5,8 @@
 import { EventEmitter } from "node:events";
 import type { ModelRegistry, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { WorkflowAgent } from "./agent.js";
-import { preview, type WorkflowAgentSnapshot, type WorkflowSnapshot } from "./display.js";
 import { MAX_AGENTS_PER_RUN } from "./config.js";
+import { preview, type WorkflowAgentSnapshot, type WorkflowSnapshot } from "./display.js";
 import { isProviderUsageLimit, WorkflowError, WorkflowErrorCode } from "./errors.js";
 import {
   createRunPersistence,
@@ -1187,10 +1187,7 @@ export class WorkflowManager extends EventEmitter {
    * UsageLimitScheduler) unchanged. `opts.args` overrides the persisted args
    * only when provided; otherwise the persisted args are kept.
    */
-  async resume(
-    runId: string,
-    opts?: { script?: string; args?: unknown; maxAgents?: number },
-  ): Promise<boolean> {
+  async resume(runId: string, opts?: { script?: string; args?: unknown; maxAgents?: number }): Promise<boolean> {
     // Guard: refuse to resume a run that is already running, or one that was
     // intentionally aborted (pause/stop/Esc). Paused and failed runs can restart.
     const active = this.runs.get(runId);
