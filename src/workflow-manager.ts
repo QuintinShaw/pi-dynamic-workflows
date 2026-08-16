@@ -5,7 +5,7 @@
 import { EventEmitter } from "node:events";
 import type { ModelRegistry, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { WorkflowAgent } from "./agent.js";
-import { MAX_AGENTS_PER_RUN, MAX_AGENTS_PER_RUN } from "./config.js";
+import { MAX_AGENTS_PER_RUN } from "./config.js";
 import { preview, type WorkflowAgentSnapshot, type WorkflowSnapshot } from "./display.js";
 import { isProviderUsageLimit, WorkflowError, WorkflowErrorCode } from "./errors.js";
 import {
