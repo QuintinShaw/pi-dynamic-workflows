@@ -470,6 +470,56 @@ return { a, b }`;
   }),
 );
 
+test(
+  "createWorkflowTool resumeFromRunId forwards maxAgents and finishes a failed-at-cap run",
+  withToolTempCwd(async (cwd) => {
+    const livePrompts: string[] = [];
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt: string, options?: { onUsage?: (u: AgentUsage) => void }) {
+          livePrompts.push(prompt);
+          options?.onUsage?.({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 1, cost: 0 });
+          return `${prompt}-ok`;
+        },
+      },
+    });
+    manager.on("error", () => {});
+    const tool = createWorkflowTool({ cwd, manager });
+    const script = `export const meta = { name: 'raise_cap_tool', description: 'raise via tool resume' }
+const a = await agent('worker-a', { label: 'a' })
+const b = await agent('worker-b', { label: 'b' })
+const synthesis = await agent('synthesis', { label: 'synthesis' })
+return { a, b, synthesis }`;
+
+    const { runId, promise } = manager.startInBackground(script, undefined, { maxAgents: 2 });
+    await promise.catch(() => {});
+    assert.equal(manager.getRun(runId)?.status, "failed");
+    assert.equal(manager.getPersistence().load(runId)?.maxAgents, 2);
+    const liveBefore = livePrompts.length;
+    assert.equal(liveBefore, 2);
+
+    const res = await tool.execute(
+      "t-raise",
+      { script, resumeFromRunId: runId, maxAgents: 3 },
+      undefined,
+      undefined,
+      undefined,
+    );
+    const details = res.details as { runId?: string; resumedFrom?: string };
+    assert.equal(details.runId, runId);
+    assert.equal(details.resumedFrom, runId);
+
+    for (let i = 0; i < 200 && manager.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const done = manager.getPersistence().load(runId);
+    assert.equal(done?.status, "completed");
+    assert.equal(done?.maxAgents, 3);
+    assert.deepEqual(livePrompts.slice(liveBefore), ["synthesis"]);
+  }),
+);
+
 // ─── `name`: reach a saved or built-in workflow without writing a script ───────
 
 const validArgsByBuiltinName: Record<string, unknown> = {

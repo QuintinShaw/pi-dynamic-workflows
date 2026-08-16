@@ -319,6 +319,100 @@ test(
 );
 
 test(
+  "resume with a higher maxAgents raises the persisted ceiling and finishes the journaled suffix",
+  withTempCwd(async (cwd) => {
+    // Sequential workers fill the cap; synthesis needs one more slot. Without an
+    // explicit raise, resume keeps maxAgents: 2 and fails again; with raise, the
+    // two workers replay from the journal and only synthesis runs live.
+    const livePrompts: string[] = [];
+    const agent = {
+      async run(prompt: string, options?: { onUsage?: (u: AgentUsage) => void }) {
+        livePrompts.push(prompt);
+        options?.onUsage?.({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 1, cost: 0 });
+        return `${prompt}-ok`;
+      },
+    };
+    const manager = new WorkflowManager({ cwd, agent });
+    manager.on("error", () => {});
+    const script = `export const meta = { name: 'raise_cap', description: 'raise maxAgents on resume' }
+const a = await agent('worker-a', { label: 'a' })
+const b = await agent('worker-b', { label: 'b' })
+const synthesis = await agent('synthesis', { label: 'synthesis' })
+return { a, b, synthesis }`;
+
+    const first = await manager.runSync(script, undefined, { maxAgents: 2 }).catch((err: unknown) => err);
+    assert.ok(first instanceof WorkflowError);
+    assert.equal(first.code, WorkflowErrorCode.AGENT_LIMIT_EXCEEDED);
+    const runId = manager.listRuns().find((r) => r.workflowName === "raise_cap")?.runId;
+    assert.ok(runId, "failed run should still be listed");
+    assert.match(
+      first.message,
+      new RegExp(`resumeFromRunId="${runId}".*same script.*maxAgents: N \\(N>2\\)`),
+      "AGENT_LIMIT text must include the concrete resume recipe",
+    );
+    const failed = manager.getPersistence().load(runId!);
+    assert.equal(failed?.status, "failed");
+    assert.equal(failed?.maxAgents, 2);
+    assert.ok((failed?.journal?.length ?? 0) >= 2, "workers should be journaled before the cap error");
+    const liveBeforeResume = livePrompts.length;
+    assert.equal(liveBeforeResume, 2, "only the two workers should have run live");
+
+    assert.equal(await manager.resume(runId!, { maxAgents: 3 }), true);
+    for (let i = 0; i < 200 && manager.getRun(runId!)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    const done = manager.getPersistence().load(runId!);
+    assert.equal(done?.status, "completed", "raised ceiling must let synthesis finish");
+    assert.equal(done?.maxAgents, 3, "raised maxAgents must persist for later resumes");
+    assert.deepEqual(
+      livePrompts.slice(liveBeforeResume),
+      ["synthesis"],
+      "workers must replay from journal; only synthesis runs live",
+    );
+
+    // Omit override → keep raised cap; a lower request must not shrink it.
+    const again = manager.getPersistence().load(runId!);
+    assert.equal(again?.maxAgents, 3);
+    // Build a fresh failed-at-cap run to assert a non-raise is refused.
+    livePrompts.length = 0;
+    const secondManager = new WorkflowManager({ cwd, agent });
+    secondManager.on("error", () => {});
+    await secondManager.runSync(script, undefined, { maxAgents: 2 }).catch(() => {});
+    const runId2 = secondManager.listRuns().find((r) => r.workflowName === "raise_cap")?.runId;
+    assert.ok(runId2);
+    assert.equal(await secondManager.resume(runId2!, { maxAgents: 1 }), false);
+    const notLowered = secondManager.getPersistence().load(runId2!);
+    assert.equal(notLowered?.maxAgents, 2, "resume must never lower the persisted ceiling");
+    assert.equal(notLowered?.status, "failed", "non-raise resume is refused; run stays failed at the old cap");
+
+    // prior === undefined: effective prior is MAX_AGENTS_PER_RUN. Resume with 50
+    // must refuse rather than pin a lower ceiling onto a never-set run.
+    const uncapped = new WorkflowManager({ cwd, agent });
+    uncapped.on("error", () => {});
+    const uncappedId = "uncapped-max-agents";
+    uncapped.getPersistence().save({
+      runId: uncappedId,
+      workflowName: "raise_cap",
+      script,
+      args: undefined,
+      status: "failed",
+      phases: [],
+      agents: [],
+      logs: [],
+      startedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+    assert.equal(await uncapped.resume(uncappedId, { maxAgents: 50 }), false);
+    assert.equal(
+      uncapped.getPersistence().load(uncappedId)?.maxAgents,
+      undefined,
+      "resume must not pin 50 over an implicit 1000 default",
+    );
+  }),
+);
+
+test(
   "resume re-resolves the run's maxAgents/agentTimeoutMs and keeps its start-time values (#A1)",
   withTempCwd(async (cwd) => {
     // 'a' hangs on its first invocation (pause point), then on its second

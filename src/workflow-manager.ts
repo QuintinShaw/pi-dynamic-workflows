@@ -6,6 +6,7 @@ import { EventEmitter } from "node:events";
 import type { ModelRegistry, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { WorkflowAgent } from "./agent.js";
 import { preview, type WorkflowAgentSnapshot, type WorkflowSnapshot } from "./display.js";
+import { MAX_AGENTS_PER_RUN } from "./config.js";
 import { isProviderUsageLimit, WorkflowError, WorkflowErrorCode } from "./errors.js";
 import {
   createRunPersistence,
@@ -1186,7 +1187,10 @@ export class WorkflowManager extends EventEmitter {
    * UsageLimitScheduler) unchanged. `opts.args` overrides the persisted args
    * only when provided; otherwise the persisted args are kept.
    */
-  async resume(runId: string, opts?: { script?: string; args?: unknown }): Promise<boolean> {
+  async resume(
+    runId: string,
+    opts?: { script?: string; args?: unknown; maxAgents?: number },
+  ): Promise<boolean> {
     // Guard: refuse to resume a run that is already running, or one that was
     // intentionally aborted (pause/stop/Esc). Paused and failed runs can restart.
     const active = this.runs.get(runId);
@@ -1215,6 +1219,24 @@ export class WorkflowManager extends EventEmitter {
           cacheWrite: persisted.tokenUsage.cacheWrite ?? 0,
         }
       : undefined;
+
+    // maxAgents: omit keeps the persisted cap (undefined means runWorkflow's
+    // MAX_AGENTS_PER_RUN default). A finite opts.maxAgents is increase-only vs
+    // that effective prior — never pin a lower ceiling onto a never-set run.
+    // A non-raise request refuses the whole resume so callers don't think
+    // recovery worked.
+    const priorMaxAgents = persisted.maxAgents;
+    const requestedMaxAgents = opts?.maxAgents;
+    let resolvedMaxAgents = priorMaxAgents;
+    if (typeof requestedMaxAgents === "number" && Number.isFinite(requestedMaxAgents)) {
+      const raised = Math.floor(requestedMaxAgents);
+      const effectivePrior = priorMaxAgents ?? MAX_AGENTS_PER_RUN;
+      if (raised <= effectivePrior) {
+        this.persistence.releaseRunLease(lease);
+        return false;
+      }
+      resolvedMaxAgents = raised;
+    }
 
     const controller = new AbortController();
     const managed: ManagedRun = {
@@ -1259,10 +1281,12 @@ export class WorkflowManager extends EventEmitter {
       // Restore the same start-time execution context for the other four
       // per-run knobs (see ManagedRun doc comments) — same rationale as
       // tokenBudget: never re-resolve against the manager's CURRENT defaults.
-      // maxAgents: legacy/never-set runs resume with no cap carried forward
-      // (runWorkflow's own MAX_AGENTS_PER_RUN default applies), exactly as if
-      // maxAgents had never been passed at all.
-      maxAgents: persisted.maxAgents,
+      // maxAgents: omit keeps the persisted cap (undefined means runWorkflow's
+      // MAX_AGENTS_PER_RUN default). A finite opts.maxAgents is increase-only vs
+      // that effective prior — never pin a lower ceiling onto a never-set run.
+      // A non-raise request refuses the whole resume so callers don't think
+      // recovery worked.
+      maxAgents: resolvedMaxAgents,
       // agentTimeoutMs: unlike tokenBudget, a legacy run's real timeout at
       // start was never "no timeout" by omission — it was always
       // this.defaultAgentTimeoutMs, because pre-A1 resume() never threaded
