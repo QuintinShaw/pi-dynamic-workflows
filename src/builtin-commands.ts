@@ -192,6 +192,9 @@ export function classifyCodeReviewArtifact(path: string): string | undefined {
   return undefined;
 }
 
+/** Flags shared by every bare `git diff HEAD` path (auto-scoped, unscoped, and fail-open). */
+const BARE_DIFF_HEAD_ARGS = ["diff", "HEAD", "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames"] as const;
+
 export async function discoverCodeReviewAutoScope(cwd: string): Promise<CodeReviewAutoScope> {
   const metadata = await captureCommandPrefix(
     "git",
@@ -224,17 +227,7 @@ function buildAutoScopedDiffArgs(scope: CodeReviewAutoScope): string[] {
       `auto-scope path arguments use ${argBytes.toLocaleString()} bytes (limit ${AUTO_SCOPE_MAX_ARG_BYTES.toLocaleString()})`,
     );
   }
-  return [
-    "--literal-pathspecs",
-    "diff",
-    "HEAD",
-    "--no-ext-diff",
-    "--no-textconv",
-    "--no-color",
-    "--no-renames",
-    "--",
-    ...scope.included.map((entry) => entry.path),
-  ];
+  return ["--literal-pathspecs", ...BARE_DIFF_HEAD_ARGS, "--", ...scope.included.map((entry) => entry.path)];
 }
 
 function sumChangedLines(entries: DiffNumstatEntry[]): number {
@@ -456,7 +449,7 @@ export function registerBuiltinWorkflows(
                 `${discovered.excluded.length.toLocaleString()} artifacts skipped)`;
             } else {
               cmd = "git";
-              cmdArgs = ["diff", "HEAD"];
+              cmdArgs = [...BARE_DIFF_HEAD_ARGS];
             }
           } catch (error) {
             ctx.ui.notify(
@@ -464,7 +457,7 @@ export function registerBuiltinWorkflows(
               "warning",
             );
             cmd = "git";
-            cmdArgs = ["diff", "HEAD"];
+            cmdArgs = [...BARE_DIFF_HEAD_ARGS];
           }
         } else if (/^\d+$/.test(input)) {
           diffSource = `gh pr diff ${input}`;
@@ -497,7 +490,7 @@ export function registerBuiltinWorkflows(
           autoScope = undefined;
           diffSource = "git diff HEAD";
           try {
-            captured = await captureCommandPrefix("git", ["diff", "HEAD"], {
+            captured = await captureCommandPrefix("git", [...BARE_DIFF_HEAD_ARGS], {
               cwd,
               maxChars: MAX_DIFF_CHARS,
             });
@@ -514,7 +507,7 @@ export function registerBuiltinWorkflows(
           autoScope = undefined;
           diffSource = "git diff HEAD";
           try {
-            captured = await captureCommandPrefix("git", ["diff", "HEAD"], {
+            captured = await captureCommandPrefix("git", [...BARE_DIFF_HEAD_ARGS], {
               cwd,
               maxChars: MAX_DIFF_CHARS,
             });
