@@ -808,6 +808,73 @@ describe("workflow extension - control tool availability", () => {
     }
   });
 
+  it("wires model_select to manager.setMainModel", async () => {
+    const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-control-extension-model-select-"));
+    try {
+      await withFakeHomeAsync(fakeHome, async () => {
+        discardWorkflowRuntime(process.cwd());
+        const { WorkflowManager } = await import("../src/workflow-manager.js");
+        const seen: Array<string | undefined> = [];
+        const original = WorkflowManager.prototype.setMainModel;
+        WorkflowManager.prototype.setMainModel = function setMainModelSpy(spec: string | undefined) {
+          seen.push(spec);
+          return original.call(this, spec);
+        };
+        try {
+          const activeTools = ["bash", "read"];
+          const handlers: Record<string, Array<(...args: any[]) => any>> = {};
+          const pi = {
+            registerTool: () => {},
+            registerCommand: () => {},
+            getCommands: () => [],
+            on: (event: string, handler: (...args: any[]) => any) => {
+              if (!handlers[event]) handlers[event] = [];
+              handlers[event].push(handler);
+            },
+            getActiveTools: () => [...activeTools],
+            setActiveTools: (tools: string[]) => {
+              activeTools.splice(0, activeTools.length, ...tools);
+            },
+            sendMessage: () => {},
+          } as unknown as ExtensionAPI;
+          const { default: installExtension } = await import("../extensions/workflow.js");
+          installExtension(pi);
+
+          assert.equal(handlers.model_select?.length, 1, "must listen for model_select");
+
+          handlers.session_start[0](
+            {},
+            {
+              cwd: process.cwd(),
+              model: { provider: "start-prov", id: "model-a" },
+              modelRegistry: {},
+              sessionManager: { getSessionId: () => "session-model" },
+              ui: { setWidget: () => {}, notify: () => {} },
+            },
+          );
+          assert.ok(seen.includes("start-prov/model-a"), "session_start should seed mainModel from ctx.model");
+
+          handlers.model_select[0]({
+            type: "model_select",
+            model: { provider: "live-prov", id: "model-b" },
+            previousModel: { provider: "start-prov", id: "model-a" },
+            source: "set",
+          });
+          assert.ok(
+            seen.includes("live-prov/model-b"),
+            "model_select must call setMainModel with the newly selected spec",
+          );
+
+          discardWorkflowRuntime(process.cwd());
+        } finally {
+          WorkflowManager.prototype.setMainModel = original;
+        }
+      });
+    } finally {
+      rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+
   it("queues completions that land before session_start and flushes them after", async () => {
     const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-control-extension-prebind-"));
     try {

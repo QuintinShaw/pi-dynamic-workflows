@@ -149,6 +149,14 @@ test("resolveAgentModelSpec: unconfigured tier falls back to the main model", ()
   assert.equal(resolveAgentModelSpec({ tier: "unknown-tier" }, "main/model", loadCfg), "main/model");
 });
 
+test("resolveAgentModelSpec: no model-tiers.json — after mainModel refresh, tier:medium uses the NEW mainModel", () => {
+  // #148: /model then /code-review with no model-tiers.json. Agents tagged
+  // { tier: "medium" } fall through to mainModel, which must be the post-/model
+  // value — not a session-start snapshot.
+  assert.equal(resolveAgentModelSpec({ tier: "medium" }, "start-prov/model-a", noCfg), "start-prov/model-a");
+  assert.equal(resolveAgentModelSpec({ tier: "medium" }, "live-prov/model-b", noCfg), "live-prov/model-b");
+});
+
 test("resolveAgentModelSpec: untagged agent defaults to the configured medium tier", () => {
   // The "set tier but nothing changed" fix: an agent with no model and no tier
   // falls back to the user's medium tier when a config exists.

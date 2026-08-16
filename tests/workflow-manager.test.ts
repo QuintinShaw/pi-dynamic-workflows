@@ -901,6 +901,33 @@ return { a }`;
     await manager.runSync(script);
     const run = manager.listRuns().find((r) => r.workflowName === "mm_test");
     assert.ok(run, "run should exist");
+    const agentSnap = run?.agents.find((ag) => ag.label === "a");
+    assert.equal(agentSnap?.model, "anthropic/claude-sonnet-4", "untagged agents display the session mainModel");
+  }),
+);
+
+test(
+  "setMainModel after a prior run reaches subsequent untagged agents (mid-session /model)",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent() });
+    const script = `export const meta = { name: 'mm_refresh', description: 'main model refresh' }
+const a = await agent('test', { label: 'a' })
+return { a }`;
+
+    manager.setMainModel("start-prov/model-a");
+    const firstResult = await manager.runSync(script);
+    const first = manager.getPersistence().load(firstResult.runId);
+    assert.equal(first?.agents.find((ag) => ag.label === "a")?.model, "start-prov/model-a");
+
+    manager.setMainModel("live-prov/model-b");
+    const secondResult = await manager.runSync(script);
+    const second = manager.getPersistence().load(secondResult.runId);
+    assert.notEqual(firstResult.runId, secondResult.runId);
+    assert.equal(
+      second?.agents.find((ag) => ag.label === "a")?.model,
+      "live-prov/model-b",
+      "a later setMainModel must win for new runs (model_select path)",
+    );
   }),
 );
 

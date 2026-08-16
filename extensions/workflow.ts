@@ -335,4 +335,12 @@ export default function extension(pi: ExtensionAPI) {
       armingInstalled = true;
     }
   });
+
+  // Keep mainModel in sync with mid-session /model (and cycle/restore). Without
+  // this, workflow subagents that fall through to mainModel keep the frozen
+  // session_start value for the rest of the process lifetime.
+  pi.on("model_select", (event) => {
+    const m = event.model;
+    manager.setMainModel(m ? `${m.provider}/${m.id}` : undefined);
+  });
 }
