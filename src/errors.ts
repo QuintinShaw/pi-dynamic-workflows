@@ -87,6 +87,17 @@ export class WorkflowError extends Error {
   }
 }
 
+/** Internal control signal used to suspend a run at a durable workflow checkpoint. */
+export class WorkflowCheckpointSuspensionError extends Error {
+  readonly checkpointId: string;
+
+  constructor(checkpointId: string) {
+    super(`workflow checkpoint ${JSON.stringify(checkpointId)} is waiting for a response`);
+    this.name = "WorkflowCheckpointSuspensionError";
+    this.checkpointId = checkpointId;
+  }
+}
+
 /** Contract failure that retains every definition or assembly diagnostic. */
 export class WorkflowCapabilityContractError extends Error {
   readonly diagnostics: readonly CapabilityErrorDiagnostic[];

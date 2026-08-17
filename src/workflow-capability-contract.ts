@@ -418,13 +418,15 @@ const capabilities: readonly CapabilityDescriptor[] = [
     evidence: ["tests/quality-stdlib.test.ts"],
   }),
   runtimeGlobal("checkpoint", {
-    signature: "checkpoint(prompt, options?) => Promise<unknown>",
+    signature: "checkpoint(prompt, options?) | checkpoint({ kind, checkpointId, payload }) => Promise<unknown>",
     discovery: DiscoveryPlacement.WORKFLOW_AUTHORING_SKILL,
     optionShape: "checkpoint-options",
     constraints: [
       "foreground confirm and headless behavior are implemented; input/select/timeout are declared-only",
       "consumes one agent slot and no tokens",
       "journaled answers replay only within an unchanged resume prefix",
+      "object checkpoints persist their JSON payload and pause the run until workflow_control resume supplies the exact run ID, checkpoint ID, and response",
+      "durable checkpoint responses resume the same run ID, are journaled before continuation, and reject stale or conflicting delivery",
     ],
     evidence: ["tests/checkpoint.test.ts"],
   }),

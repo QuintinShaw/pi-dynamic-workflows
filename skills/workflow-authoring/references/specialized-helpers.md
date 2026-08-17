@@ -15,5 +15,6 @@ Preserve candidate or work identity outside helper results that may omit failed 
 | --- | --- |
 | `gate(thunk, validator, { attempts })` | Calls `thunk(feedback, attempt)` with initial `undefined` feedback and a zero-based attempt. `validator(value)` returns `{ ok, feedback? }`, synchronously or asynchronously; a bare boolean is not accepted. Three attempts by default. Returns `{ ok, value, attempts }`, including the last value on exhaustion. See [validated gate](../examples/validated-gate.js). |
 | `checkpoint(prompt, options?)` | Journals a human/default decision. Only foreground confirm and documented headless behavior work; input, select, and timeout are declared-only. |
+| `checkpoint({ kind, checkpointId, payload })` | Persists a JSON payload and pauses without returning a terminal result. `workflow_control resume` must supply the same run ID, the unique deterministic checkpoint ID, and a JSON response; the awaited call returns that response under the same run ID. |
 
 Always `await gate()`. A thunk containing `await` must itself be declared `async`; await `agent()` before adding its resolved value to a ledger. Runtime agent retries repeat recoverable execution failures; helper attempts are new semantic calls. Bound both layers and ledger exhaustion.

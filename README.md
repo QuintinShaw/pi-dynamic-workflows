@@ -101,7 +101,7 @@ The installed extension generates this compact index from its executable capabil
 | completenessCheck | runtime-global | `completenessCheck(taskArgs: unknown, results: unknown) => Promise<{ complete: boolean; missing?: string[] } \| null>` | — |
 | retry | runtime-global | `retry(thunk: (attempt: number) => unknown \| Promise<unknown>, options?: { attempts?: number; until?: (result: unknown) => boolean }) => Promise<unknown>` | `attempts`: number (optional; default: 3)<br>`until`: (result: unknown) => boolean (optional; default: accept first result when omitted) |
 | gate | runtime-global | `gate(thunk: (feedback: string \| undefined, attempt: number) => unknown \| Promise<unknown>, validator: (value: unknown) => { ok: boolean; feedback?: string } \| Promise<{ ok: boolean; feedback?: string }>, options?: { attempts?: number }) => Promise<{ ok: boolean; value: unknown; attempts: number }>` | `attempts`: number (optional; default: 3) |
-| checkpoint | runtime-global | `checkpoint(prompt, options?) => Promise<unknown>` | `default`: unknown (optional; default: true when no UI and omitted)<br>`headless`: "default" \| "abort" (optional; default: "default")<br>`kind`: "confirm" \| "input" \| "select" (optional; default: "confirm")<br>`choices`: string[] (optional)<br>`timeoutMs`: number (optional) |
+| checkpoint | runtime-global | `checkpoint(prompt, options?) \| checkpoint({ kind, checkpointId, payload }) => Promise<unknown>` | `default`: unknown (optional; default: true when no UI and omitted)<br>`headless`: "default" \| "abort" (optional; default: "default")<br>`kind`: "confirm" \| "input" \| "select" (optional; default: "confirm")<br>`choices`: string[] (optional)<br>`timeoutMs`: number (optional) |
 | log | runtime-global | `log(message) => void` | — |
 | phase | runtime-global | `phase(title, options?) => void` | `budget`: number (optional) |
 | args | runtime-global | `args: unknown` | — |
@@ -153,7 +153,7 @@ is equivalent to `/deep-research "..."`. A saved workflow always wins over a bui
 
 ## Commands and run control
 
-Pi can manage background runs directly with the `workflow_control` tool instead of asking you to type a command. It supports `list`, `status`, `pause`, `resume`, and `stop`; run-specific actions use the canonical run ID returned when the workflow starts. Status output includes the run state, current phase, agent counts, active labels, and recorded token total.
+Pi can manage background runs directly with the `workflow_control` tool instead of asking you to type a command. It supports `list`, `status`, `pause`, `resume`, and `stop`; run-specific actions use the canonical run ID returned when the workflow starts. Status output includes the run state, current phase, durable checkpoint, agent counts, active labels, and recorded token total. A durable checkpoint resumes with `{ action: "resume", runId, checkpointId, response }`; repeated identical responses are idempotent, while stale or conflicting responses fail.
 
 | Command | Purpose |
 | --- | --- |
@@ -184,7 +184,7 @@ Agent details use a compact summary by default: completed agents show their fina
 | `verify` / `judgePanel` | Cross-check a result or choose the best candidate |
 | `loopUntilDry` / `completenessCheck` | Repeat discovery until no new findings remain |
 | `workflow(name, args)` | Run a saved workflow inline |
-| `checkpoint(prompt, opts)` | Add a journaled human-approval gate |
+| `checkpoint(prompt, opts)` / `checkpoint({ kind, checkpointId, payload })` | Add a journaled human/default gate or a durable controller handoff |
 | `budget` | Inspect real tokens spent and remaining |
 
 | Agent option | Description |

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { JournalEntry } from "../src/workflow.js";
+import { WorkflowCheckpointSuspensionError } from "../src/errors.js";
+import type { JournalEntry, WorkflowCheckpoint } from "../src/workflow.js";
 import { runWorkflow } from "../src/workflow.js";
 
 const noopAgent = {
@@ -84,6 +85,257 @@ await checkpoint('b', { default: 1 })
 await checkpoint('c', { default: 1 })
 return 1`;
   await assert.rejects(() => runWorkflow(script, { agent: noopAgent, persistLogs: false, maxAgents: 2 }), /limit/i);
+});
+
+test("checkpoint(): durable object suspends, then replays its persisted response", async () => {
+  const script = `export const meta = { name: 'durable', description: 'durable checkpoint' }
+const publication = await checkpoint({ kind: 'proposal-ready', checkpointId: 'proposal-1', payload: { digest: 'abc' } })
+return { publication }`;
+  const updates: WorkflowCheckpoint[] = [];
+
+  await assert.rejects(
+    () =>
+      runWorkflow(script, {
+        agent: noopAgent,
+        persistLogs: false,
+        runId: "durable-checkpoint-run",
+        onWorkflowCheckpoint: (checkpoint) => updates.push(checkpoint),
+      }),
+    (error) => error instanceof WorkflowCheckpointSuspensionError,
+  );
+  assert.deepEqual(updates, [
+    {
+      version: 1,
+      checkpointId: "proposal-1",
+      kind: "proposal-ready",
+      status: "waiting",
+      payload: { digest: "abc" },
+      createdAt: updates[0]?.createdAt,
+    },
+  ]);
+
+  const journal = new Map<string, JournalEntry>();
+  const resumed = await runWorkflow<{ publication: unknown }>(script, {
+    agent: noopAgent,
+    persistLogs: false,
+    runId: "durable-checkpoint-run",
+    resumeCheckpoint: {
+      ...updates[0],
+      status: "resuming",
+      response: { head: "def" },
+    },
+    onAgentJournal: (entry) => journal.set(`${entry.runId}:${entry.index}`, entry),
+    onWorkflowCheckpoint: (checkpoint) => updates.push(checkpoint),
+  });
+
+  assert.deepEqual(resumed.result.publication, { head: "def" });
+  assert.deepEqual(updates[1], {
+    ...updates[0],
+    status: "consumed",
+    response: { head: "def" },
+    consumedAt: updates[1]?.consumedAt,
+  });
+  assert.equal(journal.size, 1, "the resumed response is journaled before execution continues");
+});
+
+test("checkpoint(): durable payload rejects lossy non-JSON values", async () => {
+  const scripts = [
+    `export const meta = { name: 'nan', description: 'nan payload' }
+await checkpoint({ kind: 'proposal-ready', checkpointId: 'nan', payload: { approved: NaN } })`,
+    `export const meta = { name: 'undefined', description: 'undefined payload' }
+await checkpoint({ kind: 'proposal-ready', checkpointId: 'undefined', payload: { approved: undefined } })`,
+    `export const meta = { name: 'accessor', description: 'accessor payload' }
+const values = []
+Object.defineProperty(values, '0', { enumerable: true, get() { return true } })
+values.length = 1
+await checkpoint({ kind: 'proposal-ready', checkpointId: 'accessor', payload: { values } })`,
+  ];
+  for (const script of scripts) {
+    await assert.rejects(() => runWorkflow(script, { agent: noopAgent, persistLogs: false }), /lossless JSON value/);
+  }
+});
+
+test("checkpoint(): durable object accepts only controller checkpoint kinds", async () => {
+  const script = `export const meta = { name: 'kind', description: 'invalid kind' }
+await checkpoint({ kind: 'custom', checkpointId: 'custom', payload: {} })`;
+  await assert.rejects(
+    () => runWorkflow(script, { agent: noopAgent, persistLogs: false }),
+    /exactly.*kind.*checkpointId.*payload/i,
+  );
+});
+
+test("checkpoint(): concurrent distinct checkpoints expose only one active checkpoint", async () => {
+  const script = `export const meta = { name: 'concurrent', description: 'concurrent checkpoints' }
+const values = await Promise.all([
+  checkpoint({ kind: 'proposal-ready', checkpointId: 'first', payload: { order: 1 } }),
+  checkpoint({ kind: 'waiting-for-gitlab', checkpointId: 'second', payload: { order: 2 } }),
+])
+return values`;
+  const updates: WorkflowCheckpoint[] = [];
+  await assert.rejects(
+    () =>
+      runWorkflow(script, {
+        agent: noopAgent,
+        persistLogs: false,
+        runId: "concurrent-checkpoint-run",
+        onWorkflowCheckpoint: (checkpoint) => updates.push(checkpoint),
+      }),
+    WorkflowCheckpointSuspensionError,
+  );
+  assert.deepEqual(
+    updates.map(({ checkpointId, status }) => ({ checkpointId, status })),
+    [{ checkpointId: "first", status: "waiting" }],
+  );
+
+  const first = updates[0];
+  assert.ok(first);
+  await assert.rejects(
+    () =>
+      runWorkflow(script, {
+        agent: noopAgent,
+        persistLogs: false,
+        runId: "concurrent-checkpoint-run",
+        resumeCheckpoint: { ...first, status: "resuming", response: { accepted: true } },
+        onWorkflowCheckpoint: (checkpoint) => updates.push(checkpoint),
+      }),
+    WorkflowCheckpointSuspensionError,
+  );
+  assert.deepEqual(
+    updates.slice(1).map(({ checkpointId, status }) => ({ checkpointId, status })),
+    [
+      { checkpointId: "first", status: "consumed" },
+      { checkpointId: "second", status: "waiting" },
+    ],
+  );
+});
+test("checkpoint(): outer then nested checkpoints consume one shared response in order", async () => {
+  const child = `export const meta = { name: 'child', description: 'nested checkpoint' }
+return await checkpoint({ kind: 'waiting-for-gitlab', checkpointId: 'nested-second', payload: { order: 2 } })`;
+  const outer = `export const meta = { name: 'outer', description: 'outer then nested' }
+const first = await checkpoint({ kind: 'proposal-ready', checkpointId: 'outer-first', payload: { order: 1 } })
+const second = await workflow('child')
+return { first, second }`;
+  const journal = new Map<string, JournalEntry>();
+  const updates: WorkflowCheckpoint[] = [];
+  const execute = (resumeCheckpoint?: WorkflowCheckpoint) =>
+    runWorkflow<{ first: unknown; second: unknown }>(outer, {
+      agent: noopAgent,
+      persistLogs: false,
+      runId: "outer-nested-run",
+      loadSavedWorkflow: (name) => (name === "child" ? child : undefined),
+      resumeJournal: journal,
+      ...(resumeCheckpoint ? { resumeCheckpoint } : {}),
+      onAgentJournal: (entry) => journal.set(`${entry.runId}:${entry.index}`, entry),
+      onWorkflowCheckpoint: (checkpoint) => updates.push(checkpoint),
+    });
+
+  await assert.rejects(() => execute(), WorkflowCheckpointSuspensionError);
+  const first = updates.at(-1);
+  assert.ok(first);
+  await assert.rejects(
+    () => execute({ ...first, status: "resuming", response: { accepted: 1 } }),
+    WorkflowCheckpointSuspensionError,
+  );
+  const second = updates.at(-1);
+  assert.ok(second);
+  assert.equal(second.checkpointId, "nested-second");
+  const completed = await execute({ ...second, status: "resuming", response: { accepted: 2 } });
+  assert.equal(JSON.stringify(completed.result), JSON.stringify({ first: { accepted: 1 }, second: { accepted: 2 } }));
+});
+
+test("checkpoint(): nested then outer checkpoints consume one shared response in order", async () => {
+  const child = `export const meta = { name: 'child', description: 'nested checkpoint' }
+return await checkpoint({ kind: 'proposal-ready', checkpointId: 'nested-first', payload: { order: 1 } })`;
+  const outer = `export const meta = { name: 'outer', description: 'nested then outer' }
+const first = await workflow('child')
+const second = await checkpoint({ kind: 'waiting-for-gitlab', checkpointId: 'outer-second', payload: { order: 2 } })
+return { first, second }`;
+  const journal = new Map<string, JournalEntry>();
+  const updates: WorkflowCheckpoint[] = [];
+  const execute = (resumeCheckpoint?: WorkflowCheckpoint) =>
+    runWorkflow<{ first: unknown; second: unknown }>(outer, {
+      agent: noopAgent,
+      persistLogs: false,
+      runId: "nested-outer-run",
+      loadSavedWorkflow: (name) => (name === "child" ? child : undefined),
+      resumeJournal: journal,
+      ...(resumeCheckpoint ? { resumeCheckpoint } : {}),
+      onAgentJournal: (entry) => journal.set(`${entry.runId}:${entry.index}`, entry),
+      onWorkflowCheckpoint: (checkpoint) => updates.push(checkpoint),
+    });
+
+  await assert.rejects(() => execute(), WorkflowCheckpointSuspensionError);
+  const first = updates.at(-1);
+  assert.ok(first);
+  await assert.rejects(
+    () => execute({ ...first, status: "resuming", response: { accepted: 1 } }),
+    WorkflowCheckpointSuspensionError,
+  );
+  const second = updates.at(-1);
+  assert.ok(second);
+  assert.equal(second.checkpointId, "outer-second");
+  const completed = await execute({ ...second, status: "resuming", response: { accepted: 2 } });
+  assert.equal(JSON.stringify(completed.result), JSON.stringify({ first: { accepted: 1 }, second: { accepted: 2 } }));
+});
+
+test("checkpoint(): nested workflow frames cannot reuse a durable checkpoint ID", async () => {
+  const child = (name: string) => `export const meta = { name: '${name}', description: 'duplicate nested ID' }
+return await checkpoint({ kind: 'proposal-ready', checkpointId: 'shared-id', payload: { child: '${name}' } })`;
+  const outer = `export const meta = { name: 'outer', description: 'duplicate nested IDs' }
+await workflow('one')
+await workflow('two')
+return 'unreachable'`;
+  const journal = new Map<string, JournalEntry>();
+  let waiting: WorkflowCheckpoint | undefined;
+  const options = {
+    agent: noopAgent,
+    persistLogs: false,
+    runId: "nested-duplicate-run",
+    loadSavedWorkflow: (name: string) => (name === "one" || name === "two" ? child(name) : undefined),
+    resumeJournal: journal,
+    onAgentJournal: (entry: JournalEntry) => journal.set(`${entry.runId}:${entry.index}`, entry),
+    onWorkflowCheckpoint: (checkpoint: WorkflowCheckpoint) => {
+      waiting = checkpoint;
+    },
+  };
+  await assert.rejects(() => runWorkflow(outer, options), WorkflowCheckpointSuspensionError);
+  assert.ok(waiting);
+  await assert.rejects(
+    () => runWorkflow(outer, { ...options, resumeCheckpoint: { ...waiting, status: "resuming", response: {} } }),
+    /must be unique within the run/,
+  );
+});
+
+test("checkpoint(): durable checkpoint IDs cannot be reused within one run", async () => {
+  const script = `export const meta = { name: 'duplicate', description: 'duplicate durable checkpoint' }
+await checkpoint({ kind: 'proposal-ready', checkpointId: 'same-id', payload: { cycle: 1 } })
+await checkpoint({ kind: 'waiting-for-gitlab', checkpointId: 'same-id', payload: { cycle: 2 } })
+return 'unreachable'`;
+  let waiting: WorkflowCheckpoint | undefined;
+  await assert.rejects(
+    () =>
+      runWorkflow(script, {
+        agent: noopAgent,
+        persistLogs: false,
+        runId: "duplicate-checkpoint-run",
+        onWorkflowCheckpoint: (checkpoint) => {
+          waiting = checkpoint;
+        },
+      }),
+    WorkflowCheckpointSuspensionError,
+  );
+  assert.ok(waiting);
+
+  await assert.rejects(
+    () =>
+      runWorkflow(script, {
+        agent: noopAgent,
+        persistLogs: false,
+        runId: "duplicate-checkpoint-run",
+        resumeCheckpoint: { ...waiting, status: "resuming", response: {} },
+      }),
+    /must be unique within the run/,
+  );
 });
 
 // ─── Checkpoint resume-identity hash coverage ─────────────────────────────────

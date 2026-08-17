@@ -2,7 +2,7 @@
 # Exhaustive workflow capability facts
 
 Contract format: `1.0.0`<br>
-Contract content / skill / extension: `3.5.1`
+Contract content / skill / extension: `3.6.0`
 
 Every exact fact below is projected from the installed extension's capability contract. Explanatory judgment belongs in the hand-written references next to this file.
 
@@ -149,7 +149,7 @@ Every exact fact below is projected from the installed extension's capability co
 
 - Classification: `runtime-global`
 - Support: `supported`
-- Signature: `checkpoint(prompt, options?) => Promise<unknown>`
+- Signature: `checkpoint(prompt, options?) \| checkpoint({ kind, checkpointId, payload }) => Promise<unknown>`
 - Option shape: `checkpoint-options`
 - `default`: unknown (optional; default: true when no UI and omitted)
 - `headless`: "default" | "abort" (optional; default: "default")
@@ -159,6 +159,8 @@ Every exact fact below is projected from the installed extension's capability co
 - Constraint: foreground confirm and headless behavior are implemented; input/select/timeout are declared-only
 - Constraint: consumes one agent slot and no tokens
 - Constraint: journaled answers replay only within an unchanged resume prefix
+- Constraint: object checkpoints persist their JSON payload and pause the run until workflow_control resume supplies the exact run ID, checkpoint ID, and response
+- Constraint: durable checkpoint responses resume the same run ID, are journaled before continuation, and reject stale or conflicting delivery
 
 <a id="log"></a>
 ## log

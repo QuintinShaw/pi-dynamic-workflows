@@ -8,9 +8,11 @@ Enter a phase budget with `phase("Name", { budget: N })`; phase metadata does no
 
 ## Checkpoints
 
-A checkpoint consumes an agent slot but no tokens. A workflow invocation is backgrounded by default, and background workflows are headless: they cannot display checkpoint confirmation. Use `background: false` when a checkpoint must reach the foreground host confirmation interface. Without a UI, a checkpoint returns the declared default (or `true` when omitted) unless `headless: "abort"` is selected. Confirm is implemented. Input, select, and timeout fields are declared for compatibility/future behavior but are not authoring promises.
+A string checkpoint consumes an agent slot but no tokens. A workflow invocation is backgrounded by default, and background workflows are headless: they cannot display checkpoint confirmation. Use `background: false` when a string checkpoint must reach the foreground host confirmation interface. Without a UI, it returns the declared default (or `true` when omitted) unless `headless: "abort"` is selected. Confirm is implemented. Input, select, and timeout fields are declared for compatibility/future behavior but are not authoring promises. String-checkpoint answers are journaled and can replay during an unchanged resume prefix.
 
-Checkpoint answers are journaled and can replay during an unchanged resume prefix. Do not describe checkpoints as guaranteed arbitrary forms or as remote steering.
+`await checkpoint({ kind, checkpointId, payload })` is the durable controller handoff. The payload must be JSON-serializable. The runtime persists it, sets the run to `paused`, and returns no terminal workflow result. Resume it only through `workflow_control` with the exact run ID and checkpoint ID plus a JSON-serializable `response`; the awaited call then returns that response under the same run ID. Use a deterministic checkpoint ID that is unique within the run, including the cycle or operation identity when a lexical checkpoint repeats. Stale or conflicting responses fail closed.
+
+Do not describe string checkpoints as guaranteed arbitrary forms or durable object checkpoints as human prompts. Code after an object checkpoint executes only after its exact response is persisted and replayed.
 
 ## Retry and recoverable failure
 

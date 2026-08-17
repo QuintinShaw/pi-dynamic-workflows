@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import vm from "node:vm";
 import type { Node } from "acorn";
 import { parse } from "acorn";
@@ -15,7 +16,7 @@ import {
   resolveAgentType,
 } from "./agent-registry.js";
 import { DEFAULT_AGENT_TIMEOUT_MS, MAX_AGENT_RETRIES, MAX_AGENTS_PER_RUN, MAX_CONCURRENCY } from "./config.js";
-import { WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
+import { WorkflowCheckpointSuspensionError, WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
 import { createWorkflowLogger } from "./logger.js";
 import { parseModelRoutingFromMeta, resolveModelForPhase } from "./model-routing.js";
 import { createAgentStoreTools, SharedStore } from "./shared-store.js";
@@ -114,6 +115,12 @@ export interface SharedRuntime {
    * when the second child starts and mints the very same id.
    */
   nestedCallSeq: number;
+  /** Exact durable checkpoint currently waiting or resuming across this run tree. */
+  activeCheckpointId: string | null;
+  /** Persisted response currently being consumed by exactly one checkpoint in the run tree. */
+  activeCheckpointResponse: WorkflowCheckpoint | null;
+  /** Every durable checkpoint ID encountered across outer and nested workflow frames. */
+  seenCheckpointIds: Set<string>;
   /**
    * Fires exactly once a run-fatal error is determined: an error that escaped
    * the TOP-level script's own execution completely uncaught (see runWorkflow's
@@ -154,6 +161,20 @@ export interface WorkflowAgentRunner {
   run(prompt: string, options?: AgentRunOptions<TSchema>): Promise<unknown>;
 }
 
+export interface WorkflowCheckpointInput {
+  readonly checkpointId: string;
+  readonly kind: "proposal-ready" | "waiting-for-gitlab";
+  readonly payload: unknown;
+}
+
+export interface WorkflowCheckpoint extends WorkflowCheckpointInput {
+  readonly version: 1;
+  readonly status: "waiting" | "resuming" | "consumed";
+  readonly response?: unknown;
+  readonly createdAt: string;
+  readonly consumedAt?: string;
+}
+
 export interface WorkflowRunOptions extends WorkflowAgentOptions {
   args?: unknown;
   agent?: WorkflowAgentRunner;
@@ -192,6 +213,10 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   resumeFromRunId?: string;
   /** Called after each live agent completes so the caller can persist the journal. */
   onAgentJournal?: (entry: JournalEntry) => void;
+  /** Active durable checkpoint response supplied by WorkflowManager.resume(). */
+  resumeCheckpoint?: WorkflowCheckpoint;
+  /** Persist a durable checkpoint transition before it becomes externally observable. */
+  onWorkflowCheckpoint?: (checkpoint: WorkflowCheckpoint) => void;
   /**
    * Called once per FAILED-AND-RETRIED attempt (not the final attempt of an
    * agent() call, which reports its own tokens via onAgentEnd as before),
@@ -468,6 +493,9 @@ export async function runWorkflow<T = unknown>(
       : { input: 0, output: 0, total: 0, cost: 0, cacheRead: 0, cacheWrite: 0 },
     depth: 0,
     nestedCallSeq: 0,
+    activeCheckpointId: options.resumeCheckpoint?.checkpointId ?? null,
+    activeCheckpointResponse: options.resumeCheckpoint ?? null,
+    seenCheckpointIds: new Set<string>(),
     runFatalController: new AbortController(),
     inFlight: new Set<Promise<unknown>>(),
   };
@@ -1183,29 +1211,116 @@ export async function runWorkflow<T = unknown>(
     return { ok: false, value: last, attempts };
   };
 
-  // Deterministic, journaled, replayable human checkpoint. Spends no tokens, so it
-  // is gated on the agent counter + abort (not budget). On resume the human's reply
-  // replays by callIndex exactly like a cached agent() — the genuine edge over CC,
-  // whose steering is in-session only. Headless (no UI threaded in): takes the
-  // declared default and journals THAT, so a detached/background run never hangs.
-  const checkpoint = async (promptText: string, checkpointOptions: CheckpointOptions = {}) => {
+  // Deterministic, journaled checkpoint overloads. String prompts retain the
+  // foreground/headless helper. Object checkpoints suspend the workflow until
+  // WorkflowManager persists and supplies an exact response.
+  const checkpoint = async (
+    promptOrCheckpoint: string | WorkflowCheckpointInput,
+    checkpointOptions: CheckpointOptions = {},
+  ) => {
     throwIfAborted();
-    if (typeof promptText !== "string") throw new TypeError("checkpoint(promptText, options?) needs a prompt string");
-    if (shared.agentCount >= maxAgents) {
-      throw agentLimitError();
+    if (typeof promptOrCheckpoint !== "string" && !isWorkflowCheckpointInput(promptOrCheckpoint)) {
+      throw new TypeError(
+        "checkpoint(object) needs exactly { kind, checkpointId, payload } with valid string identifiers",
+      );
     }
+    if (shared.agentCount >= maxAgents) throw agentLimitError();
+
     const callIndex = state.callSeq++;
-    const callHash = hashCheckpoint(promptText, checkpointOptions);
-    // Namespaced by runId like agent()'s deltaKey — see JournalEntry.runId.
+    const promptText = typeof promptOrCheckpoint === "string" ? promptOrCheckpoint : null;
+    const durableInput =
+      promptText === null
+        ? {
+            ...(promptOrCheckpoint as WorkflowCheckpointInput),
+            payload: cloneDurableJsonValue(
+              (promptOrCheckpoint as WorkflowCheckpointInput).payload,
+              "checkpoint payload",
+            ),
+          }
+        : null;
+    if (durableInput !== null) {
+      if (shared.seenCheckpointIds.has(durableInput.checkpointId)) {
+        throw new WorkflowError(
+          `durable checkpoint ID ${JSON.stringify(durableInput.checkpointId)} must be unique within the run`,
+          WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+          { recoverable: false },
+        );
+      }
+      shared.seenCheckpointIds.add(durableInput.checkpointId);
+    }
+    const activeResumeCheckpoint = shared.activeCheckpointResponse;
+    const callHash =
+      promptText === null
+        ? hashWorkflowCheckpoint(durableInput as WorkflowCheckpointInput)
+        : hashCheckpoint(promptText, checkpointOptions);
     const journalKey = `${runId}:${callIndex}`;
     const cached = options.resumeJournal?.get(journalKey);
-    if (cached != null && cached.hash === callHash && callIndex < state.firstMiss) {
+    const replayingActiveCheckpoint =
+      durableInput !== null && activeResumeCheckpoint?.checkpointId === durableInput.checkpointId;
+    if (cached != null && cached.hash === callHash && callIndex < state.firstMiss && !replayingActiveCheckpoint) {
       shared.agentCount++;
-      return cached.result; // replay the journaled human reply
+      return cached.result;
     }
     if (cached == null || cached.hash !== callHash) state.firstMiss = Math.min(state.firstMiss, callIndex);
     shared.agentCount++;
 
+    if (durableInput !== null) {
+      if (activeResumeCheckpoint) {
+        if (shared.activeCheckpointId !== durableInput.checkpointId) {
+          throw new WorkflowError(
+            `durable checkpoint ${JSON.stringify(durableInput.checkpointId)} does not own the active reservation`,
+            WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+            { recoverable: false },
+          );
+        }
+      } else if (shared.activeCheckpointId !== null) {
+        throw new WorkflowError(
+          `durable checkpoint ${JSON.stringify(shared.activeCheckpointId)} is already active`,
+          WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+          { recoverable: false },
+        );
+      } else {
+        shared.activeCheckpointId = durableInput.checkpointId;
+      }
+      if (activeResumeCheckpoint) {
+        const active = activeResumeCheckpoint;
+        if (
+          active.version !== 1 ||
+          active.status !== "resuming" ||
+          active.checkpointId !== durableInput.checkpointId ||
+          active.kind !== durableInput.kind ||
+          !isDeepStrictEqual(active.payload, durableInput.payload) ||
+          !Object.hasOwn(active, "response")
+        ) {
+          throw new WorkflowError(
+            `durable checkpoint ${JSON.stringify(durableInput.checkpointId)} does not match the persisted response`,
+            WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+            { recoverable: false },
+          );
+        }
+        options.onAgentJournal?.({ index: callIndex, runId, hash: callHash, result: active.response });
+        const consumed: WorkflowCheckpoint = {
+          ...active,
+          status: "consumed",
+          consumedAt: new Date().toISOString(),
+        };
+        options.onWorkflowCheckpoint?.(consumed);
+        shared.activeCheckpointResponse = null;
+        shared.activeCheckpointId = null;
+        return active.response;
+      }
+
+      const waiting: WorkflowCheckpoint = {
+        version: 1,
+        ...durableInput,
+        status: "waiting",
+        createdAt: new Date().toISOString(),
+      };
+      options.onWorkflowCheckpoint?.(waiting);
+      throw new WorkflowCheckpointSuspensionError(waiting.checkpointId);
+    }
+
+    if (promptText === null) throw new Error("unreachable durable checkpoint branch");
     let reply: unknown;
     if (options.confirm) {
       reply = await options.confirm(promptText, checkpointOptions);
@@ -1514,6 +1629,82 @@ function hashCheckpoint(promptText: string, options: CheckpointOptions): string 
     timeoutMs: options.timeoutMs ?? null,
   });
   return createHash("sha256").update(identity).digest("hex");
+}
+
+function isWorkflowCheckpointInput(value: unknown): value is WorkflowCheckpointInput {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const input = value as Record<string, unknown>;
+  return (
+    Object.keys(input).length === 3 &&
+    Object.hasOwn(input, "payload") &&
+    typeof input.checkpointId === "string" &&
+    /^[A-Za-z0-9._:-]{1,200}$/u.test(input.checkpointId) &&
+    (input.kind === "proposal-ready" || input.kind === "waiting-for-gitlab")
+  );
+}
+
+export function cloneDurableJsonValue(value: unknown, label: string): unknown {
+  const active = new WeakSet<object>();
+  const invalid = (cause?: unknown): never => {
+    throw new TypeError(`${label} must be a lossless JSON value`, cause === undefined ? undefined : { cause });
+  };
+  const clone = (item: unknown, depth: number): unknown => {
+    if (item === null || typeof item === "string" || typeof item === "boolean") return item;
+    if (typeof item === "number") return Number.isFinite(item) ? item : invalid();
+    if (typeof item !== "object" || depth > 100) return invalid();
+    if (active.has(item)) return invalid();
+    active.add(item);
+    try {
+      if (Array.isArray(item)) {
+        const ownKeys = Reflect.ownKeys(item);
+        if (
+          ownKeys.some(
+            (key) =>
+              typeof key !== "string" ||
+              (key !== "length" && (!/^(?:0|[1-9]\d*)$/u.test(key) || Number(key) >= item.length)),
+          )
+        ) {
+          return invalid();
+        }
+        const arrayCopy: unknown[] = [];
+        for (let index = 0; index < item.length; index++) {
+          const descriptor = Object.getOwnPropertyDescriptor(item, String(index));
+          if (!descriptor?.enumerable || !Object.hasOwn(descriptor, "value")) return invalid();
+          arrayCopy.push(clone(descriptor.value, depth + 1));
+        }
+        return arrayCopy;
+      }
+
+      const prototype = Object.getPrototypeOf(item);
+      const objectConstructor =
+        prototype === null ? Object : Object.getOwnPropertyDescriptor(prototype, "constructor")?.value;
+      if (prototype !== null && (typeof objectConstructor !== "function" || objectConstructor.name !== "Object")) {
+        return invalid();
+      }
+      const copy: Record<string, unknown> = {};
+      for (const key of Reflect.ownKeys(item)) {
+        if (typeof key !== "string") return invalid();
+        const descriptor = Object.getOwnPropertyDescriptor(item, key);
+        if (!descriptor?.enumerable || !Object.hasOwn(descriptor, "value")) return invalid();
+        Object.defineProperty(copy, key, {
+          configurable: true,
+          enumerable: true,
+          writable: true,
+          value: clone(descriptor.value, depth + 1),
+        });
+      }
+      return copy;
+    } catch (error) {
+      return invalid(error);
+    } finally {
+      active.delete(item);
+    }
+  };
+  return clone(value, 0);
+}
+
+function hashWorkflowCheckpoint(input: WorkflowCheckpointInput): string {
+  return createHash("sha256").update(JSON.stringify(input)).digest("hex");
 }
 
 function hashAgentCall(

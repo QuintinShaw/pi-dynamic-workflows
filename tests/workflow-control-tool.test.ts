@@ -29,7 +29,7 @@ function run(status: RunStatus = "running", runId = "audit-abc123"): PersistedRu
 
 function fakeManager(initial: PersistedRunState[], liveSnapshots: Record<string, WorkflowSnapshot> = {}) {
   const runs = new Map(initial.map((item) => [item.runId, item]));
-  const calls: Array<{ action: string; runId: string }> = [];
+  const calls: Array<{ action: string; runId: string; checkpointId?: string; response?: unknown }> = [];
   const manager = {
     listRuns: () => [...runs.values()],
     getSnapshot: (runId: string) => liveSnapshots[runId] ?? null,
@@ -40,8 +40,8 @@ function fakeManager(initial: PersistedRunState[], liveSnapshots: Record<string,
       item.status = "paused";
       return true;
     },
-    async resume(runId: string) {
-      calls.push({ action: "resume", runId });
+    async resume(runId: string, options?: { checkpointId?: string; response?: unknown }) {
+      calls.push({ action: "resume", runId, ...options });
       const item = runs.get(runId);
       if (!item || (item.status !== "paused" && item.status !== "failed" && item.status !== "pending")) return false;
       item.status = "running";
@@ -86,6 +86,15 @@ test("workflow_control exposes only list, status, pause, resume, and stop in a s
   assert.equal(Check(tool.parameters, { action: "pause", runId: "abc" }), true);
   assert.equal(Check(tool.parameters, { action: "resume", runId: "abc" }), true);
   assert.equal(Check(tool.parameters, { action: "stop", runId: "abc" }), true);
+  assert.equal(
+    Check(tool.parameters, {
+      action: "resume",
+      runId: "abc",
+      checkpointId: "proposal-1",
+      response: { pushedHead: "def" },
+    }),
+    true,
+  );
   assert.equal(Check(tool.parameters, { action: "status" }), true, "runId is optional at the schema level");
   assert.equal(Check(tool.parameters, { action: "restart", runId: "abc" }), false);
   assert.equal(Check(tool.parameters, { action: "remove", runId: "abc" }), false);
@@ -100,6 +109,11 @@ test("workflow_control exposes only list, status, pause, resume, and stop in a s
   assert.throws(() => prepare({ action: "list", runId: "abc" }), /does not accept runId/);
   assert.throws(() => prepare({ action: "status", runId: "abc", extra: true }), /does not accept extra/);
   assert.throws(() => prepare({ action: "restart", runId: "abc" }), /requires action/);
+  assert.throws(
+    () => prepare({ action: "resume", runId: "abc", checkpointId: "proposal-1" }),
+    /checkpointId and response together/,
+  );
+  assert.throws(() => prepare({ action: "status", runId: "abc", response: {} }), /does not accept response/);
 });
 
 test("list and status return stable lifecycle and observability fields", async () => {
@@ -119,6 +133,7 @@ test("list and status return stable lifecycle and observability fields", async (
         workflowName: "audit",
         status: "running",
         phase: "Inspect",
+        checkpoint: null,
         counts: { total: 4, done: 0, running: 1, queued: 1, error: 1, skipped: 1 },
         activeLabels: ["active scan"],
         tokenTotal: 30,
@@ -181,6 +196,26 @@ test("pause, resume, and stop call the shared manager lifecycle methods", async 
     fixture.calls.map((call) => call.action),
     ["pause", "resume", "stop"],
   );
+});
+
+test("resume forwards an exact durable checkpoint response", async () => {
+  const fixture = fakeManager([run("paused")]);
+  const response = await execute(fixture.manager, {
+    action: "resume",
+    runId: "audit-abc123",
+    checkpointId: "proposal-1",
+    response: { pushedHead: "def" },
+  });
+
+  assert.match(text(response), /result=resumed/);
+  assert.deepEqual(fixture.calls, [
+    {
+      action: "resume",
+      runId: "audit-abc123",
+      checkpointId: "proposal-1",
+      response: { pushedHead: "def" },
+    },
+  ]);
 });
 
 test("stop succeeds via the tool for a run resolved from disk but not tracked in memory (cold pi restart)", async () => {

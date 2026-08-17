@@ -33,7 +33,7 @@ export const WORKFLOW_COMPREHENSION_SCENARIO_IDS = COMPREHENSION_SCENARIOS.map((
 export const WORKFLOW_AUTHORING_FROZEN_FILES = [
   {
     path: "skills/workflow-authoring/SKILL.md",
-    sha256: "d0437e6a79328628148c005e7bdfc560a35b447becb2c3bbd0ed7df52488c881",
+    sha256: "6bdf3587a849b88b7b44a2678905a388b38db984cb77d3ef172f8f68b9c3fc42",
   },
   {
     path: "skills/workflow-authoring/references/runtime.md",
@@ -45,11 +45,11 @@ export const WORKFLOW_AUTHORING_FROZEN_FILES = [
   },
   {
     path: "skills/workflow-authoring/references/specialized-helpers.md",
-    sha256: "7597c94bbacea885697fb2d05a96ed9ec39403ca6d3a94547bf8ce5e233b2c76",
+    sha256: "a23297cac641767851ffe2956f9148b56f2a54f24ecbc9fef76777657c322d8d",
   },
   {
     path: "skills/workflow-authoring/references/lifecycle.md",
-    sha256: "04a07ddbc03ac7b4452e4bea82418000ff84e429c4a3de602fbc47abaaae8843",
+    sha256: "fc324855e21f1faee11cd5d66d532095ee10e4aebdfd6937a3f6d228cd16e7c3",
   },
   {
     path: "skills/workflow-authoring/references/pattern-selection.md",

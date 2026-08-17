@@ -96,6 +96,8 @@ export type {
   AgentOptions,
   JournalEntry,
   SharedRuntime,
+  WorkflowCheckpoint,
+  WorkflowCheckpointInput,
   WorkflowMeta,
   WorkflowMetaPhase,
   WorkflowRunOptions,

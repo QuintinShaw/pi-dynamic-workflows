@@ -15,6 +15,7 @@ import {
   unlinkIfExistsSafe,
   writeJsonAtomicWithBackup,
 } from "./fs-persistence.js";
+import type { WorkflowCheckpoint } from "./workflow.js";
 import { workflowProjectPaths } from "./workflow-paths.js";
 
 export type RunStatus = "pending" | "running" | "paused" | "completed" | "failed" | "aborted";
@@ -57,6 +58,8 @@ export interface PersistedRunState {
   pauseReason?: string;
   /** Provider reset hint for a usage-limit pause, e.g. "Resets in ~3h" (verbatim). */
   resetHint?: string;
+  /** Durable workflow-controlled suspension and its at-most-once response. */
+  checkpoint?: WorkflowCheckpoint;
   phases: string[];
   currentPhase?: string;
   agents: PersistedAgentState[];

@@ -38,11 +38,11 @@
     "workflowAuthoringSkillCorpus": {
       "serialization": "sum of UTF-8 bytes for every file under skills/workflow-authoring",
       "files": 28,
-      "bytes": 73626
+      "bytes": 75060
     },
     "representativeAuthoringProfiles": {
       "serialization": "sum of UTF-8 bytes for each profile's declared package-relative files",
-      "medianBytes": 12366,
+      "medianBytes": 12517,
       "profiles": [
         {
           "name": "write",
@@ -66,7 +66,7 @@
             "skills/workflow-authoring/examples/phased-budgets.js",
             "skills/workflow-authoring/examples/saved-nested-workflows.js"
           ],
-          "bytes": 16972
+          "bytes": 17704
         },
         {
           "name": "review",
@@ -88,7 +88,7 @@
             "skills/workflow-authoring/references/specialized-helpers.md",
             "skills/workflow-authoring/examples/validated-gate.js"
           ],
-          "bytes": 12472
+          "bytes": 12774
         },
         {
           "name": "loop",
@@ -101,7 +101,7 @@
             "skills/workflow-authoring/examples/loop-until-done.js",
             "skills/workflow-authoring/examples/structured-output.js"
           ],
-          "bytes": 17508
+          "bytes": 18240
         },
         {
           "name": "retry",
