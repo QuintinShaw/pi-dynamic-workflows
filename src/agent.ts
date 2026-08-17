@@ -893,7 +893,16 @@ export class WorkflowAgent {
       throw error;
     }
     const usageBeforeTurn = options.thread ? session.getSessionStats() : undefined;
-    const messagesBeforeTurn = session.messages.length;
+    // This turn's own transcript, collected from message_end events below rather
+    // than sliced out of session.messages with a pre-prompt() length snapshot.
+    // Auto-compaction (on by default) can rewrite session.messages inside
+    // prompt() — the array is rebuilt shorter (summary + kept tail) — so any
+    // index captured here goes stale and a slice from it comes back empty,
+    // misclassifying a successful turn as AGENT_EMPTY_OUTPUT and rolling back a
+    // threaded turn that actually landed. Events are append-only per turn, so
+    // the collected window survives compaction, and it naturally spans the
+    // schema path's repair re-prompts, which run on this same session.
+    const turnMessages: unknown[] = [];
 
     // Name the persisted session so it's identifiable in session pickers.
     // Skip when an injected session.sessionManager override won (tests/embedders),
@@ -913,6 +922,7 @@ export class WorkflowAgent {
 
     let removeAbortListener: (() => void) | undefined;
     let removeHistoryListener: (() => void) | undefined;
+    let removeTurnListener: (() => void) | undefined;
     let lastHistoryEmit = 0;
     let threadTurnSucceeded = false;
     const emitHistory = () => options.onHistory?.(compactAgentHistory(session.messages));
@@ -933,6 +943,9 @@ export class WorkflowAgent {
       if (options.onHistory) {
         removeHistoryListener = session.subscribe(() => maybeEmitHistory());
       }
+      removeTurnListener = session.subscribe((event) => {
+        if (event.type === "message_end") turnMessages.push(event.message);
+      });
 
       await session.prompt(this.buildPrompt(prompt, options as AgentRunOptions<any>, Boolean(options.schema)));
 
@@ -945,8 +958,8 @@ export class WorkflowAgent {
       throwIfProviderLimit(session.messages, options.label);
 
       if (options.schema) {
-        const result = (await resolveStructuredOutput(session, capture, options.schema, options, (messages) =>
-          this.lastAssistantText(messages.slice(messagesBeforeTurn)),
+        const result = (await resolveStructuredOutput(session, capture, options.schema, options, () =>
+          this.lastAssistantText(turnMessages),
         )) as AgentRunResult<TSchemaDef>;
         threadTurnSucceeded = true;
         return result;
@@ -956,8 +969,9 @@ export class WorkflowAgent {
       // Text emitted before it is stale progress (the agent's last real action was
       // a tool call) — accepting it would report an incomplete run as successful
       // and suppress the AGENT_EMPTY_OUTPUT retry (#111). A threaded session's
-      // restored transcript is excluded so an empty turn cannot reuse an old answer.
-      const text = this.finalAssistantText(session.messages.slice(messagesBeforeTurn));
+      // restored transcript never enters turnMessages, so an empty turn cannot
+      // reuse an old answer.
+      const text = this.finalAssistantText(turnMessages);
       if (!text.trim()) {
         throw new WorkflowError("Subagent produced no assistant output", WorkflowErrorCode.AGENT_EMPTY_OUTPUT, {
           recoverable: true,
@@ -969,6 +983,7 @@ export class WorkflowAgent {
     } finally {
       removeAbortListener?.();
       removeHistoryListener?.();
+      removeTurnListener?.();
       try {
         emitHistory();
       } catch {

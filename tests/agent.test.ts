@@ -440,6 +440,131 @@ test("failed or empty named turns restore the active transcript before the next 
   }
 });
 
+// ═══════════════════════════════════════════════════════════════════════
+// Turn isolation must survive auto-compaction. Pi compaction (on by default)
+// can rewrite session.messages inside prompt() — the array is rebuilt shorter
+// (summary + kept tail) — so isolating a threaded turn by a pre-prompt()
+// length snapshot slices an empty window and misclassifies a successful turn
+// as AGENT_EMPTY_OUTPUT. These tests trigger REAL auto-compaction (tiny
+// reserve threshold + a huge reply) and assert the turn's output survives.
+// ═══════════════════════════════════════════════════════════════════════
+
+/** Compaction settings that trip auto-compaction on a ~50k-token reply
+ * (threshold = contextWindow 128k - reserveTokens 98k = 30k) while leaving
+ * the small pad turns alone. keepRecentTokens: 1 forces the cut right at the
+ * huge reply, exercising the split-turn path (history + prefix summaries). */
+function writeCompactionSettings(home: string): void {
+  mkdirSync(join(home, ".pi", "agent"), { recursive: true });
+  writeFileSync(
+    join(home, ".pi", "agent", "settings.json"),
+    JSON.stringify({ compaction: { enabled: true, reserveTokens: 98000, keepRecentTokens: 1 } }),
+  );
+}
+
+test("a threaded turn whose prompt() triggers auto-compaction still returns its output", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-thread-compaction-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-thread-compaction-cwd-"));
+  const core = createFauxCore({
+    provider: "fauxtest-compaction",
+    models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 16384 }],
+    tokenSize: { min: 8000, max: 8000 },
+  });
+  try {
+    await withFakeHomeAsync(home, async () => {
+      writeCompactionSettings(home);
+      const runtime = await ModelRuntime.create({ authPath: join(home, "auth.json"), modelsPath: null });
+      runtime.registerProvider("fauxtest-compaction", {
+        name: "Faux Compaction",
+        baseUrl: "http://127.0.0.1:9/faux",
+        apiKey: "faux-dummy-key-not-used",
+        api: core.api,
+        streamSimple: core.streamSimple as never,
+        models: core.models.map((model) => ({
+          ...model,
+          input: ["text"] as ("text" | "image")[],
+        })),
+      });
+      // ~216k chars ≈ 54k estimated tokens: over the 30k compaction threshold,
+      // under the 128k context window (threshold path, not overflow).
+      const hugeAnswer = `COMPACTED_TURN_ANSWER ${"lorem ipsum dolor ".repeat(12000)}`;
+      core.setResponses([
+        fauxAssistantMessage("first pad answer", { stopReason: "stop" }),
+        fauxAssistantMessage("second pad answer", { stopReason: "stop" }),
+        fauxAssistantMessage(hugeAnswer, { stopReason: "stop" }),
+        // Consumed by auto-compaction inside the third prompt(): history summary,
+        // then the split-turn prefix summary.
+        fauxAssistantMessage("history summary", { stopReason: "stop" }),
+        fauxAssistantMessage("turn prefix summary", { stopReason: "stop" }),
+      ]);
+      const agent = new WorkflowAgent({ cwd, modelRegistry: new ModelRegistry(runtime) });
+      const runOptions = { thread: "implementer", model: "fauxtest-compaction/faux-model" } as const;
+
+      await agent.run("pad turn one", runOptions);
+      await agent.run("pad turn two", runOptions);
+      const text = await agent.run("big turn", runOptions);
+
+      assert.match(String(text), /^COMPACTED_TURN_ANSWER /, "the compacted turn's real answer must survive");
+      assert.equal(core.getPendingResponseCount(), 0, "auto-compaction must have run (both summaries consumed)");
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("a threaded structured turn recovers its prose payload across auto-compaction", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-thread-compaction-schema-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-thread-compaction-schema-cwd-"));
+  const core = createFauxCore({
+    provider: "fauxtest-compaction-schema",
+    models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 16384 }],
+    tokenSize: { min: 8000, max: 8000 },
+  });
+  try {
+    await withFakeHomeAsync(home, async () => {
+      writeCompactionSettings(home);
+      const runtime = await ModelRuntime.create({ authPath: join(home, "auth.json"), modelsPath: null });
+      runtime.registerProvider("fauxtest-compaction-schema", {
+        name: "Faux Compaction Schema",
+        baseUrl: "http://127.0.0.1:9/faux",
+        apiKey: "faux-dummy-key-not-used",
+        api: core.api,
+        streamSimple: core.streamSimple as never,
+        models: core.models.map((model) => ({
+          ...model,
+          input: ["text"] as ("text" | "image")[],
+        })),
+      });
+      // Prose JSON (the model never calls structured_output) big enough to trip
+      // compaction; the prose-extraction fallback must still see this turn's text.
+      const structuredValue = { finding: `STRUCTURED_ANSWER ${"pad ".repeat(54000)}` };
+      core.setResponses([
+        fauxAssistantMessage("first pad answer", { stopReason: "stop" }),
+        fauxAssistantMessage("second pad answer", { stopReason: "stop" }),
+        fauxAssistantMessage(JSON.stringify(structuredValue), { stopReason: "stop" }),
+        fauxAssistantMessage("history summary", { stopReason: "stop" }),
+        fauxAssistantMessage("turn prefix summary", { stopReason: "stop" }),
+      ]);
+      const agent = new WorkflowAgent({ cwd, modelRegistry: new ModelRegistry(runtime) });
+      const runOptions = { thread: "implementer", model: "fauxtest-compaction-schema/faux-model" } as const;
+
+      await agent.run("pad turn one", runOptions);
+      await agent.run("pad turn two", runOptions);
+      const result = await agent.run("big structured turn", {
+        ...runOptions,
+        schema: Type.Object({ finding: Type.String() }),
+        maxSchemaRetries: 0,
+      });
+
+      assert.deepEqual(result, structuredValue, "the compacted turn's structured payload must survive");
+      assert.equal(core.getPendingResponseCount(), 0, "auto-compaction must have run (both summaries consumed)");
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("WorkflowAgent.run() rejects a non-object top-level schema before touching the model registry", async () => {
   const agent = new WorkflowAgent({ cwd: "/tmp" });
   await assert.rejects(
