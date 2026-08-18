@@ -32,6 +32,7 @@ function fakeManager(initial: PersistedRunState[], liveSnapshots: Record<string,
   const calls: Array<{ action: string; runId: string; checkpointId?: string; response?: unknown }> = [];
   const manager = {
     listRuns: () => [...runs.values()],
+    listAllRuns: () => [...runs.values()],
     getSnapshot: (runId: string) => liveSnapshots[runId] ?? null,
     pause(runId: string) {
       calls.push({ action: "pause", runId });
@@ -123,7 +124,7 @@ test("list and status return stable lifecycle and observability fields", async (
   assert.match(text(listed), /^action=list result=ok runs=1\n/);
   assert.match(text(listed), /runId=audit-abc123 name="audit" status=running phase="Inspect"/);
   assert.match(text(listed), /total=4 done=0 running=1 queued=1 error=1 skipped=1/);
-  assert.match(text(listed), /active="active scan" tokens=30/);
+  assert.match(text(listed), /active="active scan" agentPolicies=.* tokens=30/);
   assert.deepEqual(listed.details, {
     action: "list",
     result: "ok",
@@ -136,6 +137,12 @@ test("list and status return stable lifecycle and observability fields", async (
         checkpoint: null,
         counts: { total: 4, done: 0, running: 1, queued: 1, error: 1, skipped: 1 },
         activeLabels: ["active scan"],
+        agentPolicies: [
+          { label: "active scan", agentType: null, source: null, effectiveToolNames: [] },
+          { label: "queued check", agentType: null, source: null, effectiveToolNames: [] },
+          { label: "failed check", agentType: null, source: null, effectiveToolNames: [] },
+          { label: "optional check", agentType: null, source: null, effectiveToolNames: [] },
+        ],
         tokenTotal: 30,
       },
     ],
@@ -218,9 +225,34 @@ test("resume forwards an exact durable checkpoint response", async () => {
   ]);
 });
 
+test("resume resolves a paused checkpoint from a prior pi session", async () => {
+  const persisted = run("paused");
+  const fixture = fakeManager([persisted]);
+  const manager = {
+    ...fixture.manager,
+    listRuns: () => [],
+    listAllRuns: () => [persisted],
+  } as unknown as WorkflowManager;
+
+  const response = await execute(manager, {
+    action: "resume",
+    runId: persisted.runId,
+    checkpointId: "proposal-1",
+    response: { pushedHead: "def" },
+  });
+
+  assert.match(text(response), /result=resumed/);
+  assert.deepEqual(fixture.calls, [{
+    action: "resume",
+    runId: persisted.runId,
+    checkpointId: "proposal-1",
+    response: { pushedHead: "def" },
+  }]);
+});
+
 test("stop succeeds via the tool for a run resolved from disk but not tracked in memory (cold pi restart)", async () => {
   // Regression guard for the workflow_control "stop" bug: findRun() resolves
-  // candidates from manager.listRuns() (disk-backed), so a run persisted as
+  // candidates from manager.listAllRuns() (disk-backed), so a run persisted as
   // "paused" by a prior pi session — never loaded into the manager's
   // in-memory map — is still advertised with "stop" as an allowed action.
   // Before the fix, manager.stop() only checked its in-memory map and
@@ -230,6 +262,7 @@ test("stop succeeds via the tool for a run resolved from disk but not tracked in
   const runs = new Map([[coldRun.runId, coldRun]]);
   const manager = {
     listRuns: () => [...runs.values()],
+    listAllRuns: () => [...runs.values()],
     getSnapshot: () => null,
     pause: () => false,
     async resume() {
@@ -255,6 +288,7 @@ test("a thrown error from the manager during an action is reported as a structur
   const throwingRun = run("paused", "throws-1");
   const manager = {
     listRuns: () => [throwingRun],
+    listAllRuns: () => [throwingRun],
     getSnapshot: () => null,
     pause: () => false,
     async resume() {

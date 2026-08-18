@@ -68,6 +68,12 @@ export interface WorkflowControlRunDetails {
     skipped: number;
   };
   activeLabels: string[];
+  agentPolicies: Array<{
+    label: string;
+    agentType: string | null;
+    source: string | null;
+    effectiveToolNames: string[];
+  }>;
   tokenTotal: number;
 }
 
@@ -191,7 +197,7 @@ function result(text: string, details: Record<string, unknown>): ControlResult {
 }
 
 function findRun(manager: WorkflowManager, runId: string): PersistedRunState | undefined {
-  return manager.listRuns().find((candidate) => candidate.runId === runId);
+  return manager.listAllRuns().find((candidate) => candidate.runId === runId);
 }
 
 function currentSummary(manager: WorkflowManager, fallback: PersistedRunState): WorkflowControlRunDetails {
@@ -247,6 +253,12 @@ function summarizeRun(run: PersistedRunState, live?: WorkflowSnapshot | null): W
     checkpoint: run.checkpoint ?? null,
     counts,
     activeLabels: agents.filter((agent) => agent.status === "running").map((agent) => agent.label),
+    agentPolicies: agents.map((agent) => ({
+      label: agent.label,
+      agentType: agent.agentType ?? null,
+      source: agent.agentTypeSourcePath ?? agent.agentTypeSource ?? null,
+      effectiveToolNames: [...(agent.effectiveToolNames ?? [])],
+    })),
     tokenTotal: Math.max(
       liveUsage.fresh + liveUsage.cacheRead,
       persistedUsage.fresh + persistedUsage.cacheRead,
@@ -268,8 +280,9 @@ function countAgents(agents: Array<Pick<WorkflowAgentSnapshot, "status">>): Work
 
 function formatRun(run: WorkflowControlRunDetails): string {
   const active = run.activeLabels.join(",") || "-";
+  const policies = JSON.stringify(run.agentPolicies);
   const checkpoint = JSON.stringify(run.checkpoint ?? null);
-  return `runId=${run.runId} name=${quote(run.workflowName)} status=${run.status} phase=${quote(run.phase ?? "-")} checkpoint=${checkpoint} total=${run.counts.total} done=${run.counts.done} running=${run.counts.running} queued=${run.counts.queued} error=${run.counts.error} skipped=${run.counts.skipped} active=${quote(active)} tokens=${run.tokenTotal}`;
+  return `runId=${run.runId} name=${quote(run.workflowName)} status=${run.status} phase=${quote(run.phase ?? "-")} checkpoint=${checkpoint} total=${run.counts.total} done=${run.counts.done} running=${run.counts.running} queued=${run.counts.queued} error=${run.counts.error} skipped=${run.counts.skipped} active=${quote(active)} agentPolicies=${policies} tokens=${run.tokenTotal}`;
 }
 
 function quote(value: string): string {
