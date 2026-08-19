@@ -1,6 +1,10 @@
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
-import { releaseCheckpointResponse, resolveCheckpointResponse } from "./checkpoint-response-token.js";
+import {
+  registerCheckpointResumeDispatchService,
+  releaseCheckpointResponse,
+  resolveCheckpointResponse,
+} from "./checkpoint-response-token.js";
 import { aggregateAgentUsage, tokenFigures, type WorkflowAgentSnapshot, type WorkflowSnapshot } from "./display.js";
 import type { PersistedRunState, RunStatus } from "./run-persistence.js";
 import type { WorkflowManager } from "./workflow-manager.js";
@@ -76,12 +80,6 @@ export interface WorkflowControlRunDetails {
     skipped: number;
   };
   activeLabels: string[];
-  agentPolicies: Array<{
-    label: string;
-    agentType: string | null;
-    source: string | null;
-    effectiveToolNames: string[];
-  }>;
   tokenTotal: number;
 }
 
@@ -98,6 +96,62 @@ export function createWorkflowControlTool(
     if (!m) throw new Error("workflow_control: no WorkflowManager configured");
     return m;
   };
+  const executeControl = async (params: WorkflowControlInput): Promise<ControlResult> => {
+    const manager = getManager();
+    if (params.action === "list") {
+      const runs = manager.listRuns();
+      const summaries = runs.map((run) => summarizeRun(run, manager.getSnapshot(run.runId)));
+      return result(
+        summaries.length
+          ? `action=list result=ok runs=${summaries.length}\n${summaries.map(formatRun).join("\n")}`
+          : "action=list result=ok runs=0",
+        { action: "list", result: "ok", runs: summaries },
+      );
+    }
+
+    if (!params.runId) return controlError(params.action, "", "runId is required for this action", ["list"]);
+    const run = findRun(manager, params.runId);
+    if (!run) return controlError(params.action, params.runId, "run not found", ["list"]);
+
+    try {
+      switch (params.action) {
+        case "status": {
+          const summary = summarizeRun(run, manager.getSnapshot(run.runId));
+          return result(`action=status result=ok ${formatRun(summary)}`, {
+            action: "status",
+            result: "ok",
+            run: summary,
+          });
+        }
+        case "pause":
+          if (!manager.pause(run.runId)) return invalidTransition("pause", run);
+          return actionSuccess("pause", "paused", currentSummary(manager, run));
+        case "resume": {
+          const binding =
+            params.checkpointId === undefined ? undefined : { runId: run.runId, checkpointId: params.checkpointId };
+          const response =
+            binding !== undefined && params.responseToken !== undefined
+              ? resolveCheckpointResponse(params.responseToken, binding)
+              : params.response;
+          const resumeOptions = binding === undefined ? undefined : { checkpointId: binding.checkpointId, response };
+          if (!(await manager.resume(run.runId, resumeOptions))) return invalidTransition("resume", run);
+          if (binding !== undefined && params.responseToken !== undefined) {
+            releaseCheckpointResponse(params.responseToken, binding);
+          }
+          return actionSuccess("resume", "resumed", currentSummary(manager, run));
+        }
+        case "stop":
+          if (!manager.stop(run.runId)) return invalidTransition("stop", run);
+          return actionSuccess("stop", "stopped", currentSummary(manager, run));
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return controlError(params.action, run.runId, message, allowedActions(run.status));
+    }
+  };
+  registerCheckpointResumeDispatchService({
+    resume: async (request) => executeControl(normalizeInput(request)),
+  });
   return defineTool({
     name: "workflow_control",
     label: "Workflow Control",
@@ -111,64 +165,7 @@ export function createWorkflowControlTool(
     parameters: workflowControlSchema,
     prepareArguments: normalizeInput,
     async execute(_toolCallId, params) {
-      const manager = getManager();
-      if (params.action === "list") {
-        const runs = manager.listRuns();
-        const summaries = runs.map((run) => summarizeRun(run, manager.getSnapshot(run.runId)));
-        return result(
-          summaries.length
-            ? `action=list result=ok runs=${summaries.length}\n${summaries.map(formatRun).join("\n")}`
-            : "action=list result=ok runs=0",
-          { action: "list", result: "ok", runs: summaries },
-        );
-      }
-
-      // runId is optional in the schema (see workflowControlSchema) but required
-      // for every non-list action; normalizeInput already enforces this, and this
-      // guard both narrows the type and returns a structured error if a model
-      // somehow calls a run action without one.
-      if (!params.runId) return controlError(params.action, "", "runId is required for this action", ["list"]);
-      const run = findRun(manager, params.runId);
-      if (!run) return controlError(params.action, params.runId, "run not found", ["list"]);
-
-      try {
-        switch (params.action) {
-          case "status": {
-            const summary = summarizeRun(run, manager.getSnapshot(run.runId));
-            return result(`action=status result=ok ${formatRun(summary)}`, {
-              action: "status",
-              result: "ok",
-              run: summary,
-            });
-          }
-          case "pause":
-            if (!manager.pause(run.runId)) return invalidTransition("pause", run);
-            return actionSuccess("pause", "paused", currentSummary(manager, run));
-          case "resume": {
-            const binding =
-              params.checkpointId === undefined ? undefined : { runId: run.runId, checkpointId: params.checkpointId };
-            const response =
-              binding !== undefined && params.responseToken !== undefined
-                ? resolveCheckpointResponse(params.responseToken, binding)
-                : params.response;
-            const resumeOptions = binding === undefined ? undefined : { checkpointId: binding.checkpointId, response };
-            if (!(await manager.resume(run.runId, resumeOptions))) return invalidTransition("resume", run);
-            if (binding !== undefined && params.responseToken !== undefined) {
-              releaseCheckpointResponse(params.responseToken, binding);
-            }
-            return actionSuccess("resume", "resumed", currentSummary(manager, run));
-          }
-          case "stop":
-            if (!manager.stop(run.runId)) return invalidTransition("stop", run);
-            return actionSuccess("stop", "stopped", currentSummary(manager, run));
-        }
-      } catch (err) {
-        // A transient persistence I/O error (or any unexpected throw from the
-        // manager) shouldn't surface as a raw stack trace to the model — report
-        // it via the tool's normal structured error shape instead.
-        const message = err instanceof Error ? err.message : String(err);
-        return controlError(params.action, run.runId, message, allowedActions(run.status));
-      }
+      return executeControl(params);
     },
   });
 }
@@ -274,12 +271,6 @@ function summarizeRun(run: PersistedRunState, live?: WorkflowSnapshot | null): W
     checkpoint: run.checkpoint ?? null,
     counts,
     activeLabels: agents.filter((agent) => agent.status === "running").map((agent) => agent.label),
-    agentPolicies: agents.map((agent) => ({
-      label: agent.label,
-      agentType: agent.agentType ?? null,
-      source: agent.agentTypeSourcePath ?? agent.agentTypeSource ?? null,
-      effectiveToolNames: [...(agent.effectiveToolNames ?? [])],
-    })),
     tokenTotal: Math.max(
       liveUsage.fresh + liveUsage.cacheRead,
       persistedUsage.fresh + persistedUsage.cacheRead,
@@ -301,9 +292,8 @@ function countAgents(agents: Array<Pick<WorkflowAgentSnapshot, "status">>): Work
 
 function formatRun(run: WorkflowControlRunDetails): string {
   const active = run.activeLabels.join(",") || "-";
-  const policies = JSON.stringify(run.agentPolicies);
   const checkpoint = JSON.stringify(run.checkpoint ?? null);
-  return `runId=${run.runId} name=${quote(run.workflowName)} status=${run.status} phase=${quote(run.phase ?? "-")} checkpoint=${checkpoint} total=${run.counts.total} done=${run.counts.done} running=${run.counts.running} queued=${run.counts.queued} error=${run.counts.error} skipped=${run.counts.skipped} active=${quote(active)} agentPolicies=${policies} tokens=${run.tokenTotal}`;
+  return `runId=${run.runId} name=${quote(run.workflowName)} status=${run.status} phase=${quote(run.phase ?? "-")} checkpoint=${checkpoint} total=${run.counts.total} done=${run.counts.done} running=${run.counts.running} queued=${run.counts.queued} error=${run.counts.error} skipped=${run.counts.skipped} active=${quote(active)} tokens=${run.tokenTotal}`;
 }
 
 function quote(value: string): string {

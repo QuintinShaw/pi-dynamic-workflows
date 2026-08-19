@@ -3,6 +3,9 @@ import { randomBytes } from "node:crypto";
 export const CHECKPOINT_RESPONSE_TOKEN_SERVICE_SYMBOL = Symbol.for(
   "@quintinshaw/pi-dynamic-workflows/checkpoint-response-token-service/v1",
 );
+export const CHECKPOINT_RESUME_DISPATCH_SERVICE_SYMBOL = Symbol.for(
+  "@quintinshaw/pi-dynamic-workflows/checkpoint-resume-dispatch-service/v1",
+);
 const TOKEN_PREFIX = "wfcr_";
 
 interface RegisteredCheckpointResponse {
@@ -22,8 +25,18 @@ export interface CheckpointResponseBinding {
   readonly checkpointId: string;
 }
 
+export interface CheckpointResumeDispatchRequest extends CheckpointResponseBinding {
+  readonly action: "resume";
+  readonly responseToken: string;
+}
+
+export interface CheckpointResumeDispatchService<TResult = unknown> {
+  resume(request: CheckpointResumeDispatchRequest): Promise<TResult>;
+}
+
 const root = globalThis as typeof globalThis & {
   [CHECKPOINT_RESPONSE_TOKEN_SERVICE_SYMBOL]?: CheckpointResponseTokenService;
+  [CHECKPOINT_RESUME_DISPATCH_SERVICE_SYMBOL]?: CheckpointResumeDispatchService;
 };
 const entries = new Map<string, RegisteredCheckpointResponse>();
 
@@ -75,4 +88,10 @@ export function resolveCheckpointResponse(token: string, binding: CheckpointResp
 
 export function releaseCheckpointResponse(token: string, binding: CheckpointResponseBinding): boolean {
   return service.release(token, binding);
+}
+
+export function registerCheckpointResumeDispatchService<TResult>(
+  dispatch: CheckpointResumeDispatchService<TResult>,
+): void {
+  root[CHECKPOINT_RESUME_DISPATCH_SERVICE_SYMBOL] = dispatch;
 }

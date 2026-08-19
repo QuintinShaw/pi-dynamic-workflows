@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { Check } from "typebox/value";
-import { registerCheckpointResponse } from "../src/checkpoint-response-token.js";
+import {
+  CHECKPOINT_RESUME_DISPATCH_SERVICE_SYMBOL,
+  type CheckpointResumeDispatchService,
+  registerCheckpointResponse,
+} from "../src/checkpoint-response-token.js";
 import type { WorkflowSnapshot } from "../src/display.js";
 import type { PersistedRunState, RunStatus } from "../src/run-persistence.js";
 import { createWorkflowControlTool } from "../src/workflow-control-tool.js";
@@ -145,7 +149,7 @@ test("list and status return stable lifecycle and observability fields", async (
   assert.match(text(listed), /^action=list result=ok runs=1\n/);
   assert.match(text(listed), /runId=audit-abc123 name="audit" status=running phase="Inspect"/);
   assert.match(text(listed), /total=4 done=0 running=1 queued=1 error=1 skipped=1/);
-  assert.match(text(listed), /active="active scan" agentPolicies=.* tokens=30/);
+  assert.match(text(listed), /active="active scan" tokens=30/);
   assert.deepEqual(listed.details, {
     action: "list",
     result: "ok",
@@ -158,12 +162,6 @@ test("list and status return stable lifecycle and observability fields", async (
         checkpoint: null,
         counts: { total: 4, done: 0, running: 1, queued: 1, error: 1, skipped: 1 },
         activeLabels: ["active scan"],
-        agentPolicies: [
-          { label: "active scan", agentType: null, source: null, effectiveToolNames: [] },
-          { label: "queued check", agentType: null, source: null, effectiveToolNames: [] },
-          { label: "failed check", agentType: null, source: null, effectiveToolNames: [] },
-          { label: "optional check", agentType: null, source: null, effectiveToolNames: [] },
-        ],
         tokenTotal: 30,
       },
     ],
@@ -269,6 +267,27 @@ test("resume resolves an opaque checkpoint response token before calling the man
   assert.match(text(replay), /result=error/);
   assert.match(text(replay), /token is invalid for this run and checkpoint/);
   assert.equal(fixture.calls.length, 1);
+});
+
+test("registered checkpoint dispatcher resumes without a model-generated tool call", async () => {
+  const fixture = fakeManager([run("paused")]);
+  createWorkflowControlTool({ manager: fixture.manager });
+  const binding = { runId: "audit-abc123", checkpointId: "proposal-1" };
+  const responseToken = registerCheckpointResponse(binding, { pushedHead: "def" });
+  const dispatch = (globalThis as Record<symbol, unknown>)[
+    CHECKPOINT_RESUME_DISPATCH_SERVICE_SYMBOL
+  ] as CheckpointResumeDispatchService<Awaited<ReturnType<typeof execute>>>;
+
+  const response = await dispatch.resume({ action: "resume", ...binding, responseToken });
+
+  assert.match(text(response), /result=resumed/);
+  assert.deepEqual(fixture.calls, [
+    {
+      action: "resume",
+      ...binding,
+      response: { pushedHead: "def" },
+    },
+  ]);
 });
 
 test("resume rejects a checkpoint response token bound to another run without calling the manager", async () => {

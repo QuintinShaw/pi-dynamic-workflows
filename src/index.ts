@@ -7,9 +7,15 @@ export { compactAgentHistory } from "./agent-history.js";
 export type { AgentDefinition, AgentRegistry } from "./agent-registry.js";
 export { applyToolPolicy, listAgentTypes, loadAgentRegistry, resolveAgentType } from "./agent-registry.js";
 export { registerBuiltinWorkflows } from "./builtin-commands.js";
-export type { CheckpointResponseBinding, CheckpointResponseTokenService } from "./checkpoint-response-token.js";
+export type {
+  CheckpointResponseBinding,
+  CheckpointResponseTokenService,
+  CheckpointResumeDispatchRequest,
+  CheckpointResumeDispatchService,
+} from "./checkpoint-response-token.js";
 export {
   CHECKPOINT_RESPONSE_TOKEN_SERVICE_SYMBOL,
+  CHECKPOINT_RESUME_DISPATCH_SERVICE_SYMBOL,
   registerCheckpointResponse,
 } from "./checkpoint-response-token.js";
 export { generateCodeReviewWorkflow, MAX_DIFF_CHARS } from "./code-review.js";
