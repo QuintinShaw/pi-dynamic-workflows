@@ -34,7 +34,7 @@ export interface CheckpointResumeDispatchService<TResult = unknown> {
   resume(request: CheckpointResumeDispatchRequest): Promise<TResult>;
 }
 
-const root = globalThis as typeof globalThis & {
+const root = process as typeof process & {
   [CHECKPOINT_RESPONSE_TOKEN_SERVICE_SYMBOL]?: CheckpointResponseTokenService;
   [CHECKPOINT_RESUME_DISPATCH_SERVICE_SYMBOL]?: CheckpointResumeDispatchService;
 };

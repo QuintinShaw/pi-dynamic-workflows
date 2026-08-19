@@ -274,10 +274,9 @@ test("registered checkpoint dispatcher resumes without a model-generated tool ca
   createWorkflowControlTool({ manager: fixture.manager });
   const binding = { runId: "audit-abc123", checkpointId: "proposal-1" };
   const responseToken = registerCheckpointResponse(binding, { pushedHead: "def" });
-  const dispatch = (globalThis as Record<symbol, unknown>)[
+  const dispatch = (process as Record<symbol, unknown>)[
     CHECKPOINT_RESUME_DISPATCH_SERVICE_SYMBOL
   ] as CheckpointResumeDispatchService<Awaited<ReturnType<typeof execute>>>;
-
   const response = await dispatch.resume({ action: "resume", ...binding, responseToken });
 
   assert.match(text(response), /result=resumed/);
