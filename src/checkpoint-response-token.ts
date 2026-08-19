@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { BroadcastChannel } from "node:worker_threads";
 
 export const CHECKPOINT_RESPONSE_TOKEN_SERVICE_SYMBOL = Symbol.for(
   "@quintinshaw/pi-dynamic-workflows/checkpoint-response-token-service/v1",
@@ -6,6 +7,8 @@ export const CHECKPOINT_RESPONSE_TOKEN_SERVICE_SYMBOL = Symbol.for(
 export const CHECKPOINT_RESUME_DISPATCH_SERVICE_SYMBOL = Symbol.for(
   "@quintinshaw/pi-dynamic-workflows/checkpoint-resume-dispatch-service/v1",
 );
+const CHECKPOINT_RESUME_CHANNEL = "@quintinshaw/pi-dynamic-workflows/checkpoint-resume/v1";
+const CHECKPOINT_RESUME_ENV = "PI_DYNAMIC_WORKFLOWS_CHECKPOINT_RESUME_CHANNEL";
 const TOKEN_PREFIX = "wfcr_";
 
 interface RegisteredCheckpointResponse {
@@ -27,9 +30,9 @@ export interface CheckpointResponseBinding {
 
 export interface CheckpointResumeDispatchRequest extends CheckpointResponseBinding {
   readonly action: "resume";
-  readonly responseToken: string;
+  readonly responseToken?: string;
+  readonly response?: unknown;
 }
-
 export interface CheckpointResumeDispatchService<TResult = unknown> {
   resume(request: CheckpointResumeDispatchRequest): Promise<TResult>;
 }
@@ -38,6 +41,7 @@ const root = process as typeof process & {
   [CHECKPOINT_RESPONSE_TOKEN_SERVICE_SYMBOL]?: CheckpointResponseTokenService;
   [CHECKPOINT_RESUME_DISPATCH_SERVICE_SYMBOL]?: CheckpointResumeDispatchService;
 };
+let resumeChannel: BroadcastChannel | null = null;
 const entries = new Map<string, RegisteredCheckpointResponse>();
 
 const serializeResponse = (response: unknown): string => {
@@ -94,4 +98,36 @@ export function registerCheckpointResumeDispatchService<TResult>(
   dispatch: CheckpointResumeDispatchService<TResult>,
 ): void {
   root[CHECKPOINT_RESUME_DISPATCH_SERVICE_SYMBOL] = dispatch;
+  process.env[CHECKPOINT_RESUME_ENV] = CHECKPOINT_RESUME_CHANNEL;
+  resumeChannel ??= new BroadcastChannel(CHECKPOINT_RESUME_CHANNEL);
+  resumeChannel.unref();
+  resumeChannel.onmessage = (event) => {
+    const message = event.data as {
+      protocol?: string;
+      requestId?: string;
+      request?: CheckpointResumeDispatchRequest;
+    };
+    if (
+      message?.protocol !== CHECKPOINT_RESUME_CHANNEL ||
+      typeof message.requestId !== "string" ||
+      message.request?.action !== "resume"
+    )
+      return;
+    void dispatch.resume(message.request).then(
+      (result) =>
+        resumeChannel?.postMessage({
+          protocol: CHECKPOINT_RESUME_CHANNEL,
+          requestId: message.requestId,
+          ok: true,
+          result,
+        }),
+      (error: unknown) =>
+        resumeChannel?.postMessage({
+          protocol: CHECKPOINT_RESUME_CHANNEL,
+          requestId: message.requestId,
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+        }),
+    );
+  };
 }
