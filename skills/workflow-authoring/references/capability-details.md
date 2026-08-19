@@ -159,7 +159,8 @@ Every exact fact below is projected from the installed extension's capability co
 - Constraint: foreground confirm and headless behavior are implemented; input/select/timeout are declared-only
 - Constraint: consumes one agent slot and no tokens
 - Constraint: journaled answers replay only within an unchanged resume prefix
-- Constraint: object checkpoints persist their JSON payload and pause the run until workflow_control resume supplies the exact run ID, checkpoint ID, and response
+- Constraint: object checkpoints persist their JSON payload and pause the run until workflow_control resume supplies the exact run ID, checkpoint ID, and either the response or a process-local opaque response token
+- Constraint: opaque response tokens keep large controller-owned responses out of model-visible tool arguments, are bound to one run/checkpoint pair, and are consumed only after a successful resume
 - Constraint: durable checkpoint responses resume the same run ID, are journaled before continuation, and reject stale or conflicting delivery
 
 <a id="log"></a>

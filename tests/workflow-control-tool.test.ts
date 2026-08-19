@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { Check } from "typebox/value";
+import { registerCheckpointResponse } from "../src/checkpoint-response-token.js";
 import type { WorkflowSnapshot } from "../src/display.js";
 import type { PersistedRunState, RunStatus } from "../src/run-persistence.js";
 import { createWorkflowControlTool } from "../src/workflow-control-tool.js";
@@ -96,6 +97,15 @@ test("workflow_control exposes only list, status, pause, resume, and stop in a s
     }),
     true,
   );
+  assert.equal(
+    Check(tool.parameters, {
+      action: "resume",
+      runId: "abc",
+      checkpointId: "proposal-1",
+      responseToken: "wfcr_registered",
+    }),
+    true,
+  );
   assert.equal(Check(tool.parameters, { action: "status" }), true, "runId is optional at the schema level");
   assert.equal(Check(tool.parameters, { action: "restart", runId: "abc" }), false);
   assert.equal(Check(tool.parameters, { action: "remove", runId: "abc" }), false);
@@ -112,7 +122,18 @@ test("workflow_control exposes only list, status, pause, resume, and stop in a s
   assert.throws(() => prepare({ action: "restart", runId: "abc" }), /requires action/);
   assert.throws(
     () => prepare({ action: "resume", runId: "abc", checkpointId: "proposal-1" }),
-    /checkpointId and response together/,
+    /checkpointId with exactly one of response or responseToken/,
+  );
+  assert.throws(
+    () =>
+      prepare({
+        action: "resume",
+        runId: "abc",
+        checkpointId: "proposal-1",
+        response: {},
+        responseToken: "wfcr_registered",
+      }),
+    /exactly one of response or responseToken/,
   );
   assert.throws(() => prepare({ action: "status", runId: "abc", response: {} }), /does not accept response/);
 });
@@ -225,6 +246,50 @@ test("resume forwards an exact durable checkpoint response", async () => {
   ]);
 });
 
+test("resume resolves an opaque checkpoint response token before calling the manager", async () => {
+  const fixture = fakeManager([run("paused")]);
+  const binding = { runId: "audit-abc123", checkpointId: "proposal-1" };
+  const responseToken = registerCheckpointResponse(binding, { pushedHead: "def" });
+
+  const response = await execute(fixture.manager, {
+    action: "resume",
+    ...binding,
+    responseToken,
+  });
+
+  assert.match(text(response), /result=resumed/);
+  assert.deepEqual(fixture.calls, [
+    {
+      action: "resume",
+      ...binding,
+      response: { pushedHead: "def" },
+    },
+  ]);
+  const replay = await execute(fixture.manager, { action: "resume", ...binding, responseToken });
+  assert.match(text(replay), /result=error/);
+  assert.match(text(replay), /token is invalid for this run and checkpoint/);
+  assert.equal(fixture.calls.length, 1);
+});
+
+test("resume rejects a checkpoint response token bound to another run without calling the manager", async () => {
+  const fixture = fakeManager([run("paused")]);
+  const responseToken = registerCheckpointResponse(
+    { runId: "another-run", checkpointId: "proposal-1" },
+    { pushedHead: "def" },
+  );
+
+  const response = await execute(fixture.manager, {
+    action: "resume",
+    runId: "audit-abc123",
+    checkpointId: "proposal-1",
+    responseToken,
+  });
+
+  assert.match(text(response), /result=error/);
+  assert.match(text(response), /token is invalid for this run and checkpoint/);
+  assert.deepEqual(fixture.calls, []);
+});
+
 test("resume resolves a paused checkpoint from a prior pi session", async () => {
   const persisted = run("paused");
   const fixture = fakeManager([persisted]);
@@ -242,12 +307,14 @@ test("resume resolves a paused checkpoint from a prior pi session", async () => 
   });
 
   assert.match(text(response), /result=resumed/);
-  assert.deepEqual(fixture.calls, [{
-    action: "resume",
-    runId: persisted.runId,
-    checkpointId: "proposal-1",
-    response: { pushedHead: "def" },
-  }]);
+  assert.deepEqual(fixture.calls, [
+    {
+      action: "resume",
+      runId: persisted.runId,
+      checkpointId: "proposal-1",
+      response: { pushedHead: "def" },
+    },
+  ]);
 });
 
 test("stop succeeds via the tool for a run resolved from disk but not tracked in memory (cold pi restart)", async () => {

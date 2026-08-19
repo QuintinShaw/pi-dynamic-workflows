@@ -425,10 +425,11 @@ const capabilities: readonly CapabilityDescriptor[] = [
       "foreground confirm and headless behavior are implemented; input/select/timeout are declared-only",
       "consumes one agent slot and no tokens",
       "journaled answers replay only within an unchanged resume prefix",
-      "object checkpoints persist their JSON payload and pause the run until workflow_control resume supplies the exact run ID, checkpoint ID, and response",
+      "object checkpoints persist their JSON payload and pause the run until workflow_control resume supplies the exact run ID, checkpoint ID, and either the response or a process-local opaque response token",
+      "opaque response tokens keep large controller-owned responses out of model-visible tool arguments, are bound to one run/checkpoint pair, and are consumed only after a successful resume",
       "durable checkpoint responses resume the same run ID, are journaled before continuation, and reject stale or conflicting delivery",
     ],
-    evidence: ["tests/checkpoint.test.ts"],
+    evidence: ["tests/checkpoint.test.ts", "tests/workflow-control-tool.test.ts"],
   }),
   runtimeGlobal("log", { signature: "log(message) => void" }),
   runtimeGlobal("phase", {

@@ -1,5 +1,6 @@
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
+import { releaseCheckpointResponse, resolveCheckpointResponse } from "./checkpoint-response-token.js";
 import { aggregateAgentUsage, tokenFigures, type WorkflowAgentSnapshot, type WorkflowSnapshot } from "./display.js";
 import type { PersistedRunState, RunStatus } from "./run-persistence.js";
 import type { WorkflowManager } from "./workflow-manager.js";
@@ -33,12 +34,19 @@ const workflowControlSchema = Type.Object(
     checkpointId: Type.Optional(
       Type.String({
         minLength: 1,
-        description: "Exact durable checkpoint ID. For resume only; must be supplied together with response.",
+        description: "Exact durable checkpoint ID. For resume only; supply with either response or responseToken.",
       }),
     ),
     response: Type.Optional(
       Type.Unknown({
         description: "JSON-serializable durable checkpoint response. For resume only; requires checkpointId.",
+      }),
+    ),
+    responseToken: Type.Optional(
+      Type.String({
+        minLength: 1,
+        description:
+          "Opaque registered durable checkpoint response. For resume only; requires checkpointId and replaces response.",
       }),
     ),
   },
@@ -137,11 +145,17 @@ export function createWorkflowControlTool(
             if (!manager.pause(run.runId)) return invalidTransition("pause", run);
             return actionSuccess("pause", "paused", currentSummary(manager, run));
           case "resume": {
-            const resumeOptions =
-              params.checkpointId === undefined
-                ? undefined
-                : { checkpointId: params.checkpointId, response: params.response };
+            const binding =
+              params.checkpointId === undefined ? undefined : { runId: run.runId, checkpointId: params.checkpointId };
+            const response =
+              binding !== undefined && params.responseToken !== undefined
+                ? resolveCheckpointResponse(params.responseToken, binding)
+                : params.response;
+            const resumeOptions = binding === undefined ? undefined : { checkpointId: binding.checkpointId, response };
             if (!(await manager.resume(run.runId, resumeOptions))) return invalidTransition("resume", run);
+            if (binding !== undefined && params.responseToken !== undefined) {
+              releaseCheckpointResponse(params.responseToken, binding);
+            }
             return actionSuccess("resume", "resumed", currentSummary(manager, run));
           }
           case "stop":
@@ -173,7 +187,7 @@ function normalizeInput(value: unknown): WorkflowControlInput {
     input.action === "list"
       ? new Set(["action"])
       : input.action === "resume"
-        ? new Set(["action", "runId", "checkpointId", "response"])
+        ? new Set(["action", "runId", "checkpointId", "response", "responseToken"])
         : new Set(["action", "runId"]);
   const extraKey = Object.keys(input).find((key) => !allowedKeys.has(key));
   if (extraKey) throw new Error(`workflow_control action "${input.action}" does not accept ${extraKey}`);
@@ -181,13 +195,20 @@ function normalizeInput(value: unknown): WorkflowControlInput {
   if (input.action !== "list" && (typeof input.runId !== "string" || !input.runId.trim())) {
     throw new Error(`workflow_control action "${input.action}" requires runId`);
   }
-  if (
-    input.action === "resume" &&
-    (Object.hasOwn(input, "checkpointId") !== Object.hasOwn(input, "response") ||
-      (Object.hasOwn(input, "checkpointId") &&
-        (typeof input.checkpointId !== "string" || input.checkpointId.length === 0)))
-  ) {
-    throw new Error('workflow_control action "resume" requires checkpointId and response together');
+  if (input.action === "resume") {
+    const hasCheckpoint = Object.hasOwn(input, "checkpointId");
+    const hasResponse = Object.hasOwn(input, "response");
+    const hasToken = Object.hasOwn(input, "responseToken");
+    if (
+      hasCheckpoint !== (hasResponse || hasToken) ||
+      (hasResponse && hasToken) ||
+      (hasCheckpoint && (typeof input.checkpointId !== "string" || input.checkpointId.length === 0)) ||
+      (hasToken && (typeof input.responseToken !== "string" || input.responseToken.length === 0))
+    ) {
+      throw new Error(
+        'workflow_control action "resume" requires checkpointId with exactly one of response or responseToken',
+      );
+    }
   }
   return input as WorkflowControlInput;
 }
