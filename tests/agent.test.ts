@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { createFauxCore, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
-import { ModelRegistry, ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { ModelRegistry, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { AgentRunOptions, AgentUsage } from "../src/agent.js";
 import {
@@ -26,7 +26,16 @@ type WorkflowAgentPrivates = {
   buildPrompt(prompt: string, options: AgentRunOptions<any>, structured: boolean): string;
   lastAssistantText(messages: unknown[]): string;
   finalAssistantText(messages: unknown[]): string;
-  createSessionManager(): { isPersisted(): boolean; getCwd(): string };
+  createSessionManager(thread?: string): {
+    isPersisted(): boolean;
+    getCwd(): string;
+    getSessionId(): string;
+    getSessionDir(): string;
+    getSessionFile(): string | undefined;
+    getLeafId(): string | null;
+    appendSessionInfo(name: string): string;
+  };
+  restoreThreadLeaf(manager: ReturnType<WorkflowAgentPrivates["createSessionManager"]>, leafId: string | null): void;
 };
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -59,6 +68,57 @@ test("WorkflowAgent with persistAgentSessions=true creates a file-backed manager
       // createSessionManager() takes no per-call cwd by design; assert the
       // manager saw the project cwd.
       assert.equal(manager.getCwd(), projectCwd);
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("WorkflowAgent retains one session manager per named thread", () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp" }) as unknown as WorkflowAgentPrivates;
+  const first = agent.createSessionManager("implementer");
+  const again = agent.createSessionManager("implementer");
+  const reviewer = agent.createSessionManager("reviewer");
+
+  assert.equal(again, first);
+  assert.equal(again.getSessionId(), first.getSessionId());
+  assert.notEqual(reviewer.getSessionId(), first.getSessionId());
+  const nextInvocation = new WorkflowAgent({ cwd: "/tmp" }) as unknown as WorkflowAgentPrivates;
+  assert.notEqual(nextInvocation.createSessionManager("implementer").getSessionId(), first.getSessionId());
+  assert.notEqual(agent.createSessionManager(), agent.createSessionManager(), "unthreaded calls remain one-shot");
+});
+
+test("WorkflowAgent restores a failed named turn to its previous leaf", () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp" }) as unknown as WorkflowAgentPrivates;
+  const manager = agent.createSessionManager("implementer");
+  const acceptedLeaf = manager.appendSessionInfo("accepted");
+  manager.appendSessionInfo("failed-attempt");
+
+  agent.restoreThreadLeaf(manager, acceptedLeaf);
+  assert.equal(manager.getLeafId(), acceptedLeaf);
+});
+
+test("persistAgentSessions uses one file per named thread", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-thread-files-"));
+  const projectCwd = join(dir, "project");
+  const fakeHome = join(dir, "home");
+  try {
+    withFakeHome(fakeHome, () => {
+      const agent = new WorkflowAgent({
+        cwd: projectCwd,
+        persistAgentSessions: true,
+      }) as unknown as WorkflowAgentPrivates;
+      const implementer = agent.createSessionManager("implementer");
+      implementer.appendSessionInfo("first turn");
+      agent.createSessionManager("implementer").appendSessionInfo("second turn");
+      agent.createSessionManager("reviewer").appendSessionInfo("review");
+
+      const sessionFiles = new Set([
+        implementer.getSessionFile(),
+        agent.createSessionManager("implementer").getSessionFile(),
+        agent.createSessionManager("reviewer").getSessionFile(),
+      ]);
+      assert.equal(sessionFiles.size, 2);
     });
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -318,6 +378,193 @@ test("WorkflowAgent.run(): tier routing resolves correctly through the real (non
 // parameters schema and fail with an opaque transport-level 400.
 // ═══════════════════════════════════════════════════════════════════════════
 
+test("failed or empty named turns restore the active transcript before the next call", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-thread-rollback-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-thread-rollback-cwd-"));
+  const core = createFauxCore({
+    provider: "fauxtest-thread",
+    models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 4096 }],
+  });
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const runtime = await ModelRuntime.create({ authPath: join(home, "auth.json"), modelsPath: null });
+      runtime.registerProvider("fauxtest-thread", {
+        name: "Faux Thread",
+        baseUrl: "http://127.0.0.1:9/faux",
+        apiKey: "faux-dummy-key-not-used",
+        api: core.api,
+        streamSimple: core.streamSimple as never,
+        models: core.models.map((model) => ({
+          ...model,
+          input: ["text"] as ("text" | "image")[],
+        })),
+      });
+      const contexts: unknown[] = [];
+      core.setResponses([
+        () => {
+          throw new Error("attempt failed");
+        },
+        fauxAssistantMessage("accepted", { stopReason: "stop" }),
+        fauxAssistantMessage("", { stopReason: "stop" }),
+        (context) => {
+          contexts.push(context);
+          return fauxAssistantMessage("followed up", { stopReason: "stop" });
+        },
+      ]);
+      const injectedManager = SessionManager.inMemory();
+      const agent = new WorkflowAgent({
+        cwd,
+        modelRegistry: new ModelRegistry(runtime),
+        session: { sessionManager: injectedManager },
+      });
+      const runOptions = { thread: "implementer", model: "fauxtest-thread/faux-model" } as const;
+
+      await assert.rejects(agent.run("FAILED_TURN_MARKER", runOptions));
+      await agent.run("ACCEPTED_TURN_MARKER", runOptions);
+      await assert.rejects(agent.run("EMPTY_TURN_MARKER", runOptions), (error: unknown) => {
+        assert.ok(error instanceof WorkflowError);
+        assert.equal(error.code, WorkflowErrorCode.AGENT_EMPTY_OUTPUT);
+        return true;
+      });
+      await agent.run("FOLLOWUP_TURN_MARKER", runOptions);
+
+      const contextText = JSON.stringify(contexts[0]);
+      assert.doesNotMatch(contextText, /FAILED_TURN_MARKER|EMPTY_TURN_MARKER/);
+      assert.match(contextText, /ACCEPTED_TURN_MARKER/);
+      assert.match(contextText, /FOLLOWUP_TURN_MARKER/);
+      assert.equal(injectedManager.getLeafId(), null, "a named thread must not use the injected one-shot manager");
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// Turn isolation must survive auto-compaction. Pi compaction (on by default)
+// can rewrite session.messages inside prompt() — the array is rebuilt shorter
+// (summary + kept tail) — so isolating a threaded turn by a pre-prompt()
+// length snapshot slices an empty window and misclassifies a successful turn
+// as AGENT_EMPTY_OUTPUT. These tests trigger REAL auto-compaction (tiny
+// reserve threshold + a huge reply) and assert the turn's output survives.
+// ═══════════════════════════════════════════════════════════════════════
+
+/** Compaction settings that trip auto-compaction on a ~50k-token reply
+ * (threshold = contextWindow 128k - reserveTokens 98k = 30k) while leaving
+ * the small pad turns alone. keepRecentTokens: 1 forces the cut right at the
+ * huge reply, exercising the split-turn path (history + prefix summaries). */
+function writeCompactionSettings(home: string): void {
+  mkdirSync(join(home, ".pi", "agent"), { recursive: true });
+  writeFileSync(
+    join(home, ".pi", "agent", "settings.json"),
+    JSON.stringify({ compaction: { enabled: true, reserveTokens: 98000, keepRecentTokens: 1 } }),
+  );
+}
+
+test("a threaded turn whose prompt() triggers auto-compaction still returns its output", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-thread-compaction-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-thread-compaction-cwd-"));
+  const core = createFauxCore({
+    provider: "fauxtest-compaction",
+    models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 16384 }],
+    tokenSize: { min: 8000, max: 8000 },
+  });
+  try {
+    await withFakeHomeAsync(home, async () => {
+      writeCompactionSettings(home);
+      const runtime = await ModelRuntime.create({ authPath: join(home, "auth.json"), modelsPath: null });
+      runtime.registerProvider("fauxtest-compaction", {
+        name: "Faux Compaction",
+        baseUrl: "http://127.0.0.1:9/faux",
+        apiKey: "faux-dummy-key-not-used",
+        api: core.api,
+        streamSimple: core.streamSimple as never,
+        models: core.models.map((model) => ({
+          ...model,
+          input: ["text"] as ("text" | "image")[],
+        })),
+      });
+      // ~216k chars ≈ 54k estimated tokens: over the 30k compaction threshold,
+      // under the 128k context window (threshold path, not overflow).
+      const hugeAnswer = `COMPACTED_TURN_ANSWER ${"lorem ipsum dolor ".repeat(12000)}`;
+      core.setResponses([
+        fauxAssistantMessage("first pad answer", { stopReason: "stop" }),
+        fauxAssistantMessage("second pad answer", { stopReason: "stop" }),
+        fauxAssistantMessage(hugeAnswer, { stopReason: "stop" }),
+        // Consumed by auto-compaction inside the third prompt(): history summary,
+        // then the split-turn prefix summary.
+        fauxAssistantMessage("history summary", { stopReason: "stop" }),
+        fauxAssistantMessage("turn prefix summary", { stopReason: "stop" }),
+      ]);
+      const agent = new WorkflowAgent({ cwd, modelRegistry: new ModelRegistry(runtime) });
+      const runOptions = { thread: "implementer", model: "fauxtest-compaction/faux-model" } as const;
+
+      await agent.run("pad turn one", runOptions);
+      await agent.run("pad turn two", runOptions);
+      const text = await agent.run("big turn", runOptions);
+
+      assert.match(String(text), /^COMPACTED_TURN_ANSWER /, "the compacted turn's real answer must survive");
+      assert.equal(core.getPendingResponseCount(), 0, "auto-compaction must have run (both summaries consumed)");
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("a threaded structured turn recovers its prose payload across auto-compaction", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-thread-compaction-schema-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-thread-compaction-schema-cwd-"));
+  const core = createFauxCore({
+    provider: "fauxtest-compaction-schema",
+    models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 16384 }],
+    tokenSize: { min: 8000, max: 8000 },
+  });
+  try {
+    await withFakeHomeAsync(home, async () => {
+      writeCompactionSettings(home);
+      const runtime = await ModelRuntime.create({ authPath: join(home, "auth.json"), modelsPath: null });
+      runtime.registerProvider("fauxtest-compaction-schema", {
+        name: "Faux Compaction Schema",
+        baseUrl: "http://127.0.0.1:9/faux",
+        apiKey: "faux-dummy-key-not-used",
+        api: core.api,
+        streamSimple: core.streamSimple as never,
+        models: core.models.map((model) => ({
+          ...model,
+          input: ["text"] as ("text" | "image")[],
+        })),
+      });
+      // Prose JSON (the model never calls structured_output) big enough to trip
+      // compaction; the prose-extraction fallback must still see this turn's text.
+      const structuredValue = { finding: `STRUCTURED_ANSWER ${"pad ".repeat(54000)}` };
+      core.setResponses([
+        fauxAssistantMessage("first pad answer", { stopReason: "stop" }),
+        fauxAssistantMessage("second pad answer", { stopReason: "stop" }),
+        fauxAssistantMessage(JSON.stringify(structuredValue), { stopReason: "stop" }),
+        fauxAssistantMessage("history summary", { stopReason: "stop" }),
+        fauxAssistantMessage("turn prefix summary", { stopReason: "stop" }),
+      ]);
+      const agent = new WorkflowAgent({ cwd, modelRegistry: new ModelRegistry(runtime) });
+      const runOptions = { thread: "implementer", model: "fauxtest-compaction-schema/faux-model" } as const;
+
+      await agent.run("pad turn one", runOptions);
+      await agent.run("pad turn two", runOptions);
+      const result = await agent.run("big structured turn", {
+        ...runOptions,
+        schema: Type.Object({ finding: Type.String() }),
+        maxSchemaRetries: 0,
+      });
+
+      assert.deepEqual(result, structuredValue, "the compacted turn's structured payload must survive");
+      assert.equal(core.getPendingResponseCount(), 0, "auto-compaction must have run (both summaries consumed)");
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("WorkflowAgent.run() rejects a non-object top-level schema before touching the model registry", async () => {
   const agent = new WorkflowAgent({ cwd: "/tmp" });
   await assert.rejects(
@@ -537,15 +784,23 @@ test("WorkflowAgent.run() still completes with a normal object schema (no regres
       const registry = new ModelRegistry(runtime);
       core.setResponses([
         fauxAssistantMessage(fauxToolCall("structured_output", { verdict: "ok" }), { stopReason: "toolUse" }),
+        fauxAssistantMessage("", { stopReason: "stop" }),
       ]);
 
       const agent = new WorkflowAgent({ cwd, modelRegistry: registry });
-      const result = await agent.run("task", {
+      const runOptions = {
         model: "fauxtest-schema/faux-model",
         schema: Type.Object({ verdict: Type.String() }),
-      });
+        thread: "structured",
+      } as const;
+      const result = await agent.run("task", runOptions);
 
       assert.deepEqual(result, { verdict: "ok" });
+      await assert.rejects(agent.run("empty follow-up", { ...runOptions, maxSchemaRetries: 0 }), (error: unknown) => {
+        assert.ok(error instanceof WorkflowError);
+        assert.equal(error.code, WorkflowErrorCode.SCHEMA_NONCOMPLIANCE);
+        return true;
+      });
     });
   } finally {
     rmSync(home, { recursive: true, force: true });

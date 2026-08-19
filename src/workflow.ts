@@ -140,6 +140,10 @@ export interface SharedRuntime {
    * after the run has been marked complete and torn down. See the drain below.
    */
   inFlight: Set<Promise<unknown>>;
+  /** Named conversations currently executing anywhere in this run tree. */
+  activeThreads: Set<string>;
+  /** Whether a threaded call has invalidated journal replay for the remaining run tree. */
+  resumeBarrierReached: boolean;
 }
 
 /** Runtime instrumentation for workflow boundaries, quality helpers, and control attempts. */
@@ -315,6 +319,12 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
   tier?: string;
   isolation?: "worktree";
   /**
+   * Re-enter a named subagent conversation during this workflow invocation.
+   * Calls using the same name must be sequential. Thread state is never resumed
+   * across a later workflow-tool invocation.
+   */
+  thread?: string;
+  /**
    * Name of a registered subagent definition (`.pi/agents/<name>.md`, project >
    * user). Binds that definition's tool allow/denylist, model, and body prompt
    * to this agent. An explicit `model` overrides the definition's model; the
@@ -470,6 +480,8 @@ export async function runWorkflow<T = unknown>(
     nestedCallSeq: 0,
     runFatalController: new AbortController(),
     inFlight: new Set<Promise<unknown>>(),
+    activeThreads: new Set<string>(),
+    resumeBarrierReached: false,
   };
   const limiter = shared.limiter;
   // This frame created `shared` fresh (rather than inheriting a parent
@@ -534,11 +546,32 @@ export async function runWorkflow<T = unknown>(
   };
 
   const agent = (prompt: string, agentOptions: AgentOptions = {}): Promise<unknown> => {
+    const rawThread = agentOptions.thread;
+    const thread = rawThread === undefined ? undefined : typeof rawThread === "string" ? rawThread.trim() : "";
+    let call: Promise<unknown>;
+    if (rawThread !== undefined && !thread) {
+      call = Promise.reject(
+        new WorkflowError("agent() thread must be a non-empty string", WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, {
+          recoverable: false,
+        }),
+      );
+    } else if (thread && shared.activeThreads.has(thread)) {
+      call = Promise.reject(
+        new WorkflowError(
+          `agent thread "${thread}" is already running; same-thread calls must be sequential`,
+          WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+          { recoverable: false },
+        ),
+      );
+    } else {
+      if (thread) shared.activeThreads.add(thread);
+      call = agentImpl(prompt, thread === rawThread ? agentOptions : { ...agentOptions, thread });
+      if (thread) call = call.finally(() => shared.activeThreads.delete(thread));
+    }
     // Track every call (awaited or not) so the top-level run can drain
     // outstanding calls before completing (see SharedRuntime.inFlight and the
     // drain in the finally below) — this is what stops a forgotten `await`
     // from letting an agent mutate state after the run is torn down.
-    const call = agentImpl(prompt, agentOptions);
     shared.inFlight.add(call);
     // Attaching a handler here (independent of whatever the script itself does
     // with the returned promise) also means an un-awaited call's eventual
@@ -599,6 +632,13 @@ export async function runWorkflow<T = unknown>(
 
     // Resolve a named agentType to its bound definition (tools/model/prompt).
     const agentDef = resolveAgentType(agentOptions.agentType, agentRegistry);
+    if (agentOptions.thread && (agentOptions.isolation === "worktree" || agentDef?.isolation === "worktree")) {
+      throw new WorkflowError(
+        `agent thread "${agentOptions.thread}" cannot use worktree isolation because worktrees are removed after each call`,
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        { recoverable: false },
+      );
+    }
     if (agentOptions.agentType && !agentDef) {
       log(`unknown agentType "${agentOptions.agentType}"; using default tools/model`);
     }
@@ -650,10 +690,11 @@ export async function runWorkflow<T = unknown>(
     // exact `${runId}:${callIndex}` string) so a nested workflow()'s
     // callIndex-0 can never accidentally replay the parent's callIndex-0
     // entry, or vice versa (see JournalEntry.runId).
-    const cached = options.resumeJournal?.get(deltaKey);
+    if (agentOptions.thread) shared.resumeBarrierReached = true;
+    const cached = agentOptions.thread ? undefined : options.resumeJournal?.get(deltaKey);
     const hashMatches = cached != null && cached.hash === callHash;
     const cachedEmptyOutput = hashMatches && isEmptyTextAgentResult(cached.result, agentOptions.schema);
-    if (hashMatches && !cachedEmptyOutput && callIndex < state.firstMiss) {
+    if (!shared.resumeBarrierReached && hashMatches && !cachedEmptyOutput && callIndex < state.firstMiss) {
       options.onAgentStart?.({ id: deltaKey, label, phase: assignedPhase, prompt, model: displayModel });
       options.onAgentEnd?.({
         id: deltaKey,
@@ -717,6 +758,7 @@ export async function runWorkflow<T = unknown>(
           const externalSignal = options.signal;
           let onExternalAbort: (() => void) | undefined;
           let onRunFatal: (() => void) | undefined;
+          let attemptRunPromise: Promise<unknown> | undefined;
           try {
             throwIfAborted();
             // This agent's own fan-out already breached maxAgents while this
@@ -748,7 +790,9 @@ export async function runWorkflow<T = unknown>(
             const runPromise = agentRunner.run(prompt, {
               label,
               // Identifiable name for persisted sessions (persistAgentSessions).
-              sessionName: `workflow:${runId} ${label}`,
+              sessionName: agentOptions.thread
+                ? `workflow:${runId} thread:${agentOptions.thread}`
+                : `workflow:${runId} ${label}`,
               schema: agentOptions.schema,
               signal: agentController.signal,
               instructions: buildAgentInstructions(assignedPhase, agentOptions, agentDef, resolvedIsolation),
@@ -779,7 +823,9 @@ export async function runWorkflow<T = unknown>(
               onHistory: (history: AgentHistoryEntry[]) => {
                 options.onAgentHistory?.({ id: deltaKey, label, phase: assignedPhase, history });
               },
+              thread: agentOptions.thread,
             });
+            attemptRunPromise = runPromise;
             // After a timeout the run() promise still settles later, rejecting with
             // "aborted" once agentController fires; the race has already resolved,
             // so swallow that to avoid an unhandled rejection.
@@ -795,13 +841,17 @@ export async function runWorkflow<T = unknown>(
             }
 
             const tokens = recordTokens(result);
-            options.onAgentJournal?.({
-              index: callIndex,
-              runId,
-              hash: callHash,
-              result,
-              storeDelta: store.commitDelta(deltaKey),
-            });
+            if (!agentOptions.thread) {
+              options.onAgentJournal?.({
+                index: callIndex,
+                runId,
+                hash: callHash,
+                result,
+                storeDelta: store.commitDelta(deltaKey),
+              });
+            } else {
+              store.commitDelta(deltaKey);
+            }
             options.onAgentEnd?.({
               id: deltaKey,
               label,
@@ -814,6 +864,10 @@ export async function runWorkflow<T = unknown>(
             });
             return result;
           } catch (error) {
+            // A named thread cannot start its next turn while an aborted wrapper
+            // is still unwinding against the shared SessionManager. Wait for the
+            // wrapper to restore its prior leaf before retrying or returning.
+            if (agentOptions.thread && attemptRunPromise) await attemptRunPromise.catch(() => {});
             if (isAborted()) throw error;
 
             const workflowError = wrapError(error, { agentLabel: label });
@@ -997,6 +1051,9 @@ export async function runWorkflow<T = unknown>(
         sharedStore: store,
         resumeJournal: prefixIntact ? options.resumeJournal : undefined,
         resumeFromRunId: undefined,
+        // Reuse the same runner so named threads span parent/child frames but
+        // still die with this one top-level runWorkflow invocation.
+        agent: agentRunner,
         // shared.nestedCallSeq, not shared.depth — see its doc comment: depth
         // returns to 0 between sequential sibling calls, which would otherwise
         // mint the same child runId (and hence colliding deltaKeys/event ids)
@@ -1199,7 +1256,7 @@ export async function runWorkflow<T = unknown>(
     // Namespaced by runId like agent()'s deltaKey — see JournalEntry.runId.
     const journalKey = `${runId}:${callIndex}`;
     const cached = options.resumeJournal?.get(journalKey);
-    if (cached != null && cached.hash === callHash && callIndex < state.firstMiss) {
+    if (!shared.resumeBarrierReached && cached != null && cached.hash === callHash && callIndex < state.firstMiss) {
       shared.agentCount++;
       return cached.result; // replay the journaled human reply
     }
@@ -1529,6 +1586,7 @@ function hashAgentCall(
     tier: options.tier ?? null,
     phase: phase ?? null,
     agentType: options.agentType ?? null,
+    ...(options.thread ? { thread: options.thread } : {}),
     // Resolved definition (tools/model/prompt) so editing an agent .md invalidates
     // this call's cached result on a later resume.
     agentDef: agentDefKey,

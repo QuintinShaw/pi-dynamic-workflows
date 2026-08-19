@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 import type { AgentUsage } from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
@@ -77,6 +78,143 @@ return xs`;
   assert.equal(maxActive, 2);
   assert.deepEqual(result.result, ["ok:a", "ok:b", "ok:c", "ok:d"]);
   assert.equal(result.agentCount, 4);
+});
+
+test("named agent threads can be re-entered around a separate reviewer", async () => {
+  const calls: Array<{ prompt: string; thread?: string }> = [];
+  const result = await runWorkflow(
+    `export const meta = { name: 'thread_reentry', description: 're-enter implementer' }
+const first = await agent('implement', { thread: 'implementer' })
+const review = await agent('review', { thread: 'reviewer' })
+const second = await agent('address review', { thread: 'implementer' })
+return { first, review, second }`,
+    {
+      agent: {
+        async run(prompt, options) {
+          calls.push({ prompt, thread: options?.thread });
+          return `${options?.thread}:${prompt}`;
+        },
+      },
+      persistLogs: false,
+    },
+  );
+
+  assert.deepEqual(calls, [
+    { prompt: "implement", thread: "implementer" },
+    { prompt: "review", thread: "reviewer" },
+    { prompt: "address review", thread: "implementer" },
+  ]);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.result)), {
+    first: "implementer:implement",
+    review: "reviewer:review",
+    second: "implementer:address review",
+  });
+});
+
+test("concurrent calls on one named thread are rejected before a second agent starts", async () => {
+  let starts = 0;
+  await assert.rejects(
+    runWorkflow(
+      `export const meta = { name: 'thread_concurrency', description: 'reject overlap' }
+return await parallel([
+  () => agent('first', { thread: 'implementer' }),
+  () => agent('second', { thread: 'implementer' })
+])`,
+      {
+        agent: {
+          async run() {
+            starts++;
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            return "ok";
+          },
+        },
+        persistLogs: false,
+      },
+    ),
+    /same-thread calls must be sequential/,
+  );
+  assert.equal(starts, 1);
+});
+
+test("named threads reject worktree isolation", async () => {
+  await assert.rejects(
+    runWorkflow(
+      `export const meta = { name: 'thread_worktree', description: 'reject worktree' }
+return await agent('work', { thread: 'implementer', isolation: 'worktree' })`,
+      { agent: countingAgent().runner, persistLogs: false },
+    ),
+    /cannot use worktree isolation/,
+  );
+});
+
+test("threaded calls are live resume barriers and are not journaled", async () => {
+  const firstJournal: JournalEntry[] = [];
+  const first = countingAgent();
+  await runWorkflow(
+    `export const meta = { name: 'thread_resume', description: 'thread barrier' }
+const before = await agent('before')
+const threaded = await agent('threaded', { thread: 'implementer' })
+const after = await agent('after')
+return { before, threaded, after }`,
+    {
+      agent: first.runner,
+      runId: "thread-run",
+      persistLogs: false,
+      onAgentJournal: (entry) => firstJournal.push(entry),
+    },
+  );
+  assert.deepEqual(
+    firstJournal.map((entry) => entry.index),
+    [0, 2],
+  );
+
+  const resumed = countingAgent();
+  await runWorkflow(
+    `export const meta = { name: 'thread_resume', description: 'thread barrier' }
+const before = await agent('before')
+const threaded = await agent('threaded', { thread: 'implementer' })
+const after = await agent('after')
+return { before, threaded, after }`,
+    {
+      agent: resumed.runner,
+      runId: "thread-run",
+      persistLogs: false,
+      resumeJournal: new Map(firstJournal.map((entry) => [`thread-run:${entry.index}`, entry])),
+      resumeFromRunId: "thread-run",
+    },
+  );
+  assert.equal(resumed.state.calls, 2, "the prefix replays, then the threaded call and all later calls run live");
+});
+
+test("a timed-out named turn fully settles before retrying the thread", async () => {
+  let calls = 0;
+  let active = 0;
+  let maxActive = 0;
+  const result = await runWorkflow(
+    `export const meta = { name: 'thread_timeout_retry', description: 'safe retry' }
+return await agent('work', { thread: 'implementer', timeoutMs: 5, retries: 1 })`,
+    {
+      agent: {
+        async run(_prompt, options) {
+          calls++;
+          active++;
+          maxActive = Math.max(maxActive, active);
+          if (calls === 1) {
+            await new Promise<void>((_resolve, reject) => {
+              options?.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+            }).finally(() => active--);
+          } else {
+            active--;
+            return "ok";
+          }
+        },
+      },
+      persistLogs: false,
+    },
+  );
+
+  assert.equal(result.result, "ok");
+  assert.equal(maxActive, 1);
 });
 
 test("runWorkflow retries recoverable empty output then succeeds", async () => {
@@ -366,6 +504,30 @@ test("resume replays cached results without re-running agents", async () => {
   assert.equal(JSON.stringify(r2.result), JSON.stringify(r1.result));
 });
 
+test("unthreaded agent journal hashes remain compatible with pre-thread runs", async () => {
+  const journal: JournalEntry[] = [];
+  await runWorkflow(
+    `export const meta = { name: 'hash_compat', description: 'stable unthreaded hash' }
+return await agent('work')`,
+    {
+      agent: countingAgent().runner,
+      persistLogs: false,
+      onAgentJournal: (entry) => journal.push(entry),
+    },
+  );
+
+  const oldIdentity = JSON.stringify({
+    prompt: "work",
+    model: null,
+    tier: null,
+    phase: null,
+    agentType: null,
+    agentDef: null,
+    schema: null,
+  });
+  assert.equal(journal[0]?.hash, createHash("sha256").update(oldIdentity).digest("hex"));
+});
+
 test("resume re-runs only the changed call (hash mismatch)", async () => {
   const first = countingAgent();
   const journal: JournalEntry[] = [];
@@ -481,6 +643,78 @@ return { a, nested }`;
 
   assert.equal(result.agentCount, 2);
   assert.equal(result.result.nested.child, "ran:child task");
+});
+
+test("nested workflows share named agent threads with their parent", async () => {
+  const turns = new Map<string, string[]>();
+  const runner = {
+    async run(prompt: string, options?: { thread?: string }) {
+      const thread = options?.thread ?? "one-shot";
+      const prior = turns.get(thread) ?? [];
+      prior.push(prompt);
+      turns.set(thread, prior);
+      return prior.join(" -> ");
+    },
+  };
+  const child = `export const meta = { name: 'child_thread', description: 'continue parent thread' }
+return await agent('child', { thread: 'implementer' })`;
+  const parent = `export const meta = { name: 'parent_thread', description: 'share thread with child' }
+const first = await agent('parent-before', { thread: 'implementer' })
+const nested = await workflow('child')
+const last = await agent('parent-after', { thread: 'implementer' })
+return { first, nested, last }`;
+
+  const result = await runWorkflow<{ first: string; nested: string; last: string }>(parent, {
+    agent: runner,
+    persistLogs: false,
+    loadSavedWorkflow: (name) => (name === "child" ? child : undefined),
+  });
+
+  assert.deepEqual(turns.get("implementer"), ["parent-before", "child", "parent-after"]);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.result)), {
+    first: "parent-before",
+    nested: "parent-before -> child",
+    last: "parent-before -> child -> parent-after",
+  });
+});
+
+test("a nested threaded call invalidates later parent journal entries", async () => {
+  const script = `export const meta = { name: 'parent_resume_barrier', description: 'propagate child barrier' }
+const before = await agent('before')
+await workflow('child')
+const after = await agent('after')
+const confirmed = await checkpoint('confirm', { default: false })
+return { before, after, confirmed }`;
+  const child = `export const meta = { name: 'child_resume_barrier', description: 'thread barrier' }
+return await agent('threaded child', { thread: 'implementer' })`;
+  const journal: JournalEntry[] = [];
+  await runWorkflow(script, {
+    agent: countingAgent().runner,
+    runId: "nested-thread-barrier",
+    persistLogs: false,
+    loadSavedWorkflow: (name) => (name === "child" ? child : undefined),
+    confirm: async () => true,
+    onAgentJournal: (entry) => journal.push(entry),
+  });
+
+  const resumed = countingAgent();
+  let confirmations = 0;
+  const result = await runWorkflow<{ before: string; after: string; confirmed: boolean }>(script, {
+    agent: resumed.runner,
+    runId: "nested-thread-barrier",
+    persistLogs: false,
+    loadSavedWorkflow: (name) => (name === "child" ? child : undefined),
+    resumeJournal: new Map(journal.map((entry) => [`${entry.runId}:${entry.index}`, entry])),
+    resumeFromRunId: "nested-thread-barrier",
+    confirm: async () => {
+      confirmations++;
+      return false;
+    },
+  });
+
+  assert.equal(resumed.state.calls, 2, "the child thread and later parent agent both run live");
+  assert.equal(confirmations, 1, "the later parent checkpoint also runs live");
+  assert.equal(result.result.confirmed, false);
 });
 
 test("workflow() nesting is one level deep (second level throws)", async () => {
