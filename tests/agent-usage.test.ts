@@ -31,7 +31,7 @@ test("agent call usage tracker reconciles provisional estimates to exact termina
   attempt.reportProgress({ ...createEmptyAgentUsage(), output: 10, total: 10 });
   const exactUsage = { ...createEmptyAgentUsage(), input: 4, output: 3, total: 7, cost: 0.2 };
   attempt.reportTerminal(exactUsage);
-  assert.deepEqual(attempt.commitWithFallback(99), { tokens: 7, terminalUsage: exactUsage });
+  assert.deepEqual(attempt.commitWithFallback(99), { tokens: 7, tokenUsage: exactUsage });
   attempt.reportProgress({ ...createEmptyAgentUsage(), output: 100, total: 100 });
 
   assert.deepEqual(updates, [
@@ -49,13 +49,18 @@ test("agent call usage tracker accumulates retries and exposes each committed de
   const tracker = createAgentCallUsageTracker((update) => updates.push(update));
 
   const firstAttempt = tracker.startAttempt();
-  firstAttempt.reportTerminal({ ...createEmptyAgentUsage(), output: 40, total: 40 });
-  firstAttempt.commitWithFallback(1);
+  const firstTerminal = { ...createEmptyAgentUsage(), output: 40, total: 40 };
+  firstAttempt.reportTerminal(firstTerminal);
+  assert.deepEqual(firstAttempt.commitWithFallback(1), { tokens: 40, tokenUsage: firstTerminal });
 
   const secondAttempt = tracker.startAttempt();
   secondAttempt.reportProgress({ ...createEmptyAgentUsage(), output: 30, total: 30 });
-  secondAttempt.reportTerminal({ ...createEmptyAgentUsage(), output: 25, total: 25 });
-  secondAttempt.commitWithFallback(1);
+  const secondTerminal = { ...createEmptyAgentUsage(), output: 25, total: 25 };
+  secondAttempt.reportTerminal(secondTerminal);
+  assert.deepEqual(secondAttempt.commitWithFallback(1), {
+    tokens: 65,
+    tokenUsage: { ...createEmptyAgentUsage(), output: 65, total: 65 },
+  });
 
   assert.deepEqual(
     updates.filter((update) => update.committedUsage).map((update) => update.committedUsage?.total),
@@ -77,7 +82,7 @@ test("agent call usage tracker aborts estimates but commits cost-only terminal u
   costOnlyAttempt.reportTerminal({ ...createEmptyAgentUsage(), cost: 0.5 });
   assert.deepEqual(costOnlyAttempt.commitTerminalUsage(), {
     tokens: 0,
-    terminalUsage: { ...createEmptyAgentUsage(), cost: 0.5 },
+    tokenUsage: { ...createEmptyAgentUsage(), cost: 0.5 },
   });
 
   assert.deepEqual(

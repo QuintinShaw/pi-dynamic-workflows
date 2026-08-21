@@ -457,6 +457,38 @@ test("runWorkflow streams cumulative token usage before an agent returns", async
   assert.equal(result.tokenUsage?.total, 20, "the exact terminal total must replace the progress estimate");
 });
 
+test("onAgentEnd reports cumulative settled usage across retries", async () => {
+  let attempts = 0;
+  let endedTokens: number | undefined;
+  let endedUsage: AgentUsage | undefined;
+  const result = await runWorkflow(
+    `export const meta = { name: 'retry_usage', description: 'retry usage' }
+     return await agent('work', { label: 'worker', retries: 1 })`,
+    {
+      agent: {
+        async run(prompt, options) {
+          void prompt;
+          attempts++;
+          const total = attempts === 1 ? 40 : 25;
+          options?.onUsageProgress?.({ input: 0, output: 100, total: 100, cost: 0, cacheRead: 0, cacheWrite: 0 });
+          options?.onUsage?.({ input: 0, output: total, total, cost: 0, cacheRead: 0, cacheWrite: 0 });
+          return attempts === 1 ? "" : "done";
+        },
+      },
+      persistLogs: false,
+      onAgentEnd: (event) => {
+        endedTokens = event.tokens;
+        endedUsage = event.tokenUsage;
+      },
+    },
+  );
+
+  assert.equal(result.result, "done");
+  assert.equal(attempts, 2);
+  assert.equal(endedTokens, 65);
+  assert.equal(endedUsage?.total, 65);
+});
+
 test("meta.model is parsed and routes as the default model for agents", async () => {
   let seenModel: string | undefined;
   const recorder = {

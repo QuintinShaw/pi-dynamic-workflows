@@ -371,7 +371,7 @@ test("WorkflowAgent.run(): tier routing resolves correctly through the real (non
   }
 });
 
-test("WorkflowAgent.run() reports in-flight usage without changing terminal onUsage semantics", async () => {
+test("WorkflowAgent.run() reports per-turn in-flight usage for a named thread", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-dw-live-usage-home-"));
   const cwd = mkdtempSync(join(tmpdir(), "pi-dw-live-usage-cwd-"));
   const core = createFauxCore({
@@ -399,7 +399,10 @@ test("WorkflowAgent.run() reports in-flight usage without changing terminal onUs
           maxTokens: model.maxTokens ?? 4096,
         })),
       });
-      core.setResponses([fauxAssistantMessage("streaming output proves this agent is active", { stopReason: "stop" })]);
+      core.setResponses([
+        fauxAssistantMessage("streaming output proves this agent is active", { stopReason: "stop" }),
+        fauxAssistantMessage("the second threaded turn has independent usage", { stopReason: "stop" }),
+      ]);
 
       const registry = new ModelRegistry(runtime);
       const agent = new WorkflowAgent({
@@ -414,8 +417,10 @@ test("WorkflowAgent.run() reports in-flight usage without changing terminal onUs
         resolveFirstProgress = resolve;
       });
 
+      const thread = "live-usage-thread";
       const run = agent
         .run("respond slowly", {
+          thread,
           onUsageProgress: (usage) => {
             if (usage.total > 0) {
               resolveFirstProgress(usage);
@@ -442,6 +447,23 @@ test("WorkflowAgent.run() reports in-flight usage without changing terminal onUs
       assert.ok(progress.output > 0, "streaming text should produce a positive output estimate");
       await run;
       assert.equal(terminalCalls, 1, "onUsage remains a once-only terminal callback");
+
+      const secondProgress: AgentUsage[] = [];
+      let secondTerminal: AgentUsage | undefined;
+      await agent.run("continue in the same thread", {
+        thread,
+        onUsageProgress: (usage) => secondProgress.push(usage),
+        onUsage: (usage) => {
+          secondTerminal = usage;
+        },
+      });
+
+      assert.ok(secondProgress.length > 0, "the second turn should stream usage");
+      assert.deepEqual(
+        secondProgress.at(-1),
+        secondTerminal,
+        "the last live update must describe this turn only, matching its terminal usage",
+      );
     });
   } finally {
     rmSync(home, { recursive: true, force: true });

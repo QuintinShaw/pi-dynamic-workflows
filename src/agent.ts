@@ -433,10 +433,31 @@ function estimateStreamingAssistantUsage(event: AgentSessionEvent): AgentUsage |
   return { input: 0, output: estimatedOutput, cacheRead: 0, cacheWrite: 0, total: estimatedOutput, cost: 0 };
 }
 
-function usageFromSessionProgress(
-  stats: Parameters<typeof usageFromStats>[0],
-  event: AgentSessionEvent,
-): AgentUsage | undefined {
+type SessionUsageStats = Parameters<typeof usageFromStats>[0];
+
+function subtractSessionUsageStats(stats: SessionUsageStats, baseline?: SessionUsageStats): SessionUsageStats {
+  if (!baseline) {
+    return stats;
+  }
+  return {
+    tokens: {
+      input: Math.max(0, stats.tokens.input - baseline.tokens.input),
+      output: Math.max(0, stats.tokens.output - baseline.tokens.output),
+      cacheRead: Math.max(0, stats.tokens.cacheRead - baseline.tokens.cacheRead),
+      cacheWrite: Math.max(0, stats.tokens.cacheWrite - baseline.tokens.cacheWrite),
+      total: Math.max(0, stats.tokens.total - baseline.tokens.total),
+    },
+    cost: Math.max(0, stats.cost - baseline.cost),
+  };
+}
+
+/**
+ * Combine usage from completed messages with the current streaming message.
+ * AgentSession notifies subscribers before it appends a message_end event to
+ * SessionManager, so the event's assistant usage is absent from stats and must
+ * be added exactly once. The real-session regression test pins this ordering.
+ */
+function usageFromSessionProgress(stats: SessionUsageStats, event: AgentSessionEvent): AgentUsage | undefined {
   const persisted = usageFromStats(stats);
   const streaming = estimateStreamingAssistantUsage(event);
   if (!streaming) {
@@ -997,7 +1018,10 @@ export class WorkflowAgent {
       ) {
         return;
       }
-      const usage = usageFromSessionProgress(session.getSessionStats(), event);
+      const usage = usageFromSessionProgress(
+        subtractSessionUsageStats(session.getSessionStats(), usageBeforeTurn),
+        event,
+      );
       if (!usage || (lastProgressUsage && agentUsageEquals(lastProgressUsage, usage))) {
         return;
       }
@@ -1077,20 +1101,7 @@ export class WorkflowAgent {
       if (options.onUsage) {
         try {
           const stats = session.getSessionStats();
-          const usage = usageFromStats(
-            usageBeforeTurn
-              ? {
-                  tokens: {
-                    input: Math.max(0, stats.tokens.input - usageBeforeTurn.tokens.input),
-                    output: Math.max(0, stats.tokens.output - usageBeforeTurn.tokens.output),
-                    cacheRead: Math.max(0, stats.tokens.cacheRead - usageBeforeTurn.tokens.cacheRead),
-                    cacheWrite: Math.max(0, stats.tokens.cacheWrite - usageBeforeTurn.tokens.cacheWrite),
-                    total: Math.max(0, stats.tokens.total - usageBeforeTurn.tokens.total),
-                  },
-                  cost: Math.max(0, stats.cost - usageBeforeTurn.cost),
-                }
-              : stats,
-          );
+          const usage = usageFromStats(subtractSessionUsageStats(stats, usageBeforeTurn));
           if (usage) options.onUsage(usage);
         } catch {
           // Usage is best-effort; never let stats failure mask the real result/error.

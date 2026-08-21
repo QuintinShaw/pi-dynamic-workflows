@@ -173,7 +173,7 @@ test(
 );
 
 test(
-  "manager exposes live token usage while an agent is still running",
+  "manager replaces a high live estimate with settled agent usage",
   withTempCwd(async (cwd) => {
     let release: (() => void) | undefined;
     const blocked = new Promise<void>((resolve) => {
@@ -186,8 +186,8 @@ test(
           void prompt;
           options?.onUsageProgress?.({
             input: 20,
-            output: 10,
-            total: 30,
+            output: 80,
+            total: 100,
             cost: 0.01,
             cacheRead: 0,
             cacheWrite: 0,
@@ -211,21 +211,24 @@ test(
       tokenUsageEvents++;
     });
     const { runId, promise } = manager.startInBackground(oneAgentScript);
-    while ((manager.getRun(runId)?.snapshot.agents[0]?.tokens ?? 0) < 30) {
+    while ((manager.getRun(runId)?.snapshot.agents[0]?.tokens ?? 0) < 100) {
       await new Promise((resolve) => setTimeout(resolve, 0));
     }
 
     const live = manager.getRun(runId);
     assert.equal(live?.status, "running");
     assert.equal(live?.snapshot.agents[0]?.status, "running");
-    assert.equal(live?.snapshot.agents[0]?.tokens, 30);
+    assert.equal(live?.snapshot.agents[0]?.tokens, 100);
     assert.equal(live?.snapshot.tokenUsage, undefined, "in-flight estimates must not alter finalized run accounting");
     assert.ok(tokenUsageEvents > 0, "live task-panel listeners should be notified before agent completion");
 
     assert.ok(release);
     release();
     await promise;
-    assert.equal(manager.getRun(runId)?.snapshot.tokenUsage?.total, 30);
+    const settled = manager.getRun(runId);
+    assert.equal(settled?.snapshot.agents[0]?.tokens, 30);
+    assert.equal(settled?.snapshot.agents[0]?.tokenUsage?.total, 30);
+    assert.equal(settled?.snapshot.tokenUsage?.total, 30);
   }),
 );
 
@@ -271,7 +274,7 @@ test(
 );
 
 test(
-  "paused event is emitted after exact abort usage is persisted",
+  "manual pause settles with exact abort usage and never emits 'error'",
   withTempCwd(async (cwd) => {
     const exactUsage: AgentUsage = {
       input: 20,
@@ -303,9 +306,11 @@ test(
       },
     });
     manager.on("error", () => {});
-    let usageAtPausedEvent: number | undefined;
-    manager.on("paused", ({ runId }: { runId: string }) => {
-      usageAtPausedEvent = manager.getPersistence().load(runId)?.tokenUsage?.total;
+    // pause() announces "paused" synchronously (lifecycle control); the exact
+    // abort-teardown usage lands later, when executeRun() settles and persists.
+    let errorEvents = 0;
+    manager.on("error", () => {
+      errorEvents++;
     });
 
     const { runId, promise } = manager.startInBackground(oneAgentScript);
@@ -315,7 +320,11 @@ test(
     assert.equal(manager.pause(runId), true);
     await assert.rejects(promise);
 
-    assert.equal(usageAtPausedEvent, 25);
+    const settled = manager.getPersistence().load(runId);
+    assert.equal(settled?.status, "paused");
+    assert.equal(settled?.tokenUsage?.total, 25);
+    assert.equal(settled?.tokenUsage?.cost, 0.1);
+    assert.equal(errorEvents, 0, "a manual pause must not surface as an error");
   }),
 );
 

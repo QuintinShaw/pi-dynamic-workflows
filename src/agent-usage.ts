@@ -33,10 +33,10 @@ interface AgentCallUsageUpdate {
   committedUsage?: AgentUsage;
 }
 
-/** Settled token count plus exact provider usage when the provider reported it. */
+/** Settled cumulative usage for one logical agent call, including retries. */
 interface AgentUsageCommit {
   tokens: number;
-  terminalUsage?: AgentUsage;
+  tokenUsage?: AgentUsage;
 }
 
 /**
@@ -57,16 +57,14 @@ export function createAgentCallUsageTracker(onUpdate: (update: AgentCallUsageUpd
       const emitProgress = () => {
         onUpdate({ tokenUsage: sumAgentUsage(committedCallUsage, attemptUsage) });
       };
-      const commitUsage = (usage: AgentUsage, reportedTerminalUsage?: AgentUsage): AgentUsageCommit => {
+      const commitUsage = (usage: AgentUsage): AgentUsageCommit => {
         if (!isOpen()) {
           return { tokens: 0 };
         }
         closed = true;
         committedCallUsage = sumAgentUsage(committedCallUsage, usage);
         onUpdate({ tokenUsage: committedCallUsage, committedUsage: usage });
-        return reportedTerminalUsage
-          ? { tokens: usage.total, terminalUsage: reportedTerminalUsage }
-          : { tokens: usage.total };
+        return { tokens: committedCallUsage.total, tokenUsage: committedCallUsage };
       };
 
       return {
@@ -89,7 +87,7 @@ export function createAgentCallUsageTracker(onUpdate: (update: AgentCallUsageUpd
         },
         commitWithFallback(fallbackTotal: number) {
           if (terminalUsage && (terminalUsage.total > 0 || terminalUsage.cost > 0)) {
-            return commitUsage(terminalUsage, terminalUsage);
+            return commitUsage(terminalUsage);
           }
           return commitUsage({ ...createEmptyAgentUsage(), total: Math.max(0, fallbackTotal) });
         },
@@ -98,7 +96,7 @@ export function createAgentCallUsageTracker(onUpdate: (update: AgentCallUsageUpd
             closed = true;
             return { tokens: 0 };
           }
-          return commitUsage(terminalUsage, terminalUsage);
+          return commitUsage(terminalUsage);
         },
       };
     },

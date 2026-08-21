@@ -892,7 +892,7 @@ export async function runWorkflow<T = unknown>(
               phase: assignedPhase,
               result,
               tokens: usageCommit.tokens,
-              tokenUsage: usageCommit.terminalUsage,
+              tokenUsage: usageCommit.tokenUsage,
               worktree: runCwd,
               model: displayModel,
             });
@@ -943,7 +943,7 @@ export async function runWorkflow<T = unknown>(
               phase: assignedPhase,
               result: null,
               tokens: usageCommit.tokens,
-              tokenUsage: usageCommit.terminalUsage,
+              tokenUsage: usageCommit.tokenUsage,
               worktree: runCwd,
               model: displayModel,
               error: workflowError.message,

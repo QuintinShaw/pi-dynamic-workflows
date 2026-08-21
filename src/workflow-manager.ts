@@ -897,9 +897,11 @@ export class WorkflowManager extends EventEmitter {
             agent.error = event.error;
             agent.errorCode = event.errorCode;
             agent.recoverable = event.recoverable;
-            agent.tokens = Math.max(agent.tokens ?? 0, event.tokens ?? 0);
-            if (!agent.tokenUsage && event.tokenUsage) {
+            if (event.tokenUsage) {
               agent.tokenUsage = event.tokenUsage;
+              agent.tokens = event.tokenUsage.total;
+            } else if (event.tokens !== undefined) {
+              agent.tokens = event.tokens;
             }
             if (event.model) agent.model = event.model;
             // Real per-agent end time — only terminal agents get one; a still-
