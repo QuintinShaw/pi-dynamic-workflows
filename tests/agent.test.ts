@@ -421,6 +421,7 @@ test("WorkflowAgent.run() reports per-turn in-flight usage for a named thread", 
       const run = agent
         .run("respond slowly", {
           thread,
+          model: "fauxtest-live-usage/faux-model",
           onUsageProgress: (usage) => {
             if (usage.total > 0) {
               resolveFirstProgress(usage);
@@ -452,6 +453,7 @@ test("WorkflowAgent.run() reports per-turn in-flight usage for a named thread", 
       let secondTerminal: AgentUsage | undefined;
       await agent.run("continue in the same thread", {
         thread,
+        model: "fauxtest-live-usage/faux-model",
         onUsageProgress: (usage) => secondProgress.push(usage),
         onUsage: (usage) => {
           secondTerminal = usage;
