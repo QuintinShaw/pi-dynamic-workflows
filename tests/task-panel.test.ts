@@ -1,15 +1,186 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { before, beforeEach, describe, it } from "node:test";
 import { AgentSession, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
+import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
+import { UsageLimitScheduler } from "../src/usage-limit-scheduler.js";
+import { WorkflowManager } from "../src/workflow-manager.js";
 
 type DeliveryCall = { content: string; customType?: string; triggerTurn?: boolean };
 type StableSend = (
   msg: { customType?: string; content?: string; display?: boolean },
   opts?: { triggerTurn?: boolean; deliverAs?: string },
 ) => unknown;
+
+const lifecycleScript = `export const meta = { name: 'lifecycle_delivery', description: 'delivery lifecycle test' }
+const result = await agent('wait for control')
+return { result }`;
+
+function controlledAgent() {
+  const resolvers: Array<(value: unknown) => void> = [];
+  let calls = 0;
+  return {
+    runner: {
+      async run() {
+        calls++;
+        return new Promise<unknown>((resolve) => resolvers.push(resolve));
+      },
+    },
+    calls: () => calls,
+    resolve(index: number, value = "done") {
+      resolvers[index]?.(value);
+    },
+    async waitForCalls(expected: number) {
+      for (let attempt = 0; attempt < 100; attempt++) {
+        if (calls >= expected) return;
+        await new Promise((resolve) => setTimeout(resolve, 2));
+      }
+      assert.fail(`agent did not reach ${expected} calls (saw ${calls})`);
+    },
+  };
+}
+
+const fatalControlRaceScript = `export const meta = { name: 'fatal_control_race', description: 'run-fatal lifecycle race' }
+await parallel([
+  () => agent('fatal', { label: 'fatal' }),
+  () => agent('sibling', { label: 'sibling' }),
+])
+return 'unreachable'`;
+
+function fatalThenDrainAgent() {
+  let siblingAbortObserved = false;
+  let rejectSibling: ((reason?: unknown) => void) | undefined;
+  return {
+    runner: {
+      async run(prompt: string, options: { signal?: AbortSignal } = {}) {
+        if (prompt === "fatal") {
+          throw new WorkflowError("fatal sibling failure", WorkflowErrorCode.AGENT_EXECUTION_ERROR, {
+            recoverable: false,
+          });
+        }
+        return new Promise<unknown>((_resolve, reject) => {
+          rejectSibling = reject;
+          options.signal?.addEventListener(
+            "abort",
+            () => {
+              siblingAbortObserved = true;
+            },
+            { once: true },
+          );
+        });
+      },
+    },
+    async waitForSiblingAbort() {
+      for (let attempt = 0; attempt < 100; attempt++) {
+        if (siblingAbortObserved) return;
+        await new Promise((resolve) => setTimeout(resolve, 2));
+      }
+      assert.fail("run-fatal signal did not reach the sibling");
+    },
+    settleSibling() {
+      rejectSibling?.(new Error("sibling drained after run-fatal"));
+    },
+  };
+}
+
+const usageLimitControlRaceScript = `export const meta = { name: 'usage_limit_control_race', description: 'usage-limit lifecycle race' }
+await parallel([
+  () => agent('quota', { label: 'quota' }),
+  () => agent('sibling', { label: 'sibling' }),
+])
+return 'unreachable'`;
+
+function usageLimitThenDrainAgent() {
+  let siblingAbortObserved = false;
+  let rejectSibling: ((reason?: unknown) => void) | undefined;
+  return {
+    runner: {
+      async run(prompt: string, options: { signal?: AbortSignal } = {}) {
+        if (prompt === "quota") {
+          throw new WorkflowError("quota exhausted", WorkflowErrorCode.PROVIDER_USAGE_LIMIT, {
+            recoverable: false,
+            resetHint: "Resets in 1m",
+          });
+        }
+        return new Promise<unknown>((_resolve, reject) => {
+          rejectSibling = reject;
+          options.signal?.addEventListener(
+            "abort",
+            () => {
+              siblingAbortObserved = true;
+            },
+            { once: true },
+          );
+        });
+      },
+    },
+    async waitForSiblingAbort() {
+      for (let attempt = 0; attempt < 100; attempt++) {
+        if (siblingAbortObserved) return;
+        await new Promise((resolve) => setTimeout(resolve, 2));
+      }
+      assert.fail("usage-limit fatal signal did not reach the sibling");
+    },
+    settleSibling() {
+      rejectSibling?.(new Error("sibling drained after usage limit"));
+    },
+  };
+}
+
+function lateUsageLimitAgent() {
+  let rejectAgent: ((reason?: unknown) => void) | undefined;
+  return {
+    runner: {
+      async run() {
+        return new Promise<unknown>((_resolve, reject) => {
+          rejectAgent = reject;
+        });
+      },
+    },
+    async waitForStart() {
+      for (let attempt = 0; attempt < 100; attempt++) {
+        if (rejectAgent) return;
+        await new Promise((resolve) => setTimeout(resolve, 2));
+      }
+      assert.fail("late provider-limit agent did not start");
+    },
+    rejectWithUsageLimit() {
+      rejectAgent?.(
+        new WorkflowError("late quota exhausted", WorkflowErrorCode.PROVIDER_USAGE_LIMIT, {
+          recoverable: false,
+          resetHint: "Resets in 1m",
+        }),
+      );
+    },
+  };
+}
+
+function lateErrorAgent() {
+  let rejectAgent: ((reason?: unknown) => void) | undefined;
+  return {
+    runner: {
+      async run() {
+        return new Promise<unknown>((_resolve, reject) => {
+          rejectAgent = reject;
+        });
+      },
+    },
+    async waitForStart() {
+      for (let attempt = 0; attempt < 100; attempt++) {
+        if (rejectAgent) return;
+        await new Promise((resolve) => setTimeout(resolve, 2));
+      }
+      assert.fail("late-error agent did not start");
+    },
+    rejectWith(error: Error) {
+      rejectAgent?.(error);
+    },
+  };
+}
 
 type TaskPanelModule = {
   installResultDelivery: (pi: ExtensionAPI, manager: unknown, opts?: unknown) => void;
@@ -679,6 +850,279 @@ describe("installResultDelivery", () => {
     const calls = piCalls(pi);
     assert.equal(calls.length, 0);
   });
+
+  it("does not deliver or trigger a turn when a real background run is manually paused, then resumes only explicitly", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pi-dw-pause-delivery-"));
+    const agent = controlledAgent();
+    const manager = new WorkflowManager({ cwd, agent: agent.runner });
+    const pi = createMockPi();
+    const errors: unknown[] = [];
+    manager.on("error", (event) => errors.push(event));
+
+    try {
+      mod.installResultDelivery(pi, manager);
+      manager.setSessionId(SESSION);
+      mod.bindSessionDelivery(SESSION, pi, { manager, stableSend: recordingStableSend(pi) });
+
+      const { runId, promise } = manager.startInBackground(lifecycleScript);
+      await agent.waitForCalls(1);
+
+      assert.equal(manager.pause(runId), true);
+      agent.resolve(0);
+      await promise.catch(() => {});
+      await Promise.resolve();
+
+      assert.equal(manager.getRun(runId)?.status, "paused");
+      assert.equal(agent.calls(), 1, "pause must not restart the workflow");
+      assert.equal(errors.length, 0, "manual pause teardown is not an unexpected error");
+      assert.equal(piCalls(pi).length, 0, "manual pause must not deliver a failed background result");
+
+      assert.equal(await manager.resume(runId), true, "only an explicit resume restarts the workflow");
+      await agent.waitForCalls(2);
+      agent.resolve(1, "resumed");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      const calls = piCalls(pi);
+      assert.equal(calls.length, 1, "the explicitly resumed completion is delivered once");
+      assert.equal(calls[0].triggerTurn, true, "only the real completion continues the conversation");
+      assert.match(calls[0].content, /finished/);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("does not deliver or trigger a turn when a real background run is manually stopped", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pi-dw-stop-delivery-"));
+    const agent = controlledAgent();
+    const manager = new WorkflowManager({ cwd, agent: agent.runner });
+    const pi = createMockPi();
+    const errors: unknown[] = [];
+    manager.on("error", (event) => errors.push(event));
+
+    try {
+      mod.installResultDelivery(pi, manager);
+      manager.setSessionId(SESSION);
+      mod.bindSessionDelivery(SESSION, pi, { manager, stableSend: recordingStableSend(pi) });
+
+      const { runId, promise } = manager.startInBackground(lifecycleScript);
+      await agent.waitForCalls(1);
+
+      assert.equal(manager.stop(runId), true);
+      agent.resolve(0);
+      await promise.catch(() => {});
+      await Promise.resolve();
+
+      assert.equal(manager.getRun(runId)?.status, "aborted");
+      assert.equal(errors.length, 0, "manual stop teardown is not an unexpected error");
+      assert.equal(piCalls(pi).length, 0, "manual stop must not deliver a failed background result");
+      assert.equal(await manager.resume(runId), false, "a stopped run remains non-resumable");
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("still delivers an external abort when a later manual pause races its teardown", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pi-dw-external-abort-delivery-"));
+    const agent = controlledAgent();
+    const manager = new WorkflowManager({ cwd, agent: agent.runner });
+    const pi = createMockPi();
+    const errors: unknown[] = [];
+    manager.on("error", (event) => errors.push(event));
+    const external = new AbortController();
+
+    try {
+      mod.installResultDelivery(pi, manager);
+      manager.setSessionId(SESSION);
+      mod.bindSessionDelivery(SESSION, pi, { manager, stableSend: recordingStableSend(pi) });
+
+      const { runId, promise } = manager.startInBackground(lifecycleScript, undefined, {
+        externalSignal: external.signal,
+      });
+      await agent.waitForCalls(1);
+
+      external.abort();
+      assert.equal(manager.pause(runId), true, "a late pause must not reclassify the external abort");
+      agent.resolve(0);
+      await promise.catch(() => {});
+      await Promise.resolve();
+
+      assert.equal(manager.getRun(runId)?.status, "aborted");
+      assert.equal(errors.length, 1, "an external abort remains observable as an error");
+      const calls = piCalls(pi);
+      assert.equal(calls.length, 1, "an external abort remains visible to the originating conversation");
+      assert.equal(calls[0].triggerTurn, true);
+      assert.match(calls[0].content, /failed: workflow aborted/i);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  for (const lateError of [
+    new WorkflowError("late quota exhausted", WorkflowErrorCode.PROVIDER_USAGE_LIMIT, {
+      recoverable: false,
+      resetHint: "Resets in 1m",
+    }),
+    new WorkflowError("late fatal failure", WorkflowErrorCode.AGENT_EXECUTION_ERROR, { recoverable: false }),
+    new WorkflowError("late timeout", WorkflowErrorCode.AGENT_TIMEOUT, { recoverable: true }),
+  ]) {
+    it(`keeps an external abort terminal when a non-cooperative agent later returns ${lateError.code}`, async () => {
+      const cwd = mkdtempSync(join(tmpdir(), `pi-dw-external-before-${lateError.code}-`));
+      const agent = lateErrorAgent();
+      const manager = new WorkflowManager({ cwd, agent: agent.runner });
+      const pi = createMockPi();
+      const external = new AbortController();
+      const errors: Array<{ error?: WorkflowError }> = [];
+      manager.on("error", (event) => errors.push(event));
+
+      try {
+        mod.installResultDelivery(pi, manager);
+        manager.setSessionId(SESSION);
+        mod.bindSessionDelivery(SESSION, pi, { manager, stableSend: recordingStableSend(pi) });
+
+        const { runId, promise } = manager.startInBackground(lifecycleScript, undefined, {
+          externalSignal: external.signal,
+        });
+        await agent.waitForStart();
+        external.abort();
+        agent.rejectWith(lateError);
+        await promise.catch(() => {});
+        await Promise.resolve();
+
+        assert.equal(manager.getRun(runId)?.status, "aborted");
+        assert.equal(manager.getPersistence().load(runId)?.pauseReason, undefined);
+        assert.equal(errors.length, 1);
+        assert.equal(errors[0]?.error?.code, WorkflowErrorCode.WORKFLOW_ABORTED);
+        const calls = piCalls(pi);
+        assert.equal(calls.length, 1);
+        assert.equal(calls[0].triggerTurn, true);
+        assert.match(calls[0].content, /failed: workflow aborted/i);
+      } finally {
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+  }
+
+  for (const action of ["pause", "stop"] as const) {
+    it(`does not let a late ${action} hide a run-fatal error while a sibling drains`, async () => {
+      const cwd = mkdtempSync(join(tmpdir(), `pi-dw-fatal-${action}-`));
+      const agent = fatalThenDrainAgent();
+      const manager = new WorkflowManager({ cwd, agent: agent.runner });
+      const pi = createMockPi();
+      const errors: Array<{ error?: WorkflowError }> = [];
+      manager.on("error", (event) => errors.push(event));
+
+      try {
+        mod.installResultDelivery(pi, manager);
+        manager.setSessionId(SESSION);
+        mod.bindSessionDelivery(SESSION, pi, { manager, stableSend: recordingStableSend(pi) });
+
+        const { runId, promise } = manager.startInBackground(fatalControlRaceScript);
+        await agent.waitForSiblingAbort();
+        assert.equal(manager[action](runId), true, `late ${action} request is accepted while the sibling drains`);
+
+        agent.settleSibling();
+        await promise.catch(() => {});
+        await Promise.resolve();
+
+        assert.equal(manager.getRun(runId)?.status, "failed", "the earlier run-fatal error wins the lifecycle state");
+        assert.equal(errors.length, 1, "the earlier run-fatal error remains observable");
+        assert.equal(errors[0]?.error?.code, WorkflowErrorCode.AGENT_EXECUTION_ERROR);
+        const calls = piCalls(pi);
+        assert.equal(calls.length, 1, "the real failure is delivered to the originating conversation");
+        assert.equal(calls[0].triggerTurn, true);
+        assert.match(calls[0].content, /fatal sibling failure/);
+      } finally {
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+  }
+
+  for (const action of ["pause", "stop"] as const) {
+    it(`keeps an earlier usage-limit checkpoint through a late ${action}`, async () => {
+      const cwd = mkdtempSync(join(tmpdir(), `pi-dw-usage-before-${action}-`));
+      const agent = usageLimitThenDrainAgent();
+      const manager = new WorkflowManager({ cwd, agent: agent.runner });
+      const pi = createMockPi();
+      const errors: unknown[] = [];
+      let arms = 0;
+      const scheduler = new UsageLimitScheduler(manager, {
+        setTimer: () => {
+          arms++;
+          return {};
+        },
+        clearTimer: () => {},
+      });
+      manager.on("error", (event) => errors.push(event));
+
+      try {
+        mod.installResultDelivery(pi, manager);
+        manager.setSessionId(SESSION);
+        mod.bindSessionDelivery(SESSION, pi, { manager, stableSend: recordingStableSend(pi) });
+
+        const { runId, promise } = manager.startInBackground(usageLimitControlRaceScript);
+        await agent.waitForSiblingAbort();
+        assert.equal(manager[action](runId), true, `late ${action} is accepted while the sibling drains`);
+
+        agent.settleSibling();
+        await promise.catch(() => {});
+        await Promise.resolve();
+
+        assert.equal(manager.getRun(runId)?.status, "paused", "the earlier quota checkpoint wins the final state");
+        assert.equal(errors.length, 0, "a usage limit is not delivered as a generic error");
+        const persisted = manager.getPersistence().load(runId);
+        assert.equal(persisted?.pauseReason, "usage_limit");
+        assert.equal(persisted?.resetHint, "Resets in 1m");
+        assert.equal(arms, 1, "the usage-limit scheduler is armed after the final pause");
+        const calls = piCalls(pi);
+        assert.equal(calls.length, 1, "the quota checkpoint is delivered once");
+        assert.equal(calls[0].triggerTurn, true);
+        assert.match(calls[0].content, /paused.*Resets in 1m/i);
+      } finally {
+        scheduler.dispose();
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+  }
+
+  for (const action of ["pause", "stop"] as const) {
+    it(`does not let a late usage-limit result revive an earlier ${action}`, async () => {
+      const cwd = mkdtempSync(join(tmpdir(), `pi-dw-${action}-before-usage-`));
+      const agent = lateUsageLimitAgent();
+      const manager = new WorkflowManager({ cwd, agent: agent.runner });
+      const pi = createMockPi();
+      let arms = 0;
+      const scheduler = new UsageLimitScheduler(manager, {
+        setTimer: () => {
+          arms++;
+          return {};
+        },
+        clearTimer: () => {},
+      });
+
+      try {
+        mod.installResultDelivery(pi, manager);
+        manager.setSessionId(SESSION);
+        mod.bindSessionDelivery(SESSION, pi, { manager, stableSend: recordingStableSend(pi) });
+
+        const { runId, promise } = manager.startInBackground(lifecycleScript);
+        await agent.waitForStart();
+        assert.equal(manager[action](runId), true);
+
+        agent.rejectWithUsageLimit();
+        await promise.catch(() => {});
+        await Promise.resolve();
+
+        const expectedStatus = action === "pause" ? "paused" : "aborted";
+        assert.equal(manager.getRun(runId)?.status, expectedStatus);
+        assert.equal(manager.getPersistence().load(runId)?.pauseReason, undefined);
+        assert.equal(arms, 0, "a late quota result after user control must not arm auto-resume");
+        assert.equal(piCalls(pi).length, 0, "a late quota result after user control must not trigger a turn");
+      } finally {
+        scheduler.dispose();
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+  }
 
   it("skips usage-limit pause delivery for foreground runs", () => {
     const pi = createMockPi();

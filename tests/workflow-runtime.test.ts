@@ -1383,6 +1383,40 @@ function abortAwareAgent(delayMs: number) {
   };
 }
 
+test("onRunFatal consumes an asynchronous observer rejection without masking the workflow error", async () => {
+  let unhandled: unknown;
+  const onUnhandled = (reason: unknown) => {
+    unhandled = reason;
+  };
+  process.on("unhandledRejection", onUnhandled);
+  const script = `export const meta = { name: 'fatal_observer', description: 'fatal observer' }
+await agent('failer')`;
+  const runner = {
+    async run() {
+      throw new WorkflowError("primary workflow failure", WorkflowErrorCode.AGENT_EXECUTION_ERROR, {
+        recoverable: false,
+      });
+    },
+  };
+
+  try {
+    await assert.rejects(
+      runWorkflow(script, {
+        agent: runner,
+        persistLogs: false,
+        onRunFatal: async () => {
+          throw new Error("observer rejection");
+        },
+      }),
+      /primary workflow failure/,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(unhandled, undefined, "observer rejection must be consumed");
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
+});
+
 test("a run-fatal error aborts in-flight parallel() siblings instead of letting them run to completion", async () => {
   const { state, runner } = abortAwareAgent(200);
   const script = `export const meta = { name: 'fatal_abort', description: 'sibling abort' }

@@ -279,6 +279,13 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
     cacheRead?: number;
     cacheWrite?: number;
   }) => void;
+  /**
+   * Top-level workflow error observed before runWorkflow drains in-flight agents.
+   * This preserves error provenance for hosts whose own lifecycle control can race
+   * with that cooperative drain. Observational only: callback failures (sync or
+   * async) are ignored.
+   */
+  onRunFatal?: (error: unknown) => void | PromiseLike<void>;
 }
 
 export interface WorkflowRunResult<T = unknown> {
@@ -1363,7 +1370,23 @@ export async function runWorkflow<T = unknown>(
     // journal — this stops burning an already-exhausted budget right now, at
     // the cost of that sibling's work being thrown away and re-run live when
     // the paused run resumes (it was never journaled, so it isn't cached).
-    if (isTopLevelRun) shared.runFatalController.abort();
+    if (isTopLevelRun) {
+      // Notify the host before the cooperative drain below. A pause/stop can be
+      // requested while siblings settle, but it must not erase a provider-limit
+      // error that had already escaped this top-level workflow.
+      try {
+        const observation = options.onRunFatal?.(error);
+        // The hook is observational, but consumers can still accidentally
+        // return a rejecting thenable. Explicitly consume it so it cannot turn
+        // a workflow's own failure into an unhandled rejection.
+        if (observation != null && typeof (observation as { then?: unknown }).then === "function") {
+          void Promise.resolve(observation).catch(() => {});
+        }
+      } catch {
+        // Instrumentation must never mask the workflow's own terminal error.
+      }
+      shared.runFatalController.abort();
+    }
     throw error;
   } finally {
     // Only the top-level frame drains/disposes (see isTopLevelRun) — a nested
