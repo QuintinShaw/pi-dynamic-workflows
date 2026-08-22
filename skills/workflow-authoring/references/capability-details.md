@@ -73,9 +73,12 @@ Every exact fact below is projected from the installed extension's capability co
 - Support: `supported`
 - Signature: `verify(item: unknown, options?: { reviewers?: number; threshold?: number; lens?: string \| string[] }) => Promise<{ real: boolean; realCount: number; total: number; votes: Array<{ real: boolean; reason?: string }> }>`
 - Option shape: `verify-options`
-- `reviewers`: number (optional; default: 2; authors should provide a finite integer; runtime clamps below 1)
+- `reviewers`: number (optional; default: 2; only undefined uses the default; all supplied values, including null, must be finite integers >= 1 or throw TypeError)
 - `threshold`: number (optional; default: 0.5)
 - `lens`: string | string[] (optional)
+- Constraint: external abort takes precedence over capacity preflight and option validation; no reviewer starts
+- Constraint: consumes one logical agent slot per reviewer (default 2); runtime preflights the whole reviewer fan-out before starting any reviewer
+- Constraint: agent execution retries do not consume extra logical slots
 - Constraint: reviewer failures are omitted; successful votes form the denominator in realCount / total
 - Constraint: threshold comparison is inclusive and real is false when no reviewer succeeds
 - Constraint: multiple lenses cycle across reviewers
@@ -87,8 +90,12 @@ Every exact fact below is projected from the installed extension's capability co
 - Support: `supported`
 - Signature: `judgePanel(attempts: unknown[], options?: { judges?: number; rubric?: string }) => Promise<{ index: number; attempt: unknown; score: number; judgments: Array<{ score: number; reason?: string }> } \| undefined>`
 - Option shape: `judge-panel-options`
-- `judges`: number (optional; default: 3; authors should provide a finite integer; runtime clamps below 1)
+- `judges`: number (optional; default: 3; only undefined uses the default; all supplied values, including null, must be finite integers >= 1 or throw TypeError)
 - `rubric`: string (optional; default: "overall quality and correctness")
+- Constraint: external abort takes precedence over capacity preflight and option validation; no judge starts
+- Constraint: consumes populated attempts × judges logical agent slots (dense input: attempts.length × judges; default judges 3); runtime preflights the full normalized fan-out before starting any judge
+- Constraint: sparse attempt holes are absent candidates and consume no slots; populated candidates retain their original input index
+- Constraint: agent execution retries do not consume extra logical slots
 - Constraint: failed judgments are omitted and each candidate score averages successful judgments only
 - Constraint: a candidate with no successful judgments scores 0
 - Constraint: highest mean score wins with stable input index as the tie-break; empty input returns undefined
@@ -115,6 +122,9 @@ Every exact fact below is projected from the installed extension's capability co
 - Classification: `runtime-global`
 - Support: `supported`
 - Signature: `completenessCheck(taskArgs: unknown, results: unknown) => Promise<{ complete: boolean; missing?: string[] } \| null>`
+- Constraint: external abort takes precedence over capacity preflight; no critic starts
+- Constraint: consumes one logical agent slot; runtime preflights capacity before starting the critic
+- Constraint: agent execution retries do not consume extra logical slots
 - Constraint: only the first 4,000 characters of serialized result evidence are sent to the critic
 - Constraint: missing is optional and recoverable critic failure returns null
 - Constraint: large evidence sets must be chunked or summarized before relying on the advisory verdict
@@ -259,6 +269,8 @@ Every exact fact below is projected from the installed extension's capability co
 - Support: `supported`
 - Signature: `maxAgents?: number = 1000`
 - Constraint: default, not a hard product maximum
+- Constraint: counts logical agent calls across the shared nested run tree, including quality-helper expansion: verify = reviewers, judgePanel = populated attempts × judges (dense input: attempts.length × judges), completenessCheck = 1
+- Constraint: agent execution retries do not consume extra logical slots; retry(), gate(), and loopUntilDry callbacks must be budgeted from their bounded planned calls
 
 <a id="tool-input-concurrency"></a>
 ## concurrency

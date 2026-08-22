@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { WorkflowErrorCode } from "../src/errors.js";
 import { runWorkflow } from "../src/workflow.js";
 
 // Fake agents return a schema-shaped object when a schema is requested.
@@ -110,6 +111,331 @@ return { winner, empty: empty ?? null }`;
   assert.equal(res.result.winner.score, 0.5);
   assert.equal(res.result.winner.judgments.length, 2);
   assert.equal(res.result.empty, null);
+});
+
+test("judgePanel(): sparse candidates use populated entries for capacity and retain original indexes", async () => {
+  const labels: string[] = [];
+  const scorer = {
+    async run(prompt: string) {
+      return { score: /WIN/.test(prompt) ? 0.9 : 0.1 };
+    },
+  };
+  const script = `export const meta = { name: 'sparse_judges', description: 'sparse candidates retain original indexes' }
+const attempts = []
+attempts[1] = 'lose'
+attempts[3] = 'WIN candidate'
+return await judgePanel(attempts, { judges: 2 })`;
+  const result = await runWorkflow<{ index: number; attempt: string }>(script, {
+    agent: scorer,
+    maxAgents: 4,
+    persistLogs: false,
+    onAgentStart: ({ label }) => labels.push(label),
+  });
+
+  assert.equal(result.agentCount, 4, "two populated candidates × two judges fit exactly");
+  assert.equal(result.result.index, 3, "winner keeps its original sparse-array index");
+  assert.equal(result.result.attempt, "WIN candidate");
+  assert.deepEqual(labels, ["judge 2.1", "judge 2.2", "judge 4.1", "judge 4.2"]);
+});
+
+test("verify and judgePanel reject invalid fan-out counts before starting agents", async () => {
+  const invalidCounts = ["NaN", "Infinity", "1.5", "0", "-1", "null", "true", "'2'", "{}", "1n", "Symbol('count')"];
+  for (const { helper, option, makeScript } of [
+    {
+      helper: "verify() reviewers",
+      option: "reviewers",
+      makeScript: (
+        count: string,
+      ) => `export const meta = { name: 'invalid_verify_count', description: 'reject invalid reviewers' }
+return await verify('claim', { reviewers: ${count} })`,
+    },
+    {
+      helper: "judgePanel() judges",
+      option: "judges",
+      makeScript: (
+        count: string,
+      ) => `export const meta = { name: 'invalid_judge_count', description: 'reject invalid judges' }
+return await judgePanel(['candidate'], { judges: ${count} })`,
+    },
+  ]) {
+    for (const count of invalidCounts) {
+      let starts = 0;
+      await assert.rejects(
+        () =>
+          runWorkflow(makeScript(count), {
+            agent: {
+              async run() {
+                starts++;
+                return { real: true, score: 1 };
+              },
+            },
+            persistLogs: false,
+          }),
+        (error: unknown) => {
+          assert.ok(error instanceof TypeError);
+          assert.match(String(error), new RegExp(`${helper.replace(/[()]/g, "\\$&")} must be a finite integer`));
+          return true;
+        },
+      );
+      assert.equal(starts, 0, `${option}=${count} must not bypass quality work`);
+    }
+  }
+});
+
+test("quality helpers give external abort precedence over insufficient capacity", async () => {
+  for (const { helper, script, maxAgents } of [
+    {
+      helper: "verify",
+      script: `export const meta = { name: 'abort_verify_preflight', description: 'abort beats capacity' }
+return await verify('claim', { reviewers: 2 })`,
+      maxAgents: 1,
+    },
+    {
+      helper: "judgePanel",
+      script: `export const meta = { name: 'abort_judge_preflight', description: 'abort beats capacity' }
+return await judgePanel(['candidate'], { judges: 2 })`,
+      maxAgents: 1,
+    },
+    {
+      helper: "completenessCheck",
+      script: `export const meta = { name: 'abort_complete_preflight', description: 'abort beats capacity' }
+return await completenessCheck({ task: true }, { result: true })`,
+      maxAgents: 0,
+    },
+  ]) {
+    const controller = new AbortController();
+    controller.abort();
+    let starts = 0;
+    await assert.rejects(
+      () =>
+        runWorkflow(script, {
+          agent: {
+            async run() {
+              starts++;
+              return { real: true, score: 1, complete: true };
+            },
+          },
+          maxAgents,
+          signal: controller.signal,
+          persistLogs: false,
+        }),
+      (error: unknown) => {
+        assert.equal((error as { code?: string }).code, WorkflowErrorCode.WORKFLOW_ABORTED);
+        return true;
+      },
+    );
+    assert.equal(starts, 0, `${helper} must not start internal agents after abort`);
+  }
+});
+
+test("external abort takes precedence over invalid quality fan-out options", async () => {
+  for (const script of [
+    `export const meta = { name: 'abort_invalid_verify', description: 'abort beats validation' }
+return await verify('claim', { reviewers: null })`,
+    `export const meta = { name: 'abort_invalid_judge', description: 'abort beats validation' }
+return await judgePanel(['candidate'], { judges: null })`,
+  ]) {
+    const controller = new AbortController();
+    controller.abort();
+    let starts = 0;
+    await assert.rejects(
+      () =>
+        runWorkflow(script, {
+          agent: {
+            async run() {
+              starts++;
+              return { real: true, score: 1 };
+            },
+          },
+          maxAgents: 0,
+          signal: controller.signal,
+          persistLogs: false,
+        }),
+      (error: unknown) => {
+        assert.equal((error as { code?: string }).code, WorkflowErrorCode.WORKFLOW_ABORTED);
+        assert.doesNotMatch(String(error), /finite integer/i);
+        return true;
+      },
+    );
+    assert.equal(starts, 0, "abort must prevent invalid-option helper work");
+  }
+});
+
+test("quality helpers preflight their full known capacity before any helper agent starts", async () => {
+  const calls: string[] = [];
+  const runner = {
+    async run(prompt: string, options: { schema?: unknown }) {
+      calls.push(prompt);
+      if (options.schema && /Score this candidate/.test(prompt)) return { score: 0.5 };
+      return "prefix";
+    },
+  };
+  const script = `export const meta = { name: 'judge_preflight', description: 'preflight known helper capacity' }
+await agent('prefix')
+return await judgePanel(['a', 'b'], { judges: 2 })`;
+
+  await assert.rejects(
+    () => runWorkflow(script, { agent: runner, maxAgents: 4, persistLogs: false }),
+    (error: unknown) => {
+      assert.equal((error as { code?: string }).code, WorkflowErrorCode.AGENT_LIMIT_EXCEEDED);
+      assert.match(String(error), /judgePanel\(\).*requires 4 logical agent slots.*only 3 remain/i);
+      return true;
+    },
+  );
+  assert.deepEqual(calls, ["prefix"], "no judge starts when the entire panel cannot fit");
+});
+
+test("verify and completenessCheck preflight their documented slot counts", async () => {
+  for (const { script, maxAgents, helper, slots } of [
+    {
+      script: `export const meta = { name: 'verify_preflight', description: 'verify capacity' }
+return await verify('claim', { reviewers: 2 })`,
+      maxAgents: 1,
+      helper: "verify()",
+      slots: 2,
+    },
+    {
+      script: `export const meta = { name: 'complete_preflight', description: 'critic capacity' }
+return await completenessCheck({ task: true }, { result: true })`,
+      maxAgents: 0,
+      helper: "completenessCheck()",
+      slots: 1,
+    },
+  ]) {
+    let starts = 0;
+    await assert.rejects(
+      () =>
+        runWorkflow(script, {
+          agent: {
+            async run() {
+              starts++;
+              return { real: true, complete: true };
+            },
+          },
+          maxAgents,
+          persistLogs: false,
+        }),
+      (error: unknown) => {
+        assert.equal((error as { code?: string }).code, WorkflowErrorCode.AGENT_LIMIT_EXCEEDED);
+        assert.match(
+          String(error),
+          new RegExp(`${helper.replace(/[()]/g, "\\$&")}.*requires ${slots} logical agent slot`),
+        );
+        return true;
+      },
+    );
+    assert.equal(starts, 0, `${helper} must fail before starting its agent`);
+  }
+});
+
+test("quality helper capacity is exact at the boundary and shared with concurrent work", async () => {
+  const prompts: string[] = [];
+  const runner = {
+    async run(prompt: string, options: { schema?: unknown }) {
+      prompts.push(prompt);
+      return options.schema ? { score: 0.5 } : "outside";
+    },
+  };
+  const script = `export const meta = { name: 'judge_boundary', description: 'shared capacity boundary' }
+const results = await parallel([
+  () => agent('outside'),
+  () => judgePanel(['a', 'b'], { judges: 2 }),
+])
+return results`;
+  const result = await runWorkflow(script, { agent: runner, maxAgents: 5, concurrency: 1, persistLogs: false });
+
+  assert.equal(result.agentCount, 5);
+  assert.equal(prompts.length, 5);
+  assert.equal(prompts.filter((prompt) => /Score this candidate/.test(prompt)).length, 4);
+});
+
+test("quality helper capacity shares the parent run tree with nested workflows", async () => {
+  const prompts: string[] = [];
+  const runner = {
+    async run(prompt: string, options: { schema?: unknown }) {
+      prompts.push(prompt);
+      return options.schema ? { score: 0.5 } : "parent";
+    },
+  };
+  const child = `export const meta = { name: 'quality_child', description: 'child panel' }
+return await judgePanel(['a', 'b'], { judges: 2 })`;
+  const parent = `export const meta = { name: 'quality_parent', description: 'parent capacity' }
+await agent('parent')
+return await workflow('quality_child')`;
+
+  await assert.rejects(
+    () =>
+      runWorkflow(parent, {
+        agent: runner,
+        loadSavedWorkflow: (name) => (name === "quality_child" ? child : undefined),
+        maxAgents: 4,
+        persistLogs: false,
+      }),
+    (error: unknown) => {
+      assert.equal((error as { code?: string }).code, WorkflowErrorCode.AGENT_LIMIT_EXCEEDED);
+      return true;
+    },
+  );
+  assert.deepEqual(prompts, ["parent"], "the child panel sees the parent slot reservation");
+});
+
+test("quality helper capacity remains compatible with journal resume and agent retries", async () => {
+  const journal = new Map();
+  const livePrompts: string[] = [];
+  const runner = {
+    async run(prompt: string, options: { schema?: unknown }) {
+      livePrompts.push(prompt);
+      if (options.schema && /Score this candidate/.test(prompt)) return { score: 0.5 };
+      return "prefix";
+    },
+  };
+  const script = `export const meta = { name: 'judge_resume', description: 'resume panel after preflight' }
+const prefix = await agent('prefix')
+const winner = await judgePanel(['a', 'b'], { judges: 2 })
+return { prefix, winner }`;
+  const runId = "quality-resume";
+
+  await assert.rejects(
+    () =>
+      runWorkflow(script, {
+        agent: runner,
+        maxAgents: 4,
+        persistLogs: false,
+        runId,
+        onAgentJournal: (entry) => journal.set(`${entry.runId}:${entry.index}`, entry),
+      }),
+    /judgePanel\(\).*requires 4 logical agent slots/i,
+  );
+  assert.deepEqual(livePrompts, ["prefix"]);
+
+  const resumed = await runWorkflow(script, {
+    agent: runner,
+    maxAgents: 5,
+    persistLogs: false,
+    runId,
+    resumeJournal: journal,
+  });
+  assert.equal(resumed.agentCount, 5, "replayed prefix and live judges share the raised cap");
+  assert.equal(livePrompts.length, 5, "only the four judges execute after the prefix replay");
+
+  let attempts = 0;
+  const retrying = {
+    async run() {
+      attempts++;
+      throw new Error("temporary reviewer failure");
+    },
+  };
+  const retryScript = `export const meta = { name: 'verify_retries', description: 'logical slots ignore execution retries' }
+return await verify('claim', { reviewers: 2 })`;
+  const retried = await runWorkflow<{ total: number }>(retryScript, {
+    agent: retrying,
+    agentRetries: 1,
+    maxAgents: 2,
+    persistLogs: false,
+  });
+  assert.equal(retried.agentCount, 2, "each reviewer keeps one logical slot across execution retries");
+  assert.equal(attempts, 4, "both reviewers retry once");
+  assert.equal(retried.result.total, 0);
 });
 
 test("loopUntilDry(): dedupes by key and stops after K empty rounds", async () => {

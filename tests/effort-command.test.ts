@@ -12,6 +12,9 @@ test("effortDirective shapes fan-out without inventing token budgets", () => {
   assert.match(ultra, /ULTRA/);
   assert.match(high, /maxAgents/);
   assert.match(ultra, /maxAgents/);
+  assert.match(ultra, /judgePanel.*populated attempts.*dense input.*attempts\.length.*judges/i);
+  assert.match(ultra, /completenessCheck.*1/i);
+  assert.match(ultra, /execution retries.*do not add slots/i);
   assert.doesNotMatch(high, /tokenBudget/);
   assert.doesNotMatch(ultra, /tokenBudget/);
 });

@@ -532,12 +532,56 @@ export async function runWorkflow<T = unknown>(
     remaining: () => (options.tokenBudget == null ? Infinity : Math.max(0, options.tokenBudget - shared.spent)),
   });
 
-  const agentLimitError = () =>
-    new WorkflowError(
-      `Agent limit exceeded (${shared.agentCount}/${maxAgents}). Re-call workflow with resumeFromRunId="${runId}", the same script, and maxAgents: N (N>${maxAgents}) — journaled prefix replays free. /workflows resume alone cannot raise the cap.`,
+  const agentLimitError = (requiredSlots = 1, helper?: string) => {
+    const remainingSlots = Math.max(0, maxAgents - shared.agentCount);
+    const preflight =
+      helper === undefined
+        ? ""
+        : ` ${helper} requires ${requiredSlots} logical agent slot${requiredSlots === 1 ? "" : "s"}, but only ${remainingSlots} remain.`;
+    return new WorkflowError(
+      `Agent limit exceeded (${shared.agentCount}/${maxAgents}).${preflight} Re-call workflow with resumeFromRunId="${runId}", the same script, and maxAgents: N (N>${maxAgents}) — journaled prefix replays free. /workflows resume alone cannot raise the cap.`,
       WorkflowErrorCode.AGENT_LIMIT_EXCEEDED,
       { recoverable: false },
     );
+  };
+
+  /**
+   * Check capacity for one or more logical agent() calls before a helper begins
+   * its known fan-out. This intentionally does not mutate agentCount: the
+   * helper's immediate synchronous agent() calls retain their existing stable
+   * call order, journaling, and per-fan-out cancellation behavior. JavaScript
+   * executes that expansion without yielding, so after this check passes each
+   * logical slot is reserved by agent() before another workflow expression can
+   * observe the shared counter.
+   */
+  const ensureAgentCapacity = (requiredSlots = 1, helper?: string) => {
+    if (requiredSlots > maxAgents - shared.agentCount) {
+      throw agentLimitError(requiredSlots, helper);
+    }
+  };
+
+  /** Normalize every helper fan-out option once so preflight and execution cannot diverge. */
+  const normalizeQualityFanout = (value: unknown, fallback: number, optionName: string) => {
+    const count = value === undefined ? fallback : value;
+    if (typeof count !== "number" || !Number.isFinite(count) || !Number.isInteger(count) || count < 1) {
+      throw new TypeError(`${optionName} must be a finite integer greater than or equal to 1`);
+    }
+    return count;
+  };
+
+  /**
+   * Normalize panel candidates once for both capacity and execution. Sparse holes
+   * are absent candidates (and therefore consume no slots); populated entries
+   * retain their original input index for the documented stable tie-break.
+   */
+  const normalizeJudgeCandidates = (attempts: unknown) => {
+    if (!Array.isArray(attempts)) return [] as Array<{ attempt: unknown; index: number }>;
+    const candidates: Array<{ attempt: unknown; index: number }> = [];
+    for (let index = 0; index < attempts.length; index++) {
+      if (Object.hasOwn(attempts, index)) candidates.push({ attempt: attempts[index], index });
+    }
+    return candidates;
+  };
 
   // True on an intentional external abort (pause/stop/Esc, via options.signal)
   // OR once this run's fate has been sealed (shared.runFatalController — see
@@ -601,9 +645,7 @@ export async function runWorkflow<T = unknown>(
     // and queued up to `maxAgents` agents; the breaching call throws here, and
     // parallel()/pipeline() mark their own batch cancelled so the already-queued
     // agents short-circuit before their real API call (see the limiter body).
-    if (shared.agentCount >= maxAgents) {
-      throw agentLimitError();
-    }
+    ensureAgentCapacity();
 
     if (budget.total !== null && budget.remaining() <= 0) {
       throw new WorkflowError("workflow token budget exhausted", WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED, {
@@ -1088,15 +1130,17 @@ export async function runWorkflow<T = unknown>(
     item: unknown,
     opts: { reviewers?: number; threshold?: number; lens?: string | string[] } = {},
   ) => {
+    throwIfAborted();
+    const reviewerSlots = normalizeQualityFanout(opts.reviewers, 2, "verify() reviewers");
+    ensureAgentCapacity(reviewerSlots, "verify()");
     options.onRuntimeEvent?.({ type: "quality", stage: "start", helper: "verify" });
-    const reviewers = Math.max(1, opts.reviewers ?? 2);
     const threshold = opts.threshold ?? 0.5;
     const lenses = opts.lens ? (Array.isArray(opts.lens) ? opts.lens : [opts.lens]) : [];
     const claim = typeof item === "string" ? item : JSON.stringify(item);
     const votes = (
       await parallel(
         Array.from(
-          { length: reviewers },
+          { length: reviewerSlots },
           (_v, i) => () =>
             agent(
               `Adversarially review whether the following is REAL/correct. Try to refute it; default to real=false if unsure.${lenses.length ? ` Focus lens: ${lenses[i % lenses.length]}.` : ""}\n\n${claim}`,
@@ -1122,22 +1166,25 @@ export async function runWorkflow<T = unknown>(
     required: ["score"],
   };
   const judgePanel = async (attempts: unknown[], opts: { judges?: number; rubric?: string } = {}) => {
+    throwIfAborted();
+    const judgeSlots = normalizeQualityFanout(opts.judges, 3, "judgePanel() judges");
+    const candidates = normalizeJudgeCandidates(attempts);
+    ensureAgentCapacity(candidates.length * judgeSlots, "judgePanel()");
     options.onRuntimeEvent?.({ type: "quality", stage: "start", helper: "judgePanel" });
-    const judges = Math.max(1, opts.judges ?? 3);
     const rubric = opts.rubric ?? "overall quality and correctness";
     const scored = (
       await parallel(
-        (Array.isArray(attempts) ? attempts : []).map((att, idx) => async () => {
+        candidates.map(({ attempt: att, index }) => async () => {
           const text = typeof att === "string" ? att : JSON.stringify(att);
           const js = (
             await parallel(
               Array.from(
-                { length: judges },
+                { length: judgeSlots },
                 (_v, j) => () =>
                   agent(
                     `Score this candidate from 0 to 1 on: ${rubric}. Reply with the score.\n\nCandidate:\n${text}`,
                     {
-                      label: `judge ${idx + 1}.${j + 1}`,
+                      label: `judge ${index + 1}.${j + 1}`,
                       schema: JUDGE_SCHEMA,
                     },
                   ),
@@ -1145,7 +1192,7 @@ export async function runWorkflow<T = unknown>(
             )
           ).filter(Boolean) as Array<{ score?: number }>;
           const score = js.length ? js.reduce((s, v) => s + (Number(v?.score) || 0), 0) / js.length : 0;
-          return { index: idx, attempt: att, score, judgments: js };
+          return { index, attempt: att, score, judgments: js };
         }),
       )
     ).filter(Boolean) as Array<{ index: number; attempt: unknown; score: number; judgments: unknown[] }>;
@@ -1200,6 +1247,8 @@ export async function runWorkflow<T = unknown>(
     required: ["complete"],
   };
   const completenessCheck = async (taskArgs: unknown, results: unknown) => {
+    throwIfAborted();
+    ensureAgentCapacity(1, "completenessCheck()");
     options.onRuntimeEvent?.({ type: "quality", stage: "start", helper: "completenessCheck" });
     const verdict = await agent(
       `Given the task and the results gathered so far, list what is still MISSING (modalities not covered, claims unverified, gaps). Be specific and concise.\n\nTask:\n${JSON.stringify(taskArgs)}\n\nResults so far:\n${JSON.stringify(results).slice(0, 4000)}`,
@@ -1255,9 +1304,7 @@ export async function runWorkflow<T = unknown>(
   const checkpoint = async (promptText: string, checkpointOptions: CheckpointOptions = {}) => {
     throwIfAborted();
     if (typeof promptText !== "string") throw new TypeError("checkpoint(promptText, options?) needs a prompt string");
-    if (shared.agentCount >= maxAgents) {
-      throw agentLimitError();
-    }
+    ensureAgentCapacity();
     const callIndex = state.callSeq++;
     const callHash = hashCheckpoint(promptText, checkpointOptions);
     // Namespaced by runId like agent()'s deltaKey — see JournalEntry.runId.

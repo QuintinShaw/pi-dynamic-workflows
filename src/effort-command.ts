@@ -28,7 +28,7 @@ export function createEffortState(): EffortState {
 const HIGH_DIRECTIVE =
   "Effort: HIGH. Be thorough — use a few parallel reviewers/perspectives and an adversarial verify pass (see verify()/judgePanel()); set maxAgents to match the planned fan-out.";
 const ULTRA_DIRECTIVE =
-  "Effort: ULTRA. Be exhaustive — fan out widely (more reviewers/judges, deeper loopUntilDry rounds, a completenessCheck at the end), prefer the big tier for synthesis, and set a high maxAgents that matches the planned fan-out. This can spend a lot of tokens quickly; maximal effort does not imply an inferred spend ceiling.";
+  "Effort: ULTRA. Be exhaustive — fan out widely (more reviewers/judges, deeper loopUntilDry rounds, a completenessCheck at the end), prefer the big tier for synthesis, and set a high maxAgents that covers every planned logical call across the shared run tree: verify = reviewers, judgePanel = populated attempts × judges (dense input: attempts.length × judges), completenessCheck = 1, plus bounded retry/gate/loop callback calls. Agent execution retries do not add slots. This can spend a lot of tokens quickly; maximal effort does not imply an inferred spend ceiling.";
 
 /** The extra directive appended to the forced-workflow prompt for an effort level. */
 export function effortDirective(level: EffortLevel): string | undefined {
