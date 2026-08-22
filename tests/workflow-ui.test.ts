@@ -1,19 +1,20 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, type ExtensionUIContext, initTheme } from "@earendil-works/pi-coding-agent";
 import type { Component } from "@earendil-works/pi-tui";
 import type { WorkflowSnapshot } from "../src/display.js";
 import { WorkflowErrorCode } from "../src/errors.js";
 import type { PersistedRunState } from "../src/run-persistence.js";
 import { parseWorkflowScript } from "../src/workflow.js";
 import type { ManagedRun, WorkflowManager } from "../src/workflow-manager.js";
-import type { SavedWorkflow } from "../src/workflow-saved.js";
+import type { SavedWorkflow, WorkflowStorage } from "../src/workflow-saved.js";
 import {
   keyToAction,
   NavigatorModel,
   NavigatorState,
   openWorkflowNavigator,
   renderNavigator,
+  safeInputText,
 } from "../src/workflow-ui.js";
 
 /** Fake manager exposing one running run with two phases. */
@@ -578,7 +579,7 @@ test("NavigatorState activeRunId returns run at cursor on runs view", () => {
   const model = new NavigatorModel(multiRunManager());
   const state = new NavigatorState();
   assert.equal(state.activeRunId(model), "r1");
-  state.move(1, 2);
+  state.moveRuns(1, model.visible(state.filter));
   assert.equal(state.activeRunId(model), "r2");
 });
 
@@ -901,7 +902,7 @@ test("renderNavigator footer hint changes based on item under cursor", () => {
   assert.notEqual(runText.indexOf("x stop"), -1, "run item should show x stop");
 
   // Cursor on a saved item (position 1)
-  state.cursor = 1;
+  state.moveRuns(1, model.visible(state.filter));
   const savedText = renderNavigator(state, model, 80).join("\n");
   assert.notEqual(savedText.indexOf("x delete"), -1, "saved item should show x delete");
   assert.equal(savedText.indexOf("x stop"), -1, "saved item should NOT show x stop");
@@ -1164,11 +1165,12 @@ test("deleting a saved workflow whose storage.delete throws (e.g. EACCES) notifi
 
   const component = getComponent();
   assert.ok(component, "openWorkflowNavigator should have produced a component");
-  assert.doesNotThrow(() => component?.handleInput("x"), "deleteSaved must not throw/crash the overlay");
+  assert.doesNotThrow(() => component?.handleInput("x"), "first delete only asks for confirmation");
+  assert.doesNotThrow(() => component?.handleInput("x"), "confirmed delete must not throw/crash the overlay");
 
   assert.equal(notifications.length, 1);
   assert.equal(notifications[0].type, "error");
-  assert.match(notifications[0].message, /deleteSaved.*failed/);
+  assert.match(notifications[0].message, /Workflow action failed/);
   assert.match(notifications[0].message, /EACCES/);
 });
 
@@ -1194,11 +1196,12 @@ test("stopping a run whose manager.stop throws (cold-run lease/persistence failu
 
   const component = getComponent();
   assert.ok(component, "openWorkflowNavigator should have produced a component");
-  assert.doesNotThrow(() => component?.handleInput("x"), "stop must not throw/crash the overlay");
+  assert.doesNotThrow(() => component?.handleInput("x"), "first stop only asks for confirmation");
+  assert.doesNotThrow(() => component?.handleInput("x"), "confirmed stop must not throw/crash the overlay");
 
   assert.equal(notifications.length, 1);
   assert.equal(notifications[0].type, "error");
-  assert.match(notifications[0].message, /stop.*failed/);
+  assert.match(notifications[0].message, /Workflow action failed/);
   assert.match(notifications[0].message, /ENOSPC/);
 });
 
@@ -1305,4 +1308,358 @@ test("navigator save registers via manager + live loadWorkflow so a same-name ov
     ["export SCRIPT_V2"],
     "handler must execute the second save's script via manager.startInBackground (not the frozen first snapshot / inline path)",
   );
+});
+
+test("component input keeps filtered and jumped selection identity and confirms drilled lifecycle targets", async () => {
+  const { ui, notifications, getComponent } = fakeUiCapturingComponent();
+  let stopped = 0;
+  const runs = ["a", "b", "c", "d"].map((name) => ({
+    runId: `run-${name}`,
+    workflowName: name,
+    status: "running",
+    phases: ["P"],
+    agents: [],
+    logs: [],
+  })) as unknown as PersistedRunState[];
+  const manager = {
+    on: () => {},
+    off: () => {},
+    listRuns: () => runs,
+    getRun: (runId: string) =>
+      runs.some((run) => run.runId === runId)
+        ? ({
+            runId,
+            status: "running",
+            snapshot: { name: runId, phases: ["P"], agents: [], logs: [] },
+          } as unknown as ManagedRun)
+        : undefined,
+    stop: (runId: string) => {
+      assert.equal(runId, "run-d");
+      stopped++;
+      return true;
+    },
+  } as unknown as WorkflowManager;
+  openWorkflowNavigator({} as ExtensionAPI, manager, ui).catch(() => {});
+  await Promise.resolve();
+  await Promise.resolve();
+  const component = getComponent();
+  assert.ok(component);
+
+  component.handleInput("/");
+  component.handleInput("d");
+  component.handleInput("\r");
+  assert.match((component.render?.(80) ?? []).join("\n"), /❯ ◆ run-d/);
+  component.handleInput("G");
+  assert.match((component.render?.(80) ?? []).join("\n"), /❯ ◆ run-d/);
+
+  component.handleInput("\r");
+  assert.equal((component.render?.(80) ?? []).join("\n").includes("P"), true);
+  component.handleInput("x");
+  assert.match((component.render?.(80) ?? []).join("\n"), /confirm stop/);
+  component.handleInput("p");
+  assert.equal(stopped, 0, "a different key cannot confirm stop");
+  component.handleInput("x");
+  assert.equal(stopped, 0, "the mismatched key cancels instead of confirming");
+  component.handleInput("x");
+  assert.equal(stopped, 1, "the drilled frame run is stopped by matching x/x");
+  assert.equal(
+    notifications.some((notice) => notice.message.includes("Stopped run-d")),
+    true,
+  );
+});
+
+test("renderNavigator honors every small direct viewport", () => {
+  const model = new NavigatorModel(multiRunManager());
+  const state = new NavigatorState();
+  for (let rows = 1; rows <= 5; rows++) {
+    assert.ok(renderNavigator(state, model, 80, undefined, rows).length <= rows);
+  }
+});
+
+test("component filter renders the draft live, commits on Enter, and Esc preserves the applied query", async () => {
+  const { ui, getComponent } = fakeUiCapturingComponent();
+  const runs = ["alpha", "beta"].map((name) => ({
+    runId: `run-${name}`,
+    workflowName: name,
+    status: "completed",
+    phases: [],
+    agents: [],
+    logs: [],
+  })) as unknown as PersistedRunState[];
+  const manager = {
+    on: () => {},
+    off: () => {},
+    listRuns: () => runs,
+    getRun: () => undefined,
+  } as unknown as WorkflowManager;
+
+  openWorkflowNavigator({} as ExtensionAPI, manager, ui).catch(() => {});
+  await Promise.resolve();
+  await Promise.resolve();
+  const component = getComponent();
+  assert.ok(component);
+
+  component.handleInput("/");
+  component.handleInput("b");
+  let text = (component.render?.(80) ?? []).join("\n");
+  assert.match(text, /Workflows {2}\/ b/);
+  assert.match(text, /run-beta/);
+  assert.doesNotMatch(text, /run-alpha/);
+
+  component.handleInput("\r");
+  text = (component.render?.(80) ?? []).join("\n");
+  assert.match(text, /Workflows {2}\/ b/);
+  assert.match(text, /run-beta/);
+
+  // A draft that has no matches must not erase the already-applied query when
+  // Esc cancels editing, nor should it lose the selected identity.
+  component.handleInput("/");
+  component.handleInput("x");
+  const unmatchedDraft = (component.render?.(80) ?? []).join("\n");
+  assert.doesNotMatch(unmatchedDraft, /run-beta/);
+  assert.match(unmatchedDraft, /No matching workflows\./);
+  component.handleInput(String.fromCharCode(0x1b));
+  text = (component.render?.(80) ?? []).join("\n");
+  assert.match(text, /Workflows {2}\/ b/);
+  assert.match(text, /❯ .*run-beta/);
+});
+
+test("safeInputText removes complete OSC/CSI sequences without leaking payload", () => {
+  const esc = String.fromCharCode(0x1b);
+  const bel = String.fromCharCode(0x07);
+  assert.equal(safeInputText(`left${esc}]0;BEL payload${bel}mid${esc}]1;ST payload${esc}\\right`), "leftmidright");
+  assert.equal(safeInputText(`a${esc}]first${bel}b${esc}[31mc${esc}]second${esc}\\d`), "abcd");
+  assert.equal(safeInputText("普通文本é paste"), "普通文本é paste");
+  assert.equal(safeInputText("left\u{E0001}right"), "leftright");
+  assert.equal(safeInputText("left🙂right"), "left🙂right");
+  assert.equal(safeInputText(`a${esc}[2Kb`), "ab");
+});
+
+test("component rename strips astral format characters and keeps the same safe name", async () => {
+  const { ui, notifications, getComponent } = fakeUiCapturingComponent();
+  const workflow = {
+    name: "safe",
+    description: "safe workflow",
+    script: "export SAFE",
+    location: "project" as const,
+    source: "project" as const,
+    path: "/safe.json",
+    savedAt: "2025-01-01",
+  } as SavedWorkflow;
+  let renameCalls = 0;
+  const storage = {
+    list: () => [workflow],
+    rename: () => {
+      renameCalls++;
+      return { ok: true as const, workflow };
+    },
+    delete: () => true,
+  };
+  const manager = {
+    on: () => {},
+    off: () => {},
+    listRuns: () => [] as PersistedRunState[],
+    getRun: () => undefined,
+  } as unknown as WorkflowManager;
+
+  openWorkflowNavigator({} as ExtensionAPI, manager, ui, { storage: storage as unknown as WorkflowStorage }).catch(
+    () => {},
+  );
+  await Promise.resolve();
+  await Promise.resolve();
+  const component = getComponent();
+  assert.ok(component);
+
+  component.handleInput("r");
+  component.handleInput(String.fromCodePoint(0xe0001));
+  component.handleInput("\r");
+  assert.equal(renameCalls, 0, "same-name rename should not reach storage");
+  assert.ok(notifications.some((notice) => notice.message === "Kept /safe"));
+  assert.ok(notifications.every((notice) => !notice.message.includes("invalid")));
+});
+
+test("component manager refresh invalidates a stale confirmation instead of acting on the new row", async () => {
+  const { ui, getComponent } = fakeUiCapturingComponent();
+  const run = {
+    runId: "run-old",
+    workflowName: "old",
+    status: "running",
+    phases: [],
+    agents: [],
+    logs: [],
+  } as unknown as PersistedRunState;
+  let rows: PersistedRunState[] = [run];
+  const listeners = new Map<string, () => void>();
+  let stopped = 0;
+  let deleted = 0;
+  const storage = {
+    list: () =>
+      rows.length
+        ? []
+        : [
+            {
+              name: "replacement",
+              description: "",
+              script: "saved",
+              location: "project" as const,
+              source: "project" as const,
+              path: "/replacement.json",
+              savedAt: "2025-01-01",
+            },
+          ],
+    delete: () => {
+      deleted++;
+      return true;
+    },
+  };
+  const manager = {
+    on: (event: string, listener: () => void) => listeners.set(event, listener),
+    off: () => {},
+    listRuns: () => rows,
+    getRun: () => undefined,
+    stop: () => {
+      stopped++;
+      return true;
+    },
+  } as unknown as WorkflowManager;
+
+  openWorkflowNavigator({} as ExtensionAPI, manager, ui, { storage: storage as unknown as WorkflowStorage }).catch(
+    () => {},
+  );
+  await Promise.resolve();
+  await Promise.resolve();
+  const component = getComponent();
+  assert.ok(component);
+
+  component.handleInput("x");
+  assert.match((component.render?.(80) ?? []).join("\n"), /confirm stop/);
+  rows = [];
+  listeners.get("agentEnd")?.();
+  component.handleInput("x");
+  assert.equal(stopped, 0, "the second x must not stop the replacement row");
+  assert.equal(deleted, 0, "the second x must not delete the replacement row");
+});
+
+test("component rename handles a legacy source and live-loads only the new slash command", async () => {
+  const { ui, getComponent } = fakeUiCapturingComponent();
+  type Stored = SavedWorkflow;
+  const oldWorkflow: Stored = {
+    name: "legacy-old",
+    description: "legacy",
+    script: "export LEGACY_OLD",
+    location: "project",
+    source: "legacy",
+    path: "/legacy-old.json",
+    savedAt: "2025-01-01",
+  };
+  let current: Stored | null = oldWorkflow;
+  const storage = {
+    list: () => (current ? [current] : []),
+    load: (name: string) => (current?.name === name ? current : null),
+    save: () => oldWorkflow,
+    delete: () => true,
+    rename: (_workflow: SavedWorkflow, name: string) => {
+      current = { ...oldWorkflow, name, path: `/${name}.json`, script: "export RENAMED_NEW" };
+      return { ok: true as const, workflow: current };
+    },
+  };
+  const started: string[] = [];
+  const manager = {
+    on: () => {},
+    off: () => {},
+    listRuns: () => [] as PersistedRunState[],
+    getRun: () => undefined,
+    startInBackground: (script: string) => {
+      started.push(script);
+      return { runId: `run-${started.length}`, promise: new Promise(() => {}) };
+    },
+  } as unknown as WorkflowManager;
+  const pi = {
+    getCommands: () => commands.map((command) => ({ name: command.name })),
+    registerCommand: (
+      name: string,
+      spec: { description?: string; handler: (args: string, ctx: unknown) => unknown },
+    ) => {
+      commands.push({ name, handler: spec.handler });
+    },
+  } as unknown as ExtensionAPI;
+  const commands: Array<{ name: string; handler: (args: string, ctx: unknown) => unknown }> = [];
+
+  const { registerSavedWorkflow } = await import("../src/saved-commands.js");
+  registerSavedWorkflow(
+    pi,
+    "/cwd",
+    oldWorkflow,
+    manager,
+    () => current?.name === "legacy-old",
+    () => (current?.name === "legacy-old" ? current : null),
+  );
+  openWorkflowNavigator(pi, manager, ui, { storage: storage as unknown as WorkflowStorage }).catch(() => {});
+  await Promise.resolve();
+  await Promise.resolve();
+  const component = getComponent();
+  assert.ok(component);
+
+  component.handleInput("r");
+  component.handleInput("\b");
+  component.handleInput("\b");
+  component.handleInput("\b");
+  component.handleInput("\b");
+  component.handleInput("\b");
+  component.handleInput("\b");
+  component.handleInput("\b");
+  component.handleInput("\b");
+  component.handleInput("\b");
+  component.handleInput("\b");
+  component.handleInput("renamed");
+  component.handleInput("\r");
+
+  const oldCommand = commands.find((command) => command.name === "legacy-old");
+  const newCommand = commands.find((command) => command.name === "renamed");
+  assert.ok(oldCommand);
+  assert.ok(newCommand);
+  await oldCommand.handler("", { ui: { notify: () => {}, setStatus: () => {} } });
+  await newCommand.handler("", { ui: { notify: () => {}, setStatus: () => {} } });
+  assert.deepEqual(started, ["export RENAMED_NEW"]);
+});
+
+test("component saved detail exposes confirmation before delete", async () => {
+  initTheme("dark");
+  const { ui, getComponent } = fakeUiCapturingComponent();
+  let deleted = 0;
+  const workflow = {
+    name: "保存",
+    description: "Unicode",
+    script: "export const meta = {}",
+    location: "project" as const,
+    source: "project" as const,
+    path: "/saved/保存.json",
+    savedAt: "2025-01-01",
+  } as SavedWorkflow;
+  const storage = {
+    list: () => [workflow],
+    delete: () => {
+      deleted++;
+      return true;
+    },
+  };
+  const manager = {
+    on: () => {},
+    off: () => {},
+    listRuns: () => [] as PersistedRunState[],
+    getRun: () => undefined,
+  } as unknown as WorkflowManager;
+  openWorkflowNavigator({} as ExtensionAPI, manager, ui, { storage: storage as unknown as WorkflowStorage }).catch(
+    () => {},
+  );
+  await Promise.resolve();
+  await Promise.resolve();
+  const component = getComponent();
+  assert.ok(component);
+  component.handleInput("\r");
+  component.handleInput("x");
+  const confirming = component.render?.(80) ?? [];
+  assert.match(confirming.join("\n"), /confirm delete/);
+  component.handleInput("x");
+  assert.equal(deleted, 1);
 });

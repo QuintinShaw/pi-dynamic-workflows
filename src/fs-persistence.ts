@@ -67,9 +67,26 @@ export function ensureDir(fs: PersistenceFsLayer, dir: string): void {
  * power loss on a filesystem/OS combination where rename isn't fully atomic).
  */
 export function writeJsonAtomicWithBackup(fs: PersistenceFsLayer, path: string, data: unknown): void {
+  writeJsonAtomic(fs, path, data, false);
+}
+
+/**
+ * The same tmp-write + atomic-rename protocol, but reports a backup-write
+ * failure. Mutations that must retain a source record until a replacement is
+ * fully recoverable (notably saved-workflow rename) use this stricter variant.
+ */
+export function writeJsonAtomicWithBackupStrict(fs: PersistenceFsLayer, path: string, data: unknown): void {
+  writeJsonAtomic(fs, path, data, true);
+}
+
+function writeJsonAtomic(fs: PersistenceFsLayer, path: string, data: unknown, strictBackup: boolean): void {
   const json = JSON.stringify(data, null, 2);
   fs.writeFileSync(`${path}.tmp`, json);
   fs.renameSync(`${path}.tmp`, path);
+  if (strictBackup) {
+    fs.writeFileSync(`${path}.bak`, json);
+    return;
+  }
   try {
     fs.writeFileSync(`${path}.bak`, json);
   } catch {

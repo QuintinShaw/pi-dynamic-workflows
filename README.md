@@ -169,7 +169,7 @@ Pi can manage background runs directly with the `workflow_control` tool instead 
 | `/ultracode [off]` | Toggle exhaustive automatic workflows |
 | `/effort off\|high\|ultra` | Set the standing orchestration effort |
 
-In the navigator: `↑/↓` select · `enter/→` open · `esc/←` back · `p` pause · `x` stop · `r` restart · `s` save · `q` quit.
+In the navigator: `↑/↓` select · `PgUp/PgDn` page · `Home/End` jump · `/` filter runs by name, ID, or status and saved workflows by name or description · `enter/→` open · `esc/←` back. Filter text updates the visible list immediately; `enter` commits the draft filter. In filter-edit mode, `esc` cancels the draft and keeps the committed query; in browse mode, `esc` first clears an existing filter without closing the navigator, and only a second `esc` with no filter backs/closes normally. On a run, `p` pauses (press `p` again to confirm), `x` stops (press `x` again to confirm), `r` restarts, and `s` saves; these lifecycle controls remain bound to the run while viewing its phases, agents, or detail. On a saved workflow (including its detail view), `r` renames and `x` deletes (press `x` again to confirm). Rename `enter` commits and `esc` cancels; names cannot contain whitespace, controls, or path separators. `q` quits.
 
 Agent details use a compact summary by default: completed agents show their final result, while active agents show the prompt and two latest history events. Press `enter` to open the full syntax-highlighted pager. In the pager, use `j/k` or `↑/↓` for lines, `PgUp/PgDn` for pages, `g/G` for the ends, and `t` to toggle live tail mode.
 
