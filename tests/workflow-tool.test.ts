@@ -202,8 +202,13 @@ test("createWorkflowTool schema exposes resource controls and large-fan-out auth
 
   assert.match(parameterDescription(tool, "concurrency"), /Maximum concurrent agents/i);
   assert.match(parameterDescription(tool, "agentRetries"), /Retry attempts/i);
-  assert.match(parameterDescription(tool, "maxAgents"), /1000.*safety ceiling, not a target/i);
-  assert.match(parameterDescription(tool, "maxAgents"), /lower limit.*dynamic or exploratory fan-out/i);
+  assert.match(parameterDescription(tool, "maxAgents"), /1000.*safety/i);
+  assert.match(
+    parameterDescription(tool, "maxAgents"),
+    /verify=reviewers.*judgePanel=entries×judges.*completenessCheck=1/i,
+  );
+  assert.match(parameterDescription(tool, "maxAgents"), /retries add no slots/i);
+  assert.match(parameterDescription(tool, "maxAgents"), /lower.*dynamic fan-out/i);
   assert.match(parameterDescription(tool, "maxAgents"), /large fan-outs.*explicit user intent/i);
 });
 

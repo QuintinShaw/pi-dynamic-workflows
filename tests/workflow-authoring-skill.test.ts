@@ -286,6 +286,16 @@ test("generated helper facts expose exact callback, option, result, and failure 
       ["lens", null],
     ],
   );
+  assert.match(
+    verify?.options?.options[0]?.constraints.join(" ") ?? "",
+    /undefined.*null.*finite integers.*TypeError/i,
+  );
+  assert.match(
+    verify?.constraints.join(" ") ?? "",
+    /external abort.*capacity preflight.*option validation.*no reviewer starts/i,
+  );
+  assert.match(verify?.constraints.join(" ") ?? "", /logical agent slot per reviewer.*preflights/i);
+  assert.match(verify?.constraints.join(" ") ?? "", /execution retries.*not consume extra logical slots/i);
   assert.match(verify?.constraints.join(" ") ?? "", /successful votes.*denominator/i);
 
   assert.match(judgePanel?.signature ?? "", /judges.*rubric.*index.*attempt.*score.*judgments.*undefined/i);
@@ -296,6 +306,16 @@ test("generated helper facts expose exact callback, option, result, and failure 
       ["rubric", '"overall quality and correctness"'],
     ],
   );
+  assert.match(
+    judgePanel?.options?.options[0]?.constraints.join(" ") ?? "",
+    /undefined.*null.*finite integers.*TypeError/i,
+  );
+  assert.match(
+    judgePanel?.constraints.join(" ") ?? "",
+    /external abort.*capacity preflight.*option validation.*no judge starts/i,
+  );
+  assert.match(judgePanel?.constraints.join(" ") ?? "", /populated attempts.*judges.*logical agent slots.*preflights/i);
+  assert.match(judgePanel?.constraints.join(" ") ?? "", /sparse.*absent candidates.*original input index/i);
   assert.match(judgePanel?.constraints.join(" ") ?? "", /stable.*input index.*tie/i);
 
   assert.match(loopUntilDry?.signature ?? "", /round.*roundIndex.*key.*consecutiveEmpty.*maxRounds/i);
@@ -312,6 +332,8 @@ test("generated helper facts expose exact callback, option, result, and failure 
   assert.match(loopUntilDry?.constraints.join(" ") ?? "", /does not report whether termination/i);
 
   assert.match(completenessCheck?.signature ?? "", /complete: boolean.*missing\?: string\[\].*null/i);
+  assert.match(completenessCheck?.constraints.join(" ") ?? "", /external abort.*capacity preflight.*no critic starts/i);
+  assert.match(completenessCheck?.constraints.join(" ") ?? "", /one logical agent slot.*preflights/i);
   assert.match(completenessCheck?.constraints.join(" ") ?? "", /4,000.*serialized result/i);
 
   assert.match(retry?.signature ?? "", /attempt: number.*until.*boolean.*Promise<unknown>/i);
@@ -342,6 +364,13 @@ test("generated helper facts expose exact callback, option, result, and failure 
   assert.match(qualityHelpers, /verify.*reviewers: number.*threshold: number.*lens: string/i);
   assert.match(qualityHelpers, /judgePanel.*judges: number.*rubric: string/i);
   assert.match(qualityHelpers, /successful votes.*denominator/i);
+  assert.match(qualityHelpers, /verify.*reviewers.*logical slots/i);
+  assert.match(qualityHelpers, /judgePanel.*populated.*attempts.*judges/i);
+  assert.match(qualityHelpers, /finite integer.*TypeError/i);
+  assert.match(qualityHelpers, /preflight.*known expansion.*not infer arbitrary callback/i);
+  assert.match(qualityHelpers, /external pause\/stop abort.*capacity preflight.*no helper agent starts/i);
+  assert.match(specializedHelpers, /completenessCheck.*one logical agent slot.*preflights/i);
+  assert.match(specializedHelpers, /completenessCheck.*external pause\/stop abort.*before the critic starts/i);
   assert.match(specializedHelpers, /agent-limit exhaustion.*partial/i);
   assert.match(retryHelper, /retry.*zero-based.*synchronous/i);
   assert.match(retryHelper, /await retry/i);
@@ -358,6 +387,8 @@ test("generated helper facts expose exact callback, option, result, and failure 
   const lifecycle = readFileSync(join(ROOT, SKILL_ROOT, "references/lifecycle.md"), "utf8");
   assert.match(lifecycle, /background workflows are headless/i);
   assert.match(lifecycle, /checkpoint.*foreground/i);
+  assert.match(lifecycle, /judgePanel.*populated candidate.*attempts\.length.*judges/i);
+  assert.match(lifecycle, /agent execution retries.*do not add slots/i);
 });
 
 test("fan-out-and-synthesize example waits for the complete result set and preserves failures", async () => {

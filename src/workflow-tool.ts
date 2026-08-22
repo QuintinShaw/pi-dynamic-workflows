@@ -77,7 +77,7 @@ const workflowToolSchema = Type.Object({
   maxAgents: Type.Optional(
     Type.Number({
       description:
-        "Maximum number of agents allowed in this run. Default: 1000; this is a safety ceiling, not a target. Set a lower limit for dynamic or exploratory fan-out, and reserve large fan-outs for explicit user intent.",
+        "Agent cap (1000 default; safety). Count: verify=reviewers, judgePanel=entries×judges, completenessCheck=1. Retries add no slots. Lower for dynamic fan-out; large fan-outs need explicit user intent.",
     }),
   ),
   concurrency: Type.Optional(
