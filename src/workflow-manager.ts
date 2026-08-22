@@ -19,6 +19,17 @@ import {
 } from "./run-persistence.js";
 import { type JournalEntry, parseWorkflowScript, runWorkflow, type WorkflowRunResult } from "./workflow.js";
 
+/** Per-execution identity for an abort initiated by pause()/stop(). */
+interface LifecycleControl {
+  action: "pause" | "stop";
+  abortReason: object;
+}
+
+/** Per-execution identity for an abort received from the host/tool signal. */
+interface ExternalAbort {
+  abortReason: object;
+}
+
 export interface ManagedRun {
   runId: string;
   status: RunStatus;
@@ -61,6 +72,31 @@ export interface ManagedRun {
    * Undefined means eligible (default-on); false opts out.
    */
   autoResume?: boolean;
+  /**
+   * A user-requested lifecycle transition that aborted this exact execution.
+   *
+   * `pause` and `stop` already emit their own semantic events synchronously.
+   * Their later cooperative AbortError is teardown, not an unexpected workflow
+   * failure, so executeRun() must not emit a second generic `error` event (which
+   * would otherwise cause background-result delivery to start a new turn). The
+   * reason identity is compared with AbortSignal.reason: a later lifecycle action
+   * must never mask an error that had already escaped the workflow.
+   * This is deliberately transient: the status is the durable lifecycle fact.
+   */
+  lifecycleControl?: LifecycleControl;
+  /**
+   * External abort that owns this execution. Its identity keeps a provider,
+   * timeout, or other late agent result from reviving an already-aborted run.
+   */
+  externalAbort?: ExternalAbort;
+  /**
+   * Provider limit that escaped the top-level workflow before any manager
+   * lifecycle control could race with runWorkflow's cooperative sibling drain.
+   * This preserves the true terminal cause if pause()/stop() arrives later.
+   */
+  usageLimitEscapedBeforeLifecycleControl?: WorkflowError;
+  /** A provider-limit pause accepted as this run's durable pause reason. */
+  usageLimitPause?: WorkflowError;
   /**
    * The run's resolved hard token budget (per-run value, else the manager
    * default), fixed at run start and carried through resume() — a resumed run
@@ -711,11 +747,26 @@ export class WorkflowManager extends EventEmitter {
       if (this.isCurrent(managed)) onProgress?.(managed.snapshot);
     };
     // Let a host abort (e.g. Esc during a blocking tool call) cancel this run.
-    if (externalSignal) {
-      if (externalSignal.aborted) managed.controller.abort();
-      else externalSignal.addEventListener("abort", () => managed.controller.abort(), { once: true });
-    }
+    // Own this listener for exactly this executeRun() invocation: a reused host
+    // signal must not retain a settled manager/run closure or abort it later.
+    let externalAbortListener: (() => void) | undefined;
     try {
+      if (externalSignal) {
+        externalAbortListener = () => this.abortForExternalSignal(managed);
+        if (externalSignal.aborted) {
+          externalAbortListener();
+        } else {
+          try {
+            externalSignal.addEventListener("abort", externalAbortListener, { once: true });
+          } catch (error) {
+            throw new WorkflowError(
+              `Failed to register external abort listener: ${error instanceof Error ? error.message : String(error)}`,
+              WorkflowErrorCode.AGENT_EXECUTION_ERROR,
+              { recoverable: false, details: error },
+            );
+          }
+        }
+      }
       const result = await runWorkflow(script, {
         cwd: this.cwd,
         args,
@@ -847,6 +898,18 @@ export class WorkflowManager extends EventEmitter {
           this.emitLive(managed, "agentHistory", { runId: managed.runId, agentId: agent?.id, ...event });
           progress();
         },
+        onRunFatal: (error) => {
+          // Capture only provider limits that escaped BEFORE a manager lifecycle
+          // action. runWorkflow calls this before draining run-fatal siblings;
+          // a later pause()/stop() must not erase the quota checkpoint.
+          if (
+            isProviderUsageLimit(error) &&
+            !managed.controller.signal.aborted &&
+            managed.lifecycleControl === undefined
+          ) {
+            managed.usageLimitEscapedBeforeLifecycleControl = error;
+          }
+        },
         onTokenUsage: (usage) => {
           managed.snapshot.tokenUsage = usage;
           this.emitLive(managed, "tokenUsage", { runId: managed.runId, usage });
@@ -887,21 +950,50 @@ export class WorkflowManager extends EventEmitter {
               { recoverable: true },
             );
 
-      const usageLimitPaused = !managed.controller.signal.aborted && isProviderUsageLimit(workflowError);
-      if (managed.controller.signal.aborted) {
-        // Intentional abort (pause/stop/Esc) — preserve status set by pause()/stop()
-        if (managed.status === "running") {
-          managed.status = "aborted";
-        }
-      } else if (usageLimitPaused) {
-        // Provider quota/usage limit: NOT a failure. Checkpoint the run as paused so
-        // the persisted journal (completed agent results) is replayed by resume()
-        // once the budget refills — instead of the user starting from scratch.
+      const escapedUsageLimit = managed.usageLimitEscapedBeforeLifecycleControl;
+      const usageLimitPaused =
+        isProviderUsageLimit(workflowError) &&
+        (escapedUsageLimit === workflowError ||
+          (!managed.controller.signal.aborted && managed.lifecycleControl === undefined));
+      const lifecycleControlOwnsExecution =
+        managed.lifecycleControl !== undefined &&
+        managed.controller.signal.reason === managed.lifecycleControl.abortReason;
+      const externalAbortOwnsExecution =
+        managed.externalAbort !== undefined && managed.controller.signal.reason === managed.externalAbort.abortReason;
+      const lifecycleControlledAbort =
+        workflowError.code === WorkflowErrorCode.WORKFLOW_ABORTED && lifecycleControlOwnsExecution;
+      const lateUsageLimitAfterLifecycleControl =
+        isProviderUsageLimit(workflowError) && lifecycleControlOwnsExecution && !usageLimitPaused;
+      const externalAbortError = externalAbortOwnsExecution
+        ? new WorkflowError("workflow aborted", WorkflowErrorCode.WORKFLOW_ABORTED, { recoverable: true })
+        : undefined;
+      const terminalError = externalAbortError ?? workflowError;
+      if (usageLimitPaused) {
+        // A provider limit that escaped before a later pause()/stop() remains a
+        // quota checkpoint. Preserve its reset hint and scheduler path instead
+        // of letting the later control reclassify it as an ordinary failure.
         managed.status = "paused";
+        managed.usageLimitPause = workflowError;
+      } else if (externalAbortOwnsExecution) {
+        // The host signal happened first. Its cancellation remains the terminal
+        // cause; a non-cooperative agent's late provider/fatal/timeout result
+        // must not turn the aborted run into a failure or quota checkpoint.
+        managed.status = "aborted";
+      } else if (lifecycleControlledAbort || lateUsageLimitAfterLifecycleControl) {
+        // pause()/stop() already announced the requested state. Suppress only
+        // their own AbortError, plus a provider result that arrived AFTER this
+        // control cancelled the execution. The latter cannot revive a stop or
+        // arm quota auto-resume after a human intentionally paused/stopped.
+      } else if (managed.controller.signal.aborted && workflowError.code === WorkflowErrorCode.WORKFLOW_ABORTED) {
+        // A host/external abort remains observable, but is not a failed workflow.
+        managed.status = "aborted";
       } else {
+        // A real failure wins even when the user requested pause/stop after it
+        // escaped (for example, while runWorkflow is cooperatively draining a
+        // run-fatal sibling). Never let a late control marker hide that failure.
         managed.status = "failed";
       }
-      managed.error = workflowError;
+      managed.error = terminalError;
       // Both branches gated via emitLive() (see its doc comment) — a stale
       // execution's "paused"/"error" is equally misleading once superseded.
       if (usageLimitPaused) {
@@ -911,11 +1003,13 @@ export class WorkflowManager extends EventEmitter {
           error: workflowError,
           resetHint: workflowError.resetHint,
         });
-      } else if (this.listenerCount("error") > 0) {
+      } else if (!lifecycleControlledAbort && !lateUsageLimitAfterLifecycleControl && this.listenerCount("error") > 0) {
         // Guarded: EventEmitter throws on an unlistened "error" emit, which
         // would abort this catch block mid-way — skipping the final persist,
-        // the lease release, and the real error rethrow below.
-        this.emitLive(managed, "error", { runId: managed.runId, error: workflowError });
+        // the lease release, and the real error rethrow below. Only the
+        // AbortError proven to originate from pause()/stop() is excluded;
+        // failures that raced with a later lifecycle control still surface.
+        this.emitLive(managed, "error", { runId: managed.runId, error: terminalError });
       }
 
       // Persist final state (see the success-path comment above for the
@@ -933,6 +1027,21 @@ export class WorkflowManager extends EventEmitter {
       }
 
       throw workflowError;
+    } finally {
+      // AbortSignal's once listener is removed when it fires, but explicit
+      // removal is still required for normal/failing/paused executions where
+      // it never fires. removeEventListener is idempotent for already-fired
+      // listeners, so this is also safe across every terminal path.
+      if (externalSignal && externalAbortListener) {
+        try {
+          externalSignal.removeEventListener("abort", externalAbortListener);
+        } catch (error) {
+          // Cleanup must never replace the workflow's real result/error. Keep a
+          // diagnostic for broken host signal implementations without changing
+          // lifecycle state, persistence, lease handling, or delivery.
+          console.warn("[workflow-manager] Failed to remove external abort listener:", error);
+        }
+      }
     }
   }
 
@@ -1030,6 +1139,28 @@ export class WorkflowManager extends EventEmitter {
       usage.cacheWrite += tokenUsage.cacheWrite;
     }
     managed.snapshot.tokenUsage = usage;
+  }
+
+  /** Abort this execution for a host/tool signal, retaining provenance so a
+   * non-cooperative agent's late result cannot overwrite the external abort. */
+  private abortForExternalSignal(managed: ManagedRun): void {
+    if (managed.controller.signal.aborted) return;
+    const abortReason = {};
+    managed.externalAbort = { abortReason };
+    managed.controller.abort(abortReason);
+  }
+
+  /** Abort this execution for an explicit user lifecycle action.
+   *
+   * AbortSignal.reason is an execution-scoped identity token. If the controller
+   * had already been aborted externally, do not replace or annotate it: the
+   * original external failure must remain observable when executeRun() settles.
+   */
+  private abortForLifecycleControl(managed: ManagedRun, action: LifecycleControl["action"]): void {
+    if (managed.controller.signal.aborted) return;
+    const abortReason = {};
+    managed.lifecycleControl = { action, abortReason };
+    managed.controller.abort(abortReason);
   }
 
   private releaseRunLease(managed: ManagedRun): void {
@@ -1147,11 +1278,12 @@ export class WorkflowManager extends EventEmitter {
         agentTimeoutMs: managed.agentTimeoutMs,
         concurrency: managed.concurrency,
         agentRetries: managed.agentRetries,
-        // Why a usage-limit pause happened, so the navigator / a future cold start
-        // can show it and (eventually) re-arm resume after the budget refills.
-        pauseReason: managed.status === "paused" && isProviderUsageLimit(managed.error) ? "usage_limit" : undefined,
+        // Set only when this execution actually accepted a provider-limit
+        // checkpoint. A late provider result after manual pause/stop must not
+        // manufacture a usage-limit resume path from managed.error alone.
+        pauseReason: managed.status === "paused" && managed.usageLimitPause ? "usage_limit" : undefined,
         resetHint:
-          managed.status === "paused" && isProviderUsageLimit(managed.error) ? managed.error.resetHint : undefined,
+          managed.status === "paused" && managed.usageLimitPause ? managed.usageLimitPause.resetHint : undefined,
         phases: managed.snapshot.phases,
         currentPhase: managed.snapshot.currentPhase,
         // Real per-agent timestamps only (see agentTimestamps) — never the run's
@@ -1201,8 +1333,8 @@ export class WorkflowManager extends EventEmitter {
     const managed = this.runs.get(runId);
     if (managed?.status !== "running") return false;
 
-    managed.controller.abort();
     managed.status = "paused";
+    this.abortForLifecycleControl(managed, "pause");
     this.emit("paused", { runId });
     this.persistRun(managed);
     this.releaseRunLease(managed);
@@ -1416,8 +1548,8 @@ export class WorkflowManager extends EventEmitter {
       // `runs` forever (no future tail to mark it eviction-eligible) — a
       // small leak in exactly the class this manager otherwise bounds.
       const hadNoPendingSettle = managed.status === "paused";
-      managed.controller.abort();
       managed.status = "aborted";
+      this.abortForLifecycleControl(managed, "stop");
       this.emit("stopped", { runId });
       this.persistRun(managed);
       this.releaseRunLease(managed);

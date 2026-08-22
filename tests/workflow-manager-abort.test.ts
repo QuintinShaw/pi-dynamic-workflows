@@ -47,10 +47,202 @@ function deferredAgent() {
   };
 }
 
+/** AbortSignal wrapper that exposes listeners manager code retains. */
+function trackingAbortSignal(options: { throwOnAdd?: boolean; throwOnRemove?: boolean } = {}) {
+  const controller = new AbortController();
+  const listeners = new Set<EventListenerOrEventListenerObject>();
+  let addCalls = 0;
+  let removeCalls = 0;
+  const signal = {
+    get aborted() {
+      return controller.signal.aborted;
+    },
+    addEventListener(
+      type: string,
+      listener: EventListenerOrEventListenerObject | null,
+      eventOptions?: AddEventListenerOptions,
+    ) {
+      addCalls++;
+      if (options.throwOnAdd) throw new Error("add listener failed");
+      if (type === "abort" && listener) listeners.add(listener);
+      controller.signal.addEventListener(type, listener, eventOptions);
+    },
+    removeEventListener(
+      type: string,
+      listener: EventListenerOrEventListenerObject | null,
+      eventOptions?: EventListenerOptions,
+    ) {
+      removeCalls++;
+      if (options.throwOnRemove) throw new Error("remove listener failed");
+      if (type === "abort" && listener) listeners.delete(listener);
+      controller.signal.removeEventListener(type, listener, eventOptions);
+    },
+  } as unknown as AbortSignal;
+  return {
+    signal,
+    abort: () => controller.abort(),
+    listenerCount: () => listeners.size,
+    addCalls: () => addCalls,
+    removeCalls: () => removeCalls,
+  };
+}
+
 const oneAgentScript = `export const meta = { name: 'tracked_demo', description: 'one agent' }
 phase('Work')
 const a = await agent('do it', { label: 'a' })
 return { a }`;
+
+test(
+  "externalSignal listener is released after normal, failed, paused/resumed, and externally aborted executions",
+  withTempCwd(async (cwd) => {
+    // Normal completion.
+    const normalSignal = trackingAbortSignal();
+    const normalManager = new WorkflowManager({ cwd, agent: fakeAgent() });
+    await normalManager.runSync(oneAgentScript, undefined, { externalSignal: normalSignal.signal });
+    assert.equal(normalSignal.listenerCount(), 0);
+
+    // Failure before the signal aborts.
+    const failedSignal = trackingAbortSignal();
+    const failedManager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run() {
+          throw new WorkflowError("fatal", WorkflowErrorCode.AGENT_EXECUTION_ERROR, { recoverable: false });
+        },
+      },
+    });
+    failedManager.on("error", () => {});
+    await assert.rejects(failedManager.runSync(oneAgentScript, undefined, { externalSignal: failedSignal.signal }));
+    assert.equal(failedSignal.listenerCount(), 0);
+
+    // Manual pause leaves the old execution settling; after it settles, its
+    // listener is gone and an explicit resume starts a fresh execution safely.
+    const pausedSignal = trackingAbortSignal();
+    const pausedAgent = deferredAgent();
+    const pausedManager = new WorkflowManager({ cwd, agent: pausedAgent.runner });
+    pausedManager.on("error", () => {});
+    const { runId: pausedRunId, promise: pausedPromise } = pausedManager.startInBackground(oneAgentScript, undefined, {
+      externalSignal: pausedSignal.signal,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(pausedManager.pause(pausedRunId), true);
+    pausedAgent.resolve();
+    await pausedPromise.catch(() => {});
+    assert.equal(pausedSignal.listenerCount(), 0);
+    assert.equal(await pausedManager.resume(pausedRunId), true);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(pausedSignal.listenerCount(), 0);
+
+    // A fired signal still reaches a settled execution through its own listener,
+    // which the finally path removes even though EventTarget's once handling is
+    // implementation-owned.
+    const abortedSignal = trackingAbortSignal();
+    const abortedAgent = deferredAgent();
+    const abortedManager = new WorkflowManager({ cwd, agent: abortedAgent.runner });
+    abortedManager.on("error", () => {});
+    const { promise: abortedPromise } = abortedManager.startInBackground(oneAgentScript, undefined, {
+      externalSignal: abortedSignal.signal,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    abortedSignal.abort();
+    abortedAgent.resolve();
+    await abortedPromise.catch(() => {});
+    assert.equal(abortedSignal.listenerCount(), 0);
+
+    // Already-aborted signals never register a listener.
+    const alreadyAbortedSignal = trackingAbortSignal();
+    alreadyAbortedSignal.abort();
+    const alreadyAbortedManager = new WorkflowManager({ cwd, agent: fakeAgent() });
+    alreadyAbortedManager.on("error", () => {});
+    await assert.rejects(
+      alreadyAbortedManager.runSync(oneAgentScript, undefined, { externalSignal: alreadyAbortedSignal.signal }),
+    );
+    assert.equal(alreadyAbortedSignal.listenerCount(), 0);
+  }),
+);
+
+test(
+  "external signal registration and cleanup failures converge without replacing execution outcomes",
+  withTempCwd(async (cwd) => {
+    // Cleanup failure after a successful synchronous run is diagnostic-only.
+    const successfulCleanupSignal = trackingAbortSignal({ throwOnRemove: true });
+    const successfulManager = new WorkflowManager({ cwd, agent: fakeAgent() });
+    const successfulResult = await successfulManager.runSync(oneAgentScript, undefined, {
+      externalSignal: successfulCleanupSignal.signal,
+    });
+    assert.equal((successfulResult.result as { a?: unknown }).a, "ok");
+    assert.equal(successfulManager.getRun(successfulResult.runId ?? "")?.status, "completed");
+    assert.equal(successfulCleanupSignal.removeCalls(), 1);
+
+    // Cleanup failure must not replace the original workflow error.
+    const failedCleanupSignal = trackingAbortSignal({ throwOnRemove: true });
+    const failedManager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run() {
+          throw new WorkflowError("original workflow failure", WorkflowErrorCode.AGENT_EXECUTION_ERROR, {
+            recoverable: false,
+          });
+        },
+      },
+    });
+    failedManager.on("error", () => {});
+    await assert.rejects(
+      failedManager.runSync(oneAgentScript, undefined, { externalSignal: failedCleanupSignal.signal }),
+      /original workflow failure/,
+    );
+    assert.equal(failedManager.listRuns()[0]?.status, "failed");
+    assert.equal(failedCleanupSignal.removeCalls(), 1);
+
+    // Background completion also survives a throwing cleanup implementation.
+    const backgroundCleanupSignal = trackingAbortSignal({ throwOnRemove: true });
+    const backgroundManager = new WorkflowManager({ cwd, agent: fakeAgent() });
+    const { runId: backgroundRunId, promise: backgroundPromise } = backgroundManager.startInBackground(
+      oneAgentScript,
+      undefined,
+      {
+        externalSignal: backgroundCleanupSignal.signal,
+      },
+    );
+    await backgroundPromise;
+    assert.equal(backgroundManager.getRun(backgroundRunId)?.status, "completed");
+    assert.equal(backgroundCleanupSignal.removeCalls(), 1);
+
+    // Registration failure enters executeRun's normal error convergence path for
+    // both synchronous and background callers: status/persistence/lease/error
+    // are all finalized rather than leaving a permanently-running row.
+    const syncRegistrationSignal = trackingAbortSignal({ throwOnAdd: true });
+    const syncRegistrationManager = new WorkflowManager({ cwd, agent: fakeAgent() });
+    syncRegistrationManager.on("error", () => {});
+    await assert.rejects(
+      syncRegistrationManager.runSync(oneAgentScript, undefined, { externalSignal: syncRegistrationSignal.signal }),
+      /Failed to register external abort listener: add listener failed/,
+    );
+    assert.equal(syncRegistrationManager.listRuns()[0]?.status, "failed");
+    assert.equal(syncRegistrationSignal.addCalls(), 1);
+    assert.equal(syncRegistrationSignal.removeCalls(), 1);
+
+    const backgroundRegistrationSignal = trackingAbortSignal({ throwOnAdd: true });
+    const backgroundRegistrationManager = new WorkflowManager({ cwd, agent: fakeAgent() });
+    const observedErrors: WorkflowError[] = [];
+    backgroundRegistrationManager.on("error", (event: { error: WorkflowError }) => observedErrors.push(event.error));
+    const { runId: registrationRunId, promise: registrationPromise } = backgroundRegistrationManager.startInBackground(
+      oneAgentScript,
+      undefined,
+      { externalSignal: backgroundRegistrationSignal.signal },
+    );
+    await assert.rejects(registrationPromise, /Failed to register external abort listener: add listener failed/);
+    assert.equal(backgroundRegistrationManager.getRun(registrationRunId)?.status, "failed");
+    assert.equal(
+      backgroundRegistrationManager.listRuns().find((run) => run.runId === registrationRunId)?.status,
+      "failed",
+    );
+    assert.equal(observedErrors.length, 1);
+    assert.match(observedErrors[0]?.message ?? "", /Failed to register external abort listener/);
+    assert.equal(backgroundRegistrationSignal.addCalls(), 1);
+    assert.equal(backgroundRegistrationSignal.removeCalls(), 1);
+  }),
+);
 
 /** Run each manager test with isolated cwd and HOME so workflow state is isolated. */
 function withTempCwd(fn: (cwd: string) => Promise<void>) {
