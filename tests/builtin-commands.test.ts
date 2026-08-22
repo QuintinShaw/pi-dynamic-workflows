@@ -11,6 +11,7 @@ import {
   registerBuiltinWorkflows,
 } from "../src/builtin-commands.js";
 import { MAX_DIFF_CHARS } from "../src/code-review.js";
+import { registerSavedWorkflow, savedWorkflowCommandAvailability } from "../src/saved-commands.js";
 import { parseWorkflowScript } from "../src/workflow.js";
 import type { WorkflowManager } from "../src/workflow-manager.js";
 import type { SavedWorkflow, WorkflowStorage } from "../src/workflow-saved.js";
@@ -248,6 +249,45 @@ test("registerBuiltinWorkflows is idempotent — skips already registered comman
   ]);
   registerBuiltinWorkflows(pi, { cwd: "/tmp", manager: makeFakeManager().manager });
   assert.equal(commands.length, 0, "should not re-register when already present");
+});
+
+test("saved workflow cannot claim built-in names occupied by third-party commands", () => {
+  for (const name of ["code-review", "deep-research"]) {
+    const { pi, commands } = makeCommandRegistryPi([name]);
+    const availability = savedWorkflowCommandAvailability(pi, name);
+    assert.equal(availability.ok, false);
+    const result = registerSavedWorkflow(pi, "/tmp", {
+      name,
+      description: "third-party collision",
+      script: "export THIRD_PARTY_COLLISION",
+    });
+    assert.equal(result.ok, false);
+    assert.equal(commands.length, 0, "the rejected command must not be registered");
+  }
+});
+
+test("saved workflow may shadow a built-in only after this extension owns its handler", () => {
+  const { pi, commands } = makeCommandRegistryPi();
+  registerBuiltinWorkflows(pi, { cwd: "/tmp", manager: makeFakeManager().manager });
+  assert.equal(savedWorkflowCommandAvailability(pi, "code-review").ok, true);
+  const result = registerSavedWorkflow(pi, "/tmp", {
+    name: "code-review",
+    description: "saved shadow",
+    script: "export SAVED_SHADOW",
+  });
+  assert.equal(result.ok, true);
+  assert.equal(commands.filter((command) => command.name === "code-review").length, 1);
+});
+
+test("saved workflow rejects an ordinary third-party command name", () => {
+  const { pi, commands } = makeCommandRegistryPi(["ordinary-command"]);
+  const result = registerSavedWorkflow(pi, "/tmp", {
+    name: "ordinary-command",
+    description: "collision",
+    script: "export COLLISION",
+  });
+  assert.equal(result.ok, false);
+  assert.equal(commands.length, 0);
 });
 
 test("registerBuiltinWorkflows registers only missing commands", () => {

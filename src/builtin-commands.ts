@@ -15,6 +15,7 @@ import type { ExtensionAPI, ExtensionCommandContext, ToolDefinition } from "@ear
 import type { BuiltinWorkflowInvocation } from "./builtin-workflows.js";
 import { findBuiltinWorkflow } from "./builtin-workflows.js";
 import { MAX_DIFF_CHARS } from "./code-review.js";
+import { claimCommand, isCommandRegistered } from "./command-registry.js";
 import { parseCommandArgs } from "./saved-commands.js";
 import type { WorkflowManager } from "./workflow-manager.js";
 import { createWorkflowStorage, type WorkflowStorage } from "./workflow-saved.js";
@@ -259,11 +260,7 @@ function shortError(error: unknown): string {
 }
 
 function alreadyRegistered(pi: ExtensionAPI, name: string): boolean {
-  try {
-    return (pi.getCommands?.() ?? []).some((c: { name: string }) => c.name === name);
-  } catch {
-    return false;
-  }
+  return isCommandRegistered(pi, name);
 }
 
 /** Split a command argument string into tokens, respecting single/double quotes. */
@@ -401,6 +398,7 @@ export function registerBuiltinWorkflows(
         );
       },
     });
+    claimCommand(pi, "deep-research", "builtin");
   }
 
   if (!alreadyRegistered(pi, "adversarial-review")) {
@@ -415,6 +413,7 @@ export function registerBuiltinWorkflows(
         startBackground(getManager(), ctx, "adversarial-review", resolved.script, { task });
       },
     });
+    claimCommand(pi, "adversarial-review", "builtin");
   }
 
   if (!alreadyRegistered(pi, "code-review")) {
@@ -534,6 +533,7 @@ export function registerBuiltinWorkflows(
         startBackground(getManager(), ctx, "code-review", resolved.script, { diff, diffSource });
       },
     });
+    claimCommand(pi, "code-review", "builtin");
   }
 
   if (!alreadyRegistered(pi, "multi-perspective")) {
@@ -552,6 +552,7 @@ export function registerBuiltinWorkflows(
         startBackground(getManager(), ctx, "multi-perspective", resolved.script);
       },
     });
+    claimCommand(pi, "multi-perspective", "builtin");
   }
 
   if (!alreadyRegistered(pi, "codebase-audit")) {
@@ -568,5 +569,6 @@ export function registerBuiltinWorkflows(
         startBackground(getManager(), ctx, "codebase-audit", resolved.script);
       },
     });
+    claimCommand(pi, "codebase-audit", "builtin");
   }
 }

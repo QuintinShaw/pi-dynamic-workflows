@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 import test from "node:test";
@@ -397,5 +397,78 @@ test(
     const storage = createWorkflowStorage(cwd);
     assert.equal(existsSync(workflowProjectPaths(cwd).savedDir), false, "directory really doesn't exist yet");
     assert.deepEqual(storage.list(), []);
+  }),
+);
+
+test(
+  "strict rename rolls back target and restores source after injected failures",
+  withIsolatedHome(async (cwd) => {
+    const good = createWorkflowStorage(cwd);
+    const source = good.save({ name: "source", description: "source", script: "source" });
+    let failBackup = true;
+    const flakyBackup = createWorkflowStorage(cwd, {
+      writeFileSync: ((path, data, options) => {
+        if (failBackup && String(path).endsWith("target.json.bak")) {
+          failBackup = false;
+          throw new Error("backup write failed");
+        }
+        return writeFileSync(path, data, options);
+      }) as typeof writeFileSync,
+    });
+    assert.equal(flakyBackup.rename(source, "target").ok, false);
+    assert.equal(existsSync(join(workflowProjectPaths(cwd).savedDir, "target.json")), false);
+    assert.equal(existsSync(source.path), true);
+    assert.equal(existsSync(`${source.path}.bak`), true);
+    assert.equal(flakyBackup.rename(source, "target").ok, true);
+
+    const source2 = good.save({ name: "source2", description: "source2", script: "source2" });
+    let failDelete = true;
+    const flakyDelete = createWorkflowStorage(cwd, {
+      unlinkSync: ((path) => {
+        if (failDelete && String(path) === source2.path) {
+          failDelete = false;
+          throw new Error("source delete failed");
+        }
+        return unlinkSync(path);
+      }) as typeof unlinkSync,
+    });
+    assert.equal(flakyDelete.rename(source2, "target2").ok, false);
+    assert.equal(existsSync(source2.path), true);
+    assert.equal(existsSync(`${source2.path}.bak`), true);
+    assert.equal(existsSync(join(workflowProjectPaths(cwd).savedDir, "target2.json")), false);
+    assert.equal(flakyDelete.rename(source2, "target2").ok, true);
+  }),
+);
+
+test(
+  "string delete project covers project and legacy while omitted delete also covers user",
+  withIsolatedHome(async (cwd) => {
+    const storage = createWorkflowStorage(cwd);
+    storage.save({ name: "layers", description: "project", script: "p" });
+    const legacyDir = workflowProjectPaths(cwd).legacySavedDir;
+    mkdirSync(legacyDir, { recursive: true });
+    writeFileSync(
+      join(legacyDir, "layers.json"),
+      JSON.stringify({ name: "layers", description: "legacy", script: "l", savedAt: "2025-01-01" }),
+    );
+    storage.save({ name: "layers", description: "user", script: "u" }, "user");
+    assert.equal(storage.delete("layers", "project"), true);
+    assert.equal(storage.load("layers")?.location, "user");
+    assert.equal(storage.delete("layers"), true);
+    assert.equal(storage.load("layers"), null);
+  }),
+);
+
+test(
+  "saved mutations reject a same-path external overwrite as stale",
+  withIsolatedHome(async (cwd) => {
+    const storage = createWorkflowStorage(cwd);
+    const source = storage.save({ name: "race", description: "old", script: "old" });
+    writeFileSync(source.path, JSON.stringify({ ...source, script: "new" }));
+    const renamed = storage.rename(source, "moved");
+    const deleted = storage.delete(source);
+    assert.equal(renamed.ok, false);
+    assert.equal(deleted.ok, false);
+    assert.equal(storage.load("race")?.script, "new");
   }),
 );
