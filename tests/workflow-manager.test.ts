@@ -4271,3 +4271,58 @@ test(
     );
   }),
 );
+
+test(
+  "manager rolls back provisional agent usage when pause aborts without terminal usage",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt, options) {
+          void prompt;
+          options?.onUsageProgress?.({
+            input: 20,
+            output: 80,
+            total: 100,
+            cost: 0.01,
+            cacheRead: 0,
+            cacheWrite: 0,
+          });
+          return new Promise((resolve, reject) => {
+            void resolve;
+            const abort = () => reject(new Error("aborted without terminal usage"));
+            if (options?.signal?.aborted) {
+              abort();
+            } else {
+              options?.signal?.addEventListener("abort", abort, { once: true });
+            }
+          });
+        },
+      },
+    });
+    manager.on("error", () => {});
+
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    while ((manager.getRun(runId)?.snapshot.agents[0]?.tokens ?? 0) < 100) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    assert.equal(manager.pause(runId), true);
+    await assert.rejects(promise);
+
+    const live = manager.getRun(runId);
+    assert.equal(live?.status, "paused");
+    assert.equal(live?.snapshot.agents[0]?.tokens, 0, "the in-memory agent must discard provisional usage");
+    assert.equal(live?.snapshot.agents[0]?.tokenUsage?.total, 0);
+    assert.equal(live?.snapshot.tokenUsage, undefined, "abandoned usage must not enter run accounting");
+
+    const persisted = manager.getPersistence().load(runId);
+    assert.equal(persisted?.status, "paused");
+    assert.equal(persisted?.agents[0]?.tokens, 0, "the persisted agent must discard provisional usage");
+    assert.equal(persisted?.agents[0]?.tokenUsage?.total, 0);
+    assert.equal(persisted?.tokenUsage, undefined);
+
+    const statusRow = new NavigatorModel(manager).runs().find((run) => run.runId === runId);
+    assert.equal(statusRow?.fresh, 0, "status-facing usage must reflect committed usage only");
+    assert.equal(statusRow?.cacheRead, 0);
+  }),
+);

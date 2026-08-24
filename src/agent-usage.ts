@@ -93,7 +93,14 @@ export function createAgentCallUsageTracker(onUpdate: (update: AgentCallUsageUpd
         },
         commitTerminalUsage() {
           if (!terminalUsage) {
+            if (!isOpen()) {
+              return { tokens: 0 };
+            }
             closed = true;
+            const displayedUsage = sumAgentUsage(committedCallUsage, attemptUsage);
+            if (!agentUsageEquals(displayedUsage, committedCallUsage)) {
+              onUpdate({ tokenUsage: committedCallUsage });
+            }
             return { tokens: 0 };
           }
           return commitUsage(terminalUsage);
