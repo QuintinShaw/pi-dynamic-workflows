@@ -234,7 +234,7 @@ Model tiers live at `~/.pi/workflows/model-tiers.json`. A project file at `~/.pi
 
 Use `/workflows-models` to edit them interactively; it is cwd-aware and can save to the project or global file. A project save writes the resolved map, including keys currently inherited from global. Without a config, the extension ranks authenticated models by capability hints and assigns distinct models when possible.
 
-Omitted `tokenBudget` and `agentTimeoutMs` values use configured `defaultTokenBudget` and `defaultAgentTimeoutMs` settings; without them, runs are unlimited and have no hard per-agent timeout. Add per-run or per-agent values when you need explicit gates. `concurrency` is clamped to 16; `agentRetries` retries only recoverable failures. Defaults live in `~/.pi/workflows/settings.json`; `defaultTokenBudget` is a soft pre-call gate, and a project-level override of `null` cancels a global budget.
+Omitted `tokenBudget` and `agentTimeoutMs` values use configured `defaultTokenBudget` and `defaultAgentTimeoutMs` settings; without them, runs are unlimited and have no hard per-agent timeout. Add per-run or per-agent values when you need explicit gates. `concurrency` is clamped to 16; `agentRetries` retries only recoverable failures. Settings load in order (later wins): global `~/.pi/workflows/settings.json` → repo-local `<cwd>/.pi/workflows/settings.json` → the existing external project override `~/.pi/workflows/projects/<project>/settings.json`. Repo-local defaults can be version-controlled and shared as common repository configuration; external project overrides remain user-specific. `defaultTokenBudget` is a soft pre-call gate, and a project-level override of `null` cancels a global budget.
 
 Set `"defaultEffort": "high"` or `"ultra"` in that settings file to opt a fresh session into the corresponding orchestration effort (`"off"` is the default). Project settings overlay the global value. This is an initial in-memory value only: `/effort` and `/ultracode` change the current session without writing settings, and reload/new/fork/session switches retain their existing in-process effort.
 
@@ -252,6 +252,7 @@ Extension state lives outside the repository under `~/.pi/workflows`:
 - global settings and tiers: `~/.pi/workflows/settings.json` and `model-tiers.json`
 - project runs, journals, locks, saved overrides, and optional tier overlay: `~/.pi/workflows/projects/<project>/`
 - older project-local `.pi/workflows/runs` and `.pi/workflows/saved` remain readable as fallbacks
+- repo-local `<cwd>/.pi/workflows/settings.json` is also read for shared defaults, between global settings and the existing external project override `~/.pi/workflows/projects/<project>/settings.json`. This path is relative to the supplied project cwd; it does not search parent directories. Missing, corrupt, or invalid files are ignored. Saving settings still targets global or external project settings, not the repo-local file.
 
 Subagents are in-memory by default. Set `persistAgentSessions: true` to retain full transcripts in Pi's standard session directory. This creates one file per unthreaded call or named thread and may store sensitive material that an agent read, so enable it deliberately.
 

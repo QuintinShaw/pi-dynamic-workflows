@@ -6,8 +6,8 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { MAX_AGENT_RETRIES, MAX_CONCURRENCY, normalizeKeywordTriggerWord } from "./config.js";
+import { dirname, join, resolve } from "node:path";
+import { MAX_AGENT_RETRIES, MAX_CONCURRENCY, normalizeKeywordTriggerWord, WORKFLOW_SETTINGS_FILE } from "./config.js";
 import { workflowHomeDir, workflowProjectPaths } from "./workflow-paths.js";
 
 export interface WorkflowSettings {
@@ -68,6 +68,8 @@ export interface WorkflowSettingsOptions {
   cwd?: string;
   /** Explicit project settings path, primarily for tests. */
   projectSettingsPath?: string;
+  /** Explicit project-local (in-repo) settings path, primarily for tests. */
+  projectLocalSettingsPath?: string;
   /** Save destination when using saveWorkflowSettings with cwd. Default: global. */
   scope?: "global" | "project";
 }
@@ -82,14 +84,35 @@ export function getWorkflowProjectSettingsPath(cwd: string): string {
   return workflowProjectPaths(cwd).settingsPath;
 }
 
-/** Load settings from disk. Missing, corrupt, or invalid files resolve to {}. */
+/**
+ * Path to the project-local (in-repo) workflow settings file
+ * (`<cwd>/.pi/workflows/settings.json`). Lets a repository or its tooling ship
+ * workflow defaults with the project, the same way project-local
+ * `.pi/workflows/saved/` ships saved workflows.
+ */
+export function getProjectLocalWorkflowSettingsPath(cwd: string): string {
+  return resolve(cwd, WORKFLOW_SETTINGS_FILE);
+}
+
+/**
+ * Load settings from disk. Missing, corrupt, or invalid files resolve to {}.
+ * Precedence when a cwd is provided (later wins): global user settings, then
+ * the project-local in-repo file (`<cwd>/.pi/workflows/settings.json`), then
+ * the per-project override under `~/.pi/workflows/projects/<key>/` — so a
+ * repo can ship defaults while a user's own project override still wins.
+ */
 export function loadWorkflowSettings(settingsPathOrOptions?: string | WorkflowSettingsOptions): WorkflowSettings {
   const options = normalizeOptions(settingsPathOrOptions);
   const globalSettings = readSettings(options.settingsPath ?? getWorkflowSettingsPath());
+  const projectLocalPath =
+    options.projectLocalSettingsPath ?? (options.cwd ? getProjectLocalWorkflowSettingsPath(options.cwd) : undefined);
   const projectPath =
     options.projectSettingsPath ?? (options.cwd ? getWorkflowProjectSettingsPath(options.cwd) : undefined);
-  if (!projectPath) return globalSettings;
-  return { ...globalSettings, ...readSettings(projectPath) };
+  return {
+    ...globalSettings,
+    ...(projectLocalPath ? readSettings(projectLocalPath) : {}),
+    ...(projectPath ? readSettings(projectPath) : {}),
+  };
 }
 
 /** Merge known settings into the user-level settings file. */

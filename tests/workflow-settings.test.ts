@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, normalize } from "node:path";
+import { dirname, join, normalize, resolve } from "node:path";
 import { describe, it } from "node:test";
 import { WORKFLOW_SETTINGS_FILE } from "../src/config.js";
 import {
+  getProjectLocalWorkflowSettingsPath,
   getWorkflowProjectSettingsPath,
   getWorkflowSettingsPath,
   loadWorkflowSettings,
@@ -135,6 +136,79 @@ describe("workflow settings", () => {
 
       writeFileSync(settingsPath, JSON.stringify({ defaultConcurrency: 0, defaultAgentRetries: -1 }), "utf-8");
       assert.deepEqual(loadWorkflowSettings(settingsPath), {});
+    });
+  });
+
+  it("resolves the project-local settings path inside the project", () => {
+    assert.equal(
+      getProjectLocalWorkflowSettingsPath(join("some", "project")),
+      resolve(join("some", "project"), ".pi", "workflows", "settings.json"),
+    );
+  });
+
+  it("reads project-local settings and lets the per-project override win", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-local-settings-"));
+    const cwd = join(dir, "project");
+    const fakeHome = join(dir, "home");
+    try {
+      withFakeHome(fakeHome, () => {
+        const globalPath = getWorkflowSettingsPath();
+        const localPath = getProjectLocalWorkflowSettingsPath(cwd);
+        saveWorkflowSettings({ keywordTriggerEnabled: true, defaultAgentTimeoutMs: 600000 }, globalPath);
+        mkdirSync(dirname(localPath), { recursive: true });
+        writeFileSync(localPath, JSON.stringify({ persistAgentSessions: true, keywordTriggerEnabled: false }));
+
+        // global < project-local file: the in-repo file overrides global keys
+        // and contributes its own.
+        assert.deepEqual(loadWorkflowSettings({ cwd, settingsPath: globalPath }), {
+          keywordTriggerEnabled: false,
+          defaultAgentTimeoutMs: 600000,
+          persistAgentSessions: true,
+        });
+
+        // project-local file < per-project override: a user's own project
+        // override still wins over what the repo ships.
+        saveWorkflowSettings({ persistAgentSessions: false }, { cwd, settingsPath: globalPath, scope: "project" });
+        assert.deepEqual(loadWorkflowSettings({ cwd, settingsPath: globalPath }), {
+          keywordTriggerEnabled: false,
+          defaultAgentTimeoutMs: 600000,
+          persistAgentSessions: false,
+        });
+
+        // A corrupt project-local file is ignored, not fatal.
+        writeFileSync(localPath, "{not json");
+        assert.deepEqual(loadWorkflowSettings({ cwd, settingsPath: globalPath }), {
+          keywordTriggerEnabled: true,
+          defaultAgentTimeoutMs: 600000,
+          persistAgentSessions: false,
+        });
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("normalizes repo-local defaultEffort before applying external project overrides", () => {
+    withSettingsPath((settingsPath) => {
+      const projectLocalSettingsPath = join(dirname(settingsPath), "repo-settings.json");
+      const projectSettingsPath = join(dirname(settingsPath), "project-settings.json");
+      const options = { settingsPath, projectLocalSettingsPath, projectSettingsPath };
+      saveWorkflowSettings({ defaultEffort: "high" }, settingsPath);
+
+      assert.deepEqual(loadWorkflowSettings(options), { defaultEffort: "high" });
+      writeFileSync(projectLocalSettingsPath, JSON.stringify({ defaultEffort: "ultra" }));
+      assert.deepEqual(loadWorkflowSettings(options), { defaultEffort: "ultra" });
+      assert.deepEqual(loadWorkflowSettings(settingsPath), { defaultEffort: "high" });
+
+      for (const value of [{ defaultEffort: "HIGH" }, [], null]) {
+        writeFileSync(projectLocalSettingsPath, JSON.stringify(value));
+        assert.deepEqual(loadWorkflowSettings(options), { defaultEffort: "high" });
+      }
+
+      writeFileSync(projectLocalSettingsPath, JSON.stringify({ defaultEffort: "ultra" }));
+      saveWorkflowSettings({ defaultEffort: "off" }, { ...options, scope: "project" });
+      assert.deepEqual(loadWorkflowSettings(options), { defaultEffort: "off" });
+      assert.deepEqual(JSON.parse(readFileSync(projectLocalSettingsPath, "utf-8")), { defaultEffort: "ultra" });
     });
   });
 
