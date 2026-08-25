@@ -84,6 +84,13 @@ export interface JournalEntry {
    * which agent finished first. Absent on older journal entries.
    */
   storeDelta?: Record<string, unknown>;
+  /**
+   * The model this call actually ran on, captured post-resolution so a replayed
+   * cache hit displays what really ran instead of the pre-resolution guess.
+   * Absent on journal entries persisted before this field existed (and on
+   * checkpoints, which run no model) — those degrade to the old behavior.
+   */
+  model?: string;
 }
 
 /**
@@ -266,6 +273,19 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
     committedUsage?: AgentUsage;
   }) => void;
   onAgentHistory?: (event: { id: string; label: string; phase?: string; history: AgentHistoryEntry[] }) => void;
+  /**
+   * The agent's REAL model, pushed the moment WorkflowAgent resolves it — mid-run,
+   * long before onAgentEnd. onAgentStart can only carry the pre-resolution guess
+   * (this call's explicit/phase spec, else the session's main model), which is wrong
+   * for every tier-routed agent: an explicit `tier` deliberately defers the choice to
+   * the agent layer, and an untagged agent is implicitly routed through the "medium"
+   * tier whenever model-tiers.json exists (see resolveAgentModelSpec). Without this
+   * channel those agents display the main session model for their whole lifetime and
+   * only flip to the truth once they finish. Fires once per ATTEMPT (and per turn for
+   * a named thread), so treat it as idempotent, not once-per-agent. `id` is the same
+   * per-CALL id as onAgentStart/onAgentEnd/onAgentHistory/onAgentUsage.
+   */
+  onAgentModel?: (event: { id: string; label: string; phase?: string; model: string }) => void;
   onTokenUsage?: (usage: {
     input: number;
     output: number;
@@ -694,9 +714,12 @@ export async function runWorkflow<T = unknown>(
     const explicitModel = agentOptions.model ?? agentDef?.model;
     const modelSpec =
       explicitModel ?? (agentOptions.tier ? undefined : resolveModelForPhase(assignedPhase, routingConfig));
-    // For display in /workflows: the model this agent runs on — its explicit/phase
-    // spec, else the session's main model. The real resolved id overrides this via
-    // onModelResolved once the subagent session is created.
+    // For display in /workflows: a PRE-RESOLUTION guess — this agent's explicit/phase
+    // spec, else the session's main model. It is only a guess: a `tier` deliberately
+    // leaves modelSpec undefined so the agent layer picks, and an untagged agent is
+    // implicitly routed through the "medium" tier when model-tiers.json exists. The
+    // real resolved id replaces it via onModelResolved below, which also pushes the
+    // correction out on onAgentModel so a RUNNING agent's row stops showing the guess.
     let displayModel = modelSpec ?? options.mainModel;
 
     // Deterministic resume key: assigned at lexical call time, before the limiter,
@@ -738,14 +761,18 @@ export async function runWorkflow<T = unknown>(
     const hashMatches = cached != null && cached.hash === callHash;
     const cachedEmptyOutput = hashMatches && isEmptyTextAgentResult(cached.result, agentOptions.schema);
     if (!shared.resumeBarrierReached && hashMatches && !cachedEmptyOutput && callIndex < state.firstMiss) {
-      options.onAgentStart?.({ id: deltaKey, label, phase: assignedPhase, prompt, model: displayModel });
+      // A replayed call never runs an agent, so onModelResolved never fires for it.
+      // Use the model journaled when it originally ran; legacy entries have none and
+      // fall back to the pre-resolution guess, exactly as before this field existed.
+      const replayModel = cached.model ?? displayModel;
+      options.onAgentStart?.({ id: deltaKey, label, phase: assignedPhase, prompt, model: replayModel });
       options.onAgentEnd?.({
         id: deltaKey,
         label,
         phase: assignedPhase,
         result: cached.result,
         tokens: 0,
-        model: displayModel,
+        model: replayModel,
       });
       // Apply this agent's write delta so live agents later in the run see a
       // consistent store. Additive apply preserves parallel-agent writes that
@@ -846,6 +873,10 @@ export async function runWorkflow<T = unknown>(
               cwd: runCwd,
               onModelResolved: (id: string) => {
                 displayModel = id;
+                // Correct what /workflows shows for an agent that is STILL RUNNING.
+                // onAgentEnd keeps carrying the same value so late subscribers and
+                // the persisted snapshot stay consistent with this push.
+                options.onAgentModel?.({ id: deltaKey, label, phase: assignedPhase, model: id });
               },
               onModelFallback: ({ tier, requestedSpec }: { tier: string; requestedSpec: string }) => {
                 // Untagged agents' implicit default tier degrading to the session
@@ -881,6 +912,11 @@ export async function runWorkflow<T = unknown>(
                 runId,
                 hash: callHash,
                 result,
+                // displayModel is post-resolution here; recording it keeps a
+                // resumed run's replayed rows from regressing to mainModel.
+                // Deliberately NOT part of callHash (see hashAgentCall): the
+                // cache key stays spec-level, so no cached agent is invalidated.
+                model: displayModel,
                 storeDelta: store.commitDelta(deltaKey),
               });
             } else {

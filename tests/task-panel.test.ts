@@ -1448,6 +1448,42 @@ describe("installTaskPanel", () => {
     assert.equal(registeredPlacement, "belowEditor");
   });
 
+  it("repaints on agentModel, so a running agent's corrected model reaches the panel", () => {
+    // The manager corrects agent.model IN PLACE on the live snapshot, so without a
+    // repaint subscription the panel keeps showing the pre-resolution model until
+    // some unrelated event happens to fire.
+    const manager = new EventEmitter() as ReturnType<typeof EventEmitter> & {
+      getRun: (...args: unknown[]) => unknown;
+      listRuns: () => unknown[];
+    };
+    manager.getRun = () => undefined;
+    manager.listRuns = () => [];
+
+    let factory: ((tui: { requestRender(): void }, theme: unknown) => { dispose?(): void }) | undefined;
+    const ui = {
+      setWidget: (_name: string, registeredFactory: typeof factory) => {
+        factory = registeredFactory;
+      },
+    };
+
+    mod.installTaskPanel(null, manager, ui);
+    let renders = 0;
+    const component = factory?.(
+      { requestRender: () => renders++ },
+      {
+        fg: (_c: string, t: string) => t,
+        bold: (t: string) => t,
+      },
+    );
+
+    manager.emit("agentModel", { runId: "a", agentId: 1, id: "a:0", label: "x", model: "prov/real-model" });
+    assert.equal(renders, 1, "agentModel must be in RUN_EVENTS");
+
+    component?.dispose?.();
+    manager.emit("agentModel", { runId: "a", agentId: 1, id: "a:0", label: "x", model: "prov/real-model" });
+    assert.equal(renders, 1, "dispose must unsubscribe it again (symmetric with RUN_EVENTS)");
+  });
+
   it("passes the render width through to the task panel", () => {
     const manager = new EventEmitter() as ReturnType<typeof EventEmitter> & {
       getRun: (...args: unknown[]) => unknown;

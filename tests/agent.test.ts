@@ -18,7 +18,7 @@ import {
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { resolveModelSpecWithThinking } from "../src/model-spec.js";
 import type { ModelTierConfig } from "../src/model-tier-config.js";
-import { runWorkflow } from "../src/workflow.js";
+import { type JournalEntry, runWorkflow } from "../src/workflow.js";
 import { withFakeHome, withFakeHomeAsync } from "./helpers/fake-home.js";
 
 // Private methods used for testing - cast to this type to access them without `any`
@@ -1496,6 +1496,132 @@ test("agent() passes onModelResolved callback for display model updates", async 
     },
   );
   assert.ok(rec.calls.length > 0, "rec.calls should not be empty");
+});
+
+test("onAgentModel corrects a RUNNING agent's model, not just the finished one", async () => {
+  const rec = new CallRecordingAgent();
+  const order: string[] = [];
+  let startEvent: { id: string; model?: string } | undefined;
+  let modelEvent: { id: string; model: string } | undefined;
+  let endModel: string | undefined;
+  await runWorkflow(
+    `export const meta = { name: 'test', description: 't' }
+     await agent('task', { label: 't' })
+     return 1`,
+    {
+      agent: rec,
+      persistLogs: false,
+      mainModel: "main-prov/main-model",
+      onAgentStart: (e) => {
+        order.push("start");
+        startEvent = { id: e.id, model: e.model };
+      },
+      onAgentModel: (e) => {
+        order.push("model");
+        modelEvent = { id: e.id, model: e.model };
+      },
+      onAgentEnd: (e) => {
+        order.push("end");
+        endModel = e.model;
+      },
+    },
+  );
+  assert.equal(startEvent?.model, "main-prov/main-model", "onAgentStart can only carry the pre-resolution guess");
+  assert.equal(modelEvent?.model, "openai/gpt-4.1-mini", "onAgentModel carries the id the agent actually runs on");
+  assert.equal(modelEvent?.id, startEvent?.id, "same per-call id, so the host can match it to the started row");
+  assert.deepEqual(order, ["start", "model", "end"], "the correction must land BEFORE the agent finishes");
+  assert.equal(endModel, "openai/gpt-4.1-mini", "onAgentEnd still carries the resolved model");
+});
+
+test("onAgentModel fires for a tier-tagged agent, whose start event cannot know the tier's model", async () => {
+  const rec = new CallRecordingAgent();
+  const models: string[] = [];
+  let startModel: string | undefined;
+  await runWorkflow(
+    `export const meta = { name: 'test', description: 't' }
+     await agent('task', { label: 't', tier: 'big' })
+     return 1`,
+    {
+      agent: rec,
+      persistLogs: false,
+      mainModel: "main-prov/main-model",
+      onAgentStart: (e) => {
+        startModel = e.model;
+      },
+      onAgentModel: (e) => models.push(e.model),
+    },
+  );
+  // A tier defers the choice to the agent layer, so agent() deliberately passes
+  // model: undefined and the start event falls back to the session's main model.
+  assert.equal(rec.calls[0].options.model, undefined, "a tier must not be pre-resolved into an explicit model");
+  assert.equal(rec.calls[0].options.tier, "big");
+  assert.equal(startModel, "main-prov/main-model");
+  assert.deepEqual(models, ["openai/gpt-4.1-mini"], "the tier's real model is pushed while the agent runs");
+});
+
+test("a replayed (cache-hit) agent reports the model it actually ran on, not the main model", async () => {
+  const rec = new CallRecordingAgent();
+  const journal: JournalEntry[] = [];
+  const script = `export const meta = { name: 'test', description: 't' }
+     await agent('task', { label: 't' })
+     return 1`;
+  await runWorkflow(script, {
+    agent: rec,
+    persistLogs: false,
+    runId: "replay-model-run",
+    mainModel: "main-prov/main-model",
+    onAgentJournal: (e) => journal.push(e),
+  });
+  assert.equal(journal.length, 1);
+  assert.equal(journal[0].model, "openai/gpt-4.1-mini", "the resolved model is journaled with the result");
+
+  const replayed: Array<string | undefined> = [];
+  const secondRec = new CallRecordingAgent();
+  await runWorkflow(script, {
+    agent: secondRec,
+    persistLogs: false,
+    runId: "replay-model-run",
+    mainModel: "main-prov/main-model",
+    resumeJournal: new Map(journal.map((e) => [`${e.runId}:${e.index}`, e] as const)),
+    onAgentStart: (e) => replayed.push(e.model),
+    onAgentEnd: (e) => replayed.push(e.model),
+  });
+  assert.equal(secondRec.calls.length, 0, "the call must cache-hit, so nothing re-resolves the model");
+  assert.deepEqual(
+    replayed,
+    ["openai/gpt-4.1-mini", "openai/gpt-4.1-mini"],
+    "resume must not regress a replayed row back to the main model",
+  );
+});
+
+test("a legacy journal entry with no model degrades to the pre-resolution guess", async () => {
+  const rec = new CallRecordingAgent();
+  const journal: JournalEntry[] = [];
+  const script = `export const meta = { name: 'test', description: 't' }
+     await agent('task', { label: 't' })
+     return 1`;
+  await runWorkflow(script, {
+    agent: rec,
+    persistLogs: false,
+    runId: "legacy-model-run",
+    mainModel: "main-prov/main-model",
+    onAgentJournal: (e) => journal.push(e),
+  });
+  const legacy = journal.map(({ model: _dropped, ...rest }) => rest as JournalEntry);
+  const replayed: Array<string | undefined> = [];
+  await runWorkflow(script, {
+    agent: new CallRecordingAgent(),
+    persistLogs: false,
+    runId: "legacy-model-run",
+    mainModel: "main-prov/main-model",
+    resumeJournal: new Map(legacy.map((e) => [`${e.runId}:${e.index}`, e] as const)),
+    onAgentStart: (e) => replayed.push(e.model),
+  });
+  assert.deepEqual(
+    replayed,
+    ["main-prov/main-model"],
+    "no journaled model => same behavior as before the field existed",
+  );
 });
 
 test("agent() accumulates usage across multiple agents", async () => {

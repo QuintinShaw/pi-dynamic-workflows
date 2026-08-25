@@ -36,6 +36,7 @@ import { shortModel } from "./workflow-ui.js";
 // it redraws identical content.
 const RUN_EVENTS = [
   "agentStart",
+  "agentModel",
   "agentEnd",
   "phase",
   "log",

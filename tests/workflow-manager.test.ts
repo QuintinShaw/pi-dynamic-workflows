@@ -1180,6 +1180,46 @@ return { a, b }`;
 );
 
 test(
+  "the live snapshot shows a running agent's REAL model, corrected before it finishes",
+  withTempCwd(async (cwd) => {
+    const holder: { manager?: WorkflowManager; runId?: string } = {};
+    /** Reads back what /workflows would display while this very agent is still running. */
+    let modelWhileRunning: string | undefined;
+    const resolvingAgent = {
+      async run(_prompt: string, options: { onModelResolved?: (id: string) => void }) {
+        options.onModelResolved?.("tier-prov/tier-model");
+        // Read the LIVE in-memory snapshot — exactly what the panel and the
+        // navigator render from — while this agent is still inside run().
+        const snapshot = holder.runId ? holder.manager?.getRun(holder.runId)?.snapshot : undefined;
+        modelWhileRunning = snapshot?.agents.find((a) => a.label === "a")?.model;
+        return "ok";
+      },
+    };
+    const manager = new WorkflowManager({ cwd, agent: resolvingAgent, mainModel: "main-prov/main-model" });
+    holder.manager = manager;
+    manager.on("agentStart", (e: { runId: string }) => {
+      holder.runId = e.runId;
+    });
+
+    const events: Array<{ agentId?: number; model?: string }> = [];
+    manager.on("agentModel", (e: { agentId?: number; model?: string }) => events.push(e));
+
+    const result = await manager.runSync(oneAgentScript);
+
+    assert.equal(
+      modelWhileRunning,
+      "tier-prov/tier-model",
+      "an in-flight agent must not display the session's main model once its own is known",
+    );
+    assert.equal(events.length, 1, "the correction is broadcast live for panel repaints");
+    assert.equal(events[0]?.agentId, 1, "keyed to the agent row the panel already created");
+    assert.equal(events[0]?.model, "tier-prov/tier-model");
+    const persisted = manager.getPersistence().load(result.runId);
+    assert.equal(persisted?.agents.find((a) => a.label === "a")?.model, "tier-prov/tier-model");
+  }),
+);
+
+test(
   "runSync persists recoverable agent error details for /workflows",
   withTempCwd(async (cwd) => {
     const manager = new WorkflowManager({

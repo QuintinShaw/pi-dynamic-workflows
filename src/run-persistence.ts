@@ -51,6 +51,8 @@ export interface PersistedJournalEntry {
   hash: string;
   result: unknown;
   storeDelta?: Record<string, unknown>;
+  /** The model the call ran on; absent on journals written before this field existed. */
+  model?: string;
 }
 
 export interface PersistedRunState {
