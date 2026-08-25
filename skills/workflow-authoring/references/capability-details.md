@@ -2,7 +2,7 @@
 # Exhaustive workflow capability facts
 
 Contract format: `1.0.0`<br>
-Contract content / skill / extension: `3.7.0`
+Contract content / skill / extension: `3.8.0`
 
 Every exact fact below is projected from the installed extension's capability contract. Explanatory judgment belongs in the hand-written references next to this file.
 
