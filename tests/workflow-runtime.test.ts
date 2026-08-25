@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
-import type { AgentUsage } from "../src/agent.js";
+import type { AgentRunOptions, AgentUsage } from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { type JournalEntry, parseWorkflowScript, runWorkflow } from "../src/workflow.js";
 
@@ -243,6 +243,85 @@ return a`,
   assert.equal(journal.length, 1, "only the final success is journaled");
 });
 
+test("runWorkflow reconciles timeout fallback with exact abort-teardown usage", { timeout: 2_500 }, async () => {
+  const exactUsage: AgentUsage = {
+    input: 900,
+    output: 100,
+    total: 1_000,
+    cost: 0.5,
+    cacheRead: 0,
+    cacheWrite: 0,
+  };
+  const result = await runWorkflow(
+    `export const meta = { name: 'timeout_usage', description: 'timeout usage' }
+return await agent('short prompt', { label: 'slow', timeoutMs: 5 })`,
+    {
+      agent: {
+        async run(prompt: string, options?: AgentRunOptions) {
+          void prompt;
+          return new Promise((resolve, reject) => {
+            void resolve;
+            options?.signal?.addEventListener(
+              "abort",
+              () => {
+                setTimeout(() => {
+                  options.onUsage?.(exactUsage);
+                  reject(new Error("aborted after exact usage"));
+                }, 1_100);
+              },
+              { once: true },
+            );
+          });
+        },
+      },
+      persistLogs: false,
+    },
+  );
+
+  assert.equal(result.result, null);
+  assert.deepEqual(result.tokenUsage, exactUsage);
+});
+
+test("runWorkflow waits for timed-out teardown before starting a retry", { timeout: 3_000 }, async () => {
+  let calls = 0;
+  let active = 0;
+  let maxActive = 0;
+  const releaseFirstAttempt = createDeferred<void>();
+  const run = runWorkflow(
+    `export const meta = { name: 'slow_teardown', description: 'slow timeout teardown' }
+return await agent('stuck', { label: 'stuck', timeoutMs: 5, retries: 1 })`,
+    {
+      agent: {
+        async run(prompt: string) {
+          void prompt;
+          calls++;
+          active++;
+          maxActive = Math.max(maxActive, active);
+          try {
+            if (calls === 1) {
+              await releaseFirstAttempt.promise;
+              throw new Error("aborted after slow teardown");
+            }
+            return "retry-result";
+          } finally {
+            active--;
+          }
+        },
+      },
+      persistLogs: false,
+    },
+  );
+
+  await new Promise((resolve) => setTimeout(resolve, 1_050));
+  assert.equal(calls, 1, "a retry must not overlap a timed-out runner still tearing down");
+  releaseFirstAttempt.resolve(undefined);
+  const result = await run;
+
+  assert.equal(result.result, "retry-result");
+  assert.equal(calls, 2);
+  assert.equal(maxActive, 1);
+});
+
 test("runWorkflow returns null when recoverable retries are exhausted", async () => {
   let calls = 0;
   const logs: string[] = [];
@@ -339,6 +418,77 @@ test("runWorkflow accumulates real per-agent usage (incl. cost + cache tokens)",
   assert.equal(result.tokenUsage?.cacheWrite, 20, "cacheWrite accumulates across agents");
 });
 
+test("runWorkflow streams cumulative token usage before an agent returns", async () => {
+  const release = createDeferred<void>();
+  const usageEvents: number[] = [];
+  const finalizedUsageEvents: number[] = [];
+  let settled = false;
+  const run = runWorkflow(
+    `export const meta = { name: 'live_usage', description: 'live token usage' }
+     return await agent('work', { label: 'worker' })`,
+    {
+      agent: {
+        async run(prompt, options) {
+          void prompt;
+          options?.onUsageProgress?.({ input: 7, output: 3, total: 10, cost: 0.01, cacheRead: 0, cacheWrite: 0 });
+          options?.onUsageProgress?.({ input: 17, output: 8, total: 25, cost: 0.02, cacheRead: 0, cacheWrite: 0 });
+          await release.promise;
+          options?.onUsage?.({ input: 12, output: 8, total: 20, cost: 0.02, cacheRead: 0, cacheWrite: 0 });
+          return "done";
+        },
+      },
+      persistLogs: false,
+      onAgentUsage: (event) => usageEvents.push(event.tokenUsage.total),
+      onTokenUsage: (usage) => finalizedUsageEvents.push(usage.total),
+    },
+  ).finally(() => {
+    settled = true;
+  });
+
+  while (usageEvents.length < 2) {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  assert.equal(settled, false, "usage should be observable while the agent is still running");
+  assert.deepEqual(usageEvents, [10, 25]);
+  assert.deepEqual(finalizedUsageEvents, [], "progress estimates must not change finalized budget accounting");
+
+  release.resolve();
+  const result = await run;
+  assert.equal(result.tokenUsage?.total, 20, "the exact terminal total must replace the progress estimate");
+});
+
+test("onAgentEnd reports cumulative settled usage across retries", async () => {
+  let attempts = 0;
+  let endedTokens: number | undefined;
+  let endedUsage: AgentUsage | undefined;
+  const result = await runWorkflow(
+    `export const meta = { name: 'retry_usage', description: 'retry usage' }
+     return await agent('work', { label: 'worker', retries: 1 })`,
+    {
+      agent: {
+        async run(prompt, options) {
+          void prompt;
+          attempts++;
+          const total = attempts === 1 ? 40 : 25;
+          options?.onUsageProgress?.({ input: 0, output: 100, total: 100, cost: 0, cacheRead: 0, cacheWrite: 0 });
+          options?.onUsage?.({ input: 0, output: total, total, cost: 0, cacheRead: 0, cacheWrite: 0 });
+          return attempts === 1 ? "" : "done";
+        },
+      },
+      persistLogs: false,
+      onAgentEnd: (event) => {
+        endedTokens = event.tokens;
+        endedUsage = event.tokenUsage;
+      },
+    },
+  );
+
+  assert.equal(result.result, "done");
+  assert.equal(attempts, 2);
+  assert.equal(endedTokens, 65);
+  assert.equal(endedUsage?.total, 65);
+});
+
 test("meta.model is parsed and routes as the default model for agents", async () => {
   let seenModel: string | undefined;
   const recorder = {
@@ -352,6 +502,20 @@ await agent('x', { label: 'x' })
 return 1`;
   await runWorkflow(script, { agent: recorder, persistLogs: false });
   assert.equal(seenModel, "meta/default-model", "an agent with no model/tier/phase route uses meta.model");
+});
+
+test("runWorkflow preserves authoritative cost-only terminal usage", async () => {
+  const result = await runWorkflow(
+    `export const meta = { name: 'cost_only', description: 'cost-only provider usage' }
+     return await agent('work', { label: 'worker' })`,
+    {
+      agent: fakeAgent({ input: 0, output: 0, total: 0, cost: 0.25, cacheRead: 0, cacheWrite: 0 }),
+      persistLogs: false,
+    },
+  );
+
+  assert.equal(result.tokenUsage?.total, 0);
+  assert.equal(result.tokenUsage?.cost, 0.25);
 });
 
 test("runWorkflow falls back to an estimate when provider reports total === 0", async () => {
@@ -715,6 +879,49 @@ return await agent('threaded child', { thread: 'implementer' })`;
   assert.equal(resumed.state.calls, 2, "the child thread and later parent agent both run live");
   assert.equal(confirmations, 1, "the later parent checkpoint also runs live");
   assert.equal(result.result.confirmed, false);
+});
+
+test("sequential nested workflows assign distinct opaque agent identities", async () => {
+  const agentIds: string[] = [];
+  const childScript = `export const meta = { name: 'child', description: 'one child agent' }
+return await agent('child work', { label: 'worker' })`;
+  await runWorkflow(
+    `export const meta = { name: 'parent', description: 'two sequential child workflows' }
+const first = await workflow('child')
+const second = await workflow('child')
+return [first, second]`,
+    {
+      agent: fakeAgent(),
+      loadSavedWorkflow: (name) => (name === "child" ? childScript : undefined),
+      onAgentStart: (event) => agentIds.push(event.id),
+      persistLogs: false,
+    },
+  );
+
+  assert.equal(agentIds.length, 2);
+  assert.equal(new Set(agentIds).size, 2);
+});
+
+test("parallel sibling workflows can each use the one allowed nesting level", async () => {
+  const agentIds: string[] = [];
+  const childScript = `export const meta = { name: 'child', description: 'parallel child' }
+return await agent('child work', { label: 'worker' })`;
+  const result = await runWorkflow<string[]>(
+    `export const meta = { name: 'parent', description: 'parallel child workflows' }
+return await parallel([
+  () => workflow('child'),
+  () => workflow('child'),
+])`,
+    {
+      agent: fakeAgent({}, "child-result"),
+      loadSavedWorkflow: (name) => (name === "child" ? childScript : undefined),
+      onAgentStart: (event) => agentIds.push(event.id),
+      persistLogs: false,
+    },
+  );
+
+  assert.deepEqual(result.result, ["child-result", "child-result"]);
+  assert.equal(new Set(agentIds).size, 2);
 });
 
 test("workflow() nesting is one level deep (second level throws)", async () => {

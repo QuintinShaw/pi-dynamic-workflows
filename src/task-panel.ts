@@ -973,14 +973,10 @@ export function renderPanelDetailed(
     const done = agents.filter((a) => a.status === "done").length;
     const icon = r.status === "paused" ? "⏸" : "◆";
     const usage = snap?.tokenUsage ?? r.tokenUsage;
-    // The run-level tokenUsage aggregate is only finalized when the run ends, so
-    // it reads 0 for the whole live run; per-agent figures update on each agent
-    // completion, so aggregate those instead. The rate samples the same
-    // fresh+cacheRead sum the header displays, so tok/s tracks the visible
-    // figures. Tokens land at agent-completion granularity, so the rate reflects
-    // completion throughput — it decays to 0 during a single long-running agent
-    // or a stall (which is the intended signal). Paused runs don't accrue
-    // tokens, so their rate is suppressed (a stalled rate would mislead).
+    // Per-agent figures stream while agents run, so aggregate them for the same
+    // fresh+cacheRead sum the header displays. A flat rate now indicates a real
+    // lull rather than merely waiting for a long-running agent to return. Paused
+    // runs do not accrue tokens, so their rate is suppressed.
     const runUsage = aggregateAgentUsage(agents);
     sampleTokens(r.runId, runUsage.fresh + runUsage.cacheRead, now);
     const rate = r.status === "running" ? tokensPerSecond(r.runId) : 0;

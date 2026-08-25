@@ -309,7 +309,13 @@ test(
       agents: [],
       logs: [],
       journal: [
-        { index: 0, hash: "abc123", result: { ok: true } },
+        {
+          index: 0,
+          callId: "journal-test:0",
+          hash: "abc123",
+          result: { ok: true },
+          storeDelta: { answer: 42 },
+        },
         { index: 1, hash: "def456", result: { value: 42 } },
       ],
       startedAt: "2024-01-01T00:00:00.000Z",
@@ -319,8 +325,10 @@ test(
     const loaded = rp.load("journal-test");
     assert.equal(loaded?.journal?.length, 2);
     assert.equal(loaded?.journal?.[0].index, 0);
+    assert.equal(loaded?.journal?.[0].callId, "journal-test:0");
     assert.equal(loaded?.journal?.[0].hash, "abc123");
     assert.deepEqual(loaded?.journal?.[0].result, { ok: true });
+    assert.deepEqual(loaded?.journal?.[0].storeDelta, { answer: 42 });
   }),
 );
 
