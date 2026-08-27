@@ -869,6 +869,20 @@ export class WorkflowManager extends EventEmitter {
           this.emitLive(managed, "agentStart", { runId: managed.runId, ...event });
           progress();
         },
+        onAgentModel: (event) => {
+          // The ONLY mid-run correction of a running agent's displayed model.
+          // agentsById is keyed by the per-CALL id (never the label), so a
+          // concurrent same-label sibling can't be misattributed.
+          const agent = managed.agentsById.get(event.id);
+          if (!agent) {
+            return;
+          }
+          agent.model = event.model;
+          // No persistRun() here: this fires once per attempt, and the throttled
+          // progress persist plus every terminal persist already pick the field up.
+          this.emitLive(managed, "agentModel", { runId: managed.runId, agentId: agent.id, ...event });
+          progress();
+        },
         onAgentUsage: (event) => {
           const agent = managed.agentsById.get(event.id);
           if (!agent) {
