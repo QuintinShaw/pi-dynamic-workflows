@@ -36,6 +36,7 @@ type WorkflowAgentPrivates = {
     appendSessionInfo(name: string): string;
   };
   restoreThreadLeaf(manager: ReturnType<WorkflowAgentPrivates["createSessionManager"]>, leafId: string | null): void;
+  agentIdFor(options: AgentRunOptions<any>, runCwd: string): string;
 };
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -72,6 +73,45 @@ test("WorkflowAgent with persistAgentSessions=true creates a file-backed manager
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("agentIdFor mints a unique id per unthreaded createAgentSession call (concurrent/retry-safe)", () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp" }) as unknown as WorkflowAgentPrivates;
+  const id1 = agent.agentIdFor({}, "/worktree-a");
+  const id2 = agent.agentIdFor({}, "/worktree-b");
+  const id3 = agent.agentIdFor({}, "/worktree-a");
+  assert.notEqual(id1, id2, "distinct worktrees must never share an id");
+  assert.notEqual(id1, id3, "a retried call on the same worktree must not reuse the id");
+  // Each id embeds the pid + a monotonic per-process sequence, so ids from
+  // concurrent runs in this process can never collide either.
+  assert.match(id1, /^workflow:\/worktree-a:\d+:\d+$/);
+});
+
+test("agentIdFor keeps one stable id per named thread (a thread is one continuing session)", () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp" }) as unknown as WorkflowAgentPrivates;
+  const first = agent.agentIdFor({ thread: "implementer" }, "/worktree");
+  const again = agent.agentIdFor({ thread: "implementer" }, "/worktree");
+  const other = agent.agentIdFor({ thread: "reviewer" }, "/worktree");
+  assert.equal(again, first, "thread turns continue one session, so the id must be stable");
+  assert.notEqual(other, first, "distinct threads must not share an id");
+});
+
+test("agentIdFor ids never collide across separate WorkflowAgent instances", () => {
+  const first = new WorkflowAgent({ cwd: "/tmp" }) as unknown as WorkflowAgentPrivates;
+  const second = new WorkflowAgent({ cwd: "/tmp" }) as unknown as WorkflowAgentPrivates;
+  // Unthreaded one-shot calls: every invocation gets a fresh id, across instances too.
+  assert.notEqual(
+    first.agentIdFor({}, "/worktree"),
+    second.agentIdFor({}, "/worktree"),
+    "unthreaded ids from separate instances must not collide",
+  );
+  // Named threads: stable within one instance, but the same thread name on a
+  // separate instance must not reuse the id (process-global AgentRegistry).
+  assert.notEqual(
+    first.agentIdFor({ thread: "implementer" }, "/worktree"),
+    second.agentIdFor({ thread: "implementer" }, "/worktree"),
+    "the same thread name on separate instances must not share an AgentRegistry id",
+  );
 });
 
 test("WorkflowAgent retains one session manager per named thread", () => {

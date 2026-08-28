@@ -128,7 +128,7 @@ export function buildArmedWorkflowPrompt(
     "decomposable request to do work, handle it by calling the `workflow` tool: write a script",
     "that fans the task out across subagents via agent()/parallel()/pipeline().",
     `Why this turn is armed: ${armReasonClause(reason)}.`,
-    BACKGROUND_DELIVERY_REASSURANCE + "]",
+    `${BACKGROUND_DELIVERY_REASSURANCE}]`,
   ];
   if (opts.extraDirective) lines.push("", opts.extraDirective);
   return lines.join("\n");
@@ -152,7 +152,7 @@ export function buildForcedWorkflowPrompt(text: string, extraDirective?: string)
     "Call the `workflow` tool now: write a script that fans this task out across subagents",
     "via agent()/parallel()/pipeline(). (This is a direct command, not a heuristic guess, so",
     "do not answer in prose instead of running the workflow.)",
-    BACKGROUND_DELIVERY_REASSURANCE + "]",
+    `${BACKGROUND_DELIVERY_REASSURANCE}]`,
   ];
   if (extraDirective) lines.push("", extraDirective);
   return lines.join("\n");

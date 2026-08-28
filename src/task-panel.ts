@@ -209,6 +209,35 @@ const boundSessionSends = new Map<string, DeliverySend>();
 /** runIds with an in-flight deliver-and-ack so bind flush does not double-send. */
 const inFlightDeliveries = new Set<string>();
 
+/**
+ * Custom type for the one-shot session_start probe (see probeHostSessionSend).
+ * Invisible and turn-free on every supported host (pi 0.83/0.84, omp fork).
+ */
+export const DELIVERY_PROBE_CUSTOM_TYPE = "workflow-delivery-probe";
+
+/** Session ids already probed — one probe per session, never re-fires. */
+const probedSessionIds = new Set<string>();
+
+/**
+ * Quiet hosts (omp never sends custom messages itself) never trip the
+ * AgentSession.prototype patch, so no thenable send is ever captured. One
+ * probe through pi.sendMessage forces it: the host's void wrapper calls the
+ * live session's sendCustomMessage synchronously, the prototype patch captures
+ * the receiver, and boundSessionSends is populated by the time this returns.
+ * display:false + triggerTurn:false appends a durable invisible entry on every
+ * supported host and starts no turn.
+ */
+function probeHostSessionSend(pi: ExtensionAPI, sessionId: string): void {
+  if (probedSessionIds.has(sessionId)) return;
+  probedSessionIds.add(sessionId);
+  try {
+    pi.sendMessage({ customType: DELIVERY_PROBE_CUSTOM_TYPE, content: "", display: false }, { triggerTurn: false });
+  } catch (err) {
+    // Probe is best-effort; bind stays fail-closed without a captured send.
+    console.warn(`[workflow-delivery] delivery probe failed on session ${sessionId}:`, err);
+  }
+}
+
 let agentSessionPatched = false;
 let bindCoreObserved = false;
 
@@ -218,21 +247,15 @@ interface StealCandidate {
     persist?: boolean;
     getSessionId?: () => string;
     getSessionName?: () => string | undefined;
+    isPersisted?: () => boolean;
+    isSessionOnDisk?: () => boolean;
   };
   _resourceLoader?: { noExtensions?: boolean };
 }
 
-/**
- * Host Pi session only. Child workflow agents must not be pinned:
- *  - SessionManager.inMemory() → persist === false
- *  - shared noExtensions loader (persistAgentSessions children included)
- *  - persisted children named `workflow:<runId> …` (set after construction;
- *    still filters a later re-bindCore)
- */
-function hostSessionIdToSteal(session: StealCandidate): string | undefined {
+function hostSessionIdToSteal(session: StealCandidate, probe?: boolean): string | undefined {
   const sm = session.sessionManager;
   if (!sm) return undefined;
-  if (sm.persist === false) return undefined;
   if (session._resourceLoader?.noExtensions === true) return undefined;
   try {
     const name = sm.getSessionName?.();
@@ -241,19 +264,38 @@ function hostSessionIdToSteal(session: StealCandidate): string | undefined {
     // getSessionName unavailable — keep evaluating
   }
   if (typeof session.sendCustomMessage !== "function") return undefined;
-  try {
-    const sid = sm.getSessionId?.();
-    if (typeof sid === "string" && sid) return sid;
-  } catch {
-    return undefined;
+  const sid = sm.getSessionId?.();
+  if (typeof sid !== "string" || !sid) return undefined;
+  // omp's SessionManager (0.83) has no `persist` field — isPersisted() is the
+  // authoritative persisted check, so query it before falling back to the
+  // structural persist flag (#109). A host that IS persisted but structurally
+  // declares persist:false (in-memory host sessions that are the conversation)
+  // must still be stolen — the isPersisted() answer wins (#109).
+  // PROBE EXCEPTION: omp print-mode hosts report isSessionOnDisk()===false at
+  // session_start (persisted lazily after bind). The bind-time probe only ever
+  // fires on the session running this extension, and workflow-child sessions
+  // are already excluded by the workflow: name gate above — so a probe-bearing
+  // send skips the persistence gate.
+  if (!probe) {
+    try {
+      if (typeof sm.isPersisted === "function") {
+        if (!sm.isPersisted()) return undefined;
+      } else if (typeof sm.isSessionOnDisk === "function") {
+        if (!sm.isSessionOnDisk()) return undefined;
+      } else if (sm.persist !== true) {
+        return undefined;
+      }
+    } catch {
+      return undefined;
+    }
   }
-  return undefined;
+  return sid;
 }
 
-function captureHostSessionSend(session: StealCandidate): void {
-  const sid = hostSessionIdToSteal(session);
+function captureHostSessionSend(session: StealCandidate, probe?: boolean): void {
+  const sid = hostSessionIdToSteal(session, probe);
   if (!sid) return;
-  boundSessionSends.set(sid, (message, options) => session.sendCustomMessage!(message, options));
+  boundSessionSends.set(sid, (message, options) => session.sendCustomMessage?.(message, options));
 }
 
 /**
@@ -265,18 +307,29 @@ function patchAgentSessionCapture(): void {
   if (agentSessionPatched) return;
   agentSessionPatched = true;
   try {
-    const proto = AgentSession.prototype as unknown as {
-      _bindExtensionCore?: (runner: unknown) => unknown;
-    } & StealCandidate;
-    const original = proto._bindExtensionCore;
-    if (typeof original !== "function") return;
-    proto._bindExtensionCore = function patchedBindExtensionCore(this: StealCandidate, runner: unknown) {
+    const proto = AgentSession.prototype as unknown as StealCandidate;
+    const original = proto.sendCustomMessage;
+    if (typeof original !== "function") {
+      // AgentSession shape changed — bind stays fail-closed without steal.
+      return;
+    }
+    // Invoke the original with the runtime's live session as receiver. A
+    // `.bind(proto)` forward would freeze the receiver to the prototype, and a
+    // bound function's receiver cannot be overridden by `.call(this, …)` — the
+    // original would run with `this.agent` undefined and every non-trigger
+    // send would reject, silently losing the delivery. Patch predates session
+    // construction: this here is the session that later calls sendCustomMessage.
+    proto.sendCustomMessage = function patchedSendCustomMessage(
+      this: StealCandidate,
+      message: { customType: string; content: string; display: boolean },
+      options: { triggerTurn: boolean; deliverAs: "followUp" },
+    ) {
       try {
-        captureHostSessionSend(this);
+        captureHostSessionSend(this, message?.customType === DELIVERY_PROBE_CUSTOM_TYPE);
       } catch {
         // never break session construction
       }
-      return original.apply(this, [runner]);
+      return original.call(this, message, options);
     };
   } catch {
     // AgentSession unavailable or shape changed — bind stays fail-closed without steal
@@ -537,7 +590,7 @@ function routeBackgroundDelivery(
  */
 export function bindSessionDelivery(
   sessionId: string,
-  _pi: ExtensionAPI,
+  pi: ExtensionAPI,
   opts: {
     loadSettings?: () => WorkflowSettings;
     manager?: WorkflowManager;
@@ -565,15 +618,6 @@ export function bindSessionDelivery(
   patchAgentSessionCapture();
   patchBindCoreObserve();
 
-  const stolen = opts.stableSend ?? boundSessionSends.get(sessionId);
-
-  if (!stolen) {
-    console.warn(
-      `[workflow-delivery] no session-stable thenable send for session ${sessionId}; ` +
-        "endpoint registered fail-closed (completions stay on disk until a host send is captured).",
-    );
-  }
-
   // Optional identity check — refuse to bind when sessionManager disagrees.
   try {
     const liveId = opts.sessionManager?.getSessionId?.();
@@ -583,6 +627,23 @@ export function bindSessionDelivery(
     }
   } catch {
     // getSessionId unavailable — continue
+  }
+
+  let stolen = opts.stableSend ?? boundSessionSends.get(sessionId);
+  if (!stolen) {
+    // Quiet hosts never call sendCustomMessage themselves, so the prototype
+    // patch never captured. One invisible no-turn probe forces the host's void
+    // send wrapper through AgentSession.sendCustomMessage, populating the
+    // steal map synchronously.
+    probeHostSessionSend(pi, sessionId);
+    stolen = boundSessionSends.get(sessionId);
+  }
+
+  if (!stolen) {
+    console.warn(
+      `[workflow-delivery] no session-stable thenable send for session ${sessionId}; ` +
+        "endpoint registered fail-closed (completions stay on disk until a host send is captured).",
+    );
   }
 
   const prev = sessionEndpoints.get(sessionId);
@@ -794,6 +855,7 @@ export function _resetDeliveryRegistriesForTests(): void {
   sessionEndpoints.clear();
   boundSessionSends.clear();
   inFlightDeliveries.clear();
+  probedSessionIds.clear();
 }
 
 /** @internal test helper — register a thenable session-stable send (steal map). */
@@ -801,9 +863,14 @@ export function _registerBoundSessionSendForTests(sessionId: string, send: Deliv
   boundSessionSends.set(sessionId, send);
 }
 
-/** @internal test helper — whether the steal map holds a send for this session. */
-export function _hasBoundSessionSendForTests(sessionId: string): boolean {
-  return boundSessionSends.has(sessionId);
+/** @internal test helper — register a host-shaped session (steal-map host filter). */
+export function _registerHostSessionForTests(session: StealCandidate): void {
+  captureHostSessionSend(session);
+}
+
+/** @internal test helper — inspect which session ids currently hold a stolen send. */
+export function _getStealMapForTests(): ReadonlyMap<string, DeliverySend> {
+  return boundSessionSends;
 }
 
 /** @internal test helper — inspect endpoint suspended flag. */
