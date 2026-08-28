@@ -305,9 +305,10 @@ function patchBindCoreObserve(): void {
 patchAgentSessionCapture();
 patchBindCoreObserve();
 
-export const WORKFLOW_COMPLETE_EVENT = "pi-dynamic-workflows:complete";
+export const WORKFLOW_LIFECYCLE_EVENT = "pi-dynamic-workflows:lifecycle";
 
-export interface WorkflowCompleteEvent {
+export interface WorkflowLifecycleEvent {
+  status: "started" | "resumed" | "paused" | "completed" | "failed" | "stopped";
   runId: string;
   name: string;
   sessionId?: string;
@@ -315,8 +316,8 @@ export interface WorkflowCompleteEvent {
 
 type DeliveryManager = WorkflowManager & {
   __deliveryInstalled?: boolean;
-  __completionEventInstalled?: boolean;
-  __completionEventEmitter?: (data: WorkflowCompleteEvent) => void;
+  __lifecycleEventInstalled?: boolean;
+  __lifecycleEventEmitter?: (data: WorkflowLifecycleEvent) => void;
   /** Last loadSettings seen on install — used when binding endpoints. */
   __deliveryLoadSettings?: () => WorkflowSettings;
 };
@@ -730,19 +731,28 @@ export function installResultDelivery(
   patchAgentSessionCapture();
   patchBindCoreObserve();
 
-  m.__completionEventEmitter = (data) => pi.events?.emit(WORKFLOW_COMPLETE_EVENT, data);
-  if (!m.__completionEventInstalled) {
-    m.__completionEventInstalled = true;
-    manager.on("complete", ({ runId }: { runId: string }) => {
-      const run = manager.getRun(runId);
-      if (!run?.background) return;
-      const sessionId = resolveDeliverySessionId(run, manager);
-      m.__completionEventEmitter?.({
-        runId,
-        name: run.snapshot.name,
-        ...(sessionId ? { sessionId } : {}),
-      });
-    });
+  m.__lifecycleEventEmitter = (data) => pi.events?.emit(WORKFLOW_LIFECYCLE_EVENT, data);
+  if (!m.__lifecycleEventInstalled) {
+    m.__lifecycleEventInstalled = true;
+    const emitLifecycle =
+      (status: WorkflowLifecycleEvent["status"]) =>
+      ({ runId }: { runId: string }) => {
+        const run = manager.getRun(runId);
+        if (!run?.background) return;
+        const sessionId = resolveDeliverySessionId(run, manager);
+        m.__lifecycleEventEmitter?.({
+          status,
+          runId,
+          name: run.snapshot.name,
+          ...(sessionId ? { sessionId } : {}),
+        });
+      };
+    manager.on("started", emitLifecycle("started"));
+    manager.on("resumed", emitLifecycle("resumed"));
+    manager.on("paused", emitLifecycle("paused"));
+    manager.on("complete", emitLifecycle("completed"));
+    manager.on("error", emitLifecycle("failed"));
+    manager.on("stopped", emitLifecycle("stopped"));
   }
 
   if (m.__deliveryInstalled) {

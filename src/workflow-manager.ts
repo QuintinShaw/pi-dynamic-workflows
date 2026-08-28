@@ -636,6 +636,8 @@ export class WorkflowManager extends EventEmitter {
       throw err;
     }
 
+    this.emit("started", { runId });
+
     // Run workflow asynchronously.
     // Attach a side-channel catch to prevent Node.js unhandled-rejection crashes
     // when a workflow is aborted/paused/stopped — executeRun()'s catch block
