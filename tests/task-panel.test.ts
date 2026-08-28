@@ -183,6 +183,7 @@ function lateErrorAgent() {
 }
 
 type TaskPanelModule = {
+  WORKFLOW_COMPLETE_EVENT: string;
   installResultDelivery: (pi: ExtensionAPI, manager: unknown, opts?: unknown) => void;
   bindSessionDelivery: (
     sessionId: string,
@@ -302,7 +303,15 @@ describe("installResultDelivery", () => {
 
   function createMockPi(): ExtensionAPI & { _calls: DeliveryCall[] } {
     const calls: DeliveryCall[] = [];
+    const events = new EventEmitter();
     const obj = {
+      events: {
+        emit: (channel: string, data: unknown) => events.emit(channel, data),
+        on: (channel: string, handler: (data: unknown) => void) => {
+          events.on(channel, handler);
+          return () => events.off(channel, handler);
+        },
+      },
       sendMessage(msg: unknown, _opts?: unknown) {
         calls.push({
           content: (msg as { content?: string }).content ?? "",
@@ -575,6 +584,23 @@ describe("installResultDelivery", () => {
     manager.emit("complete", { runId: "test-run-1" });
     const calls = piCalls(pi);
     assert.equal(calls.length, 1); // exactly once, not twice
+  });
+
+  it("emits completion events through the latest extension runtime after reload", () => {
+    const stalePi = createMockPi();
+    const freshPi = createMockPi();
+    const manager = createMockManager(makeRun());
+    const staleEvents: unknown[] = [];
+    const freshEvents: unknown[] = [];
+    stalePi.events.on(mod.WORKFLOW_COMPLETE_EVENT, (event) => staleEvents.push(event));
+    freshPi.events.on(mod.WORKFLOW_COMPLETE_EVENT, (event) => freshEvents.push(event));
+
+    setup(stalePi, manager);
+    mod.installResultDelivery(freshPi, manager);
+    manager.emit("complete", { runId: "test-run-1" });
+
+    assert.deepEqual(staleEvents, []);
+    assert.deepEqual(freshEvents, [{ runId: "test-run-1", name: "test-workflow", sessionId: SESSION }]);
   });
 
   it("does not crash when sendMessage throws (stale ctx); queues and flushes on rebind", async () => {

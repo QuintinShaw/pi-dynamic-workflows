@@ -87,6 +87,8 @@ export {
   suspendResultDelivery,
   suspendSessionDelivery,
   type TaskPanelOptions,
+  WORKFLOW_COMPLETE_EVENT,
+  type WorkflowCompleteEvent,
 } from "./task-panel.js";
 export type {
   AutoResumeDelayParams,

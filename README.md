@@ -252,7 +252,7 @@ Extension state lives outside the repository under `~/.pi/workflows`:
 
 Subagents are in-memory by default. Set `persistAgentSessions: true` to retain full transcripts in Pi's standard session directory. This creates one file per unthreaded call or named thread and may store sensitive material that an agent read, so enable it deliberately.
 
-Completed background runs persist their full result in the project run JSON. The conversation delivery includes a pointer to that file when the visible summary is shortened.
+Completed background runs persist their full result in the project run JSON. The conversation delivery includes a pointer to that file when the visible summary is shortened. Other Pi extensions can subscribe to the exported `WORKFLOW_COMPLETE_EVENT` through `pi.events`; background completions emit `{ runId, name, sessionId }` through the current extension runtime.
 
 In-process session replacements (`/reload`, `/new`, resume, fork) keep the live workflow manager when the installed extension version has not changed. Active background runs therefore continue streaming progress, remain controllable, and deliver their result into the replacement session; session-local `/effort` also survives. If the package version changes, or the process is exiting, active runs are paused onto the journal recovery path instead of mixing extension versions or burning tokens after teardown. A process restart uses the same durable journal path, recovering an interrupted running workflow as paused so it can be resumed safely.
 

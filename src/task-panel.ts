@@ -305,8 +305,18 @@ function patchBindCoreObserve(): void {
 patchAgentSessionCapture();
 patchBindCoreObserve();
 
+export const WORKFLOW_COMPLETE_EVENT = "pi-dynamic-workflows:complete";
+
+export interface WorkflowCompleteEvent {
+  runId: string;
+  name: string;
+  sessionId?: string;
+}
+
 type DeliveryManager = WorkflowManager & {
   __deliveryInstalled?: boolean;
+  __completionEventInstalled?: boolean;
+  __completionEventEmitter?: (data: WorkflowCompleteEvent) => void;
   /** Last loadSettings seen on install — used when binding endpoints. */
   __deliveryLoadSettings?: () => WorkflowSettings;
 };
@@ -711,7 +721,7 @@ export function resumeResultDelivery(manager: WorkflowManager): void {
  * each new generation calls {@link bindSessionDelivery} on session_start.
  */
 export function installResultDelivery(
-  _pi: ExtensionAPI,
+  pi: ExtensionAPI,
   manager: WorkflowManager,
   opts: { loadSettings?: () => WorkflowSettings } = {},
 ): void {
@@ -719,6 +729,21 @@ export function installResultDelivery(
   m.__deliveryLoadSettings = opts.loadSettings;
   patchAgentSessionCapture();
   patchBindCoreObserve();
+
+  m.__completionEventEmitter = (data) => pi.events?.emit(WORKFLOW_COMPLETE_EVENT, data);
+  if (!m.__completionEventInstalled) {
+    m.__completionEventInstalled = true;
+    manager.on("complete", ({ runId }: { runId: string }) => {
+      const run = manager.getRun(runId);
+      if (!run?.background) return;
+      const sessionId = resolveDeliverySessionId(run, manager);
+      m.__completionEventEmitter?.({
+        runId,
+        name: run.snapshot.name,
+        ...(sessionId ? { sessionId } : {}),
+      });
+    });
+  }
 
   if (m.__deliveryInstalled) {
     // Listeners survive session replacement. Refresh loadSettings / manager
