@@ -2262,9 +2262,34 @@ test(
     const agentA = persisted?.agents.find((a) => a.label === "a");
     assert.equal(agentA?.status, "done", "the already-completed agent's state is flushed synchronously too");
     assert.ok(agentA?.endedAt, "flushed agent state carries its real endedAt, not stale/missing data");
+    const agentB = persisted?.agents.find((a) => a.label === "b");
+    assert.equal(agentB?.status, "running", "pause is resumable and must not skip in-flight agents");
+    assert.equal(agentB?.endedAt, undefined);
+    assert.equal(persisted?.error, undefined);
 
     // 'second' never resolves on its own; don't await it, just avoid an unhandled rejection.
     promise.catch(() => {});
+  }),
+);
+
+test(
+  "pause drain persist skips leftover agents once the execution has settled",
+  withTempCwd(async (cwd) => {
+    const da = deferredAgent();
+    const manager = new WorkflowManager({ cwd, agent: da.runner });
+    manager.on("error", () => {});
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    for (let i = 0; i < 200 && manager.getRun(runId)?.snapshot.agents[0]?.status !== "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(manager.pause(runId), true);
+    await promise.catch(() => {});
+
+    const persisted = manager.listRuns().find((r) => r.runId === runId);
+    assert.equal(persisted?.status, "paused");
+    assert.equal(persisted?.agents[0]?.status, "skipped");
+    assert.equal(persisted?.agents[0]?.error, "interrupted");
+    assert.ok(persisted?.agents[0]?.endedAt);
   }),
 );
 
@@ -2288,9 +2313,59 @@ test(
     const agentA = persisted?.agents.find((a) => a.label === "a");
     assert.equal(agentA?.status, "done");
     assert.ok(agentA?.endedAt, "flushed agent state carries its real endedAt, not stale/missing data");
+    const agentB = persisted?.agents.find((a) => a.label === "b");
+    assert.equal(agentB?.status, "skipped", "in-flight agents must not stay running on an aborted persist");
+    assert.equal(agentB?.error, "aborted");
+    assert.equal(agentB?.errorCode, WorkflowErrorCode.WORKFLOW_ABORTED);
+    assert.ok(agentB?.endedAt, "skipped leftover agents get endedAt from the terminal persist");
+    assert.equal(persisted?.error, "workflow aborted");
+    assert.equal(persisted?.errorCode, WorkflowErrorCode.WORKFLOW_ABORTED);
+    assert.ok(persisted?.completedAt, "aborted runs record a completion timestamp");
+    assert.ok((persisted?.durationMs ?? 0) >= 0);
 
     // 'second' never resolves on its own; don't await it, just avoid an unhandled rejection.
     promise.catch(() => {});
+  }),
+);
+
+test(
+  "failed persist settles leftover running siblings and records the cause",
+  withTempCwd(async (cwd) => {
+    const agent = {
+      async run(prompt: string, options?: { signal?: AbortSignal }) {
+        if (prompt === "failer") {
+          throw new WorkflowError("boom", WorkflowErrorCode.AGENT_EXECUTION_ERROR, { recoverable: false });
+        }
+        return new Promise((_resolve, reject) => {
+          const onAbort = () => reject(new Error("deferred agent aborted"));
+          if (options?.signal?.aborted) onAbort();
+          else options?.signal?.addEventListener("abort", onAbort, { once: true });
+        });
+      },
+    };
+    const manager = new WorkflowManager({ cwd, agent });
+    manager.on("error", () => {});
+    const script = `export const meta = { name: 'fail_sibling', description: 'fail with in-flight sibling' }
+const xs = await parallel([
+  () => agent('failer', { label: 'failer' }),
+  () => agent('hang', { label: 'hang' }),
+])
+return xs`;
+    const { runId, promise } = manager.startInBackground(script);
+    await promise.catch(() => {});
+
+    const persisted = manager.listRuns().find((r) => r.runId === runId);
+    assert.equal(persisted?.status, "failed");
+    assert.match(persisted?.error ?? "", /boom/);
+    assert.equal(persisted?.errorCode, WorkflowErrorCode.AGENT_EXECUTION_ERROR);
+    const failer = persisted?.agents.find((a) => a.label === "failer");
+    const hang = persisted?.agents.find((a) => a.label === "hang");
+    assert.equal(failer?.status, "error");
+    assert.equal(hang?.status, "skipped", "run-fatal abort must not leave siblings running on disk");
+    assert.equal(hang?.error, "boom", "leftover agents carry the run's failure cause");
+    assert.equal(hang?.errorCode, WorkflowErrorCode.AGENT_EXECUTION_ERROR);
+    assert.ok(hang?.endedAt);
+    assert.ok(persisted?.completedAt);
   }),
 );
 
@@ -2554,8 +2629,16 @@ test(
       args: undefined,
       status: "running",
       phases: [],
-      agents: [],
-      logs: [],
+      agents: [
+        {
+          id: 1,
+          label: "hang",
+          prompt: "do it",
+          status: "running",
+          startedAt: new Date().toISOString(),
+        },
+      ],
+      logs: ["still going"],
       startedAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     });
@@ -2565,6 +2648,12 @@ test(
 
     const persisted = manager.listRuns().find((r) => r.runId === runId);
     assert.equal(persisted?.status, "aborted", "persisted status should become aborted");
+    assert.equal(persisted?.error, "workflow aborted");
+    assert.equal(persisted?.errorCode, WorkflowErrorCode.WORKFLOW_ABORTED);
+    assert.equal(persisted?.agents[0]?.status, "skipped");
+    assert.equal(persisted?.agents[0]?.error, "aborted");
+    assert.ok(persisted?.agents[0]?.endedAt);
+    assert.deepEqual(persisted?.logs, ["still going"], "cold-start stop must keep already-persisted logs");
   }),
 );
 
