@@ -48,6 +48,7 @@ describe("workflow paths", () => {
       assert.equal(paths.runsDir, join(paths.rootDir, "runs"));
       assert.equal(paths.savedDir, join(paths.rootDir, "saved"));
       assert.equal(paths.settingsPath, join(paths.rootDir, "settings.json"));
+      assert.equal(paths.modelTiersPath, join(paths.rootDir, "model-tiers.json"));
       assert.equal(paths.legacyRunsDir, normalize(join(cwd, ".pi/workflows/runs")));
       assert.equal(paths.legacySavedDir, normalize(join(cwd, ".pi/workflows/saved")));
     });
