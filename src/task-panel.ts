@@ -738,13 +738,18 @@ export function installResultDelivery(
       (status: WorkflowLifecycleEvent["status"]) =>
       ({ runId }: { runId: string }) => {
         const run = manager.getRun(runId);
-        if (!run?.background) return;
-        const sessionId = resolveDeliverySessionId(run, manager);
+        const persisted = run ? undefined : manager.getPersistence().load(runId);
+        const lifecycle = run?.background
+          ? { name: run.snapshot.name, sessionId: resolveDeliverySessionId(run, manager) }
+          : persisted
+            ? { name: persisted.workflowName, sessionId: persisted.sessionId }
+            : undefined;
+        if (!lifecycle) return;
         m.__lifecycleEventEmitter?.({
           status,
           runId,
-          name: run.snapshot.name,
-          ...(sessionId ? { sessionId } : {}),
+          name: lifecycle.name,
+          ...(lifecycle.sessionId ? { sessionId: lifecycle.sessionId } : {}),
         });
       };
     manager.on("started", emitLifecycle("started"));

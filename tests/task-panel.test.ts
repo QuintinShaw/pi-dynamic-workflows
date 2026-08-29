@@ -613,6 +613,42 @@ describe("installResultDelivery", () => {
     );
   });
 
+  it("emits a stopped lifecycle event for a persisted-only run through the latest runtime", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pi-dw-cold-stop-event-"));
+    const manager = new WorkflowManager({ cwd });
+    const stalePi = createMockPi();
+    const freshPi = createMockPi();
+    const staleEvents: unknown[] = [];
+    const freshEvents: unknown[] = [];
+    const runId = "cold-start-stop-paused-1";
+    stalePi.events.on(mod.WORKFLOW_LIFECYCLE_EVENT, (event) => staleEvents.push(event));
+    freshPi.events.on(mod.WORKFLOW_LIFECYCLE_EVENT, (event) => freshEvents.push(event));
+
+    try {
+      manager.getPersistence().save({
+        runId,
+        workflowName: "cold_start_stop",
+        script: lifecycleScript,
+        sessionId: SESSION,
+        status: "paused",
+        phases: [],
+        agents: [],
+        logs: [],
+        startedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+      mod.installResultDelivery(stalePi, manager);
+      mod.installResultDelivery(freshPi, manager);
+
+      assert.equal(manager.getRun(runId), undefined);
+      assert.equal(manager.stop(runId), true);
+      assert.deepEqual(staleEvents, []);
+      assert.deepEqual(freshEvents, [{ status: "stopped", runId, name: "cold_start_stop", sessionId: SESSION }]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("does not emit lifecycle events for foreground runs", () => {
     const pi = createMockPi();
     const manager = createMockManager(makeRun({ background: false }));
