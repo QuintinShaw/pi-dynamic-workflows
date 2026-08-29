@@ -205,6 +205,7 @@ type TaskPanelModule = {
   dropSessionDelivery: (sessionId: string | undefined) => void;
   suspendResultDelivery: (manager: unknown) => void;
   resumeResultDelivery: (manager: unknown) => void;
+  _isProbedForTests: (sessionId: string) => boolean;
   suspendSessionDelivery: (sessionId: string | undefined) => void;
   resumeSessionDelivery: (sessionId: string | undefined, manager?: unknown) => void;
   _resetDeliveryRegistriesForTests: () => void;
@@ -391,6 +392,25 @@ describe("installResultDelivery", () => {
     );
   }
 
+  /**
+   * Drive the armed AgentSession._bindExtensionCore capture patch with a fake
+   * `this`. The wrapper captures BEFORE forwarding to the REAL
+   * `_bindExtensionCore`, which a fake session cannot fully satisfy — the
+   * forward's throw is irrelevant (capture already happened) and is swallowed.
+   */
+  function invokePatchedBindExtensionCore(session: object): void {
+    const proto = AgentSession.prototype as unknown as { _bindExtensionCore?: unknown };
+    const patched = proto._bindExtensionCore;
+    assert.equal(typeof patched, "function", "_bindExtensionCore patch must be armed");
+    try {
+      (patched as (runner: unknown) => unknown).call(session, {
+        bindCore: () => {},
+        getRegisteredCommands: () => [],
+      });
+    } catch {
+      // The real bindCore body may touch internals a fake session lacks.
+    }
+  }
   /**
    * Wrap a fake host send so the delivery path's captured-send invocation runs
    * with the internals the REAL AgentSession.sendCustomMessage touches
@@ -1478,6 +1498,127 @@ describe("installResultDelivery", () => {
 
     assert.equal(probeCalls, 0, "map hit skips the probe");
     assert.equal(piCalls(pi).length, 1, "delivery uses the pre-captured send");
+  });
+
+  it("probe is capture-only: never forwarded to the session's sendCustomMessage", () => {
+    let spyCalls = 0;
+    const messages: unknown[] = ["pre-existing"];
+    invokePatchedSendCustomMessage(
+      {
+        agent: { state: { messages } },
+        sessionManager: {
+          getSessionId: () => "sess-probe-only",
+          getSessionName: () => "host-probe-only",
+          // probe-bearing sends bypass the persistence gate — omit isSessionOnDisk
+        },
+        _resourceLoader: { noExtensions: false },
+        sendCustomMessage: () => {
+          spyCalls++;
+          return Promise.resolve();
+        },
+      },
+      { customType: mod.DELIVERY_PROBE_CUSTOM_TYPE, content: "", display: false },
+    );
+
+    assert.equal(spyCalls, 0, "probe must never reach the host session's send");
+    assert.equal(messages.length, 1, "probe must never append to agent.state.messages");
+    assert.ok(mod._getStealMapForTests().has("sess-probe-only"), "capture happened despite the swallow");
+  });
+
+  it("failed probe is retried on the next bind (no pre-marked probed set)", () => {
+    const pi = createMockPi();
+    const manager = createMockManager(makeRun({ sessionId: "sess-retry", runId: "run-retry" }));
+    let sendMessageCalls = 0;
+    const throwingPi = pi as unknown as { sendMessage: (m: unknown, o: unknown) => void };
+    throwingPi.sendMessage = () => {
+      sendMessageCalls++;
+      throw new Error("Extension runtime not initialized.");
+    };
+
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    manager.setSessionId("sess-retry");
+    mod.bindSessionDelivery("sess-retry", pi as unknown as ExtensionAPI, { manager });
+    manager.emit("complete", { runId: "run-retry" });
+    assert.equal(sendMessageCalls, 1);
+    assert.equal(piCalls(pi).length, 0, "first bind fail-closed");
+    assert.ok(manager.getPersistence?.().load("run-retry")?.pendingDelivery, "pending stays on disk");
+
+    // Second bind: a working pi whose probe routes through the capture patch.
+    const recoveringPi = pi as unknown as { sendMessage: (m: unknown, o: unknown) => void };
+    recoveringPi.sendMessage = () => {
+      sendMessageCalls++;
+      invokePatchedSendCustomMessage(
+        {
+          sessionManager: {
+            getSessionId: () => "sess-retry",
+            getSessionName: () => "host-retry",
+            isSessionOnDisk: () => false,
+          },
+          _resourceLoader: { noExtensions: false },
+          sendCustomMessage: recordingStableSend(pi),
+        },
+        { customType: mod.DELIVERY_PROBE_CUSTOM_TYPE, content: "", display: false },
+      );
+    };
+    mod.bindSessionDelivery("sess-retry", pi as unknown as ExtensionAPI, { manager });
+    manager.emit("complete", { runId: "run-retry" });
+
+    assert.equal(sendMessageCalls, 2, "the failed probe was retried, not skipped");
+    assert.equal(piCalls(pi).length, 1, "delivery flows after the retried probe captures");
+    assert.equal(piCalls(pi)[0].triggerTurn, true);
+  });
+
+  it("dropSessionDelivery clears probed state: a new bind probes again", () => {
+    const pi = createMockPi();
+    const manager = createMockManager(makeRun({ sessionId: "sess-dropped", runId: "run-dropped" }));
+    let probeCalls = 0;
+    const override = pi as unknown as { sendMessage: (m: unknown, o: unknown) => void };
+    override.sendMessage = () => {
+      probeCalls++;
+      invokePatchedSendCustomMessage(
+        {
+          sessionManager: {
+            getSessionId: () => "sess-dropped",
+            getSessionName: () => "host-dropped",
+            isSessionOnDisk: () => false,
+          },
+          _resourceLoader: { noExtensions: false },
+          sendCustomMessage: recordingStableSend(pi),
+        },
+        { customType: mod.DELIVERY_PROBE_CUSTOM_TYPE, content: "", display: false },
+      );
+    };
+
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    manager.setSessionId("sess-dropped");
+    mod.bindSessionDelivery("sess-dropped", pi as unknown as ExtensionAPI, { manager });
+    assert.equal(probeCalls, 1, "first bind probes");
+    assert.equal(mod._isProbedForTests("sess-dropped"), true, "successful probe marks the session");
+
+    mod.dropSessionDelivery("sess-dropped");
+    assert.equal(mod._isProbedForTests("sess-dropped"), false, "drop forgets the probe mark");
+    mod.bindSessionDelivery("sess-dropped", pi as unknown as ExtensionAPI, { manager });
+    assert.equal(probeCalls, 2, "post-drop bind probes again");
+  });
+
+  it("bindCore capture path captures a persisted host without any probe", () => {
+    const pi = createMockPi();
+    invokePatchedBindExtensionCore({
+      sessionManager: {
+        getSessionId: () => "sess-bindcore",
+        getSessionName: () => "host-bindcore",
+        isPersisted: () => true,
+      },
+      _resourceLoader: { noExtensions: false },
+      sendCustomMessage: recordingStableSend(pi),
+    });
+
+    assert.ok(mod._getStealMapForTests().has("sess-bindcore"), "bindCore captured the send");
+    assert.equal(
+      (pi as unknown as { _calls: DeliveryCall[] })._calls.length,
+      0,
+      "no probe needed: capture happened at bindCore",
+    );
   });
 
   it("steal map pins only the host session; drop releases the host closure", () => {

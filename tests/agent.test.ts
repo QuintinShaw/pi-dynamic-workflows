@@ -11,6 +11,7 @@ import {
   DEFAULT_EXCLUDED_SUBAGENT_TOOLS,
   listAvailableModelSpecs,
   resolveAgentModelSpec,
+  runtimeOf,
   subagentExcludedTools,
   usageFromStats,
   WorkflowAgent,
@@ -36,7 +37,7 @@ type WorkflowAgentPrivates = {
     appendSessionInfo(name: string): string;
   };
   restoreThreadLeaf(manager: ReturnType<WorkflowAgentPrivates["createSessionManager"]>, leafId: string | null): void;
-  agentIdFor(options: AgentRunOptions<any>, runCwd: string): string;
+  getRegistry(perRunRegistry?: ModelRegistry): Promise<ModelRegistry>;
 };
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1817,4 +1818,46 @@ test("usageFromStats keeps cost-only stats (billed but tokens unreported)", () =
     cost: 0.01,
   });
   assert.equal(usage?.cost, 0.01);
+});
+// ═══════════════════════════════════════════════════════════════════════
+// runtimeOf + 3-way fallback registry construction (omp / legacy / stock pi)
+// ═══════════════════════════════════════════════════════════════════════
+
+test("runtimeOf returns the backing ModelRuntime on stock pi and undefined on a fork-style registry", async () => {
+  const authDir = mkdtempSync(join(tmpdir(), "pi-dw-runtime-of-"));
+  try {
+    const runtime = await ModelRuntime.create({ authPath: join(authDir, "auth.json"), modelsPath: null });
+    const registry = new ModelRegistry(runtime);
+    assert.equal(runtimeOf(registry), runtime, "stock pi ModelRegistry must expose its runtime for subagent handoff");
+    // omp's auth-storage-backed registry carries no own `.runtime`; the seam
+    // must report undefined there so callers pass the registry itself instead.
+    const forkRegistry: ModelRegistry = Object.create(Object.getPrototypeOf(registry));
+    assert.equal(runtimeOf(forkRegistry), undefined);
+  } finally {
+    rmSync(authDir, { recursive: true, force: true });
+  }
+});
+
+test("stock pi exposes neither omp's discoverAuthStorage nor a legacy static ModelRegistry.create (fallback must use ModelRuntime.create)", async () => {
+  assert.equal(typeof ModelRuntime.create, "function", "runtime-split construction path must exist on stock pi");
+  const mod = await import("@earendil-works/pi-coding-agent");
+  assert.equal("discoverAuthStorage" in mod, false, "omp-only discovery export must not exist on stock pi");
+  assert.equal("create" in ModelRegistry, false, "legacy static create must not exist on stock pi");
+});
+
+test("fallback registry resolves to a real ModelRegistry on stock pi and is cached across agents (never undefined)", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-fallback-home-"));
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const agent1 = new WorkflowAgent({ cwd: "/tmp" }) as unknown as WorkflowAgentPrivates;
+      const agent2 = new WorkflowAgent({ cwd: "/tmp" }) as unknown as WorkflowAgentPrivates;
+      const first = await agent1.getRegistry();
+      assert.ok(first instanceof ModelRegistry, "fallback must resolve to a real registry, never undefined");
+      assert.ok(runtimeOf(first), "stock-pi fallback registry must carry a runtime for subagent handoff");
+      assert.equal(await agent1.getRegistry(), first, "per-agent fallback must be reused");
+      assert.equal(await agent2.getRegistry(), first, "module-level fallback registry must be shared across agents");
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });
