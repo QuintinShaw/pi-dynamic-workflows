@@ -7,16 +7,21 @@ import type { ModelRegistry, ToolDefinition } from "@earendil-works/pi-coding-ag
 import type { WorkflowAgent } from "./agent.js";
 import { type AgentUsage, createEmptyAgentUsage, sumAgentUsage } from "./agent-usage.js";
 import { MAX_AGENTS_PER_RUN } from "./config.js";
-import { preview, type WorkflowAgentSnapshot, type WorkflowSnapshot } from "./display.js";
+import { preview, recomputeWorkflowSnapshot, type WorkflowAgentSnapshot, type WorkflowSnapshot } from "./display.js";
 import { isProviderUsageLimit, WorkflowError, WorkflowErrorCode } from "./errors.js";
 import {
+  agentHasNonTerminalStatus,
   createRunPersistence,
   generateRunId,
+  INTERRUPTED_AGENT_CAUSE,
   type PendingDeliveryMarker,
   type PersistedRunState,
   type RunLease,
   type RunPersistence,
   type RunStatus,
+  settleInterruptedPersistedAgents,
+  settleNonTerminalPersistedAgents,
+  terminalRunInterruptCause,
 } from "./run-persistence.js";
 import { type JournalEntry, parseWorkflowScript, runWorkflow, type WorkflowRunResult } from "./workflow.js";
 
@@ -496,14 +501,23 @@ export class WorkflowManager extends EventEmitter {
   private recoverStaleRuns(): void {
     try {
       for (const p of this.listAllRuns()) {
-        if (p.status === "running" && !this.runs.has(p.runId)) {
-          const lease = this.persistence.acquireRunLease(p.runId);
-          if (!lease) continue;
-          try {
-            this.persistence.save({ ...p, status: "paused" });
-          } finally {
-            this.persistence.releaseRunLease(lease);
-          }
+        if (this.runs.has(p.runId)) continue;
+        const staleRunning = p.status === "running";
+        const pausedWithGhostAgents =
+          p.status === "paused" && p.agents.some((agent) => agentHasNonTerminalStatus(agent.status));
+        if (!staleRunning && !pausedWithGhostAgents) continue;
+        const lease = this.persistence.acquireRunLease(p.runId);
+        if (!lease) continue;
+        try {
+          const endedAt = new Date().toISOString();
+          this.persistence.save({
+            ...p,
+            status: "paused",
+            updatedAt: endedAt,
+            agents: settleInterruptedPersistedAgents(p.agents, INTERRUPTED_AGENT_CAUSE, endedAt),
+          });
+        } finally {
+          this.persistence.releaseRunLease(lease);
         }
       }
     } catch {
@@ -1050,7 +1064,12 @@ export class WorkflowManager extends EventEmitter {
       }
 
       // Persist final state (see the success-path comment above for the
-      // isCurrent() rationale — same guard, same reason).
+      // isCurrent() rationale — same guard, same reason). Drain has finished,
+      // so leftover queued/running agents are no longer in flight even when
+      // pause() kept the run resumable.
+      if (managed.status === "paused") {
+        this.settleManagedInterruptedAgents(managed, INTERRUPTED_AGENT_CAUSE, new Date());
+      }
       this.persistRun(managed);
       if (this.isCurrent(managed)) {
         this.releaseRunLease(managed);
@@ -1218,6 +1237,41 @@ export class WorkflowManager extends EventEmitter {
   }
 
   /**
+   * Fail-closed: leftover queued/running agents are display-only after the
+   * execution that owned them has gone. Replay is journal-keyed.
+   */
+  private settleManagedInterruptedAgents(
+    managed: ManagedRun,
+    cause: { error: string; errorCode?: WorkflowErrorCode },
+    endedAt: Date,
+  ): void {
+    const endedAtIso = endedAt.toISOString();
+    for (const agent of managed.snapshot.agents) {
+      if (agent.status !== "running" && agent.status !== "queued") continue;
+      agent.status = "skipped";
+      agent.error = cause.error;
+      agent.errorCode = cause.errorCode;
+      agent.recoverable = false;
+      const ts = managed.agentTimestamps.get(agent.id);
+      if (ts) ts.endedAt ??= endedAtIso;
+      else managed.agentTimestamps.set(agent.id, { startedAt: endedAtIso, endedAt: endedAtIso });
+    }
+    managed.snapshot = recomputeWorkflowSnapshot(managed.snapshot);
+  }
+
+  private settleManagedAgentsForTerminalRun(managed: ManagedRun, endedAt: Date): void {
+    if (!IN_MEMORY_TERMINAL_STATUSES.has(managed.status)) return;
+    this.settleManagedInterruptedAgents(
+      managed,
+      terminalRunInterruptCause(managed.status, {
+        message: managed.error?.message,
+        code: managed.error?.code,
+      }),
+      endedAt,
+    );
+  }
+
+  /**
    * Persist immediately and synchronously. Cancels any pending throttled write
    * for this run first, so the write that lands is always the caller's current
    * (final) state — never superseded by a stale deferred write. Use this for
@@ -1267,10 +1321,14 @@ export class WorkflowManager extends EventEmitter {
     // gate) reintroduces a producer for it.
     if (!this.isCurrent(managed)) return;
     try {
+      const now = new Date();
+      const terminal = IN_MEMORY_TERMINAL_STATUSES.has(managed.status);
+      if (terminal) this.settleManagedAgentsForTerminalRun(managed, now);
       // Resumable states need their journal; completed/aborted states need rich
       // agent details. Persist exactly one full copy of each agent result instead
       // of writing it to both agents[].result and journal[].result.
       const keepsResumeJournal = managed.status !== "completed" && managed.status !== "aborted";
+      const persistError = terminal && managed.status !== "completed" ? managed.error : undefined;
       this.persistence.save({
         runId: managed.runId,
         workflowName: managed.snapshot.name,
@@ -1286,6 +1344,8 @@ export class WorkflowManager extends EventEmitter {
         pendingDelivery: managed.pendingDelivery,
         journal: keepsResumeJournal ? managed.journal : undefined,
         status: managed.status,
+        error: persistError?.message,
+        errorCode: persistError?.code,
         // Persisted every write (not just at pause) so a stale read during the
         // "paused" event race (see UsageLimitScheduler) is still correct — this
         // is fixed at run-start and doesn't change over the run's lifetime.
@@ -1307,7 +1367,8 @@ export class WorkflowManager extends EventEmitter {
         currentPhase: managed.snapshot.currentPhase,
         // Real per-agent timestamps only (see agentTimestamps) — never the run's
         // own startedAt or "now" stamped onto every agent on every write. A
-        // still-running agent is persisted with no endedAt.
+        // still-running agent on a live/paused run is persisted with no endedAt;
+        // terminal persist stamps leftover in-flight agents first.
         agents: managed.snapshot.agents.map((a) => {
           const { result, ...summary } = a;
           const ts = managed.agentTimestamps.get(a.id);
@@ -1333,9 +1394,9 @@ export class WorkflowManager extends EventEmitter {
             }
           : undefined,
         startedAt: managed.startedAt.toISOString(),
-        updatedAt: new Date().toISOString(),
-        completedAt: managed.status === "completed" ? new Date().toISOString() : undefined,
-        durationMs: managed.result?.durationMs,
+        updatedAt: now.toISOString(),
+        completedAt: terminal ? now.toISOString() : undefined,
+        durationMs: managed.result?.durationMs ?? (terminal ? now.getTime() - managed.startedAt.getTime() : undefined),
       });
     } catch (err) {
       // Persistence is best-effort: the run is still healthy in memory.
@@ -1585,6 +1646,9 @@ export class WorkflowManager extends EventEmitter {
       // small leak in exactly the class this manager otherwise bounds.
       const hadNoPendingSettle = managed.status === "paused";
       managed.status = "aborted";
+      managed.error ??= new WorkflowError("workflow aborted", WorkflowErrorCode.WORKFLOW_ABORTED, {
+        recoverable: true,
+      });
       this.abortForLifecycleControl(managed, "stop");
       this.emit("stopped", { runId });
       this.persistRun(managed);
@@ -1598,7 +1662,23 @@ export class WorkflowManager extends EventEmitter {
     const lease = this.persistence.acquireRunLease(runId);
     if (!lease) return false;
     try {
-      this.persistence.save({ ...persisted, status: "aborted", updatedAt: new Date().toISOString() });
+      const endedAt = new Date().toISOString();
+      const errorMessage = persisted.error ?? "workflow aborted";
+      const errorCode = persisted.errorCode ?? WorkflowErrorCode.WORKFLOW_ABORTED;
+      this.persistence.save({
+        ...persisted,
+        status: "aborted",
+        updatedAt: endedAt,
+        completedAt: persisted.completedAt ?? endedAt,
+        error: errorMessage,
+        errorCode,
+        agents: settleNonTerminalPersistedAgents(
+          persisted.agents,
+          "aborted",
+          { message: errorMessage, code: errorCode },
+          endedAt,
+        ),
+      });
     } finally {
       this.persistence.releaseRunLease(lease);
     }

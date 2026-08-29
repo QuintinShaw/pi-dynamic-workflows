@@ -5,7 +5,7 @@
 import { join } from "node:path";
 import type { AgentUsage } from "./agent.js";
 import type { AgentHistoryEntry } from "./agent-history.js";
-import type { WorkflowErrorCode } from "./errors.js";
+import { WorkflowErrorCode } from "./errors.js";
 import {
   ensureDir as ensureDirFs,
   listJsonFilesSafe,
@@ -64,6 +64,16 @@ export interface PersistedRunState {
    * the navigator shows only the current session's runs (undefined = legacy/global). */
   sessionId?: string;
   status: RunStatus;
+  /**
+   * Terminal failure/abort message. Written for `failed` and `aborted` runs;
+   * absent on running/paused/completed and on records persisted before this field.
+   */
+  error?: string;
+  /**
+   * Classified terminal cause. Written with `error` for `failed` and `aborted`
+   * runs; absent on running/paused/completed and on legacy records.
+   */
+  errorCode?: WorkflowErrorCode;
   /** Why a paused run is paused (e.g. "usage_limit" when a provider quota was hit). */
   pauseReason?: string;
   /** Provider reset hint for a usage-limit pause, e.g. "Resets in ~3h" (verbatim). */
@@ -214,7 +224,72 @@ export type FsLayer = PersistenceFsLayer;
  */
 export const DEFAULT_MAX_TERMINAL_RUNS_ON_DISK = 300;
 
-const TERMINAL_RUN_STATUSES: ReadonlySet<RunStatus> = new Set(["completed", "failed", "aborted"]);
+export const TERMINAL_RUN_STATUSES: ReadonlySet<RunStatus> = new Set(["completed", "failed", "aborted"]);
+
+const NON_TERMINAL_AGENT_STATUSES = new Set(["queued", "running"]);
+
+/** Cause stamped onto leftover agents when a live execution is gone but the run is still paused. */
+export const INTERRUPTED_AGENT_CAUSE: { error: string; errorCode: WorkflowErrorCode } = {
+  error: "interrupted",
+  errorCode: WorkflowErrorCode.WORKFLOW_ABORTED,
+};
+
+export function agentHasNonTerminalStatus(status: PersistedAgentState["status"]): boolean {
+  return NON_TERMINAL_AGENT_STATUSES.has(status);
+}
+
+/** Cause stamped onto leftover in-flight agents when a run reaches a terminal status. */
+export function terminalRunInterruptCause(
+  status: RunStatus,
+  error?: { message?: string; code?: WorkflowErrorCode },
+): { error: string; errorCode?: WorkflowErrorCode } {
+  if (status === "aborted") {
+    return { error: "aborted", errorCode: error?.code ?? WorkflowErrorCode.WORKFLOW_ABORTED };
+  }
+  if (status === "failed") {
+    return {
+      error: error?.message ?? "run failed",
+      errorCode: error?.code ?? WorkflowErrorCode.UNKNOWN,
+    };
+  }
+  return { error: "run completed" };
+}
+
+/**
+ * Rewrite leftover queued/running agents to skipped. Replay ignores
+ * `agents[].status` (journal-keyed), so this is display-only.
+ */
+export function settleInterruptedPersistedAgents(
+  agents: PersistedAgentState[],
+  cause: { error: string; errorCode?: WorkflowErrorCode },
+  endedAt: string,
+): PersistedAgentState[] {
+  return agents.map((agent) => {
+    if (!NON_TERMINAL_AGENT_STATUSES.has(agent.status)) return agent;
+    return {
+      ...agent,
+      status: "skipped",
+      error: cause.error,
+      errorCode: cause.errorCode,
+      recoverable: false,
+      endedAt: agent.endedAt ?? endedAt,
+    };
+  });
+}
+
+/**
+ * Fail-closed rewrite of leftover queued/running agents on a terminal run.
+ * Completed/failed/aborted must never persist a still-`running` agent.
+ */
+export function settleNonTerminalPersistedAgents(
+  agents: PersistedAgentState[],
+  status: RunStatus,
+  error: { message?: string; code?: WorkflowErrorCode } | undefined,
+  endedAt: string,
+): PersistedAgentState[] {
+  if (!TERMINAL_RUN_STATUSES.has(status)) return agents;
+  return settleInterruptedPersistedAgents(agents, terminalRunInterruptCause(status, error), endedAt);
+}
 
 export interface RunPersistenceOptions {
   /** Override DEFAULT_MAX_TERMINAL_RUNS_ON_DISK (tests; advanced tuning). */
