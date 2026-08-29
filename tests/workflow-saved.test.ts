@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, sep } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import test from "node:test";
 import { WORKFLOW_SAVED_DIR } from "../src/config.js";
 import { workflowProjectPaths } from "../src/workflow-paths.js";
-import { createWorkflowStorage } from "../src/workflow-saved.js";
+import { createWorkflowStorage, resolveSavedScriptPath } from "../src/workflow-saved.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
 /**
@@ -470,5 +470,150 @@ test(
     assert.equal(renamed.ok, false);
     assert.equal(deleted.ok, false);
     assert.equal(storage.load("race")?.script, "new");
+  }),
+);
+
+test("resolveSavedScriptPath accepts a relative file inside the saved dir", () => {
+  const savedDir = join(tmpdir(), "pi-dw-saved-dir");
+  assert.equal(resolveSavedScriptPath(savedDir, "body.js"), resolve(savedDir, "body.js"));
+  assert.equal(resolveSavedScriptPath(savedDir, "nested/body.js"), resolve(savedDir, "nested/body.js"));
+  assert.equal(resolveSavedScriptPath(savedDir, "./body.js"), resolve(savedDir, "body.js"));
+});
+
+test("resolveSavedScriptPath refuses empty, absolute, NUL, and escaping paths", () => {
+  const savedDir = join(tmpdir(), "pi-dw-saved-dir");
+  assert.equal(resolveSavedScriptPath(savedDir, ""), null);
+  assert.equal(resolveSavedScriptPath(savedDir, "   "), null);
+  assert.equal(resolveSavedScriptPath(savedDir, "foo\0.js"), null);
+  assert.equal(resolveSavedScriptPath(savedDir, "/tmp/outside.js"), null);
+  assert.equal(resolveSavedScriptPath(savedDir, "../escape.js"), null);
+  assert.equal(resolveSavedScriptPath(savedDir, "nested/../../escape.js"), null);
+  assert.equal(resolveSavedScriptPath(savedDir, "."), null);
+});
+
+test(
+  "createWorkflowStorage load fills script from a relative scriptPath inside the saved dir",
+  withIsolatedHome(async (cwd) => {
+    const storage = createWorkflowStorage(cwd);
+    const savedDir = workflowProjectPaths(cwd).savedDir;
+    mkdirSync(savedDir, { recursive: true });
+    writeFileSync(join(savedDir, "from-file.js"), "export const meta = { name: 'from-file' }\n");
+    writeFileSync(
+      join(savedDir, "from-file.json"),
+      JSON.stringify({
+        name: "from-file",
+        description: "companion script",
+        scriptPath: "from-file.js",
+        savedAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+    const loaded = storage.load("from-file");
+    assert.ok(loaded, "should load");
+    assert.equal(loaded?.script, "export const meta = { name: 'from-file' }\n");
+    assert.equal("scriptPath" in (loaded as object), false, "scriptPath must not leak onto the loaded row");
+  }),
+);
+
+test(
+  "createWorkflowStorage load fills script from a nested relative scriptPath",
+  withIsolatedHome(async (cwd) => {
+    const storage = createWorkflowStorage(cwd);
+    const savedDir = workflowProjectPaths(cwd).savedDir;
+    mkdirSync(join(savedDir, "scripts"), { recursive: true });
+    writeFileSync(join(savedDir, "scripts", "body.js"), "nested script body");
+    writeFileSync(
+      join(savedDir, "nested.json"),
+      JSON.stringify({ name: "nested", description: "nested", scriptPath: "scripts/body.js" }),
+    );
+    assert.equal(storage.load("nested")?.script, "nested script body");
+  }),
+);
+
+test(
+  "createWorkflowStorage load refuses a scriptPath that escapes the saved dir",
+  withIsolatedHome(async (cwd) => {
+    const storage = createWorkflowStorage(cwd);
+    const savedDir = workflowProjectPaths(cwd).savedDir;
+    mkdirSync(savedDir, { recursive: true });
+    writeFileSync(join(savedDir, "..", "outside.js"), "escaped");
+    writeFileSync(
+      join(savedDir, "escape.json"),
+      JSON.stringify({ name: "escape", description: "bad", scriptPath: "../outside.js" }),
+    );
+    assert.equal(storage.load("escape"), null);
+    assert.deepEqual(storage.list(), []);
+  }),
+);
+
+test(
+  "createWorkflowStorage load returns null when scriptPath is missing on disk",
+  withIsolatedHome(async (cwd) => {
+    const storage = createWorkflowStorage(cwd);
+    const savedDir = workflowProjectPaths(cwd).savedDir;
+    mkdirSync(savedDir, { recursive: true });
+    writeFileSync(
+      join(savedDir, "missing-js.json"),
+      JSON.stringify({ name: "missing-js", description: "gone", scriptPath: "nope.js" }),
+    );
+    assert.equal(storage.load("missing-js"), null);
+  }),
+);
+
+test(
+  "createWorkflowStorage load prefers inline script when both script and scriptPath are present",
+  withIsolatedHome(async (cwd) => {
+    const storage = createWorkflowStorage(cwd);
+    const savedDir = workflowProjectPaths(cwd).savedDir;
+    mkdirSync(savedDir, { recursive: true });
+    writeFileSync(join(savedDir, "ignored.js"), "from file");
+    writeFileSync(
+      join(savedDir, "both.json"),
+      JSON.stringify({
+        name: "both",
+        description: "both",
+        script: "inline wins",
+        scriptPath: "ignored.js",
+      }),
+    );
+    const loaded = storage.load("both");
+    assert.equal(loaded?.script, "inline wins");
+    assert.equal("scriptPath" in (loaded as object), false);
+  }),
+);
+
+test(
+  "createWorkflowStorage load prefers an empty inline script over scriptPath",
+  withIsolatedHome(async (cwd) => {
+    const storage = createWorkflowStorage(cwd);
+    const savedDir = workflowProjectPaths(cwd).savedDir;
+    mkdirSync(savedDir, { recursive: true });
+    writeFileSync(join(savedDir, "ignored.js"), "from file");
+    writeFileSync(
+      join(savedDir, "empty-inline.json"),
+      JSON.stringify({
+        name: "empty-inline",
+        description: "empty inline",
+        script: "",
+        scriptPath: "ignored.js",
+      }),
+    );
+    assert.equal(storage.load("empty-inline")?.script, "");
+  }),
+);
+
+test(
+  "createWorkflowStorage load resolves scriptPath for a user-scoped saved workflow",
+  withIsolatedHome(async (cwd) => {
+    const storage = createWorkflowStorage(cwd);
+    storage.save({ name: "placeholder", description: "create user dir", script: "x" }, "user");
+    const userDir = dirname(storage.load("placeholder")?.path ?? "");
+    writeFileSync(join(userDir, "user-body.js"), "user companion");
+    writeFileSync(
+      join(userDir, "user-path.json"),
+      JSON.stringify({ name: "user-path", description: "user", scriptPath: "user-body.js" }),
+    );
+    const loaded = storage.load("user-path");
+    assert.equal(loaded?.location, "user");
+    assert.equal(loaded?.script, "user companion");
   }),
 );
