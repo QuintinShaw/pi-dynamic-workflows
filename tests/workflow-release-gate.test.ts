@@ -18,6 +18,7 @@ test("npm pack parsing keeps only valid publishable file paths", () => {
   assert.deepEqual(parseNpmPackFilePaths(JSON.stringify([{ files: [{ path: "README.md" }, {}, { path: 42 }] }])), [
     "README.md",
   ]);
+  assert.deepEqual(parseNpmPackFilePaths(JSON.stringify({ files: [{ path: "README.md" }] })), ["README.md"]);
   assert.deepEqual(parseNpmPackFilePaths(JSON.stringify({ files: [] })), []);
 });
 
