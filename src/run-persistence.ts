@@ -170,7 +170,9 @@ export interface PersistedRunState {
  * Disk/memory marker for a background result that still needs conversation
  * delivery. Kept small on purpose — never store full agent transcripts here.
  */
-export type PendingDeliveryMarker = { kind: "complete" } | { kind: "text"; text: string };
+export type PendingDeliveryMarker =
+  | { kind: "complete"; deliveryId?: string }
+  | { kind: "text"; text: string; deliveryId?: string };
 
 export interface RunPersistence {
   /** Save current run state. */
@@ -442,11 +444,11 @@ export function createRunPersistence(
   // Bound the number of terminal (completed/failed/aborted) runs kept on
   // disk (see DEFAULT_MAX_TERMINAL_RUNS_ON_DISK) — called after every save()
   // whose state is terminal, since that's the only time the terminal count
-  // can grow. Running/paused runs are never candidates: they're filtered out
-  // before the cap is even considered.
+  // can grow. Running/paused and undelivered runs are never candidates: they're
+  // filtered out before the cap is even considered.
   const enforceRetention = () => {
     const terminal = computeList()
-      .filter((r) => TERMINAL_RUN_STATUSES.has(r.status))
+      .filter((r) => TERMINAL_RUN_STATUSES.has(r.status) && !r.pendingDelivery)
       .sort((a, b) => new Date(a.updatedAt).getTime() - new Date(b.updatedAt).getTime());
     const excess = terminal.length - maxTerminalRunsOnDisk;
     if (excess <= 0) return;
