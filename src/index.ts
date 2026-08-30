@@ -56,11 +56,12 @@ export {
   splitModelSpecThinking,
   THINKING_LEVELS,
 } from "./model-spec.js";
-export type { ModelTierConfig, RankableModel } from "./model-tier-config.js";
+export type { ModelTierConfig, ModelTierConfigOptions, RankableModel } from "./model-tier-config.js";
 export {
   buildDefaultTierConfig,
   formatTierFallbackNotice,
   getModelTierConfigPath,
+  getProjectModelTierConfigPath,
   loadModelTierConfig,
   resolveTierModel,
   saveModelTierConfig,

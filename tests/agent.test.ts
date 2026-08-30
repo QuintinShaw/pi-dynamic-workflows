@@ -17,7 +17,11 @@ import {
 } from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { resolveModelSpecWithThinking } from "../src/model-spec.js";
-import type { ModelTierConfig } from "../src/model-tier-config.js";
+import {
+  getModelTierConfigPath,
+  getProjectModelTierConfigPath,
+  type ModelTierConfig,
+} from "../src/model-tier-config.js";
 import { type JournalEntry, runWorkflow } from "../src/workflow.js";
 import { withFakeHome, withFakeHomeAsync } from "./helpers/fake-home.js";
 
@@ -305,6 +309,28 @@ test("WorkflowAgent#loadTierConfig: memoization is per-instance (two agents, two
     a.loadTierConfig(() => cfgB),
     cfgA,
   );
+});
+
+test("WorkflowAgent#loadTierConfig: default loader overlays project tiers over global", () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-tier-overlay-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-tier-overlay-cwd-"));
+  try {
+    withFakeHome(home, () => {
+      const globalPath = getModelTierConfigPath();
+      const projectPath = getProjectModelTierConfigPath(cwd);
+      mkdirSync(join(globalPath, ".."), { recursive: true });
+      mkdirSync(join(projectPath, ".."), { recursive: true });
+      writeFileSync(globalPath, JSON.stringify({ tiers: { small: "global/small", medium: "global/medium" } }));
+      writeFileSync(projectPath, JSON.stringify({ tiers: { small: "project/small" } }));
+
+      const agent = new WorkflowAgent({ cwd }) as unknown as WorkflowAgentTierPrivates;
+      const loaded = agent.loadTierConfig();
+      assert.deepEqual(loaded, { tiers: { small: "project/small", medium: "global/medium" } });
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
 });
 
 test("WorkflowAgent.run(): tier routing resolves correctly through the real (non-injected) disk loader, read only once across two run() calls", async () => {

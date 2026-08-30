@@ -14,10 +14,11 @@
  */
 
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
+import { withFakeHome } from "./helpers/fake-home.js";
 
 async function loadModule() {
   return await import("../src/model-tier-config.js");
@@ -503,6 +504,78 @@ describe("model-tier-config", () => {
       const result = loadModelTierConfig(cfgPath);
       assert.deepEqual(result, { tiers: { small: "openai/gpt-4.1-mini" } });
       rmSync(tmpDir, { recursive: true, force: true });
+    });
+  });
+
+  describe("project overlay ({ cwd })", () => {
+    function withOverlayHome(fn: (home: string, cwd: string) => void): void {
+      const home = mkdtempSync(join(tmpdir(), "mtc-overlay-home-"));
+      const cwd = mkdtempSync(join(tmpdir(), "mtc-overlay-cwd-"));
+      try {
+        withFakeHome(home, () => fn(home, cwd));
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    }
+
+    it("overlays project keys over global when a project file exists", async () => {
+      const { loadModelTierConfig, getModelTierConfigPath, getProjectModelTierConfigPath } = await loadModule();
+      withOverlayHome((_home, cwd) => {
+        const globalPath = getModelTierConfigPath();
+        const projectPath = getProjectModelTierConfigPath(cwd);
+        mkdirSync(join(globalPath, ".."), { recursive: true });
+        mkdirSync(join(projectPath, ".."), { recursive: true });
+        writeFileSync(
+          globalPath,
+          JSON.stringify({
+            tiers: { small: "global/small", medium: "global/medium", big: "global/big" },
+          }),
+        );
+        writeFileSync(projectPath, JSON.stringify({ tiers: { small: "project/small", big: "project/big" } }));
+
+        const overlay = loadModelTierConfig({ cwd });
+        assert.deepEqual(overlay, {
+          tiers: { small: "project/small", medium: "global/medium", big: "project/big" },
+        });
+        assert.deepEqual(loadModelTierConfig(), {
+          tiers: { small: "global/small", medium: "global/medium", big: "global/big" },
+        });
+      });
+    });
+
+    it("matches current global-only resolution when no project file exists", async () => {
+      const { loadModelTierConfig, getModelTierConfigPath } = await loadModule();
+      withOverlayHome((_home, cwd) => {
+        const globalPath = getModelTierConfigPath();
+        mkdirSync(join(globalPath, ".."), { recursive: true });
+        writeFileSync(globalPath, JSON.stringify({ tiers: { medium: "global/medium" } }));
+
+        const overlay = loadModelTierConfig({ cwd });
+        const globalOnly = loadModelTierConfig();
+        assert.deepEqual(overlay, { tiers: { medium: "global/medium" } });
+        assert.deepEqual(overlay, globalOnly);
+      });
+    });
+
+    it("uses the project file alone when there is no global file", async () => {
+      const { loadModelTierConfig, getProjectModelTierConfigPath } = await loadModule();
+      withOverlayHome((_home, cwd) => {
+        const projectPath = getProjectModelTierConfigPath(cwd);
+        mkdirSync(join(projectPath, ".."), { recursive: true });
+        writeFileSync(projectPath, JSON.stringify({ tiers: { small: "project/only" } }));
+
+        assert.deepEqual(loadModelTierConfig({ cwd }), { tiers: { small: "project/only" } });
+        assert.equal(loadModelTierConfig(), null);
+      });
+    });
+
+    it("returns null when neither file exists", async () => {
+      const { loadModelTierConfig } = await loadModule();
+      withOverlayHome((_home, cwd) => {
+        assert.equal(loadModelTierConfig({ cwd }), null);
+        assert.equal(loadModelTierConfig(), null);
+      });
     });
   });
 
