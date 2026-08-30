@@ -391,8 +391,19 @@ function patchBindCoreObserve(): void {
 patchAgentSessionCapture();
 patchBindCoreObserve();
 
+export const WORKFLOW_LIFECYCLE_EVENT = "pi-dynamic-workflows:lifecycle";
+
+export interface WorkflowLifecycleEvent {
+  status: "started" | "resumed" | "paused" | "completed" | "failed" | "stopped";
+  runId: string;
+  name: string;
+  sessionId?: string;
+}
+
 type DeliveryManager = WorkflowManager & {
   __deliveryInstalled?: boolean;
+  __lifecycleEventInstalled?: boolean;
+  __lifecycleEventEmitter?: (data: WorkflowLifecycleEvent) => void;
   /** Last loadSettings seen on install — used when binding endpoints. */
   __deliveryLoadSettings?: () => WorkflowSettings;
 };
@@ -812,7 +823,7 @@ export function resumeResultDelivery(manager: WorkflowManager): void {
  * each new generation calls {@link bindSessionDelivery} on session_start.
  */
 export function installResultDelivery(
-  _pi: ExtensionAPI,
+  pi: ExtensionAPI,
   manager: WorkflowManager,
   opts: { loadSettings?: () => WorkflowSettings } = {},
 ): void {
@@ -820,6 +831,35 @@ export function installResultDelivery(
   m.__deliveryLoadSettings = opts.loadSettings;
   patchAgentSessionCapture();
   patchBindCoreObserve();
+
+  m.__lifecycleEventEmitter = (data) => pi.events?.emit(WORKFLOW_LIFECYCLE_EVENT, data);
+  if (!m.__lifecycleEventInstalled) {
+    m.__lifecycleEventInstalled = true;
+    const emitLifecycle =
+      (status: WorkflowLifecycleEvent["status"]) =>
+      ({ runId }: { runId: string }) => {
+        const run = manager.getRun(runId);
+        const persisted = run ? undefined : manager.getPersistence().load(runId);
+        const lifecycle = run?.background
+          ? { name: run.snapshot.name, sessionId: resolveDeliverySessionId(run, manager) }
+          : persisted
+            ? { name: persisted.workflowName, sessionId: persisted.sessionId }
+            : undefined;
+        if (!lifecycle) return;
+        m.__lifecycleEventEmitter?.({
+          status,
+          runId,
+          name: lifecycle.name,
+          ...(lifecycle.sessionId ? { sessionId: lifecycle.sessionId } : {}),
+        });
+      };
+    manager.on("started", emitLifecycle("started"));
+    manager.on("resumed", emitLifecycle("resumed"));
+    manager.on("paused", emitLifecycle("paused"));
+    manager.on("complete", emitLifecycle("completed"));
+    manager.on("error", emitLifecycle("failed"));
+    manager.on("stopped", emitLifecycle("stopped"));
+  }
 
   if (m.__deliveryInstalled) {
     // Listeners survive session replacement. Refresh loadSettings / manager

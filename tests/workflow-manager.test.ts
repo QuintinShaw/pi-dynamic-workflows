@@ -1334,8 +1334,13 @@ test(
   "startInBackground returns immediately with runId and promise",
   withTempCwd(async (cwd) => {
     const manager = new WorkflowManager({ cwd, agent: fakeAgent() });
+    let startedRunId = "";
+    manager.on("started", ({ runId }: { runId: string }) => {
+      startedRunId = runId;
+    });
     const { runId, promise } = manager.startInBackground(oneAgentScript);
     assert.ok(runId, "should generate a run id");
+    assert.equal(startedRunId, runId, "should emit started after the run is persisted");
     assert.ok(promise instanceof Promise, "should return a promise");
     const runs = manager.listRuns();
     assert.equal(runs.length, 1);

@@ -183,6 +183,7 @@ function lateErrorAgent() {
 }
 
 type TaskPanelModule = {
+  WORKFLOW_LIFECYCLE_EVENT: string;
   installResultDelivery: (pi: ExtensionAPI, manager: unknown, opts?: unknown) => void;
   bindSessionDelivery: (
     sessionId: string,
@@ -305,7 +306,15 @@ describe("installResultDelivery", () => {
 
   function createMockPi(): ExtensionAPI & { _calls: DeliveryCall[] } {
     const calls: DeliveryCall[] = [];
+    const events = new EventEmitter();
     const obj = {
+      events: {
+        emit: (channel: string, data: unknown) => events.emit(channel, data),
+        on: (channel: string, handler: (data: unknown) => void) => {
+          events.on(channel, handler);
+          return () => events.off(channel, handler);
+        },
+      },
       sendMessage(msg: unknown, _opts?: unknown) {
         calls.push({
           content: (msg as { content?: string }).content ?? "",
@@ -682,6 +691,83 @@ describe("installResultDelivery", () => {
     manager.emit("complete", { runId: "test-run-1" });
     const calls = piCalls(pi);
     assert.equal(calls.length, 1); // exactly once, not twice
+  });
+
+  it("emits background lifecycle events through the latest extension runtime after reload", () => {
+    const stalePi = createMockPi();
+    const freshPi = createMockPi();
+    const manager = createMockManager(makeRun());
+    const staleEvents: unknown[] = [];
+    const freshEvents: unknown[] = [];
+    stalePi.events.on(mod.WORKFLOW_LIFECYCLE_EVENT, (event) => staleEvents.push(event));
+    freshPi.events.on(mod.WORKFLOW_LIFECYCLE_EVENT, (event) => freshEvents.push(event));
+
+    setup(stalePi, manager);
+    mod.installResultDelivery(freshPi, manager);
+    for (const event of ["started", "resumed", "paused", "complete", "error", "stopped"]) {
+      manager.emit(event, { runId: "test-run-1" });
+    }
+
+    assert.deepEqual(staleEvents, []);
+    assert.deepEqual(
+      freshEvents,
+      ["started", "resumed", "paused", "completed", "failed", "stopped"].map((status) => ({
+        status,
+        runId: "test-run-1",
+        name: "test-workflow",
+        sessionId: SESSION,
+      })),
+    );
+  });
+
+  it("emits a stopped lifecycle event for a persisted-only run through the latest runtime", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pi-dw-cold-stop-event-"));
+    const manager = new WorkflowManager({ cwd });
+    const stalePi = createMockPi();
+    const freshPi = createMockPi();
+    const staleEvents: unknown[] = [];
+    const freshEvents: unknown[] = [];
+    const runId = "cold-start-stop-paused-1";
+    stalePi.events.on(mod.WORKFLOW_LIFECYCLE_EVENT, (event) => staleEvents.push(event));
+    freshPi.events.on(mod.WORKFLOW_LIFECYCLE_EVENT, (event) => freshEvents.push(event));
+
+    try {
+      manager.getPersistence().save({
+        runId,
+        workflowName: "cold_start_stop",
+        script: lifecycleScript,
+        sessionId: SESSION,
+        status: "paused",
+        phases: [],
+        agents: [],
+        logs: [],
+        startedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+      mod.installResultDelivery(stalePi, manager);
+      mod.installResultDelivery(freshPi, manager);
+
+      assert.equal(manager.getRun(runId), undefined);
+      assert.equal(manager.stop(runId), true);
+      assert.deepEqual(staleEvents, []);
+      assert.deepEqual(freshEvents, [{ status: "stopped", runId, name: "cold_start_stop", sessionId: SESSION }]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("does not emit lifecycle events for foreground runs", () => {
+    const pi = createMockPi();
+    const manager = createMockManager(makeRun({ background: false }));
+    const events: unknown[] = [];
+    pi.events.on(mod.WORKFLOW_LIFECYCLE_EVENT, (event) => events.push(event));
+
+    setup(pi, manager);
+    for (const event of ["started", "resumed", "paused", "complete", "error", "stopped"]) {
+      manager.emit(event, { runId: "test-run-1" });
+    }
+
+    assert.deepEqual(events, []);
   });
 
   it("does not crash when sendMessage throws (stale ctx); queues and flushes on rebind", async () => {
