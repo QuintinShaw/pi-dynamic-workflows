@@ -56,11 +56,12 @@ export {
   splitModelSpecThinking,
   THINKING_LEVELS,
 } from "./model-spec.js";
-export type { ModelTierConfig, RankableModel } from "./model-tier-config.js";
+export type { ModelTierConfig, ModelTierConfigOptions, RankableModel } from "./model-tier-config.js";
 export {
   buildDefaultTierConfig,
   formatTierFallbackNotice,
   getModelTierConfigPath,
+  getProjectModelTierConfigPath,
   loadModelTierConfig,
   resolveTierModel,
   saveModelTierConfig,
@@ -162,7 +163,12 @@ export {
   workflowUserSavedDir,
 } from "./workflow-paths.js";
 export type { SavedWorkflow, WorkflowStorage } from "./workflow-saved.js";
-export { assertSafeSavedWorkflowName, createWorkflowStorage, isSafeSavedWorkflowName } from "./workflow-saved.js";
+export {
+  assertSafeSavedWorkflowName,
+  createWorkflowStorage,
+  isSafeSavedWorkflowName,
+  resolveSavedScriptPath,
+} from "./workflow-saved.js";
 export type { WorkflowSettings, WorkflowSettingsOptions, WorkflowSettingsStore } from "./workflow-settings.js";
 export {
   getWorkflowProjectSettingsPath,

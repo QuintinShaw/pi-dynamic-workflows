@@ -185,7 +185,8 @@ export async function resolveStructuredOutput<T>(
  *      user customizes tiers via /workflows-models.
  * Returns undefined when nothing applies, so the session default is used.
  *
- * `loadConfig` is injectable for testing; it defaults to reading from disk.
+ * `loadConfig` is injectable for testing; it defaults to the global file.
+ * WorkflowAgent passes a cwd-aware overlay loader so project tiers win.
  */
 export function resolveAgentModelSpec(
   options: { model?: string; tier?: string },
@@ -732,7 +733,7 @@ export class WorkflowAgent {
   }
 
   /**
-   * Read+parse ~/.pi/workflows/model-tiers.json at most once for this
+   * Read+parse the cwd-aware model-tiers overlay at most once for this
    * instance's lifetime, instead of on every run() call. `resolveAgentModelSpec`
    * previously received `loadModelTierConfig` directly (sync existsSync +
    * readFileSync + JSON.parse from disk), which it calls unconditionally for
@@ -756,9 +757,10 @@ export class WorkflowAgent {
    * only ever consulted once, on the first call, regardless of what is passed
    * on later calls.
    */
-  private loadTierConfig(loader: () => ModelTierConfig | null = loadModelTierConfig): ModelTierConfig | null {
+  private loadTierConfig(loader?: () => ModelTierConfig | null): ModelTierConfig | null {
     if (!this.tierConfigBox) {
-      this.tierConfigBox = { value: loader() };
+      const read = loader ?? (() => loadModelTierConfig({ cwd: this.cwd }));
+      this.tierConfigBox = { value: read() };
     }
     return this.tierConfigBox.value;
   }
