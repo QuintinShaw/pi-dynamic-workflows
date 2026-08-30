@@ -10,7 +10,7 @@ import {
   DefaultResourceLoader,
   getAgentDir,
   ModelRegistry,
-  ModelRuntime,
+  type ModelRuntime,
   SessionManager,
   SettingsManager,
   type ToolDefinition,
@@ -221,7 +221,7 @@ export interface WorkflowAgentOptions {
    * so a workflow subagent can't fan out through them either (#107).
    */
   excludeTools?: string[];
-  /** Override any createAgentSession option (model, modelRuntime, resourceLoader, etc.). */
+  /** Override any createAgentSession option (model, modelRegistry, resourceLoader, etc.). */
   session?: Partial<CreateAgentSessionOptions>;
   /** Extra system guidance prepended to every subagent task. */
   instructions?: string;
@@ -249,26 +249,55 @@ export interface WorkflowAgentOptions {
   persistAgentSessions?: boolean;
 }
 
-// pi >= 0.80.8: ModelRegistry is a sync facade over an async-created ModelRuntime
-// (AuthStorage/ModelRegistry.create are gone). The disk-backed fallback is built
-// lazily; sync callers see [] until it resolves and real specs on later reads.
-let fallbackRuntimePromise: Promise<ModelRuntime> | undefined;
+// omp's ModelRegistry is auth-storage-backed (no pi >= 0.80.8 sync-facade /
+// runtime split): build it directly from the discovered AuthStorage. The
+// disk-backed fallback is built lazily; sync callers see [] until it resolves
+// and real specs on later reads.
+let fallbackRuntimePromise: Promise<ModelRegistry> | undefined;
 let fallbackRegistry: ModelRegistry | undefined;
 
 function ensureFallbackRegistry(): Promise<ModelRegistry> {
   if (!fallbackRuntimePromise) {
     const dir = getAgentDir();
     // Same auth.json/models.json createAgentSession uses by default, so a model
-    // resolved here carries valid credentials.
+    // resolved here carries valid credentials. Three host shapes, tried in
+    // order; only a real registry ever resolves:
+    // 1. omp's bundled pi exports discoverAuthStorage (auth-storage-backed
+    //    registry, no runtime split).
+    // 2. Legacy pi (< 0.80.8) had a static ModelRegistry.create({ dir }).
+    // 3. pi >= 0.80.8 splits registry/runtime: ModelRuntime.create() then
+    //    new ModelRegistry(runtime).
     fallbackRuntimePromise = (async () => {
-      const runtime = await ModelRuntime.create({
-        authPath: join(dir, "auth.json"),
-        modelsPath: join(dir, "models.json"),
-      });
-      // Warm the availability snapshot so the facade's sync getAvailable() is
-      // populated immediately after this promise resolves.
-      await runtime.getAvailable().catch(() => {});
-      return runtime;
+      // Dynamic import on purpose: discoverAuthStorage exists only in omp's
+      // bundled pi; a static named import would fail to resolve on stock pi,
+      // and the host shape must be feature-detected at runtime.
+      const ompExports = (await import("@earendil-works/pi-coding-agent").catch(() => undefined)) as
+        | {
+            discoverAuthStorage?: (dir: string) => Promise<unknown>;
+            ModelRuntime?: { create?: (options?: unknown) => Promise<ModelRuntime> };
+          }
+        | undefined;
+      if (typeof ompExports?.discoverAuthStorage === "function") {
+        const authStorage = (await ompExports.discoverAuthStorage(dir)) as ConstructorParameters<
+          typeof ModelRegistry
+        >[0];
+        return new ModelRegistry(authStorage);
+      }
+      const legacyCreate = (
+        ModelRegistry as unknown as {
+          create?: (opts: { dir: string }) => Promise<ModelRegistry>;
+        }
+      ).create;
+      if (typeof legacyCreate === "function") return legacyCreate({ dir });
+      const runtimeCreate = ompExports?.ModelRuntime?.create;
+      if (typeof runtimeCreate === "function") {
+        // No options: defaults to getAgentDir()/auth.json and models.json —
+        // the same disk layout the omp and legacy paths read.
+        return new ModelRegistry(await runtimeCreate());
+      }
+      throw new Error(
+        "[workflow] no ModelRegistry construction path in @earendil-works/pi-coding-agent (expected discoverAuthStorage, ModelRegistry.create, or ModelRuntime.create)",
+      );
     })();
     // Don't cache a rejection: a transient failure (e.g. auth.json lock) would
     // otherwise wedge the fallback for the rest of the process.
@@ -276,34 +305,22 @@ function ensureFallbackRegistry(): Promise<ModelRegistry> {
       fallbackRuntimePromise = undefined;
     });
   }
-  return fallbackRuntimePromise.then((runtime) => {
-    fallbackRegistry ??= new ModelRegistry(runtime);
-    return fallbackRegistry;
+  return fallbackRuntimePromise.then((registry) => {
+    fallbackRegistry ??= registry;
+    return registry;
   });
 }
 
-let warnedNoRuntime = false;
-
 /**
- * The ModelRuntime behind a registry facade. pi's ModelRegistry does not expose
- * its runtime publicly, so reach into the private field (stable since 0.80.8);
- * subagent sessions need it to share the host session's exact catalog and auth
- * (createAgentSession takes modelRuntime, not a registry, since 0.80.8).
- *
- * Exported so the test suite can pin this pi-internals contract: the cast means
- * neither tsc nor mock-based tests would notice pi renaming the field, and the
- * runtime consequence is silent (subagents fall back to a default runtime and
- * extension-registered providers vanish from routing).
+ * The ModelRuntime behind a registry facade (pi >= 0.80.8 shape: ModelRegistry
+ * wraps a ModelRuntime but exposes no getter). Subagent sessions need it to
+ * share the host session's exact catalog and auth. omp's fork is
+ * auth-storage-backed (registry has no `runtime` field and createAgentSession
+ * takes modelRegistry instead), so this returns undefined there and callers
+ * pass the registry itself.
  */
-export function runtimeOf(registry: ModelRegistry): ModelRuntime | undefined {
-  const runtime = (registry as unknown as { runtime?: ModelRuntime }).runtime;
-  if (!runtime && !warnedNoRuntime) {
-    warnedNoRuntime = true;
-    console.warn(
-      "[workflow] ModelRegistry no longer carries a private `runtime` field (pi internals changed); subagents fall back to a default-built runtime and may miss extension-registered providers",
-    );
-  }
-  return runtime;
+export function runtimeOf(registry: ModelRegistry): unknown {
+  return (registry as unknown as { runtime?: unknown }).runtime;
 }
 
 /**
@@ -581,6 +598,8 @@ export type AgentRunResult<TSchemaDef extends TSchema | undefined> = TSchemaDef 
  * additional tool names via WorkflowAgentOptions.excludeTools.
  */
 export const DEFAULT_EXCLUDED_SUBAGENT_TOOLS = ["workflow", "workflow_control"];
+/** Process-global subagent id counter: unique across concurrent workflow runs. */
+let workflowAgentSeq = 0;
 
 /**
  * The full subagent tool denylist: the always-on defaults plus any names the
@@ -633,6 +652,8 @@ export class WorkflowAgent {
    */
   private readonly threadSessions = new Map<string, SessionManager>();
   private readonly activeThreads = new Set<string>();
+  /** Unique per-instance identity: agent ids must never collide across WorkflowAgent instances. */
+  private readonly agentInstanceId = randomUUID();
 
   constructor(options: WorkflowAgentOptions = {}) {
     this.cwd = options.cwd ?? process.cwd();
@@ -695,8 +716,8 @@ export class WorkflowAgent {
   /**
    * Resolve the registry for a run: an explicit per-run registry wins, then the
    * constructor's shared registry, then a lazily-built disk registry (shared
-   * across calls once built). Async because pi >= 0.80.8 builds registries from
-   * an async-created ModelRuntime.
+   * shared across calls once built). Async because omp builds registries from an
+   * async-discovered AuthStorage.
    */
   private async getRegistry(perRunRegistry?: ModelRegistry): Promise<ModelRegistry> {
     if (perRunRegistry) {
@@ -790,6 +811,20 @@ export class WorkflowAgent {
     const probePath = join(dir, `.write-probe-${randomUUID()}`);
     writeFileSync(probePath, "");
     unlinkSync(probePath);
+  }
+  /**
+   * Unique AgentRegistry id for the next spawned subagent. Concurrent
+   * createAgentSession calls that omit agentId all default to "Main" and race
+   * on the process-global registry (omp: "Agent \"Main\" was replaced during
+   * session initialization"). Unthreaded calls embed a per-process monotonic
+   * sequence so retries and concurrent runs never reuse an id. Named threads
+   * stay stable within one WorkflowAgent instance (a thread is one continuing
+   * session) but embed the instance id, so separate instances/runs never
+   * collide in the process-global registry.
+   */
+  private agentIdFor(options: AgentRunOptions<any>, runCwd: string): string {
+    if (options.thread) return `workflow:${runCwd}:${this.agentInstanceId}:${options.thread}`;
+    return `workflow:${runCwd}:${process.pid}:${++workflowAgentSeq}`;
   }
 
   async run<TSchemaDef extends TSchema | undefined = undefined>(
@@ -918,15 +953,19 @@ export class WorkflowAgent {
     }
 
     const agentDir = getAgentDir();
-    // The runtime behind the resolved registry, handed to the subagent session
-    // below so it shares the host session's exact catalog and auth.
-    const modelRuntime = runtimeOf(modelRegistry);
     // Key persisted sessions by the runner's project cwd (this.cwd), NOT the
     // per-call runCwd: agents working in short-lived git worktrees should still
     // group under the project's session dir instead of scattering across
     // temporary worktree paths.
     const sessionManager = this.createSessionManager(options.thread);
     const threadLeaf = options.thread ? sessionManager.getLeafId() : null;
+    // Host split: pi >= 0.80.8 createAgentSession takes modelRuntime, not a
+    // registry — hand over the registry's backing runtime so subagents share
+    // the host catalog and auth. omp's fork is auth-storage-backed (registry
+    // has no `.runtime`; it takes modelRegistry instead). Never spread
+    // `modelRuntime: undefined` — it would shadow createAgentSession's own
+    // default runtime.
+    const modelRuntime = runtimeOf(modelRegistry) as ModelRuntime | undefined;
     let session: Awaited<ReturnType<typeof createAgentSession>>["session"];
     try {
       ({ session } = await createAgentSession({
@@ -944,13 +983,23 @@ export class WorkflowAgent {
         // wins and skips the shared build entirely; the ...this.sessionOptions
         // spread below re-applies the same injected value harmlessly.
         resourceLoader: this.sessionOptions.resourceLoader ?? (await this.getSharedResourceLoader(agentDir)),
-        // Share the resolved registry's ModelRuntime (catalog + auth, including
-        // extension-registered providers) with the subagent session. pi >= 0.80.8
-        // takes modelRuntime here; the old modelRegistry option is gone.
-        ...(modelRuntime ? { modelRuntime } : {}),
+        // Host split (see modelRuntime above): stock pi takes modelRuntime;
+        // omp's fork takes modelRegistry. Spread-cast keeps the runtime value
+        // while satisfying the upstream CreateAgentSessionOptions type.
+        ...(modelRuntime ? { modelRuntime } : { modelRegistry }),
         ...this.sessionOptions,
-        // Named threads must retain their own manager even when an embedder supplied
-        // a default manager for ordinary one-shot calls.
+        // The computed AgentRegistry id must win over any injected
+        // sessionOptions value: a stable embedder-supplied agentId would
+        // collide across runs in the process-global registry. `agentId` is
+        // omp-fork-only (absent from upstream 0.83 types this package builds
+        // against); spread-cast keeps the runtime value while satisfying the
+        // upstream CreateAgentSessionOptions type.
+        ...{ agentId: this.agentIdFor(options, runCwd) },
+        // Named threads must retain their own manager even when an embedder
+        // supplied a default manager for ordinary one-shot calls — the
+        // sessionOptions spread above would otherwise overwrite the cached
+        // thread manager with the injected one, breaking turn continuity and
+        // failed-turn rollback.
         ...(options.thread ? { sessionManager } : {}),
         // Per-call model/thinking wins over any sessionOptions defaults.
         ...(resolvedModel ? { model: resolvedModel } : {}),

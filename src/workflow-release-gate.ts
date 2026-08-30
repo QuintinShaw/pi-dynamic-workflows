@@ -474,7 +474,6 @@ function validatePackage(root: string, publishableFiles: readonly string[]): Wor
   return diagnostics;
 }
 
-/** Parse publishable paths from `npm pack --dry-run --json` without trusting external JSON shapes. */
 export function parseNpmPackFilePaths(output: string): string[] {
   const parsed: unknown = JSON.parse(output);
   // npm 10 emits `[{ files }]`; npm 11 emits `{ files }`.

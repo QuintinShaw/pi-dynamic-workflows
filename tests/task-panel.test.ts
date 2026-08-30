@@ -205,15 +205,18 @@ type TaskPanelModule = {
   dropSessionDelivery: (sessionId: string | undefined) => void;
   suspendResultDelivery: (manager: unknown) => void;
   resumeResultDelivery: (manager: unknown) => void;
+  _isProbedForTests: (sessionId: string) => boolean;
   suspendSessionDelivery: (sessionId: string | undefined) => void;
   resumeSessionDelivery: (sessionId: string | undefined, manager?: unknown) => void;
-  installTaskPanel: (pi: ExtensionAPI | null, manager: unknown, ui: unknown) => void;
   _resetDeliveryRegistriesForTests: () => void;
   _registerBoundSessionSendForTests: (sessionId: string, send: StableSend) => void;
-  _hasBoundSessionSendForTests: (sessionId: string) => boolean;
+  _registerHostSessionForTests: (session: object) => void;
+  DELIVERY_PROBE_CUSTOM_TYPE: string;
+  _getStealMapForTests: () => ReadonlyMap<string, StableSend>;
   _getSessionDeliveryEndpointForTests: (
     sessionId: string,
   ) => { suspended: boolean; generation: number; hasSend: boolean; hasAppend: boolean } | undefined;
+  installTaskPanel: (pi: ExtensionAPI | null, manager: unknown, ui: unknown) => void;
 };
 
 // Loaded once before all tests
@@ -331,15 +334,119 @@ describe("installResultDelivery", () => {
     };
   }
 
-  /** Drive the armed AgentSession._bindExtensionCore patch with a fake `this`. */
-  function invokePatchedBindCore(session: object): void {
-    const bind = (AgentSession.prototype as unknown as { _bindExtensionCore: (runner: unknown) => unknown })
-      ._bindExtensionCore;
-    bind.call(session, { bindCore() {} });
+  type ExactSendCall = {
+    message: { customType?: string; content?: string; display?: boolean };
+    options: { triggerTurn?: boolean; deliverAs?: string } | undefined;
+  };
+  /** Record the FULL message + options so tests can assert the exact payload
+   *  the delivery path hands to the captured host send (T1). */
+  function recordingSendExact(calls: ExactSendCall[]): StableSend {
+    return (msg, opts) => {
+      calls.push({ message: { ...msg }, options: opts ? { ...opts } : undefined });
+      return Promise.resolve();
+    };
+  }
+
+  /**
+   * Drive the armed AgentSession.sendCustomMessage capture patch with a fake
+   * `this` to exercise the steal filter. The patched forward runs the REAL
+   * sendCustomMessage, so an untriggered call is used: the non-trigger branch
+   * only needs `agent.state.messages` and `sessionManager.appendCustomMessageEntry`,
+   * both provided below — avoiding `_runAgentPrompt`'s internal fields.
+   */
+  function invokePatchedSendCustomMessage(
+    session: object,
+    message?: { customType: string; content: string; display: boolean },
+  ): void {
+    const patched = (AgentSession.prototype as unknown as { sendCustomMessage?: unknown }).sendCustomMessage;
+    assert.equal(typeof patched, "function", "sendCustomMessage patch must be armed");
+    if (!("agent" in session)) {
+      Object.assign(session, { agent: { state: { messages: [] } } });
+    }
+    if (!("sessionManager" in session)) {
+      Object.assign(session, {
+        sessionManager: {
+          appendCustomMessageEntry: () => "",
+        },
+      });
+    } else {
+      const sm = (session as { sessionManager?: Record<string, unknown> }).sessionManager;
+      if (!sm || !("appendCustomMessageEntry" in sm)) {
+        // Never inherit a host-shaped sessionManager from the real prototype: a
+        // fake session must carry exactly the fields the untriggered forward
+        // touches, and never the real session's identity (T2). MERGE the
+        // appendCustomMessageEntry onto the test-provided sessionManager so we
+        // do not destroy its persist/getSessionId/isPersisted shape (T6).
+        Object.assign(sm ?? (session as { sessionManager: Record<string, unknown> }).sessionManager, {
+          appendCustomMessageEntry: () => "",
+        });
+      }
+    }
+    if (!("_emit" in session)) {
+      Object.assign(session, { _emit: () => {} });
+    }
+    void (patched as (msg: unknown, opts: unknown) => unknown).call(
+      session,
+      message ?? { customType: "workflow-result", content: "x", display: true },
+      {},
+    );
+  }
+
+  /**
+   * Drive the armed AgentSession._bindExtensionCore capture patch with a fake
+   * `this`. The wrapper captures BEFORE forwarding to the REAL
+   * `_bindExtensionCore`, which a fake session cannot fully satisfy — the
+   * forward's throw is irrelevant (capture already happened) and is swallowed.
+   */
+  function invokePatchedBindExtensionCore(session: object): void {
+    const proto = AgentSession.prototype as unknown as { _bindExtensionCore?: unknown };
+    const patched = proto._bindExtensionCore;
+    assert.equal(typeof patched, "function", "_bindExtensionCore patch must be armed");
+    try {
+      (patched as (runner: unknown) => unknown).call(session, {
+        bindCore: () => {},
+        getRegisteredCommands: () => [],
+      });
+    } catch {
+      // The real bindCore body may touch internals a fake session lacks.
+    }
+  }
+  /**
+   * Wrap a fake host send so the delivery path's captured-send invocation runs
+   * with the internals the REAL AgentSession.sendCustomMessage touches
+   * (the fix forwards on the live receiver). The wrapped send is the function
+   * under test. The stub's job is only to make `this` look like a real host
+   * session — it must NEVER overwrite the fakes the test installed (T3).
+   */
+  function captureStub(send: StableSend): StableSend {
+    return function captureStub(this: unknown, msg, opts) {
+      const s = this as {
+        agent?: { state: { messages: unknown[] }; followUp?: () => void };
+        sessionManager?: { appendCustomMessageEntry?: () => unknown };
+        _isAgentRunActive?: boolean;
+        _pendingNextTurnMessages?: unknown[];
+        _followUpMessages?: unknown[];
+        _emit?: (e: unknown) => void;
+      };
+      if (s.agent == null) s.agent = { state: { messages: [] }, followUp: () => {} };
+      if (s.sessionManager == null) s.sessionManager = { appendCustomMessageEntry: () => "" };
+      if (s._pendingNextTurnMessages == null) s._pendingNextTurnMessages = [];
+      if (s._followUpMessages == null) s._followUpMessages = [];
+      if (s._emit == null) s._emit = () => {};
+      // Streaming route: the real sendCustomMessage queues via agent.followUp
+      // (never _runAgentPrompt) when isStreaming — avoids the prompt internals
+      // while still exercising the live-receiver forward.
+      if (s._isAgentRunActive == null) s._isAgentRunActive = true;
+      return send.call(this, msg, opts);
+    };
   }
 
   function piCalls(pi: ExtensionAPI): DeliveryCall[] {
-    return (pi as unknown as { _calls: DeliveryCall[] })._calls;
+    // The session_start probe rides the same sendMessage spy; only result
+    // deliveries count.
+    return (pi as unknown as { _calls: DeliveryCall[] })._calls.filter(
+      (c) => c.customType !== mod.DELIVERY_PROBE_CUSTOM_TYPE,
+    );
   }
 
   function makeRun(overrides: Record<string, unknown> = {}) {
@@ -1168,21 +1275,26 @@ describe("installResultDelivery", () => {
     managerA.setSessionId("sess-A");
     managerB.setSessionId("sess-B");
 
-    // Two host-shaped bindCores, B last — steal map must stay per-session.
-    invokePatchedBindCore({
+    // Two host-shaped sessions, B last — steal map must stay per-session.
+    // Seams (mirroring the source patch) now drive the *capture* arm, not the
+    // dead bindCore hook: invoke the patched sendCustomMessage on each fake
+    // session; the wrapper's host filter decides what (if anything) is stolen.
+    invokePatchedSendCustomMessage({
       sessionManager: {
         persist: true,
         getSessionId: () => "sess-A",
         getSessionName: () => "host-A",
+        isPersisted: () => true,
       },
       _resourceLoader: { noExtensions: false },
       sendCustomMessage: recordingStableSend(piA),
     });
-    invokePatchedBindCore({
+    invokePatchedSendCustomMessage({
       sessionManager: {
         persist: true,
         getSessionId: () => "sess-B",
         getSessionName: () => "host-B",
+        isPersisted: () => true,
       },
       _resourceLoader: { noExtensions: false },
       sendCustomMessage: recordingStableSend(piB),
@@ -1206,8 +1318,311 @@ describe("installResultDelivery", () => {
     assert.ok(piCalls(piB)[0].content.includes("from-B"));
   });
 
+  it("steal accepts an isSessionOnDisk-only host (omp session shape)", () => {
+    // omp's SessionManager has neither isPersisted() nor a `persist` field —
+    // only isSessionOnDisk(). Without this branch the host is never stolen and
+    // completion stays pendingDelivery forever (#109).
+    const pi = createMockPi();
+    const manager = createMockManager(
+      makeRun({
+        sessionId: "sess-omp",
+        runId: "run-omp",
+        result: { result: { verdict: "delivered" }, agentCount: 1, durationMs: 1 },
+      }),
+    );
+    manager.setSessionId("sess-omp");
+    invokePatchedSendCustomMessage({
+      sessionManager: {
+        getSessionId: () => "sess-omp",
+        getSessionName: () => "host-omp",
+        isSessionOnDisk: () => true,
+      },
+      _resourceLoader: { noExtensions: false },
+      sendCustomMessage: recordingStableSend(pi),
+    });
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    mod.bindSessionDelivery("sess-omp", pi as unknown as ExtensionAPI, { manager });
+    manager.emit("complete", { runId: "run-omp" });
+    assert.equal(piCalls(pi).length, 1, "omp-shaped host receives its result");
+    assert.ok(piCalls(pi)[0].content.includes("delivered"));
+    const stealKeys = () => [...mod._getStealMapForTests().keys()];
+    assert.ok(stealKeys().includes("sess-omp"), "omp-shaped host is stolen");
+  });
+
+  it("quiet host: bind probes once via pi.sendMessage, captures send, delivers", () => {
+    const pi = createMockPi();
+    const manager = createMockManager(
+      makeRun({
+        sessionId: "sess-quiet",
+        runId: "run-quiet",
+        result: { result: { verdict: "delivered" }, agentCount: 1, durationMs: 1 },
+      }),
+    );
+    let probeCalls = 0;
+    // Emulate the real host wiring: the void extension wrapper synchronously
+    // routes through AgentSession.sendCustomMessage, where the prototype patch
+    // captures the live session.
+    (pi as unknown as { sendMessage: (m: unknown, o: unknown) => void }).sendMessage = () => {
+      probeCalls++;
+      invokePatchedSendCustomMessage({
+        sessionManager: {
+          getSessionId: () => "sess-quiet",
+          getSessionName: () => "host-quiet",
+          isSessionOnDisk: () => true,
+        },
+        _resourceLoader: { noExtensions: false },
+        sendCustomMessage: recordingStableSend(pi),
+      });
+    };
+
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    manager.setSessionId("sess-quiet");
+    mod.bindSessionDelivery("sess-quiet", pi as unknown as ExtensionAPI, { manager });
+    manager.emit("complete", { runId: "run-quiet" });
+
+    assert.equal(probeCalls, 1, "exactly one probe per session");
+    assert.equal(piCalls(pi).length, 1, "delivery flows after probe capture");
+    assert.ok(piCalls(pi)[0].content.includes("delivered"));
+  });
+
+  it("omp print-mode host: probe captures despite isSessionOnDisk false at session_start", () => {
+    const pi = createMockPi();
+    const manager = createMockManager(
+      makeRun({
+        sessionId: "sess-omp",
+        runId: "run-omp",
+        result: { result: { verdict: "delivered" }, agentCount: 1, durationMs: 1 },
+      }),
+    );
+    let probeCalls = 0;
+    (pi as unknown as { sendMessage: (m: unknown, o: unknown) => void }).sendMessage = () => {
+      probeCalls++;
+      invokePatchedSendCustomMessage(
+        {
+          sessionManager: {
+            getSessionId: () => "sess-omp",
+            getSessionName: () => "host-omp",
+            // omp persists lazily AFTER bind — the on-disk gate must not
+            // reject a probe-bearing send (root cause of the E2E failure).
+            isSessionOnDisk: () => false,
+          },
+          _resourceLoader: { noExtensions: false },
+          sendCustomMessage: recordingStableSend(pi),
+        },
+        { customType: mod.DELIVERY_PROBE_CUSTOM_TYPE, content: "", display: false },
+      );
+    };
+
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    manager.setSessionId("sess-omp");
+    mod.bindSessionDelivery("sess-omp", pi as unknown as ExtensionAPI, { manager });
+    manager.emit("complete", { runId: "run-omp" });
+
+    assert.equal(probeCalls, 1, "probe attempted");
+    assert.equal(piCalls(pi).length, 1, "delivery flows after probe capture");
+    assert.ok(piCalls(pi)[0].content.includes("delivered"));
+  });
+
+  it("probe bypass never captures workflow: child sessions", () => {
+    const pi = createMockPi();
+    const manager = createMockManager(makeRun({ sessionId: "sess-child", runId: "run-child" }));
+    (pi as unknown as { sendMessage: (m: unknown, o: unknown) => void }).sendMessage = () => {
+      invokePatchedSendCustomMessage(
+        {
+          sessionManager: {
+            getSessionId: () => "sess-child",
+            getSessionName: () => "workflow:run-child",
+            isSessionOnDisk: () => false,
+          },
+          _resourceLoader: { noExtensions: false },
+          sendCustomMessage: recordingStableSend(pi),
+        },
+        { customType: mod.DELIVERY_PROBE_CUSTOM_TYPE, content: "", display: false },
+      );
+    };
+
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    manager.setSessionId("sess-child");
+    mod.bindSessionDelivery("sess-child", pi as unknown as ExtensionAPI, { manager });
+    manager.emit("complete", { runId: "run-child" });
+
+    assert.equal(piCalls(pi).length, 0, "child session probe is rejected by the name gate");
+  });
+
+  it("probe failure keeps bind fail-closed with pending on disk", () => {
+    const pi = createMockPi();
+    const manager = createMockManager(makeRun({ sessionId: "sess-throws", runId: "run-throws" }));
+    let probeCalls = 0;
+    (pi as unknown as { sendMessage: (m: unknown, o: unknown) => void }).sendMessage = () => {
+      probeCalls++;
+      throw new Error("Extension runtime not initialized.");
+    };
+
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    manager.setSessionId("sess-throws");
+    mod.bindSessionDelivery("sess-throws", pi as unknown as ExtensionAPI, { manager });
+    manager.emit("complete", { runId: "run-throws" });
+
+    assert.equal(probeCalls, 1, "probe attempted");
+    assert.equal(piCalls(pi).length, 0, "no delivery without a captured send");
+    assert.ok(manager.getPersistence?.().load("run-throws")?.pendingDelivery, "pending stays on disk");
+  });
+
+  it("no probe when the steal map already holds the send", () => {
+    const pi = createMockPi();
+    const manager = createMockManager(
+      makeRun({
+        sessionId: "sess-map",
+        runId: "run-map",
+        result: { result: { verdict: "delivered" }, agentCount: 1, durationMs: 1 },
+      }),
+    );
+    let probeCalls = 0;
+    (pi as unknown as { sendMessage: (m: unknown, o: unknown) => void }).sendMessage = () => {
+      probeCalls++;
+    };
+
+    invokePatchedSendCustomMessage({
+      sessionManager: {
+        getSessionId: () => "sess-map",
+        getSessionName: () => "host-map",
+        isSessionOnDisk: () => true,
+      },
+      _resourceLoader: { noExtensions: false },
+      sendCustomMessage: recordingStableSend(pi),
+    });
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    manager.setSessionId("sess-map");
+    mod.bindSessionDelivery("sess-map", pi as unknown as ExtensionAPI, { manager });
+    manager.emit("complete", { runId: "run-map" });
+
+    assert.equal(probeCalls, 0, "map hit skips the probe");
+    assert.equal(piCalls(pi).length, 1, "delivery uses the pre-captured send");
+  });
+
+  it("probe is capture-only: never forwarded to the session's sendCustomMessage", () => {
+    let spyCalls = 0;
+    const messages: unknown[] = ["pre-existing"];
+    invokePatchedSendCustomMessage(
+      {
+        agent: { state: { messages } },
+        sessionManager: {
+          getSessionId: () => "sess-probe-only",
+          getSessionName: () => "host-probe-only",
+          // probe-bearing sends bypass the persistence gate — omit isSessionOnDisk
+        },
+        _resourceLoader: { noExtensions: false },
+        sendCustomMessage: () => {
+          spyCalls++;
+          return Promise.resolve();
+        },
+      },
+      { customType: mod.DELIVERY_PROBE_CUSTOM_TYPE, content: "", display: false },
+    );
+
+    assert.equal(spyCalls, 0, "probe must never reach the host session's send");
+    assert.equal(messages.length, 1, "probe must never append to agent.state.messages");
+    assert.ok(mod._getStealMapForTests().has("sess-probe-only"), "capture happened despite the swallow");
+  });
+
+  it("failed probe is retried on the next bind (no pre-marked probed set)", () => {
+    const pi = createMockPi();
+    const manager = createMockManager(makeRun({ sessionId: "sess-retry", runId: "run-retry" }));
+    let sendMessageCalls = 0;
+    const throwingPi = pi as unknown as { sendMessage: (m: unknown, o: unknown) => void };
+    throwingPi.sendMessage = () => {
+      sendMessageCalls++;
+      throw new Error("Extension runtime not initialized.");
+    };
+
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    manager.setSessionId("sess-retry");
+    mod.bindSessionDelivery("sess-retry", pi as unknown as ExtensionAPI, { manager });
+    manager.emit("complete", { runId: "run-retry" });
+    assert.equal(sendMessageCalls, 1);
+    assert.equal(piCalls(pi).length, 0, "first bind fail-closed");
+    assert.ok(manager.getPersistence?.().load("run-retry")?.pendingDelivery, "pending stays on disk");
+
+    // Second bind: a working pi whose probe routes through the capture patch.
+    const recoveringPi = pi as unknown as { sendMessage: (m: unknown, o: unknown) => void };
+    recoveringPi.sendMessage = () => {
+      sendMessageCalls++;
+      invokePatchedSendCustomMessage(
+        {
+          sessionManager: {
+            getSessionId: () => "sess-retry",
+            getSessionName: () => "host-retry",
+            isSessionOnDisk: () => false,
+          },
+          _resourceLoader: { noExtensions: false },
+          sendCustomMessage: recordingStableSend(pi),
+        },
+        { customType: mod.DELIVERY_PROBE_CUSTOM_TYPE, content: "", display: false },
+      );
+    };
+    mod.bindSessionDelivery("sess-retry", pi as unknown as ExtensionAPI, { manager });
+    manager.emit("complete", { runId: "run-retry" });
+
+    assert.equal(sendMessageCalls, 2, "the failed probe was retried, not skipped");
+    assert.equal(piCalls(pi).length, 1, "delivery flows after the retried probe captures");
+    assert.equal(piCalls(pi)[0].triggerTurn, true);
+  });
+
+  it("dropSessionDelivery clears probed state: a new bind probes again", () => {
+    const pi = createMockPi();
+    const manager = createMockManager(makeRun({ sessionId: "sess-dropped", runId: "run-dropped" }));
+    let probeCalls = 0;
+    const override = pi as unknown as { sendMessage: (m: unknown, o: unknown) => void };
+    override.sendMessage = () => {
+      probeCalls++;
+      invokePatchedSendCustomMessage(
+        {
+          sessionManager: {
+            getSessionId: () => "sess-dropped",
+            getSessionName: () => "host-dropped",
+            isSessionOnDisk: () => false,
+          },
+          _resourceLoader: { noExtensions: false },
+          sendCustomMessage: recordingStableSend(pi),
+        },
+        { customType: mod.DELIVERY_PROBE_CUSTOM_TYPE, content: "", display: false },
+      );
+    };
+
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    manager.setSessionId("sess-dropped");
+    mod.bindSessionDelivery("sess-dropped", pi as unknown as ExtensionAPI, { manager });
+    assert.equal(probeCalls, 1, "first bind probes");
+    assert.equal(mod._isProbedForTests("sess-dropped"), true, "successful probe marks the session");
+
+    mod.dropSessionDelivery("sess-dropped");
+    assert.equal(mod._isProbedForTests("sess-dropped"), false, "drop forgets the probe mark");
+    mod.bindSessionDelivery("sess-dropped", pi as unknown as ExtensionAPI, { manager });
+    assert.equal(probeCalls, 2, "post-drop bind probes again");
+  });
+
+  it("bindCore capture path captures a persisted host without any probe", () => {
+    const pi = createMockPi();
+    invokePatchedBindExtensionCore({
+      sessionManager: {
+        getSessionId: () => "sess-bindcore",
+        getSessionName: () => "host-bindcore",
+        isPersisted: () => true,
+      },
+      _resourceLoader: { noExtensions: false },
+      sendCustomMessage: recordingStableSend(pi),
+    });
+
+    assert.ok(mod._getStealMapForTests().has("sess-bindcore"), "bindCore captured the send");
+    assert.equal(
+      (pi as unknown as { _calls: DeliveryCall[] })._calls.length,
+      0,
+      "no probe needed: capture happened at bindCore",
+    );
+  });
+
   it("steal map pins only the host session; drop releases the host closure", () => {
-    invokePatchedBindCore({
+    invokePatchedSendCustomMessage({
       sessionManager: {
         persist: false,
         getSessionId: () => "child-mem",
@@ -1215,7 +1630,7 @@ describe("installResultDelivery", () => {
       },
       sendCustomMessage: async () => {},
     });
-    invokePatchedBindCore({
+    invokePatchedSendCustomMessage({
       sessionManager: {
         persist: true,
         getSessionId: () => "child-noext",
@@ -1224,7 +1639,7 @@ describe("installResultDelivery", () => {
       _resourceLoader: { noExtensions: true },
       sendCustomMessage: async () => {},
     });
-    invokePatchedBindCore({
+    invokePatchedSendCustomMessage({
       sessionManager: {
         persist: true,
         getSessionId: () => "child-named",
@@ -1232,23 +1647,269 @@ describe("installResultDelivery", () => {
       },
       sendCustomMessage: async () => {},
     });
-    invokePatchedBindCore({
-      sessionManager: {
-        persist: true,
-        getSessionId: () => "host-1",
-        getSessionName: () => "chat",
-      },
-      _resourceLoader: { noExtensions: false },
-      sendCustomMessage: async () => {},
-    });
+    const hostSend: StableSend = async () => {};
+    mod._registerBoundSessionSendForTests("host-1", hostSend);
 
-    assert.equal(mod._hasBoundSessionSendForTests("child-mem"), false, "in-memory child must not pin");
-    assert.equal(mod._hasBoundSessionSendForTests("child-noext"), false, "noExtensions child must not pin");
-    assert.equal(mod._hasBoundSessionSendForTests("child-named"), false, "workflow: child must not pin");
-    assert.equal(mod._hasBoundSessionSendForTests("host-1"), true, "host session is stolen");
+    const stealKeys = () => [...mod._getStealMapForTests().keys()];
+    assert.ok(!stealKeys().includes("child-mem"), "in-memory child must not pin");
+    assert.ok(!stealKeys().includes("child-noext"), "noExtensions child must not pin");
+    assert.ok(!stealKeys().includes("child-named"), "workflow: child must not pin");
+    assert.ok(stealKeys().includes("host-1"), "host session is stolen");
+    // The captured value must be the EXACT send the host registered — the steal
+    // map holds the session-stable original, never a wrapper or a stale copy
+    // from an earlier session (T5).
+    assert.equal(mod._getStealMapForTests().get("host-1"), hostSend, "steal map holds the exact original send");
 
     mod.dropSessionDelivery("host-1");
-    assert.equal(mod._hasBoundSessionSendForTests("host-1"), false, "drop releases the host send closure");
+    assert.ok(!stealKeys().includes("host-1"), "drop releases the host send closure");
+    assert.equal(mod._getStealMapForTests().get("host-1"), undefined, "drop clears the map entry entirely");
+    assert.equal(mod._getSessionDeliveryEndpointForTests("host-1"), undefined, "drop clears the endpoint too");
+  });
+
+  it("live sendCustomMessage capture: host session send is used for delivery end to end", () => {
+    const pi = createMockPi();
+    const manager = createMockManager(makeRun());
+
+    // Production capture path: a live host AgentSession's sendCustomMessage is
+    // wrapped by the patch, so invoking it steals the session-stable send.
+    invokePatchedSendCustomMessage({
+      sessionManager: {
+        persist: true,
+        getSessionId: () => SESSION,
+        getSessionName: () => "chat",
+        isPersisted: () => true,
+      },
+      _resourceLoader: { noExtensions: false },
+      sendCustomMessage: recordingStableSend(pi),
+    });
+
+    assert.ok(mod._getStealMapForTests().has(SESSION), "host send captured into steal map");
+
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    manager.setSessionId(SESSION);
+    // Production session_start: steal map is the only send source.
+    mod.bindSessionDelivery(SESSION, pi as unknown as ExtensionAPI, { manager });
+    manager.emit("complete", { runId: "test-run-1" });
+
+    const calls = piCalls(pi);
+    assert.equal(calls.length, 1, "captured send delivers the result");
+    assert.equal(calls[0].triggerTurn, true, "captured send must triggerTurn");
+    assert.ok(calls[0].content.includes("All tests passed"));
+  });
+
+  it("captured host send receives the exact production payload (T1)", async () => {
+    const pi = createMockPi();
+    const manager = createMockManager(makeRun());
+    const exact: ExactSendCall[] = [];
+
+    // A live host AgentSession send is captured; the delivery path must invoke
+    // the captured send with EXACTLY the arguments tryDeliverEndpoint sends:
+    // {customType:"workflow-result", content, display:true} and
+    // {triggerTurn:true, deliverAs:"followUp"}.
+    invokePatchedSendCustomMessage({
+      sessionManager: {
+        persist: true,
+        getSessionId: () => SESSION,
+        getSessionName: () => "chat",
+        isPersisted: () => true,
+      },
+      _resourceLoader: { noExtensions: false },
+      sendCustomMessage: recordingSendExact(exact),
+    });
+
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    manager.setSessionId(SESSION);
+    mod.bindSessionDelivery(SESSION, pi as unknown as ExtensionAPI, { manager });
+    manager.emit("complete", { runId: "test-run-1" });
+
+    await Promise.resolve();
+    await Promise.resolve();
+
+    assert.equal(exact.length, 1, "captured host send is invoked exactly once");
+    assert.equal(exact[0].message.customType, "workflow-result");
+    assert.equal(exact[0].message.display, true);
+    assert.ok(exact[0].message.content?.includes("All tests passed"), "content is the delivered result text");
+    assert.equal(exact[0].options?.triggerTurn, true, "delivery must triggerTurn");
+    assert.equal(exact[0].options?.deliverAs, "followUp", "delivery must be queued as followUp");
+    // ACK cleared the pending marker.
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(
+      manager.getPersistence?.().load("test-run-1")?.pendingDelivery,
+      undefined,
+      "cleared after thenable ACK",
+    );
+  });
+
+  it("triggerTurn non-streaming routes through _runAgentPrompt (T4)", async () => {
+    const pi = createMockPi();
+    const manager = createMockManager(makeRun());
+    const prompted: unknown[] = [];
+    const settled: string[] = [];
+
+    // An IDLE host session: isStreaming=false, so the real sendCustomMessage
+    // with triggerTurn:true takes the _runAgentPrompt branch — the branch real
+    // host deliveries actually hit. The fake supplies the internals that path
+    // touches; agent.prompt is a stub so no real LLM call is made.
+    const idleSession = Object.create(AgentSession.prototype) as object & {
+      agent: unknown;
+      sessionManager: unknown;
+      _resourceLoader: unknown;
+      _isAgentRunActive: boolean;
+      _pendingBashMessages: unknown[];
+      _pendingNextTurnMessages: unknown[];
+      _extensionRunner: unknown;
+      _emit: () => void;
+    };
+    idleSession.agent = {
+      state: { messages: [] },
+      prompt: async (messages: unknown) => {
+        prompted.push(messages);
+        return { stopReason: "end_turn" };
+      },
+      continue: async () => {},
+    };
+    idleSession.sessionManager = {
+      persist: true,
+      getSessionId: () => SESSION,
+      getSessionName: () => "chat",
+      isPersisted: () => true,
+      appendCustomMessageEntry: () => "",
+    };
+    idleSession._resourceLoader = { noExtensions: false };
+    idleSession._isAgentRunActive = false;
+    idleSession._pendingBashMessages = [];
+    idleSession._pendingNextTurnMessages = [];
+    idleSession._extensionRunner = {
+      emit: async (e: { type: string }) => {
+        settled.push(e.type);
+      },
+    };
+    idleSession._emit = () => {};
+    mod._registerHostSessionForTests(idleSession as never);
+
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    manager.setSessionId(SESSION);
+    mod.bindSessionDelivery(SESSION, pi as unknown as ExtensionAPI, { manager });
+    manager.emit("complete", { runId: "test-run-1" });
+
+    // The thenable ACK resolves only after _runAgentPrompt settles.
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    assert.equal(prompted.length, 1, "triggerTurn delivery must start an agent prompt");
+    const appMessage = prompted[0] as { customType?: string; content?: unknown; display?: boolean };
+    assert.equal(appMessage.customType, "workflow-result", "the prompt receives the delivered app message");
+    assert.equal(appMessage.display, true);
+    assert.ok(settled.includes("agent_settled"), "the run settles after the prompt");
+    assert.equal(manager.getPersistence?.().load("test-run-1")?.pendingDelivery, undefined, "cleared after prompt ACK");
+  });
+
+  it("child session sendCustomMessage is not captured and never delivers", () => {
+    const pi = createMockPi();
+    const manager = createMockManager(makeRun());
+
+    // A workflow child (in-memory SessionManager) invoking sendCustomMessage
+    // must not be pinned — it is not the host session.
+    invokePatchedSendCustomMessage({
+      sessionManager: {
+        persist: false,
+        getSessionId: () => "child-mem",
+        getSessionName: () => "",
+      },
+      sendCustomMessage: recordingStableSend(pi),
+    });
+    assert.ok(!mod._getStealMapForTests().has("child-mem"), "child must not be stolen");
+
+    // Even if the child's id were somehow bound, a delivery routed to it has no
+    // host endpoint — fail closed, nothing sent, marker stays pending.
+    mod._registerBoundSessionSendForTests("child-mem", recordingStableSend(pi));
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    manager.setSessionId("child-mem");
+    mod.bindSessionDelivery("child-mem", pi as unknown as ExtensionAPI, { manager });
+    manager.emit("complete", { runId: "test-run-1" });
+
+    assert.equal(piCalls(pi).length, 0, "child send must never be used for delivery");
+    assert.ok(manager.getPersistence?.().load("test-run-1")?.pendingDelivery, "pending stays for a real host bind");
+  });
+
+  it("non-thenable captured send fails closed: pending stays (no false ACK)", () => {
+    const pi = createMockPi();
+    const manager = createMockManager(makeRun());
+
+    // A captured host send that does not return a thenable (fire-and-forget)
+    // must not be trusted as an ACK — content stays pending on disk.
+    const nonThenable = () => {
+      pi._calls.push({ content: "fired", customType: "workflow-result" });
+      return undefined;
+    };
+    mod._registerHostSessionForTests({
+      sessionManager: {
+        persist: true,
+        getSessionId: () => SESSION,
+        getSessionName: () => "chat",
+        isPersisted: () => true,
+      },
+      _resourceLoader: { noExtensions: false },
+      // The delivery path invokes the captured host send with a real host
+      // receiver (the fix forwards on the live session), so the stub needs the
+      // internals sendCustomMessage touches; the send itself is still the
+      // non-thenable function under test.
+      sendCustomMessage: captureStub(nonThenable),
+    });
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    manager.setSessionId(SESSION);
+    mod.bindSessionDelivery(SESSION, pi as unknown as ExtensionAPI, { manager });
+    manager.emit("complete", { runId: "test-run-1" });
+
+    // The captured send IS attempted (through the live receiver), but because it
+    // returns no thenable it must not be trusted as an ACK — no triggerTurn, and
+    // the marker stays pending on disk.
+    assert.equal(piCalls(pi).length, 1, "captured non-thenable send is attempted");
+    assert.equal(piCalls(pi)[0].triggerTurn, undefined, "non-thenable send never ACKs (fail closed)");
+    assert.ok(manager.getPersistence?.().load("test-run-1")?.pendingDelivery, "pending stays (fail closed)");
+  });
+
+  it("failed captured send leaves pending; next bind flushes", async () => {
+    const pi = createMockPi();
+    const freshPi = createMockPi();
+    const manager = createMockManager(makeRun());
+
+    // A captured host send that returns a rejecting thenable: no ACK, marker
+    // stays pending until a healthy generation binds and flushes. The captured
+    // send runs with a real host receiver (fix: forward on the live session),
+    // so the stub supplies the internals sendCustomMessage touches.
+    const failingSend = () => Promise.reject(new Error("network blip"));
+    mod._registerHostSessionForTests({
+      sessionManager: {
+        persist: true,
+        getSessionId: () => SESSION,
+        getSessionName: () => "chat",
+        isPersisted: () => true,
+      },
+      _resourceLoader: { noExtensions: false },
+      sendCustomMessage: captureStub(failingSend),
+    });
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    manager.setSessionId(SESSION);
+    mod.bindSessionDelivery(SESSION, pi as unknown as ExtensionAPI, { manager });
+    manager.emit("complete", { runId: "test-run-1" });
+
+    // Let the failing send settle (reject + in-flight release) before rebinding,
+    // so the next generation's flush picks the run up cleanly.
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.ok(manager.getPersistence?.().load("test-run-1")?.pendingDelivery, "pending stays after failed send");
+
+    // Rebind with a healthy send: flush retries the delivery and clears pending.
+    mod.bindSessionDelivery(SESSION, freshPi as unknown as ExtensionAPI, {
+      manager,
+      stableSend: recordingStableSend(freshPi),
+    });
+    const calls = piCalls(freshPi);
+    assert.equal(calls.length, 1, "healthy generation flushes the pending delivery");
+    assert.ok(calls[0].content.includes("All tests passed"));
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(manager.getPersistence?.().load("test-run-1")?.pendingDelivery, undefined, "cleared after ACK");
   });
 
   it("append-only is not an ACK; pending stays until a thenable send exists", () => {

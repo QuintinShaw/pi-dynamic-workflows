@@ -11,6 +11,7 @@ import {
   DEFAULT_EXCLUDED_SUBAGENT_TOOLS,
   listAvailableModelSpecs,
   resolveAgentModelSpec,
+  runtimeOf,
   subagentExcludedTools,
   usageFromStats,
   WorkflowAgent,
@@ -40,6 +41,7 @@ type WorkflowAgentPrivates = {
     appendSessionInfo(name: string): string;
   };
   restoreThreadLeaf(manager: ReturnType<WorkflowAgentPrivates["createSessionManager"]>, leafId: string | null): void;
+  getRegistry(perRunRegistry?: ModelRegistry): Promise<ModelRegistry>;
 };
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -76,6 +78,45 @@ test("WorkflowAgent with persistAgentSessions=true creates a file-backed manager
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("agentIdFor mints a unique id per unthreaded createAgentSession call (concurrent/retry-safe)", () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp" }) as unknown as WorkflowAgentPrivates;
+  const id1 = agent.agentIdFor({}, "/worktree-a");
+  const id2 = agent.agentIdFor({}, "/worktree-b");
+  const id3 = agent.agentIdFor({}, "/worktree-a");
+  assert.notEqual(id1, id2, "distinct worktrees must never share an id");
+  assert.notEqual(id1, id3, "a retried call on the same worktree must not reuse the id");
+  // Each id embeds the pid + a monotonic per-process sequence, so ids from
+  // concurrent runs in this process can never collide either.
+  assert.match(id1, /^workflow:\/worktree-a:\d+:\d+$/);
+});
+
+test("agentIdFor keeps one stable id per named thread (a thread is one continuing session)", () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp" }) as unknown as WorkflowAgentPrivates;
+  const first = agent.agentIdFor({ thread: "implementer" }, "/worktree");
+  const again = agent.agentIdFor({ thread: "implementer" }, "/worktree");
+  const other = agent.agentIdFor({ thread: "reviewer" }, "/worktree");
+  assert.equal(again, first, "thread turns continue one session, so the id must be stable");
+  assert.notEqual(other, first, "distinct threads must not share an id");
+});
+
+test("agentIdFor ids never collide across separate WorkflowAgent instances", () => {
+  const first = new WorkflowAgent({ cwd: "/tmp" }) as unknown as WorkflowAgentPrivates;
+  const second = new WorkflowAgent({ cwd: "/tmp" }) as unknown as WorkflowAgentPrivates;
+  // Unthreaded one-shot calls: every invocation gets a fresh id, across instances too.
+  assert.notEqual(
+    first.agentIdFor({}, "/worktree"),
+    second.agentIdFor({}, "/worktree"),
+    "unthreaded ids from separate instances must not collide",
+  );
+  // Named threads: stable within one instance, but the same thread name on a
+  // separate instance must not reuse the id (process-global AgentRegistry).
+  assert.notEqual(
+    first.agentIdFor({ thread: "implementer" }, "/worktree"),
+    second.agentIdFor({ thread: "implementer" }, "/worktree"),
+    "the same thread name on separate instances must not share an AgentRegistry id",
+  );
 });
 
 test("WorkflowAgent retains one session manager per named thread", () => {
@@ -1803,4 +1844,46 @@ test("usageFromStats keeps cost-only stats (billed but tokens unreported)", () =
     cost: 0.01,
   });
   assert.equal(usage?.cost, 0.01);
+});
+// ═══════════════════════════════════════════════════════════════════════
+// runtimeOf + 3-way fallback registry construction (omp / legacy / stock pi)
+// ═══════════════════════════════════════════════════════════════════════
+
+test("runtimeOf returns the backing ModelRuntime on stock pi and undefined on a fork-style registry", async () => {
+  const authDir = mkdtempSync(join(tmpdir(), "pi-dw-runtime-of-"));
+  try {
+    const runtime = await ModelRuntime.create({ authPath: join(authDir, "auth.json"), modelsPath: null });
+    const registry = new ModelRegistry(runtime);
+    assert.equal(runtimeOf(registry), runtime, "stock pi ModelRegistry must expose its runtime for subagent handoff");
+    // omp's auth-storage-backed registry carries no own `.runtime`; the seam
+    // must report undefined there so callers pass the registry itself instead.
+    const forkRegistry: ModelRegistry = Object.create(Object.getPrototypeOf(registry));
+    assert.equal(runtimeOf(forkRegistry), undefined);
+  } finally {
+    rmSync(authDir, { recursive: true, force: true });
+  }
+});
+
+test("stock pi exposes neither omp's discoverAuthStorage nor a legacy static ModelRegistry.create (fallback must use ModelRuntime.create)", async () => {
+  assert.equal(typeof ModelRuntime.create, "function", "runtime-split construction path must exist on stock pi");
+  const mod = await import("@earendil-works/pi-coding-agent");
+  assert.equal("discoverAuthStorage" in mod, false, "omp-only discovery export must not exist on stock pi");
+  assert.equal("create" in ModelRegistry, false, "legacy static create must not exist on stock pi");
+});
+
+test("fallback registry resolves to a real ModelRegistry on stock pi and is cached across agents (never undefined)", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-fallback-home-"));
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const agent1 = new WorkflowAgent({ cwd: "/tmp" }) as unknown as WorkflowAgentPrivates;
+      const agent2 = new WorkflowAgent({ cwd: "/tmp" }) as unknown as WorkflowAgentPrivates;
+      const first = await agent1.getRegistry();
+      assert.ok(first instanceof ModelRegistry, "fallback must resolve to a real registry, never undefined");
+      assert.ok(runtimeOf(first), "stock-pi fallback registry must carry a runtime for subagent handoff");
+      assert.equal(await agent1.getRegistry(), first, "per-agent fallback must be reused");
+      assert.equal(await agent2.getRegistry(), first, "module-level fallback registry must be shared across agents");
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });

@@ -1,10 +1,10 @@
 import { setImmediate as pause } from "node:timers/promises";
 import { isDeepStrictEqual } from "node:util";
-import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { TSchema } from "typebox";
 import type { AgentRunOptions } from "./agent.js";
 import { ComprehensionSuite, ComprehensionTaskKind } from "./enums.js";
 import { ModelGenerationError, WorkflowError, WorkflowErrorCode } from "./errors.js";
+import type { ModelThinkingLevel } from "./model-spec.js";
 import { parseWorkflowScript, runWorkflow, type WorkflowRuntimeEvent } from "./workflow.js";
 
 /** Re-exported scenario groups and authoring operations used by the optional comprehension CLI. */

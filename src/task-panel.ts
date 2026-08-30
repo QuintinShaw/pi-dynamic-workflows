@@ -209,6 +209,47 @@ const boundSessionSends = new Map<string, DeliverySend>();
 /** runIds with an in-flight deliver-and-ack so bind flush does not double-send. */
 const inFlightDeliveries = new Set<string>();
 
+/**
+ * Custom type for the session bind probe (see probeHostSessionSend). Sent
+ * through pi.sendMessage ONLY so the sendCustomMessage capture patch can
+ * identify the live host session. Capture-only: the patched sendCustomMessage
+ * swallows probe messages — nothing is appended, persisted, or turned.
+ */
+export const DELIVERY_PROBE_CUSTOM_TYPE = "workflow-delivery-probe";
+
+/**
+ * Session ids probed successfully. Marked only after a probe that captured a
+ * send; a failed or missed probe stays unmarked and is retried on the next
+ * bind.
+ */
+const probedSessionIds = new Set<string>();
+
+/**
+ * Quiet hosts (omp never sends custom messages itself) never trip the
+ * AgentSession.prototype patch, so no thenable send is ever captured. One
+ * capture-only probe through pi.sendMessage forces it: the host's void wrapper
+ * calls the live session's sendCustomMessage synchronously, the prototype patch
+ * captures the receiver (never forwarding the probe), and boundSessionSends is
+ * populated by the time this returns.
+ *
+ * Retry-correct: the session is marked probed only when the probe actually
+ * captured a send. A host whose pi.sendMessage throws (e.g. "Extension runtime
+ * not initialized" during early startup) stays unmarked, so the next
+ * bindSessionDelivery probes again instead of being permanently silent.
+ */
+function probeHostSessionSend(pi: ExtensionAPI, sessionId: string): void {
+  if (probedSessionIds.has(sessionId)) return;
+  try {
+    pi.sendMessage({ customType: DELIVERY_PROBE_CUSTOM_TYPE, content: "", display: false }, { triggerTurn: false });
+  } catch (err) {
+    // Probe is best-effort; bind stays fail-closed without a captured send.
+    // Not marked probed — the next bindSessionDelivery retries.
+    console.warn(`[workflow-delivery] delivery probe failed on session ${sessionId}:`, err);
+    return;
+  }
+  if (boundSessionSends.has(sessionId)) probedSessionIds.add(sessionId);
+}
+
 let agentSessionPatched = false;
 let bindCoreObserved = false;
 
@@ -218,21 +259,16 @@ interface StealCandidate {
     persist?: boolean;
     getSessionId?: () => string;
     getSessionName?: () => string | undefined;
+    isPersisted?: () => boolean;
+    isSessionOnDisk?: () => boolean;
   };
   _resourceLoader?: { noExtensions?: boolean };
+  _bindExtensionCore?: (...args: unknown[]) => unknown;
 }
 
-/**
- * Host Pi session only. Child workflow agents must not be pinned:
- *  - SessionManager.inMemory() → persist === false
- *  - shared noExtensions loader (persistAgentSessions children included)
- *  - persisted children named `workflow:<runId> …` (set after construction;
- *    still filters a later re-bindCore)
- */
-function hostSessionIdToSteal(session: StealCandidate): string | undefined {
+function hostSessionIdToSteal(session: StealCandidate, probe?: boolean): string | undefined {
   const sm = session.sessionManager;
   if (!sm) return undefined;
-  if (sm.persist === false) return undefined;
   if (session._resourceLoader?.noExtensions === true) return undefined;
   try {
     const name = sm.getSessionName?.();
@@ -241,19 +277,36 @@ function hostSessionIdToSteal(session: StealCandidate): string | undefined {
     // getSessionName unavailable — keep evaluating
   }
   if (typeof session.sendCustomMessage !== "function") return undefined;
-  try {
-    const sid = sm.getSessionId?.();
-    if (typeof sid === "string" && sid) return sid;
-  } catch {
-    return undefined;
+  const sid = sm.getSessionId?.();
+  // PROBE EXCEPTION: the probe bypasses ONLY this persistence gate; the
+  // sessionManager presence, noExtensions, and workflow:-name gates above
+  // still apply. Justification: unnamed in-memory workflow children are
+  // excluded by noExtensions/isPersisted at the bindCore hook (probe=false),
+  // and a probe is only ever sent through the pi.sendMessage of the session
+  // running this extension — it cannot reach a foreign or child session. omp
+  // print-mode hosts report isSessionOnDisk()===false at session_start
+  // (persisted lazily after bind), so the gate must not reject a probe-bearing
+  // send (#109).
+  if (!probe) {
+    try {
+      if (typeof sm.isPersisted === "function") {
+        if (!sm.isPersisted()) return undefined;
+      } else if (typeof sm.isSessionOnDisk === "function") {
+        if (!sm.isSessionOnDisk()) return undefined;
+      } else if (sm.persist !== true) {
+        return undefined;
+      }
+    } catch {
+      return undefined;
+    }
   }
-  return undefined;
+  return sid;
 }
 
-function captureHostSessionSend(session: StealCandidate): void {
-  const sid = hostSessionIdToSteal(session);
+function captureHostSessionSend(session: StealCandidate, probe?: boolean): void {
+  const sid = hostSessionIdToSteal(session, probe);
   if (!sid) return;
-  boundSessionSends.set(sid, (message, options) => session.sendCustomMessage!(message, options));
+  boundSessionSends.set(sid, (message, options) => session.sendCustomMessage?.(message, options));
 }
 
 /**
@@ -265,18 +318,51 @@ function patchAgentSessionCapture(): void {
   if (agentSessionPatched) return;
   agentSessionPatched = true;
   try {
-    const proto = AgentSession.prototype as unknown as {
-      _bindExtensionCore?: (runner: unknown) => unknown;
-    } & StealCandidate;
-    const original = proto._bindExtensionCore;
-    if (typeof original !== "function") return;
-    proto._bindExtensionCore = function patchedBindExtensionCore(this: StealCandidate, runner: unknown) {
+    const proto = AgentSession.prototype as unknown as StealCandidate;
+    const original = proto.sendCustomMessage;
+    if (typeof original !== "function") {
+      // AgentSession shape changed — bind stays fail-closed without steal.
+      return;
+    }
+    // PRIMARY capture hook: `_bindExtensionCore` runs at session construction,
+    // before any extension code, so a stock pi host is captured without ever
+    // probing. The omp fork bundle does not expose the symbol — guard with
+    // typeof so the patch stays a no-op there and the probe fallback handles
+    // capture. Full original gates apply (persistence gate included,
+    // probe=false).
+    if (typeof proto._bindExtensionCore === "function") {
+      const bindCore = proto._bindExtensionCore;
+      proto._bindExtensionCore = function patchedBindExtensionCore(this: StealCandidate, ...args: unknown[]) {
+        try {
+          captureHostSessionSend(this, false);
+        } catch {
+          // never break session construction
+        }
+        return bindCore.apply(this, args);
+      };
+    }
+    // Invoke the original with the runtime's live session as receiver. A
+    // `.bind(proto)` forward would freeze the receiver to the prototype, and a
+    // bound function's receiver cannot be overridden by `.call(this, …)` — the
+    // original would run with `this.agent` undefined and every non-trigger
+    // send would reject, silently losing the delivery. Patch predates session
+    // construction: this here is the session that later calls sendCustomMessage.
+    proto.sendCustomMessage = function patchedSendCustomMessage(
+      this: StealCandidate,
+      message: { customType: string; content: string; display: boolean },
+      options: { triggerTurn: boolean; deliverAs: "followUp" },
+    ) {
+      const isProbe = message?.customType === DELIVERY_PROBE_CUSTOM_TYPE;
       try {
-        captureHostSessionSend(this);
+        captureHostSessionSend(this, isProbe);
       } catch {
-        // never break session construction
+        // never break the host send
       }
-      return original.apply(this, [runner]);
+      // Capture-only probe: the probe exists only to trip this capture patch.
+      // Never append to agent.state.messages, never write a session entry,
+      // never inject an LLM user turn — swallow it entirely.
+      if (isProbe) return Promise.resolve();
+      return original.call(this, message, options);
     };
   } catch {
     // AgentSession unavailable or shape changed — bind stays fail-closed without steal
@@ -484,6 +570,10 @@ function deliverAndAck(
   if (inFlightDeliveries.has(runId)) return;
   const endpoint = sessionEndpoints.get(sessionId);
   if (!endpoint || endpoint.suspended || endpoint.sessionId !== sessionId) return;
+  // Fail-closed (no send): keep the run pending on disk with NO lock, so a
+  // synchronous re-bind + flush (e.g. probe retry on the next session_start)
+  // is not locked out by a microtask that has not run yet.
+  if (typeof endpoint.send !== "function") return;
 
   inFlightDeliveries.add(runId);
   const startedGeneration = endpoint.generation;
@@ -537,7 +627,7 @@ function routeBackgroundDelivery(
  */
 export function bindSessionDelivery(
   sessionId: string,
-  _pi: ExtensionAPI,
+  pi: ExtensionAPI,
   opts: {
     loadSettings?: () => WorkflowSettings;
     manager?: WorkflowManager;
@@ -565,15 +655,6 @@ export function bindSessionDelivery(
   patchAgentSessionCapture();
   patchBindCoreObserve();
 
-  const stolen = opts.stableSend ?? boundSessionSends.get(sessionId);
-
-  if (!stolen) {
-    console.warn(
-      `[workflow-delivery] no session-stable thenable send for session ${sessionId}; ` +
-        "endpoint registered fail-closed (completions stay on disk until a host send is captured).",
-    );
-  }
-
   // Optional identity check — refuse to bind when sessionManager disagrees.
   try {
     const liveId = opts.sessionManager?.getSessionId?.();
@@ -583,6 +664,23 @@ export function bindSessionDelivery(
     }
   } catch {
     // getSessionId unavailable — continue
+  }
+
+  let stolen = opts.stableSend ?? boundSessionSends.get(sessionId);
+  if (!stolen) {
+    // Quiet hosts never call sendCustomMessage themselves, so the prototype
+    // patch never captured. One invisible no-turn probe forces the host's void
+    // send wrapper through AgentSession.sendCustomMessage, populating the
+    // steal map synchronously.
+    probeHostSessionSend(pi, sessionId);
+    stolen = boundSessionSends.get(sessionId);
+  }
+
+  if (!stolen) {
+    console.warn(
+      `[workflow-delivery] no session-stable thenable send for session ${sessionId}; ` +
+        "endpoint registered fail-closed (completions stay on disk until a host send is captured).",
+    );
   }
 
   const prev = sessionEndpoints.get(sessionId);
@@ -618,6 +716,9 @@ export function dropSessionDelivery(sessionId: string | undefined): void {
   if (!sessionId) return;
   sessionEndpoints.delete(sessionId);
   boundSessionSends.delete(sessionId);
+  // A dropped session may be rebound fresh (e.g. replaced id): forget probe
+  // bookkeeping so the next bindSessionDelivery probes again.
+  probedSessionIds.delete(sessionId);
 }
 
 /**
@@ -794,6 +895,7 @@ export function _resetDeliveryRegistriesForTests(): void {
   sessionEndpoints.clear();
   boundSessionSends.clear();
   inFlightDeliveries.clear();
+  probedSessionIds.clear();
 }
 
 /** @internal test helper — register a thenable session-stable send (steal map). */
@@ -801,9 +903,19 @@ export function _registerBoundSessionSendForTests(sessionId: string, send: Deliv
   boundSessionSends.set(sessionId, send);
 }
 
-/** @internal test helper — whether the steal map holds a send for this session. */
-export function _hasBoundSessionSendForTests(sessionId: string): boolean {
-  return boundSessionSends.has(sessionId);
+/** @internal test helper — register a host-shaped session (steal-map host filter). */
+export function _registerHostSessionForTests(session: StealCandidate): void {
+  captureHostSessionSend(session);
+}
+
+/** @internal test helper — inspect which session ids currently hold a stolen send. */
+export function _getStealMapForTests(): ReadonlyMap<string, DeliverySend> {
+  return boundSessionSends;
+}
+
+/** @internal test helper — inspect whether a session is marked successfully probed. */
+export function _isProbedForTests(sessionId: string): boolean {
+  return probedSessionIds.has(sessionId);
 }
 
 /** @internal test helper — inspect endpoint suspended flag. */
