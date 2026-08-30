@@ -18,6 +18,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { listAvailableModels } from "./agent.js";
 import { MODEL_TIERS_FILE } from "./config.js";
+import { workflowProjectPaths } from "./workflow-paths.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -30,6 +31,16 @@ import { MODEL_TIERS_FILE } from "./config.js";
  */
 export interface ModelTierConfig {
   tiers: Record<string, string>;
+}
+
+/** Options for loading the global file, a project overlay, or an explicit test path. */
+export interface ModelTierConfigOptions {
+  /** Explicit global (or single-file) path; primarily for tests. */
+  configPath?: string;
+  /** Project cwd whose project-level tiers overlay the global file. */
+  cwd?: string;
+  /** Explicit project tiers path; primarily for tests. */
+  projectConfigPath?: string;
 }
 
 /**
@@ -55,6 +66,11 @@ export interface RankableModel {
 /** Path to the model tiers JSON config file (~/.pi/workflows/model-tiers.json). */
 export function getModelTierConfigPath(): string {
   return join(homedir(), MODEL_TIERS_FILE);
+}
+
+/** Path to this project's optional model-tiers overlay. */
+export function getProjectModelTierConfigPath(cwd: string): string {
+  return workflowProjectPaths(cwd).modelTiersPath;
 }
 
 // ---------------------------------------------------------------------------
@@ -236,22 +252,47 @@ function isValidTiersMap(value: unknown): value is Record<string, string> {
   return entries.every(([key, val]) => key.trim().length > 0 && typeof val === "string" && val.trim().length > 0);
 }
 
-/**
- * Load the model tier config from disk. Returns null if the file does not
- * exist or is unparseable (callers fall back to a default).
- */
-export function loadModelTierConfig(configPath?: string): ModelTierConfig | null {
-  const path = configPath ?? getModelTierConfigPath();
+function readTierConfig(path: string): ModelTierConfig | null {
   if (!existsSync(path)) return null;
   try {
     const raw = readFileSync(path, "utf-8");
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== "object") return null;
-    if (!isValidTiersMap(parsed.tiers)) return null;
+    if (!isValidTiersMap((parsed as { tiers?: unknown }).tiers)) return null;
     return parsed as ModelTierConfig;
   } catch {
     return null;
   }
+}
+
+function normalizeLoadOptions(configPathOrOptions?: string | ModelTierConfigOptions): ModelTierConfigOptions {
+  return typeof configPathOrOptions === "string" ? { configPath: configPathOrOptions } : (configPathOrOptions ?? {});
+}
+
+/**
+ * Load the model tier config from disk. Returns null if the file does not
+ * exist or is unparseable (callers fall back to a default).
+ *
+ * A string path (or `{ configPath }` without a project) reads that single
+ * file — the historical global-only behavior.
+ * `{ cwd }` overlays `~/.pi/workflows/projects/<key>/model-tiers.json` on the
+ * global file; project keys win. Missing project file = global-only.
+ */
+export function loadModelTierConfig(configPathOrOptions?: string | ModelTierConfigOptions): ModelTierConfig | null {
+  const options = normalizeLoadOptions(configPathOrOptions);
+  const globalPath = options.configPath ?? getModelTierConfigPath();
+  const global = readTierConfig(globalPath);
+  const overlayRequested = options.cwd !== undefined || options.projectConfigPath !== undefined;
+  if (!overlayRequested) return global;
+
+  const projectPath =
+    options.projectConfigPath ?? (options.cwd ? getProjectModelTierConfigPath(options.cwd) : undefined);
+  if (!projectPath) return global;
+  const project = readTierConfig(projectPath);
+  if (!project) return global;
+  if (!global) return project;
+  const merged = { tiers: { ...global.tiers, ...project.tiers } };
+  return isValidTiersMap(merged.tiers) ? merged : null;
 }
 
 /**

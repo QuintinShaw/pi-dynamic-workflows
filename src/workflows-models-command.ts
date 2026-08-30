@@ -13,6 +13,7 @@
  * When editing a tier, users pick a model, then an optional thinking level.
  */
 
+import { existsSync } from "node:fs";
 import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
 import {
   Container,
@@ -32,7 +33,10 @@ import {
 } from "./model-spec.js";
 import {
   buildDefaultTierConfig,
+  getModelTierConfigPath,
+  getProjectModelTierConfigPath,
   loadModelTierConfig,
+  type ModelTierConfig,
   saveModelTierConfig,
   sortedTierNames,
 } from "./model-tier-config.js";
@@ -52,9 +56,19 @@ export function registerWorkflowModelsCommand(pi: ExtensionAPI): void {
       // registry explicitly: since pi 0.80.8 the no-registry fallback inside
       // listAvailableModels() initializes asynchronously and reports [] on the
       // first call, which would rank defaults from an empty model list.
+      const cwd = ctx.cwd || process.cwd();
+      const globalPath = getModelTierConfigPath();
+      const projectPath = getProjectModelTierConfigPath(cwd);
+      let scope: "global" | "project" = existsSync(projectPath) ? "project" : "global";
       const currentModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
-      let config =
-        loadModelTierConfig() ?? buildDefaultTierConfig(currentModel, listAvailableModels(ctx.modelRegistry));
+      const defaults = () => buildDefaultTierConfig(currentModel, listAvailableModels(ctx.modelRegistry));
+      const loadForScope = (next: "global" | "project"): ModelTierConfig => {
+        if (next === "project") {
+          return loadModelTierConfig({ cwd }) ?? defaults();
+        }
+        return loadModelTierConfig(globalPath) ?? defaults();
+      };
+      let config = loadForScope(scope);
       let dirty = false;
 
       const ensureFresh = (cfg: typeof config) => {
@@ -67,6 +81,7 @@ export function registerWorkflowModelsCommand(pi: ExtensionAPI): void {
         const tiers = sortedTierNames(config);
         const menuOptions: string[] = [];
 
+        menuOptions.push(`Editing ${scope} tiers`);
         menuOptions.push("─".repeat(30));
         for (const name of tiers) {
           const model = config.tiers[name];
@@ -74,12 +89,17 @@ export function registerWorkflowModelsCommand(pi: ExtensionAPI): void {
         }
         menuOptions.push("─".repeat(30));
 
+        menuOptions.push(scope === "project" ? "Switch to global" : "Switch to project");
         menuOptions.push("Reset to defaults");
         menuOptions.push(dirty ? "Save and exit" : "Exit");
 
-        const choice = await ctx.ui.select("Model tier configuration", menuOptions);
+        const choice = await ctx.ui.select(`Model tier configuration (${scope})`, menuOptions);
 
         if (!choice) break;
+
+        if (choice === "Editing global tiers" || choice === "Editing project tiers") {
+          continue;
+        }
 
         // Handle "<tier> → [model]" selections
         for (const name of tiers) {
@@ -90,6 +110,19 @@ export function registerWorkflowModelsCommand(pi: ExtensionAPI): void {
             }
             break;
           }
+        }
+
+        if (choice === "Switch to global" || choice === "Switch to project") {
+          const nextScope = choice === "Switch to project" ? "project" : "global";
+          if (nextScope === scope) continue;
+          if (dirty) {
+            const confirmed = await ctx.ui.confirm("Switch scope", "Unsaved changes will be discarded. Continue?");
+            if (!confirmed) continue;
+          }
+          scope = nextScope;
+          config = loadForScope(scope);
+          dirty = false;
+          continue;
         }
 
         if (choice === "Reset to defaults") {
@@ -105,8 +138,8 @@ export function registerWorkflowModelsCommand(pi: ExtensionAPI): void {
 
         if (choice === "Save and exit" || choice === "Exit") {
           if (choice === "Save and exit") {
-            saveModelTierConfig(config);
-            ctx.ui.notify("Model tiers saved.", "info");
+            saveModelTierConfig(config, scope === "project" ? projectPath : globalPath);
+            ctx.ui.notify(scope === "project" ? "Project model tiers saved." : "Model tiers saved.", "info");
           }
           break;
         }

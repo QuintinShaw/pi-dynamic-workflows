@@ -219,7 +219,7 @@ The [full documentation](https://quintinshaw.github.io/pi-dynamic-workflows/) co
 <details>
 <summary><strong>Model tiers and run controls</strong></summary>
 
-Model tiers live at `~/.pi/workflows/model-tiers.json` and accept Pi CLI-style thinking suffixes:
+Model tiers live at `~/.pi/workflows/model-tiers.json`. A project file at `~/.pi/workflows/projects/<project>/model-tiers.json` overlays the global map (project keys win). They accept Pi CLI-style thinking suffixes:
 
 ```json
 {
@@ -231,7 +231,7 @@ Model tiers live at `~/.pi/workflows/model-tiers.json` and accept Pi CLI-style t
 }
 ```
 
-Use `/workflows-models` to edit them interactively. Without a config, the extension ranks authenticated models by capability hints and assigns distinct models when possible.
+Use `/workflows-models` to edit them interactively; it is cwd-aware and can save to the project or global file. A project save writes the resolved map, including keys currently inherited from global. Without a config, the extension ranks authenticated models by capability hints and assigns distinct models when possible.
 
 Omitted `tokenBudget` and `agentTimeoutMs` values use configured `defaultTokenBudget` and `defaultAgentTimeoutMs` settings; without them, runs are unlimited and have no hard per-agent timeout. Add per-run or per-agent values when you need explicit gates. `concurrency` is clamped to 16; `agentRetries` retries only recoverable failures. Defaults live in `~/.pi/workflows/settings.json`; `defaultTokenBudget` is a soft pre-call gate, and a project-level override of `null` cancels a global budget.
 
@@ -247,7 +247,7 @@ Pausing and resuming a run keeps the limits it started with — `maxAgents`, `ag
 Extension state lives outside the repository under `~/.pi/workflows`:
 
 - global settings and tiers: `~/.pi/workflows/settings.json` and `model-tiers.json`
-- project runs, journals, locks, and saved overrides: `~/.pi/workflows/projects/<project>/`
+- project runs, journals, locks, saved overrides, and optional tier overlay: `~/.pi/workflows/projects/<project>/`
 - older project-local `.pi/workflows/runs` and `.pi/workflows/saved` remain readable as fallbacks
 
 Subagents are in-memory by default. Set `persistAgentSessions: true` to retain full transcripts in Pi's standard session directory. This creates one file per unthreaded call or named thread and may store sensitive material that an agent read, so enable it deliberately.

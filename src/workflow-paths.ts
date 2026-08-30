@@ -20,6 +20,7 @@ export interface WorkflowProjectPaths {
   runsDir: string;
   savedDir: string;
   settingsPath: string;
+  modelTiersPath: string;
   legacyRunsDir: string;
   legacySavedDir: string;
 }
@@ -48,6 +49,7 @@ export function workflowProjectPaths(cwd: string): WorkflowProjectPaths {
     runsDir: join(rootDir, "runs"),
     savedDir: join(rootDir, "saved"),
     settingsPath: join(rootDir, "settings.json"),
+    modelTiersPath: join(rootDir, "model-tiers.json"),
     legacyRunsDir: resolve(cwd, WORKFLOW_RUNS_DIR),
     legacySavedDir: resolve(cwd, WORKFLOW_SAVED_DIR),
   };

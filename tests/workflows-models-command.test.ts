@@ -10,10 +10,11 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it, mock } from "node:test";
+import { getModelTierConfigPath, getProjectModelTierConfigPath } from "../src/model-tier-config.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
 async function loadCommand() {
@@ -244,6 +245,155 @@ describe("workflows-models-command", () => {
         menu.includes("mockvendor/cheap-model"),
         `default tiers must rank from the host registry's models; menu was:\n${menu}`,
       );
+    });
+  });
+
+  describe("project vs global scope", () => {
+    async function registeredHandler() {
+      const { registerWorkflowModelsCommand } = await loadCommand();
+      let handler: ((args: unknown, ctx: unknown) => Promise<void>) | undefined;
+      const mockPi = {
+        registerCommand: mock.fn(
+          (_name: string, opts: { handler?: (args: unknown, ctx: unknown) => Promise<void> }) => {
+            handler = opts.handler;
+          },
+        ),
+      };
+      registerWorkflowModelsCommand(mockPi as never);
+      assert.ok(handler, "handler should be registered");
+      return handler;
+    }
+
+    function cheapRegistry() {
+      const cheap = {
+        provider: "mockvendor",
+        id: "cheap-model",
+        cost: { input: 0, output: 1, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 100000,
+      };
+      return { getAvailable: () => [cheap], getAll: () => [cheap], find: () => cheap };
+    }
+
+    it("defaults to global scope and leaves behavior unchanged when no project file exists", async () => {
+      const handler = await registeredHandler();
+      const titles: string[] = [];
+      const selectCalls: string[][] = [];
+      const home = mkdtempSync(join(tmpdir(), "pi-dw-wmc-home-"));
+      const cwd = mkdtempSync(join(tmpdir(), "pi-dw-wmc-cwd-"));
+      try {
+        await withFakeHomeAsync(home, async () => {
+          const globalPath = getModelTierConfigPath();
+          mkdirSync(join(globalPath, ".."), { recursive: true });
+          writeFileSync(globalPath, JSON.stringify({ tiers: { small: "global/small" } }));
+          const ctx = {
+            cwd,
+            waitForIdle: async () => {},
+            model: undefined,
+            modelRegistry: cheapRegistry(),
+            ui: {
+              select: mock.fn(async (title: string, options: string[]) => {
+                titles.push(title);
+                selectCalls.push(options);
+                return "Exit";
+              }),
+              notify: mock.fn(),
+              confirm: mock.fn(async () => false),
+              custom: mock.fn(async () => null),
+            },
+          };
+          await handler(undefined, ctx);
+        });
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+        rmSync(cwd, { recursive: true, force: true });
+      }
+
+      assert.ok(titles[0]?.includes("global"), `title should indicate global scope: ${titles[0]}`);
+      const menu = selectCalls[0]?.join("\n") ?? "";
+      assert.ok(menu.includes("Editing global tiers"), `menu was:\n${menu}`);
+      assert.ok(menu.includes("small tier → global/small"), `menu was:\n${menu}`);
+      assert.ok(menu.includes("Switch to project"), `menu was:\n${menu}`);
+    });
+
+    it("defaults to project scope and shows overlay-winning models when a project file exists", async () => {
+      const handler = await registeredHandler();
+      const titles: string[] = [];
+      const selectCalls: string[][] = [];
+      const home = mkdtempSync(join(tmpdir(), "pi-dw-wmc-home-"));
+      const cwd = mkdtempSync(join(tmpdir(), "pi-dw-wmc-cwd-"));
+      try {
+        await withFakeHomeAsync(home, async () => {
+          const globalPath = getModelTierConfigPath();
+          const projectPath = getProjectModelTierConfigPath(cwd);
+          mkdirSync(join(globalPath, ".."), { recursive: true });
+          mkdirSync(join(projectPath, ".."), { recursive: true });
+          writeFileSync(globalPath, JSON.stringify({ tiers: { small: "global/small", medium: "global/medium" } }));
+          writeFileSync(projectPath, JSON.stringify({ tiers: { small: "project/small" } }));
+          const ctx = {
+            cwd,
+            waitForIdle: async () => {},
+            model: undefined,
+            modelRegistry: cheapRegistry(),
+            ui: {
+              select: mock.fn(async (title: string, options: string[]) => {
+                titles.push(title);
+                selectCalls.push(options);
+                return "Exit";
+              }),
+              notify: mock.fn(),
+              confirm: mock.fn(async () => false),
+              custom: mock.fn(async () => null),
+            },
+          };
+          await handler(undefined, ctx);
+        });
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+        rmSync(cwd, { recursive: true, force: true });
+      }
+
+      assert.ok(titles[0]?.includes("project"), `title should indicate project scope: ${titles[0]}`);
+      const menu = selectCalls[0]?.join("\n") ?? "";
+      assert.ok(menu.includes("Editing project tiers"), `menu was:\n${menu}`);
+      assert.ok(menu.includes("small tier → project/small"), `menu was:\n${menu}`);
+      assert.ok(menu.includes("medium tier → global/medium"), `menu was:\n${menu}`);
+      assert.ok(menu.includes("Switch to global"), `menu was:\n${menu}`);
+    });
+
+    it("saves the working config to the project file after switching scope", async () => {
+      const handler = await registeredHandler();
+      const home = mkdtempSync(join(tmpdir(), "pi-dw-wmc-home-"));
+      const cwd = mkdtempSync(join(tmpdir(), "pi-dw-wmc-cwd-"));
+      try {
+        await withFakeHomeAsync(home, async () => {
+          const globalPath = getModelTierConfigPath();
+          const projectPath = getProjectModelTierConfigPath(cwd);
+          mkdirSync(join(globalPath, ".."), { recursive: true });
+          writeFileSync(globalPath, JSON.stringify({ tiers: { small: "global/small" } }));
+          const actions = ["Switch to project", "Reset to defaults", "Save and exit"];
+          const ctx = {
+            cwd,
+            waitForIdle: async () => {},
+            model: undefined,
+            modelRegistry: cheapRegistry(),
+            ui: {
+              select: mock.fn(async () => actions.shift() ?? "Exit"),
+              notify: mock.fn(),
+              confirm: mock.fn(async () => true),
+              custom: mock.fn(async () => null),
+            },
+          };
+          await handler(undefined, ctx);
+          assert.equal(existsSync(projectPath), true, "project file should be written");
+          const saved = JSON.parse(readFileSync(projectPath, "utf-8"));
+          assert.equal(saved.tiers.small, "mockvendor/cheap-model");
+          const global = JSON.parse(readFileSync(globalPath, "utf-8"));
+          assert.equal(global.tiers.small, "global/small", "global file must stay untouched");
+        });
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+        rmSync(cwd, { recursive: true, force: true });
+      }
     });
   });
 });
