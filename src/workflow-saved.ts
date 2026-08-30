@@ -3,7 +3,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { join } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
   ensureDir as ensureDirFs,
   listJsonFilesSafe,
@@ -22,7 +22,7 @@ export interface SavedWorkflow {
   name: string;
   /** Human-readable description. */
   description: string;
-  /** The workflow script. */
+  /** The workflow script. Filled from a sibling `scriptPath` when that field is used instead of an inline script. */
   script: string;
   /** Optional parameter schema for parameterized workflows. */
   parameters?: Record<string, { type: string; description?: string; required?: boolean; default?: unknown }>;
@@ -101,6 +101,25 @@ export function assertSafeSavedWorkflowName(name: string): void {
   }
 }
 
+/**
+ * Resolve a saved-workflow `scriptPath` against that workflow's own saved
+ * directory. Returns the resolved file path, or null if the value is empty,
+ * absolute, contains NUL, or would escape the directory.
+ */
+export function resolveSavedScriptPath(savedDir: string, scriptPath: string): string | null {
+  if (typeof scriptPath !== "string") return null;
+  if (scriptPath.length === 0 || scriptPath.trim().length === 0 || scriptPath.includes("\0")) return null;
+  if (isAbsolute(scriptPath)) return null;
+  const asPosix = scriptPath.replace(/\\/g, "/");
+  if (asPosix.startsWith("/") || /^[a-zA-Z]:/.test(asPosix)) return null;
+  const resolved = resolve(savedDir, scriptPath);
+  const rel = relative(resolve(savedDir), resolved);
+  if (rel === "") return null;
+  if (isAbsolute(rel)) return null;
+  if (rel === ".." || rel.startsWith(`..${sep}`)) return null;
+  return resolved;
+}
+
 export function createWorkflowStorage(cwd: string, fsOverride?: Partial<PersistenceFsLayer>): WorkflowStorage {
   const fs = resolvePersistenceFs(fsOverride);
   const paths = workflowProjectPaths(cwd);
@@ -128,8 +147,21 @@ export function createWorkflowStorage(cwd: string, fsOverride?: Partial<Persiste
     const data = readJsonWithBackupRecovery<Record<string, unknown>>(fs, path);
     if (!data || typeof data !== "object" || !isSafeSavedWorkflowName((data as { name?: string }).name ?? ""))
       return null;
+    const raw = data as Record<string, unknown>;
+    const { scriptPath: rawScriptPath, ...rest } = raw;
+    let script = rest.script;
+    if (!Object.hasOwn(raw, "script") && typeof rawScriptPath === "string") {
+      const resolved = resolveSavedScriptPath(dirname(path), rawScriptPath);
+      if (!resolved) return null;
+      try {
+        script = fs.readFileSync(resolved, "utf-8");
+      } catch {
+        return null;
+      }
+    }
     return {
-      ...(data as Omit<SavedWorkflow, "location" | "source" | "path">),
+      ...(rest as Omit<SavedWorkflow, "location" | "source" | "path">),
+      script: script as string,
       location: locationFor(source),
       source,
       path,
