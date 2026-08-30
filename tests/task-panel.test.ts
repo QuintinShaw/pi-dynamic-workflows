@@ -912,6 +912,36 @@ describe("installResultDelivery", () => {
     assert.ok(calls[0].content.includes("test-workflow"));
   });
 
+  it("a failed send overlapping a re-bind cannot double-deliver", async () => {
+    // Generation N's send fails; the generation-change retry re-arms the lock
+    // (new token) and starts send 2. N's stale .finally must NOT release the
+    // lock T2 holds — otherwise a third caller could start a duplicate send.
+    const resolvers: Array<(err: Error) => void> = [];
+    let sends = 0;
+    const pi = createMockPi();
+    const manager = createMockManager(makeRun({ sessionId: SESSION, runId: "run-double" }));
+    const stableSend: StableSend = () => {
+      sends++;
+      return new Promise<never>((_resolve, reject) => {
+        resolvers.push(reject);
+      });
+    };
+    setup(pi, manager, SESSION, { stableSend });
+    manager.emit("complete", { runId: "run-double" });
+    assert.equal(sends, 1, "first in-flight send");
+
+    mod.bindSessionDelivery(SESSION, pi, { manager, stableSend }); // generation bump
+    resolvers[0](new Error("send failed")); // fail send 1 → release + generation retry
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(sends, 2, "generation-change flush retries the send exactly once");
+
+    manager.emit("complete", { runId: "run-double" });
+    assert.equal(sends, 2, "the retried send keeps its lock — no third delivery");
+    resolvers[1]?.(new Error("test cleanup"));
+  });
+
   it("never silently drops pending deliveries when the queue grows past the soft cap", () => {
     const pi1 = createMockPi();
     const pi2 = createMockPi();

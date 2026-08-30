@@ -206,8 +206,9 @@ const sessionEndpoints = new Map<string, SessionDeliveryEndpoint>();
  */
 const boundSessionSends = new Map<string, DeliverySend>();
 
-/** runIds with an in-flight deliver-and-ack so bind flush does not double-send. */
-const inFlightDeliveries = new Set<string>();
+/** runId → token of the deliver-and-ack that owns the lock, so bind flush does not double-send. Ownership prevents a stale finally from releasing a newer send's lock. */
+const inFlightDeliveries = new Map<string, number>();
+let inFlightSeq = 0;
 
 /**
  * Custom type for the session bind probe (see probeHostSessionSend). Sent
@@ -585,9 +586,15 @@ function deliverAndAck(
   // synchronous re-bind + flush (e.g. probe retry on the next session_start)
   // is not locked out by a microtask that has not run yet.
   if (typeof endpoint.send !== "function") return;
-
-  inFlightDeliveries.add(runId);
+  // Ownership token: a stale finally (from a superseded send) must never
+  // release the lock held by a newer delivery — that would let a third
+  // caller double-deliver the same result mid-flight.
+  const lockToken = ++inFlightSeq;
+  inFlightDeliveries.set(runId, lockToken);
   const startedGeneration = endpoint.generation;
+  const release = () => {
+    if (inFlightDeliveries.get(runId) === lockToken) inFlightDeliveries.delete(runId);
+  };
   void tryDeliverEndpoint(endpoint, content)
     .then((ok) => {
       if (ok) {
@@ -595,16 +602,15 @@ function deliverAndAck(
         return;
       }
       // Release the in-flight lock before a generation-change retry so flush
-      // can actually pick this run back up.
-      inFlightDeliveries.delete(runId);
+      // can actually pick this run back up. If the retry re-arms the lock with
+      // a new token before this handler's release runs, the release is a no-op.
+      release();
       const current = sessionEndpoints.get(sessionId);
       if (current && !current.suspended && current.generation !== startedGeneration && current.manager) {
         flushSessionDiskPending(current.manager, sessionId, current);
       }
     })
-    .finally(() => {
-      inFlightDeliveries.delete(runId);
-    });
+    .finally(release);
 }
 
 function routeBackgroundDelivery(
