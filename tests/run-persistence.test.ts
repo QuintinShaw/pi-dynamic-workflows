@@ -767,7 +767,7 @@ test(
 );
 
 test(
-  "createRunPersistence retention: terminal runs beyond the cap are evicted oldest-first; running/paused survive purely because of the status filter, not save order",
+  "createRunPersistence retention keeps active and undelivered runs while evicting the oldest delivered terminals",
   withTempCwd(async (cwd) => {
     const rp = createRunPersistence(cwd, undefined, { maxTerminalRunsOnDisk: 3 });
 
@@ -782,8 +782,12 @@ test(
     // masking whether the status filter does anything at all.
     rp.save(baseRunState("still-running", "2023-01-01T00:00:00.000Z", "running"));
     rp.save(baseRunState("still-paused", "2023-01-01T00:00:00.000Z", "paused"));
+    rp.save({
+      ...baseRunState("still-pending", "2023-01-01T00:00:00.000Z", "completed"),
+      pendingDelivery: { kind: "complete" },
+    });
 
-    // Now enough terminal runs (saved after, so newer) to exceed the cap.
+    // Now enough delivered terminal runs (saved after, so newer) to exceed the cap.
     for (let i = 0; i < 5; i++) {
       rp.save(baseRunState(`terminal-${i}`, `2024-01-0${i + 1}T00:00:00.000Z`, "completed"));
     }
@@ -804,6 +808,7 @@ test(
       runIds.includes("still-paused"),
       "a paused run survives even though it has the OLDEST updatedAt of everything saved here",
     );
+    assert.ok(runIds.includes("still-pending"), "an undelivered terminal run is not evicted");
     assert.equal(rp.load("terminal-0"), null, "an evicted run's file is actually gone from disk");
   }),
 );
