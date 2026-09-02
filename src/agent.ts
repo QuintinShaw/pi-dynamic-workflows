@@ -32,6 +32,13 @@ import {
   type RankableModel,
   resolveTierModel,
 } from "./model-tier-config.js";
+import {
+  applyPreSpawnModel,
+  classifyModelSource,
+  getPreSpawnModelResolver,
+  type ModelSource,
+  type PreSpawnModelResolver,
+} from "./pre-spawn-model.js";
 import { createStructuredOutputTool, type StructuredOutputCapture } from "./structured-output.js";
 
 const LIVE_USAGE_EMIT_INTERVAL_MS = 250;
@@ -232,6 +239,12 @@ export interface WorkflowAgentOptions {
    * to the session default when no config is saved yet.
    */
   mainModel?: string;
+  /**
+   * Optional host policy run after DW model-intent resolution and before
+   * createAgentSession. Per-instance; a per-run `AgentRunOptions.preSpawnModel`
+   * overrides this, which overrides {@link setPreSpawnModelResolver}.
+   */
+  preSpawnModel?: PreSpawnModelResolver;
   /**
    * Shared model registry from the host Pi session. When provided, subagents
    * resolve tier/model specs against the same registry the main session uses,
@@ -534,6 +547,13 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
    * onModelFallback below for how that degrade stays visible.
    */
   tier?: string;
+  /**
+   * Provenance of `model`/`tier` as known by the caller (workflow layer).
+   * When omitted, {@link classifyModelSource} infers it from model/tier/resolved spec.
+   */
+  modelSource?: ModelSource;
+  /** Per-run host policy; overrides the instance and process resolvers. */
+  preSpawnModel?: PreSpawnModelResolver;
   /** Called with the resolved model id once known (for display/telemetry). */
   onModelResolved?: (modelId: string) => void;
   /**
@@ -621,6 +641,7 @@ export class WorkflowAgent {
   private readonly persistAgentSessions: boolean;
   private readonly instructions?: string;
   private readonly mainModel?: string;
+  private readonly preSpawnModel?: PreSpawnModelResolver;
   /** Shared registry from the host session, when provided. */
   private readonly sharedRegistry?: ModelRegistry;
   /** Lazily built once; shares the SDK's agentDir/auth so resolved models are authed. */
@@ -663,6 +684,7 @@ export class WorkflowAgent {
     this.persistAgentSessions = options.persistAgentSessions ?? false;
     this.instructions = options.instructions;
     this.mainModel = options.mainModel;
+    this.preSpawnModel = options.preSpawnModel;
     this.sharedRegistry = options.modelRegistry;
   }
 
@@ -896,12 +918,34 @@ export class WorkflowAgent {
     // Resolve the model spec (explicit model > tier > session default). This
     // composes with phase-based routing in workflow.ts, which only supplies
     // options.model when a phase pattern matches — so an explicit model wins.
-    const modelSpec = resolveAgentModelSpec(
+    let modelSpec = resolveAgentModelSpec(
       options,
       this.mainModel,
       () => this.loadTierConfig(),
       () => warnTierUnconfiguredOnce(this.mainModel, modelRegistry),
     );
+
+    const modelSource = classifyModelSource({
+      model: options.model,
+      tier: options.tier,
+      resolvedModel: modelSpec,
+      modelSource: options.modelSource,
+    });
+    const resolver = options.preSpawnModel ?? this.preSpawnModel ?? getPreSpawnModelResolver();
+    let pinAfterPolicy = Boolean(options.model || options.tier);
+    if (resolver) {
+      const decision = await applyPreSpawnModel(resolver, {
+        requestedModel: options.model,
+        tier: options.tier,
+        resolvedModel: modelSpec,
+        modelSource,
+        label: options.label,
+      });
+      if (decision.action === "use") {
+        modelSpec = decision.model;
+        pinAfterPolicy = true;
+      }
+    }
 
     // Resolve a requested model spec to a Model object. Specs use Pi CLI-style
     // parsing, including an optional :thinking suffix such as gpt-5.5:xhigh.
@@ -921,7 +965,7 @@ export class WorkflowAgent {
     //     that model, so a broken default tier degrades to the session default
     //     instead of failing every untagged agent in the run — but the degrade
     //     still needs to be loud (onModelFallback), not a silent continuation.
-    const isExplicitRequest = Boolean(options.model || options.tier);
+    const isExplicitRequest = pinAfterPolicy;
     let resolvedModel: Model<any> | undefined;
     let resolvedThinkingLevel: CreateAgentSessionOptions["thinkingLevel"] | undefined;
     if (modelSpec) {
