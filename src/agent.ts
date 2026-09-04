@@ -933,6 +933,7 @@ export class WorkflowAgent {
     });
     const resolver = options.preSpawnModel ?? this.preSpawnModel ?? getPreSpawnModelResolver();
     let pinAfterPolicy = Boolean(options.model || options.tier);
+    let policySelectedSpec: string | undefined;
     if (resolver) {
       const decision = await applyPreSpawnModel(resolver, {
         requestedModel: options.model,
@@ -944,6 +945,7 @@ export class WorkflowAgent {
       if (decision.action === "use") {
         modelSpec = decision.model;
         pinAfterPolicy = true;
+        policySelectedSpec = decision.model;
       }
     }
 
@@ -975,11 +977,13 @@ export class WorkflowAgent {
       if (resolved.warning) console.warn(`[workflow] ${resolved.warning}`);
       if (!resolved.model) {
         if (isExplicitRequest) {
-          // The resolver's error already names the spec and the remedy; the tier
-          // branch swaps in its own message so the config source is named too.
-          const message = options.model
-            ? (resolved.error ?? `Model "${modelSpec}" not found. Use /workflows-models to choose an available model.`)
-            : `tier "${options.tier}" from model-tiers.json resolves to "${modelSpec}", which is not available. Use /workflows-models to choose an available model.`;
+          // Policy `use` pins the spec: name that spec, not the original tier/model.
+          // Otherwise a session/default `use` would report `tier "undefined"`.
+          const message = policySelectedSpec
+            ? `Model "${modelSpec}" selected by preSpawnModel policy was not found. Use /workflows-models to choose an available model.`
+            : options.model
+              ? (resolved.error ?? `Model "${modelSpec}" not found. Use /workflows-models to choose an available model.`)
+              : `tier "${options.tier}" from model-tiers.json resolves to "${modelSpec}", which is not available. Use /workflows-models to choose an available model.`;
           throw new WorkflowError(message, WorkflowErrorCode.MODEL_NOT_FOUND, {
             recoverable: false,
             agentLabel: options.label,

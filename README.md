@@ -324,10 +324,13 @@ An independent Pi extension (or embedder) can register one process-wide policy t
 import { setPreSpawnModelResolver } from "@quintinshaw/pi-dynamic-workflows";
 
 export default function (_pi) {
+  // Example host policy — not required DW behavior.
   setPreSpawnModelResolver(async (ctx) => {
-    // ctx.modelSource is "explicit" | "tier" | "default" | "session"
-    if (ctx.modelSource === "explicit") return { action: "unchanged" };
-    // Example: org availability policy, not a required built-in.
+    // ctx.modelSource is "explicit" | "tier" | "phase" | "default" | "session"
+    if (ctx.modelSource === "explicit" || ctx.modelSource === "tier" || ctx.modelSource === "phase") {
+      return { action: "unchanged" };
+    }
+    // Only untagged default / session fallback is overridden in this example.
     return { action: "use", model: "provider/model-id" };
     // return { action: "reject", reason: "policy refused this spawn" };
   });
@@ -336,7 +339,9 @@ export default function (_pi) {
 
 Unexpected policy errors do not fall back to the parent/session model.
 
-**Process-wide, single resolver.** Registration is stored on `globalThis` under `Symbol.for("@quintinshaw/pi-dynamic-workflows.preSpawnModelResolver")` so an independent extension and the packaged/dist workflow runtime share one slot even if Node loaded two copies of this package. There is no middleware chain, priority, or registry: the last `setPreSpawnModelResolver` call wins; pass `undefined` to clear. The resolver is not serialized into worker context and does not cross process boundaries. Per-run `preSpawnModel` on `WorkflowAgent.run` overrides the process resolver (tests/embedders).
+**Resolver precedence (highest wins):** per-run `AgentRunOptions.preSpawnModel` > instance `WorkflowAgentOptions.preSpawnModel` > process `setPreSpawnModelResolver`.
+
+**Process-wide, single resolver.** Registration is stored on `globalThis` under `Symbol.for("@quintinshaw/pi-dynamic-workflows.preSpawnModelResolver")` so an independent extension and the packaged/dist workflow runtime share one slot even if Node loaded two copies of this package. There is no middleware chain, priority, or registry: the last `setPreSpawnModelResolver` call wins; pass `undefined` to clear. The resolver is not serialized into worker context and does not cross process boundaries.
 
 ## Development
 

@@ -869,7 +869,7 @@ export async function runWorkflow<T = unknown>(
                   : agentOptions.tier
                     ? "tier"
                     : modelSpec
-                      ? "default"
+                      ? "phase"
                       : undefined,
               modelRegistry: options.modelRegistry,
               toolNames: agentDef?.tools,

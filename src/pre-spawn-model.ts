@@ -5,10 +5,11 @@ import { WorkflowError, WorkflowErrorCode } from "./errors.js";
  *
  * - explicit: script `model` or agentType `model`
  * - tier: script `tier` with no explicit model
- * - default: untagged medium-tier or phase routing (not a user pin)
+ * - phase: workflow phase/meta routing (`phases[].model` or `meta.model`)
+ * - default: untagged implicit medium-tier routing (not a user pin)
  * - session: no resolved spec; createAgentSession will use the session default
  */
-export type ModelSource = "explicit" | "tier" | "default" | "session";
+export type ModelSource = "explicit" | "tier" | "phase" | "default" | "session";
 
 /** Minimal fields a host policy needs to decide. No session/history. */
 export interface PreSpawnModelContext {
@@ -83,6 +84,17 @@ export async function applyPreSpawnModel(
       recoverable: false,
       agentLabel: ctx.label,
     });
+  }
+  const action = (decision as { action: string }).action;
+  if (action !== "unchanged" && action !== "use" && action !== "reject") {
+    throw new WorkflowError(
+      `preSpawnModel returned unknown action "${action}"`,
+      WorkflowErrorCode.AGENT_EXECUTION_ERROR,
+      {
+        recoverable: false,
+        agentLabel: ctx.label,
+      },
+    );
   }
   if (decision.action === "reject") {
     throw new WorkflowError(
