@@ -982,7 +982,8 @@ export class WorkflowAgent {
           const message = policySelectedSpec
             ? `Model "${modelSpec}" selected by preSpawnModel policy was not found. Use /workflows-models to choose an available model.`
             : options.model
-              ? (resolved.error ?? `Model "${modelSpec}" not found. Use /workflows-models to choose an available model.`)
+              ? (resolved.error ??
+                `Model "${modelSpec}" not found. Use /workflows-models to choose an available model.`)
               : `tier "${options.tier}" from model-tiers.json resolves to "${modelSpec}", which is not available. Use /workflows-models to choose an available model.`;
           throw new WorkflowError(message, WorkflowErrorCode.MODEL_NOT_FOUND, {
             recoverable: false,
