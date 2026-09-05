@@ -55,6 +55,11 @@ export enum WorkflowErrorCode {
    * so retrying the same spec would fail identically every time.
    */
   MODEL_NOT_FOUND = "MODEL_NOT_FOUND",
+  /**
+   * A host preSpawnModel policy rejected this agent before createAgentSession.
+   * Distinct from MODEL_NOT_FOUND: the model may be available; the policy refused spawn.
+   */
+  MODEL_SPAWN_REJECTED = "MODEL_SPAWN_REJECTED",
   /** Agent execution failed. */
   AGENT_EXECUTION_ERROR = "AGENT_EXECUTION_ERROR",
   /** Run state persistence failed. */

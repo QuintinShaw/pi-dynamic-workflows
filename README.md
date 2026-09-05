@@ -316,6 +316,33 @@ Two behavior changes to know about:
 - **Subagents no longer load host extensions by default.** Each run now builds one shared, extension-free resource loader for all of its subagents (a memory-leak mitigation). Skills, prompts, and `AGENTS.md` context still load, and the coding tools and any toolset (e.g. `web-research`) you hand a subagent are unaffected. What subagents lose is **host-extension-registered tools** — MCP bridges, browser tools, or anything else another installed extension adds. If an `agentType` names one of those tools in its allowlist, that entry now matches nothing. This also means a subagent can no longer recurse into another orchestration extension, even one not covered by the existing tool denylist.
 - **Checkpoints persisted before this release re-run once.** `checkpoint()`'s resume-identity hash now also covers `default`, `headless`, and `timeoutMs`, so changing any of them between runs correctly invalidates a stale cached answer. This is a one-time effect: any checkpoint cached under the old hash simply re-prompts once and then caches normally again.
 
+## Host: customize worker model before session creation
+
+An independent Pi extension (or embedder) can register one process-wide policy that runs **after** Dynamic Workflows resolves `model` / `tier` / phase intent and **before** `createAgentSession`. The policy may leave routing unchanged, override the concrete model, or reject the spawn. With no policy registered, routing is unchanged.
+
+```ts
+import { setPreSpawnModelResolver } from "@quintinshaw/pi-dynamic-workflows";
+
+export default function (_pi) {
+  // Example host policy — not required DW behavior.
+  setPreSpawnModelResolver(async (ctx) => {
+    // ctx.modelSource is "explicit" | "tier" | "phase" | "default" | "session"
+    if (ctx.modelSource === "explicit" || ctx.modelSource === "tier" || ctx.modelSource === "phase") {
+      return { action: "unchanged" };
+    }
+    // Only untagged default / session fallback is overridden in this example.
+    return { action: "use", model: "provider/model-id" };
+    // return { action: "reject", reason: "policy refused this spawn" };
+  });
+}
+```
+
+Unexpected policy errors do not fall back to the parent/session model.
+
+**Resolver precedence (highest wins):** per-run `AgentRunOptions.preSpawnModel` > instance `WorkflowAgentOptions.preSpawnModel` > process `setPreSpawnModelResolver`.
+
+**Process-wide, single resolver.** Registration is stored on `globalThis` under `Symbol.for("@quintinshaw/pi-dynamic-workflows.preSpawnModelResolver")` so an independent extension and the packaged/dist workflow runtime share one slot even if Node loaded two copies of this package. There is no middleware chain, priority, or registry: the last `setPreSpawnModelResolver` call wins; pass `undefined` to clear. The resolver is not serialized into worker context and does not cross process boundaries.
+
 ## Development
 
 ```bash
