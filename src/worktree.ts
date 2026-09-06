@@ -1,8 +1,7 @@
 /**
- * Per-agent git worktree isolation. When an agent requests `isolation: "worktree"`,
- * it runs in a throwaway worktree on its own branch so parallel agents can edit the
- * same files without conflict. Results are NOT auto-merged — the path is surfaced for
- * the caller to inspect. Falls back to a logged no-op when isolation isn't possible.
+ * it runs in a git worktree on its own branch so parallel agents can edit the
+ * same files without conflict. Results are NOT auto-merged. The path is logged
+ * and kept by default (`keepWorktree: false` deletes after the call).
  */
 
 import { execFile } from "node:child_process";
