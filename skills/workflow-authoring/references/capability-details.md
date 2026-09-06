@@ -18,7 +18,8 @@ Every exact fact below is projected from the installed extension's capability co
 - `schema`: plain JSON Schema (optional)
 - `model`: string (optional; highest-priority exact model selector)
 - `tier`: string (optional; configured route name; dynamic reference: model-routes)
-- `isolation`: "worktree" (optional)
+- `isolation`: "worktree" | false (optional)
+- `keepWorktree`: boolean (optional; default: true)
 - `thread`: string (optional; non-empty name; same-name calls must be sequential)
 - `agentType`: string (optional; must come from provided context; dynamic reference: agent-types)
 - `timeoutMs`: number | null (optional; default: run timeout; null disables)
@@ -34,6 +35,8 @@ Every exact fact below is projected from the installed extension's capability co
 - Constraint: an explicit model, agentType model, tier, or phase model that resolves to an unavailable model throws MODEL_NOT_FOUND naming the source (e.g. the tier and what it resolved to) instead of falling back
 - Constraint: only the implicit default medium tier (no explicit model, tier, agentType, or phase model requested) degrades to the session default when unavailable, logging a one-time run-visible warning instead of throwing
 - Constraint: worktree isolation is best-effort; failure logs that isolation was ignored and continues without an isolated working directory
+- Constraint: isolation: false opts out of an agentType worktree default
+- Constraint: keepWorktree defaults true (worktree kept for merge); false deletes after the call
 
 <a id="parallel"></a>
 ## parallel

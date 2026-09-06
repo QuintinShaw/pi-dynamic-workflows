@@ -446,10 +446,105 @@ return {}`;
       });
 
       assert.equal(seen.length, 1);
-      assert.ok(seen[0].cwd, "isolated agent should receive a cwd");
-      assert.notEqual(seen[0].cwd, repo, "agent cwd should not be the base repo");
+      const isolatedCwd = seen[0].cwd;
+      assert.ok(isolatedCwd, "isolated agent should receive a cwd");
+      assert.notEqual(isolatedCwd, repo, "agent cwd should not be the base repo");
       assert.equal(seen[0].cwdExists, true, "worktree cwd should exist while the agent runs");
       assert.ok(seen[0].instructions?.includes("Requested isolation: worktree"));
+      assert.equal(existsSync(isolatedCwd), true, "worktree kept after the call by default");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("isolation: false opts out of an agentType worktree default", async () => {
+    const repo = mkdtempSync(join(tmpdir(), "pi-agent-isolation-optout-"));
+    const git = (...args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "pipe" });
+    try {
+      git("init", "-q");
+      git("config", "user.email", "t@t.t");
+      git("config", "user.name", "t");
+      writeFileSync(join(repo, "file.txt"), "base\n");
+      git("add", ".");
+      git("commit", "-q", "-m", "init");
+
+      const isolatedRegistry: AgentRegistry = new Map([
+        [
+          "isolated-auditor",
+          {
+            name: "isolated-auditor",
+            prompt: "Run isolated.",
+            isolation: "worktree",
+            source: "project",
+          } as AgentDefinition,
+        ],
+      ]);
+      const { seen, runner } = capturingAgent();
+      const script = `export const meta = { name: 'optout', description: 'isolation false' }
+await agent('audit', { label: 'a', agentType: 'isolated-auditor', isolation: false })
+return {}`;
+
+      await runWorkflow(script, {
+        cwd: repo,
+        runId: "iso-optout",
+        agent: runner,
+        persistLogs: false,
+        agentRegistry: isolatedRegistry,
+      });
+
+      assert.equal(seen.length, 1);
+      assert.equal(seen[0].cwd, undefined, "opt-out should not isolate cwd");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("keepWorktree: false deletes the isolation worktree after the call", async () => {
+    const repo = mkdtempSync(join(tmpdir(), "pi-agent-isolation-ephemeral-"));
+    const git = (...args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "pipe" });
+    try {
+      git("init", "-q");
+      git("config", "user.email", "t@t.t");
+      git("config", "user.name", "t");
+      writeFileSync(join(repo, "file.txt"), "base\n");
+      git("add", ".");
+      git("commit", "-q", "-m", "init");
+
+      const isolatedRegistry: AgentRegistry = new Map([
+        [
+          "isolated-auditor",
+          {
+            name: "isolated-auditor",
+            prompt: "Run isolated.",
+            isolation: "worktree",
+            source: "project",
+          } as AgentDefinition,
+        ],
+      ]);
+      const { seen, runner } = capturingAgent();
+      const logs: string[] = [];
+      const script = `export const meta = { name: 'ephemeral', description: 'keepWorktree false' }
+await agent('audit', { label: 'a', agentType: 'isolated-auditor', keepWorktree: false })
+return {}`;
+
+      await runWorkflow(script, {
+        cwd: repo,
+        runId: "iso-ephemeral",
+        agent: runner,
+        persistLogs: false,
+        agentRegistry: isolatedRegistry,
+        onLog: (m) => logs.push(m),
+      });
+
+      assert.equal(seen.length, 1);
+      const isolatedCwd = seen[0].cwd;
+      assert.ok(isolatedCwd, "isolated agent should receive a cwd");
+      assert.equal(seen[0].cwdExists, true, "worktree cwd should exist while the agent runs");
+      assert.equal(existsSync(isolatedCwd), false, "worktree removed after the call");
+      assert.equal(
+        logs.some((l) => l.startsWith("worktree kept:")),
+        false,
+      );
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }
