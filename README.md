@@ -34,7 +34,7 @@ Run a workflow to audit every route under src/routes/ for missing auth checks.
 
 Pi writes and starts the workflow in the background. A live panel tracks progress while you keep working, and the final result is delivered back into the conversation automatically.
 
-Keyword triggering is on by default: use the bounded word **workflow** or **workflows** in a message to arm workflow mode — the assistant then handles a request by fanning it out across agents, but still answers plainly if you're only asking *about* workflows (the trigger authorizes the tool, it doesn't force it). Or run `/workflows run <prompt>` explicitly. Identifier-like text and paths such as `myworkflow`, `workflow_name`, and `src/workflow-editor.ts` do not trigger. You can change the keyword with `/workflows-trigger set pi-workflow` or disable it with `/workflows-trigger off`.
+Keyword-triggered input rewriting is **off by default**: the assistant uses the tool's normal guidance to handle explicit workflow requests, without an injected arming banner. You can also run `/workflows run <prompt>` explicitly. Opt into automatic keyword arming with `/workflows-trigger on` (saved for new sessions), or disable it again with `/workflows-trigger off`.
 
 ## How it works
 
@@ -162,7 +162,7 @@ Pi can manage background runs directly with the `workflow_control` tool instead 
 | `/workflows status <id>` | Watch a run and print its result when complete |
 | `/workflows pause\|resume\|stop\|rm <id>` | Control a run |
 | `/workflows save <name>` | Save the latest script as a reusable command |
-| `/workflows-trigger off\|on\|status` | Control automatic keyword triggering |
+| `/workflows-trigger off\|on\|status` | Control automatic keyword triggering (off by default) |
 | `/workflows-trigger set <word>\|reset` | Set or reset the trigger word |
 | `/workflows-progress compact\|detailed\|status\|max <N>` | Live-panel detail level (and max agents shown per phase in detailed mode) |
 | `/workflows-models` | Map model tiers and thinking levels |
@@ -263,15 +263,18 @@ Finished runs (completed, failed, or aborted) are retained in full on disk, capp
 <details>
 <summary><strong>Keyword trigger</strong></summary>
 
-Set a literal, case-insensitive custom trigger in `~/.pi/workflows/settings.json`:
+Automatic keyword arming is opt-in. Run `/workflows-trigger on`, or set `keywordTriggerEnabled` to `true` in `~/.pi/workflows/settings.json`. To also configure a custom trigger:
 
 ```json
 {
+  "keywordTriggerEnabled": true,
   "keywordTriggerWord": "pi-workflow"
 }
 ```
 
-The default `workflow` also matches `workflows`; a custom word matches exactly. Trigger words are case-insensitive and Unicode identifier-bounded, and do not activate inside paths, slash commands, or identifier-like text. Detection is purely textual, applied at submit time to the message you send — it does not depend on, or own, Pi's editor component, so it works the same regardless of what else is installed.
+When enabled, the default `workflow` also matches `workflows`; a custom word matches exactly. Trigger words are case-insensitive and Unicode identifier-bounded, and do not activate inside paths, slash commands, or identifier-like text. Detection is purely textual, applied at submit time to the message you send — it does not depend on, or own, Pi's editor component, so it works the same regardless of what else is installed.
+
+Changing the word with `/workflows-trigger set <word>` or resetting it does not enable arming. Existing explicitly saved on/off preferences are preserved; missing or unreadable settings leave keyword arming off. `/workflows run <prompt>` and standing `/effort` remain separate, explicit opt-ins.
 
 </details>
 
@@ -303,7 +306,7 @@ Only a call that finishes with a real result is journaled — a call whose every
 
 3.0 is a milestone release. The one behavior change to know about:
 
-- **Keyword triggering now _authorizes_ the workflow tool instead of _forcing_ it.** In 2.x, typing the trigger word (default `workflow`) rewrote your message into a directive that forced a background workflow. In 3.0 it _arms_ the tool and the model decides: a real, decomposable request is fanned out across agents, but a message that only mentions workflows — a question, a filename, a passing reference — is answered normally. Nothing to configure. If you relied on the word always kicking off a run, use `/workflows run <prompt>` for the explicit path. Keyword triggering stays on by default; `/workflows-trigger off` disables it and `/workflows-trigger set <word>` changes the word.
+- **Keyword triggering now _authorizes_ the workflow tool instead of _forcing_ it.** In 2.x, typing the trigger word (default `workflow`) rewrote your message into a directive that forced a background workflow. In 3.0 it _arms_ the tool and the model decides: a real, decomposable request is fanned out across agents, but a message that only mentions workflows — a question, a filename, a passing reference — is answered normally. If you relied on the word always kicking off a run, use `/workflows run <prompt>` for the explicit path. Keyword triggering was on by default in 3.0; it is now opt-in via `/workflows-trigger on`, with explicitly saved preferences preserved.
 
 Everything else is additive or a fix: the `workflow_control` tool (list/status/pause/resume/stop), edited-script resume, auto-resume on provider usage limits, and persistence/perf hardening. Requires pi ≥ 0.80.8.
 

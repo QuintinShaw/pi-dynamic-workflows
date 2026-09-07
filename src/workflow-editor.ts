@@ -1,7 +1,7 @@
 /**
- * "Workflows mode" keyword trigger: while the submitted message contains the
- * bounded word `workflow`/`workflows` (or a configured custom trigger word),
- * the message is transformed at submit time to instruct Pi to actually run the
+ * Opt-in "workflows mode" keyword trigger: when enabled and the submitted message
+ * contains the bounded word `workflow`/`workflows` (or a configured custom trigger
+ * word), the message is transformed at submit time to authorize use of the
  * workflow tool. Detection is purely textual (`event.text` on the `input`
  * hook) — it does not depend on, or own, the host's editor component.
  */
@@ -297,8 +297,9 @@ export function registerWorkflowProgressCommands(
 
 /**
  * Install the keyword-trigger arming hook (submit-time detection + prompt
- * rewrite) and the related trigger/progress commands. Call once (e.g. in
- * `session_start`).
+ * rewrite) and the related trigger/progress commands. Keyword arming is off
+ * unless explicitly enabled; standing `/effort` is an independent opt-in.
+ * Call once (e.g. in `session_start`).
  */
 export function installWorkflowKeywordArming(
   pi: ExtensionAPI,
@@ -309,7 +310,7 @@ export function installWorkflowKeywordArming(
   const initialSettings = loadInitialWorkflowSettings(settingsStore);
   const state: WorkflowModeState = {
     active: false,
-    keywordTriggerEnabled: initialSettings.keywordTriggerEnabled ?? true,
+    keywordTriggerEnabled: initialSettings.keywordTriggerEnabled ?? false,
     keywordTriggerWord: initialSettings.keywordTriggerWord ?? DEFAULT_KEYWORD_TRIGGER_WORD,
   };
 
@@ -396,7 +397,7 @@ function loadInitialWorkflowSettings(settingsStore: WorkflowSettingsStore): Work
       keywordTriggerWord: normalizeKeywordTriggerWord(settings.keywordTriggerWord) ?? DEFAULT_KEYWORD_TRIGGER_WORD,
     };
   } catch {
-    return { keywordTriggerEnabled: true, keywordTriggerWord: DEFAULT_KEYWORD_TRIGGER_WORD };
+    return { keywordTriggerEnabled: false, keywordTriggerWord: DEFAULT_KEYWORD_TRIGGER_WORD };
   }
 }
 

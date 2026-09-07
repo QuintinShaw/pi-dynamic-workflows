@@ -11,6 +11,7 @@ import { MAX_AGENT_RETRIES, MAX_CONCURRENCY, normalizeKeywordTriggerWord } from 
 import { workflowHomeDir, workflowProjectPaths } from "./workflow-paths.js";
 
 export interface WorkflowSettings {
+  /** Opt into keyword-triggered input rewriting. Default false. */
   keywordTriggerEnabled?: boolean;
   /** Literal keyword that arms workflows mode from interactive input. */
   keywordTriggerWord?: string;

@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it } from "node:test";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { loadWorkflowSettings } from "../src/workflow-settings.js";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -19,9 +23,9 @@ function testSettingsOptions(keywordTriggerEnabled = true, keywordTriggerWord?: 
   };
 }
 
-function memorySettingsOptions(keywordTriggerEnabled = true, keywordTriggerWord?: string) {
+function memorySettingsOptions(keywordTriggerEnabled?: boolean, keywordTriggerWord?: string) {
   let settings: { keywordTriggerEnabled?: boolean; keywordTriggerWord?: string } = {
-    keywordTriggerEnabled,
+    ...(keywordTriggerEnabled === undefined ? {} : { keywordTriggerEnabled }),
     ...(keywordTriggerWord ? { keywordTriggerWord } : {}),
   };
   const saved: Array<{ keywordTriggerEnabled?: boolean; keywordTriggerWord?: string }> = [];
@@ -390,29 +394,48 @@ describe("installWorkflowKeywordArming", () => {
     assert.ok(events.includes("turn_end"), 'should register "turn_end" hook');
   });
 
-  it("registers /workflows-trigger and toggles the keyword trigger", async () => {
+  it("/workflows-trigger opts in to input rewriting and persists the toggle", async () => {
     const mod = await load();
+    const captured = new Map<string, (...args: unknown[]) => unknown>();
     const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
     const sent: Array<{ content?: string }> = [];
     const store = memorySettingsOptions();
     const pi = {
-      on: () => {},
+      on: (event: string, handler: (...args: unknown[]) => unknown) => {
+        captured.set(event, handler);
+      },
       registerCommand: (name: string, command: { handler: (args: string, ctx: unknown) => Promise<void> }) => {
         commands.set(name, command);
       },
       sendMessage: (message: { content?: string }) => {
         sent.push(message);
       },
-      getActiveTools: () => [],
+      getActiveTools: () => ["bash", "read"],
       setActiveTools: () => {},
     } as unknown as ExtensionAPI;
 
     const state = mod.installWorkflowKeywordArming(pi, undefined, store.options);
-    assert.equal(state.keywordTriggerEnabled, true, "keyword trigger should default on");
+    assert.equal(state.keywordTriggerEnabled, false, "keyword trigger should default off");
     assert.equal(state.keywordTriggerWord, "workflow", "keyword trigger word should default to workflow");
 
     const command = commands.get("workflows-trigger");
     assert.ok(command, "should register /workflows-trigger");
+    const inputHandler = captured.get("input");
+    assert.ok(inputHandler, "input handler should be registered for later opt-in");
+    const event = { source: "interactive", text: "Please run a workflow to inspect the repo." };
+    assert.deepEqual(inputHandler(event), { action: "continue" });
+
+    await command.handler("status", {});
+    assert.match(sent.at(-1)?.content ?? "", /keyword trigger is off/i);
+    assert.deepEqual(store.saved, [], "reporting status must not opt in or persist a default");
+
+    await command.handler("on", {});
+    assert.equal(state.keywordTriggerEnabled, true);
+    assert.deepEqual(store.settings, { keywordTriggerEnabled: true });
+    assert.match(sent.at(-1)?.content ?? "", /keyword trigger on/i);
+    assert.match(sent.at(-1)?.content ?? "", /saved for new sessions/i);
+    assert.deepEqual(inputHandler(event), { action: "transform", text: mod.buildArmedWorkflowPrompt(event.text) });
+    captured.get("turn_end")?.();
 
     await command.handler("off", {});
     assert.equal(state.keywordTriggerEnabled, false);
@@ -420,12 +443,7 @@ describe("installWorkflowKeywordArming", () => {
     assert.deepEqual(store.settings, { keywordTriggerEnabled: false });
     assert.match(sent.at(-1)?.content ?? "", /keyword trigger off/i);
     assert.match(sent.at(-1)?.content ?? "", /saved for new sessions/i);
-
-    await command.handler("on", {});
-    assert.equal(state.keywordTriggerEnabled, true);
-    assert.deepEqual(store.settings, { keywordTriggerEnabled: true });
-    assert.match(sent.at(-1)?.content ?? "", /keyword trigger on/i);
-    assert.match(sent.at(-1)?.content ?? "", /saved for new sessions/i);
+    assert.deepEqual(inputHandler(event), { action: "continue" });
   });
 
   it("/workflows-trigger sets and reports the keyword trigger word", async () => {
@@ -451,7 +469,8 @@ describe("installWorkflowKeywordArming", () => {
 
     await command.handler("set pi-workflow", {});
     assert.equal(state.keywordTriggerWord, "pi-workflow");
-    assert.deepEqual(store.settings, { keywordTriggerEnabled: true, keywordTriggerWord: "pi-workflow" });
+    assert.equal(state.keywordTriggerEnabled, false, "setting a word must not opt in to rewriting");
+    assert.deepEqual(store.settings, { keywordTriggerWord: "pi-workflow" });
     assert.match(sent.at(-1)?.content ?? "", /pi-workflow/);
 
     await command.handler("status", {});
@@ -459,7 +478,8 @@ describe("installWorkflowKeywordArming", () => {
 
     await command.handler("reset", {});
     assert.equal(state.keywordTriggerWord, "workflow");
-    assert.deepEqual(store.settings, { keywordTriggerEnabled: true, keywordTriggerWord: "workflow" });
+    assert.equal(state.keywordTriggerEnabled, false, "resetting the word must not opt in to rewriting");
+    assert.deepEqual(store.settings, { keywordTriggerWord: "workflow" });
   });
 
   it("supports legacy WorkflowModeState objects without keywordTriggerWord", async () => {
@@ -491,8 +511,9 @@ describe("installWorkflowKeywordArming", () => {
     assert.match(sent.at(-1)?.content ?? "", /workflow\/workflows/);
   });
 
-  it("keeps keyword triggering enabled when the setting is absent or loading fails", async () => {
+  it("leaves input and tools untouched when the trigger setting is absent or loading fails", async () => {
     const mod = await load();
+    const { createEffortState } = await import("../src/effort-command.js");
     const stores = [
       { load: () => ({}), save: () => {} },
       {
@@ -504,17 +525,80 @@ describe("installWorkflowKeywordArming", () => {
     ];
 
     for (const settingsStore of stores) {
+      const captured = new Map<string, (...args: unknown[]) => unknown>();
+      const sent: unknown[] = [];
+      const toolChanges: string[][] = [];
       const pi = {
-        on: () => {},
+        on: (event: string, handler: (...args: unknown[]) => unknown) => {
+          captured.set(event, handler);
+        },
         registerCommand: () => {},
-        getActiveTools: () => [],
-        setActiveTools: () => {},
+        sendMessage: (message: unknown) => sent.push(message),
+        getActiveTools: () => ["bash", "read", "workflow"],
+        setActiveTools: (tools: string[]) => toolChanges.push(tools),
       } as unknown as ExtensionAPI;
 
-      const state = mod.installWorkflowKeywordArming(pi, undefined, { settingsStore });
-
-      assert.equal(state.keywordTriggerEnabled, true);
+      const state = mod.installWorkflowKeywordArming(pi, createEffortState(), { settingsStore });
+      assert.equal(state.keywordTriggerEnabled, false);
       assert.equal(state.keywordTriggerWord, "workflow");
+      assert.equal(state.active, false);
+
+      const inputHandler = captured.get("input");
+      assert.ok(inputHandler);
+      for (const text of [
+        "Hello world",
+        "How do workflows work?",
+        "What does the `workflow` tool do?",
+        "Run a workflow to inspect the repo.",
+        "Do not run a workflow.",
+      ]) {
+        assert.deepEqual(inputHandler({ source: "interactive", text }), { action: "continue" }, text);
+        captured.get("turn_end")?.();
+      }
+      assert.deepEqual(sent, [], "default input handling must not emit messages");
+      assert.deepEqual(toolChanges, [], "default input handling must not change active tools");
+    }
+  });
+
+  it("requires a persisted boolean opt-in when loading real settings files", async () => {
+    const mod = await load();
+    const dir = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-trigger-"));
+    const settingsPath = join(dir, "settings.json");
+    try {
+      for (const [contents, enabled] of [
+        [undefined, false],
+        ["{}", false],
+        ["{not json", false],
+        ['{"keywordTriggerEnabled":"true"}', false],
+        ['{"keywordTriggerWord":"workflow"}', false],
+        ['{"keywordTriggerEnabled":true}', true],
+        ['{"keywordTriggerEnabled":false}', false],
+      ] as const) {
+        if (contents !== undefined) writeFileSync(settingsPath, contents, "utf8");
+        const captured = new Map<string, (...args: unknown[]) => unknown>();
+        const pi = {
+          on: (event: string, handler: (...args: unknown[]) => unknown) => {
+            captured.set(event, handler);
+          },
+          registerCommand: () => {},
+          getActiveTools: () => ["bash", "read"],
+          setActiveTools: () => {},
+        } as unknown as ExtensionAPI;
+        const state = mod.installWorkflowKeywordArming(pi, undefined, {
+          settingsStore: { load: () => loadWorkflowSettings(settingsPath), save: () => {} },
+        });
+        assert.equal(state.keywordTriggerEnabled, enabled, contents ?? "missing file");
+        const inputHandler = captured.get("input");
+        assert.ok(inputHandler);
+        const text = "Run a workflow to inspect the repo.";
+        assert.deepEqual(
+          inputHandler({ source: "interactive", text }),
+          enabled ? { action: "transform", text: mod.buildArmedWorkflowPrompt(text) } : { action: "continue" },
+          contents ?? "missing file",
+        );
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 
