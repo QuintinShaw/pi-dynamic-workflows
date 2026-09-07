@@ -86,12 +86,12 @@ test("createWorkflowTool promptSnippet describes delegation and optional composi
   assert.doesNotMatch(snippet, /required script header|export const meta/i);
 });
 
-test("createWorkflowTool keeps permanent guidance to the single upstream gate", () => {
+test("createWorkflowTool scopes opt-in to workflow and respects user delegation restrictions", () => {
   const guidance = createWorkflowTool().promptGuidelines;
 
   assert.deepEqual(guidance, [WORKFLOW_GATE_GUIDELINE]);
-  assert.match(guidance[0], /ONLY call it when the user explicitly opts in/i);
-  assert.match(guidance[0], /you may briefly offer it \(with a rough cost\)/i);
+  assert.match(guidance[0], /explicit opt-in.*required for the workflow tool/i);
+  assert.match(guidance[0], /respect.*user restriction on delegation/i);
   assert.doesNotMatch(guidance[0], /export const meta|parallel\(\) requires functions/i);
 });
 

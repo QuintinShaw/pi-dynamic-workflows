@@ -9,7 +9,7 @@
   "surfaces": {
     "permanentWorkflowPrompt": {
       "serialization": "UTF-8 bytes of LF-joined Pi prompt lines",
-      "bytes": 742
+      "bytes": 267
     },
     "providerVisibleWorkflowToolDefinition": {
       "serialization": "UTF-8 bytes of JSON.stringify({ name, description, parameters })",
@@ -33,7 +33,7 @@
     },
     "ordinaryWorkflowOwnedAlwaysOn": {
       "serialization": "sum of permanent prompt, provider-visible tool definition, and every registered skill's discovery bytes",
-      "bytes": 6056
+      "bytes": 5581
     },
     "workflowAuthoringSkillCorpus": {
       "serialization": "sum of UTF-8 bytes for every file under skills/workflow-authoring",
