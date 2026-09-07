@@ -22,7 +22,7 @@ import { loadWorkflowSettings } from "./workflow-settings.js";
 
 /** The single always-on gate that authorizes workflow use without forcing it. */
 export const WORKFLOW_GATE_GUIDELINE =
-  "Explicit opt-in is required for the workflow tool. Respect any user restriction on delegation.";
+  "The `workflow` tool runs multi-agent orchestration — it fans decomposable work out across subagents, and fits tasks shaped like: repo-wide inspection, independent parallel research/checks, multi-perspective review, or fan-out/fan-in synthesis. Explicit opt-in is required for the workflow tool. Respect any user restriction on delegation.";
 
 const workflowToolSchema = Type.Object({
   script: Type.Optional(

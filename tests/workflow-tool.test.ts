@@ -86,6 +86,16 @@ test("createWorkflowTool promptSnippet describes delegation and optional composi
   assert.doesNotMatch(snippet, /required script header|export const meta/i);
 });
 
+test("createWorkflowTool preserves task-fit examples for workflow selection", () => {
+  const guidance = createWorkflowTool().promptGuidelines.join(" ");
+
+  assert.match(guidance, /decomposable work/i);
+  assert.match(guidance, /repo-wide inspection/i);
+  assert.match(guidance, /independent parallel research\/checks/i);
+  assert.match(guidance, /multi-perspective review/i);
+  assert.match(guidance, /fan-out\/fan-in synthesis/i);
+});
+
 test("createWorkflowTool scopes opt-in to workflow and respects user delegation restrictions", () => {
   const guidance = createWorkflowTool().promptGuidelines;
 
