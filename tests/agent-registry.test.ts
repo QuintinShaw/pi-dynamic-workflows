@@ -75,6 +75,26 @@ describe("parseAgentDefinition", () => {
     assert.ok(def);
     assert.equal(def.isolation, undefined);
   });
+
+
+  it("parses thinking from frontmatter", () => {
+    const def = parseAgentDefinition(
+      "---\nname: reviewer\nmodel: cursor/claude-opus-5@1m\nthinking: max\n---\nBody.",
+      "project",
+      "reviewer.md",
+    );
+    assert.equal(def?.model, "cursor/claude-opus-5@1m");
+    assert.equal(def?.thinking, "max");
+  });
+
+  it("ignores unknown thinking values", () => {
+    const def = parseAgentDefinition(
+      "---\nname: agent\nthinking: ultra\n---\nBody.",
+      "project",
+      "agent.md",
+    );
+    assert.equal(def?.thinking, undefined);
+  });
 });
 
 // ── loadAgentRegistry (dir injection) ──────────────────────────────────────
@@ -324,6 +344,7 @@ describe("agentDefinitionKey", () => {
     const base: AgentDefinition = { name: "x", prompt: "p", model: "m", tools: ["read"], source: "project" };
     assert.notEqual(agentDefinitionKey(base), agentDefinitionKey({ ...base, prompt: "p2" }));
     assert.notEqual(agentDefinitionKey(base), agentDefinitionKey({ ...base, model: "m2" }));
+    assert.notEqual(agentDefinitionKey(base), agentDefinitionKey({ ...base, thinking: "max" }));
     assert.notEqual(agentDefinitionKey(base), agentDefinitionKey({ ...base, tools: ["read", "write"] }));
   });
 

@@ -17,7 +17,8 @@
  * tools+model+system-prompt, not a prose hint.
  *
  * Bound today: `tools` (allowlist), `disallowedTools` (denylist), `model`,
- * and the markdown body (`prompt`). Parsed-but-ignored for now (documented): `mcp`, `skills`, `background`.
+ * `thinking`, and the markdown body (`prompt`). Parsed-but-ignored for now
+ * (documented): `mcp`, `skills`, `background`.
  * Wired: `isolation` ("worktree") → createWorktree() in workflow.ts.
  */
 
@@ -26,6 +27,7 @@ import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import { getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { AGENTS_DIR } from "./config.js";
+import { isThinkingLevel, type ModelThinkingLevel } from "./model-spec.js";
 
 export interface AgentDefinition {
   /** Stable identity used as the `agentType` value. */
@@ -38,6 +40,8 @@ export interface AgentDefinition {
   disallowedTools?: string[];
   /** Model spec (`provider/modelId` or bare id) for this subagent. */
   model?: string;
+  /** Pi thinking level. Catalog model id stays in `model`; this is not a model-id suffix. */
+  thinking?: ModelThinkingLevel;
   /** Isolation mode. When "worktree", agents using this type run in a git worktree. */
   isolation?: "worktree";
   /** Markdown body, prepended to the subagent's task as role guidance. */
@@ -65,6 +69,12 @@ function toStringArray(value: unknown): string[] | undefined {
     return arr.length ? arr : undefined;
   }
   return undefined;
+}
+
+function toThinkingLevel(value: unknown): ModelThinkingLevel | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim().toLowerCase();
+  return isThinkingLevel(trimmed) ? trimmed : undefined;
 }
 
 /**
@@ -95,6 +105,7 @@ export function parseAgentDefinition(
     tools: toStringArray(fm.tools),
     disallowedTools: toStringArray(fm.disallowedTools),
     model: typeof fm.model === "string" ? fm.model.trim() || undefined : undefined,
+    thinking: toThinkingLevel(fm.thinking),
     isolation:
       typeof fm.isolation === "string" && fm.isolation.toLowerCase().trim() === "worktree" ? "worktree" : undefined,
     prompt,
@@ -210,6 +221,7 @@ export function agentDefinitionKey(def: AgentDefinition | undefined): string | n
     tools: def.tools ?? null,
     disallowedTools: def.disallowedTools ?? null,
     model: def.model ?? null,
+    thinking: def.thinking ?? null,
     isolation: def.isolation ?? null,
     prompt: def.prompt,
   });

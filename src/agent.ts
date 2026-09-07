@@ -24,7 +24,12 @@ export type { AgentUsage } from "./agent-usage.js";
 
 import { applyToolPolicy } from "./agent-registry.js";
 import { classifyProviderLimit, WorkflowError, WorkflowErrorCode } from "./errors.js";
-import { canonicalModelSpec, resolveModelSpecWithThinking } from "./model-spec.js";
+import {
+  canonicalModelSpec,
+  formatModelSpecWithThinking,
+  type ModelThinkingLevel,
+  resolveModelSpecWithThinking,
+} from "./model-spec.js";
 import {
   formatTierFallbackNotice,
   loadModelTierConfig,
@@ -515,6 +520,11 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
    */
   model?: string;
   /**
+   * Pi thinking level. Used when `model` has no `:thinking` suffix.
+   * A model-id suffix still wins.
+   */
+  thinking?: ModelThinkingLevel;
+  /**
    * Model tier name (e.g. "small", "medium", "big"). When set (and no explicit
    * `model` is given), the model is resolved from the user's model-tiers.json
    * config before `run()` starts, falling back to the session's main model when
@@ -947,10 +957,13 @@ export class WorkflowAgent {
         }
       } else {
         resolvedModel = resolved.model;
-        resolvedThinkingLevel = resolved.thinkingLevel;
-        options.onModelResolved?.(resolved.resolvedSpec ?? canonicalModelSpec(resolved.model));
+        resolvedThinkingLevel = resolved.thinkingLevel ?? options.thinking;
+        options.onModelResolved?.(
+          formatModelSpecWithThinking(canonicalModelSpec(resolved.model), resolvedThinkingLevel),
+        );
       }
     }
+    resolvedThinkingLevel ??= options.thinking;
 
     const agentDir = getAgentDir();
     // Key persisted sessions by the runner's project cwd (this.cwd), NOT the

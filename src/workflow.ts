@@ -332,6 +332,8 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
    * analysis). When omitted, the session's main model is used.
    */
   model?: string;
+  /** Pi thinking level. Used when `model` has no `:thinking` suffix. */
+  thinking?: import("./model-spec.js").ModelThinkingLevel;
   /**
    * Coarse model tier ("small" | "medium" | "big"), resolved from the user's
    * model-tiers config (see /workflows-models). An explicit `model` takes
@@ -861,6 +863,7 @@ export async function runWorkflow<T = unknown>(
               signal: agentController.signal,
               instructions: buildAgentInstructions(assignedPhase, agentOptions, agentDef, resolvedIsolation),
               model: modelSpec,
+              thinking: agentOptions.thinking ?? agentDef?.thinking,
               tier: agentOptions.tier,
               modelRegistry: options.modelRegistry,
               toolNames: agentDef?.tools,
@@ -1693,6 +1696,7 @@ function hashAgentCall(
     prompt,
     model: model ?? null,
     tier: options.tier ?? null,
+    ...(options.thinking ? { thinking: options.thinking } : {}),
     phase: phase ?? null,
     agentType: options.agentType ?? null,
     ...(options.thread ? { thread: options.thread } : {}),

@@ -17,6 +17,7 @@ Every exact fact below is projected from the installed extension's capability co
 - `phase`: string (optional; default: current phase)
 - `schema`: plain JSON Schema (optional)
 - `model`: string (optional; highest-priority exact model selector)
+- `thinking`: string (optional; off; minimal; low; medium; high; xhigh; max)
 - `tier`: string (optional; configured route name; dynamic reference: model-routes)
 - `isolation`: "worktree" | false (optional)
 - `keepWorktree`: boolean (optional; default: true)
