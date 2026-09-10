@@ -162,6 +162,38 @@ export function recomputeWorkflowSnapshot(snapshot: WorkflowSnapshot): WorkflowS
   return { ...snapshot, agentCount: snapshot.agents.length, runningCount, doneCount, errorCount };
 }
 
+export interface EmptyFleetSummary {
+  /** True when the run launched at least one agent but every one of them returned no usable result. */
+  allEmpty: boolean;
+  /** Agents that ran to a terminal state and returned null (recoverable failure exhausted, e.g. AGENT_EMPTY_OUTPUT). */
+  emptyCount: number;
+  /** Agents that produced a real result. */
+  doneCount: number;
+  /** Labels of the empty agents, capped for a readable warning line. */
+  emptyLabels: string[];
+}
+
+/**
+ * Detect the "empty fleet" case: a run that spent on at least one agent yet got
+ * zero usable results back. `agent()` resolves a recoverable failure (e.g.
+ * `AGENT_EMPTY_OUTPUT` after retries are exhausted) to `null` rather than
+ * throwing, so an all-null fleet still reports the run as completed — without
+ * this check the host can mistake "nothing was produced" for "everything
+ * succeeded". Agents still queued/running are not counted; only terminal
+ * `error` (null result) and `done` (real result) states decide.
+ */
+export function emptyFleetSummary(agents: WorkflowAgentSnapshot[], maxLabels = 5): EmptyFleetSummary {
+  const terminal = agents.filter((agent) => agent.status === "error" || agent.status === "done");
+  const empty = terminal.filter((agent) => agent.status === "error");
+  const doneCount = terminal.length - empty.length;
+  return {
+    allEmpty: terminal.length > 0 && doneCount === 0,
+    emptyCount: empty.length,
+    doneCount,
+    emptyLabels: empty.slice(0, maxLabels).map((agent) => agent.label || `agent #${agent.id}`),
+  };
+}
+
 export function createWidgetWorkflowDisplay(
   ctx: Pick<ExtensionContext, "ui" | "hasUI">,
   options: WorkflowDisplayOptions = {},

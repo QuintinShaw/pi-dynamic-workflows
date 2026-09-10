@@ -7,7 +7,13 @@ import type { ModelRegistry, ToolDefinition } from "@earendil-works/pi-coding-ag
 import type { WorkflowAgent } from "./agent.js";
 import { type AgentUsage, createEmptyAgentUsage, sumAgentUsage } from "./agent-usage.js";
 import { MAX_AGENTS_PER_RUN } from "./config.js";
-import { preview, recomputeWorkflowSnapshot, type WorkflowAgentSnapshot, type WorkflowSnapshot } from "./display.js";
+import {
+  emptyFleetSummary,
+  preview,
+  recomputeWorkflowSnapshot,
+  type WorkflowAgentSnapshot,
+  type WorkflowSnapshot,
+} from "./display.js";
 import { isProviderUsageLimit, WorkflowError, WorkflowErrorCode } from "./errors.js";
 import {
   agentHasNonTerminalStatus,
@@ -969,6 +975,27 @@ export class WorkflowManager extends EventEmitter {
           progress();
         },
       });
+
+      // Guard against the "empty fleet" footgun: agent() resolves an exhausted
+      // recoverable failure (e.g. AGENT_EMPTY_OUTPUT) to null rather than
+      // throwing, so a run whose every agent came back null still reaches this
+      // completed branch. Surface it loudly so an all-null result can't
+      // masquerade as a successful fleet (the single per-agent log line is easy
+      // to miss under concurrency). Emitted before the "complete" event.
+      const fleet = emptyFleetSummary(managed.snapshot.agents);
+      if (fleet.allEmpty) {
+        const labels = fleet.emptyLabels.join(", ");
+        const overflow =
+          fleet.emptyCount > fleet.emptyLabels.length ? ` (+${fleet.emptyCount - fleet.emptyLabels.length} more)` : "";
+        const warning = [
+          `⚠  Workflow produced no usable results: all ${fleet.emptyCount} agent(s) returned nothing (${labels}${overflow}).`,
+          `   agent() resolves recoverable failures (e.g. an empty model response) to null once retries are exhausted, so the run reports "completed" even though nothing was produced.`,
+          `   Common fixes: set agentRetries: 1-2 for models that occasionally return empty, check the model's max output tokens, and read the per-agent errors above.`,
+        ].join("\n");
+        managed.snapshot.logs.push(warning);
+        this.emitLive(managed, "log", { runId: managed.runId, message: warning });
+        console.warn(`[workflow] ${warning.replace(/\n\s*/g, " ")}`);
+      }
 
       managed.status = "completed";
       managed.result = result;
