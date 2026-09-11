@@ -19,6 +19,7 @@ import type { Static, TSchema } from "typebox";
 import { Check, Convert } from "typebox/value";
 import { type AgentHistoryEntry, compactAgentHistory } from "./agent-history.js";
 import { type AgentUsage, agentUsageEquals, createEmptyAgentUsage, sumAgentUsage } from "./agent-usage.js";
+import { pinChildCacheRetention } from "./child-cache-retention.js";
 
 export type { AgentUsage } from "./agent-usage.js";
 
@@ -1013,6 +1014,7 @@ export class WorkflowAgent {
       if (options.thread) this.restoreThreadLeaf(sessionManager, threadLeaf);
       throw error;
     }
+    pinChildCacheRetention(session.agent);
     const usageBeforeTurn = options.thread ? session.getSessionStats() : undefined;
     // This turn's own transcript, collected from message_end events below rather
     // than sliced out of session.messages with a pre-prompt() length snapshot.
