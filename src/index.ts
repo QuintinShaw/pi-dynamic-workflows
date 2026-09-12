@@ -67,6 +67,13 @@ export {
   saveModelTierConfig,
   sortedTierNames,
 } from "./model-tier-config.js";
+export type {
+  ModelSource,
+  PreSpawnModelContext,
+  PreSpawnModelDecision,
+  PreSpawnModelResolver,
+} from "./pre-spawn-model.js";
+export { getPreSpawnModelResolver, setPreSpawnModelResolver } from "./pre-spawn-model.js";
 export type { PendingDeliveryMarker, PersistedRunState, RunPersistence, RunStatus } from "./run-persistence.js";
 export { createRunPersistence, generateRunId } from "./run-persistence.js";
 export {
