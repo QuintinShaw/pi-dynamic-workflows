@@ -22,13 +22,15 @@ test("npm pack parsing keeps only valid publishable file paths", () => {
   assert.deepEqual(parseNpmPackFilePaths(JSON.stringify({ files: [] })), []);
 });
 
-test("the published Pi extension is a compiled JavaScript entrypoint", async () => {
+test("the published Pi extension forwards through TypeScript to the compiled payload", () => {
   const [extensionPath] = packageJson.pi.extensions;
-  assert.match(extensionPath, /^dist\/.+\.js$/);
+  assert.equal(extensionPath, "extensions/workflow.ts");
   assert.ok(publishableFiles().includes(extensionPath));
-
-  const extension = await import(new URL(`../${extensionPath}`, import.meta.url).href);
-  assert.equal(typeof extension.default, "function");
+  assert.ok(publishableFiles().includes("dist/pi-extension.js"));
+  assert.match(
+    readFileSync(new URL(`../${extensionPath}`, import.meta.url), "utf8"),
+    /require\("\.\.\/dist\/pi-extension\.js"\)/,
+  );
 });
 
 test("normal tests and publishing share the model-free release gate", () => {

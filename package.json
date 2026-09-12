@@ -65,7 +65,7 @@
   ],
   "pi": {
     "extensions": [
-      "dist/pi-extension.js"
+      "extensions/workflow.ts"
     ],
     "skills": [
       "skills/workflow-authoring",

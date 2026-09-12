@@ -369,10 +369,15 @@ describe("installResultDelivery", () => {
   ): void {
     const patched = (AgentSession.prototype as unknown as { sendCustomMessage?: unknown }).sendCustomMessage;
     assert.equal(typeof patched, "function", "sendCustomMessage patch must be armed");
-    if (!("agent" in session)) {
+    // The production wrapper forwards to AgentSession's real async method.
+    // Give each fixture that method's prototype rather than asking a plain
+    // object to emulate its private helper methods (notably
+    // _appendCustomMessage in Pi 0.85.1).
+    Object.setPrototypeOf(session, AgentSession.prototype);
+    if (!Object.hasOwn(session, "agent")) {
       Object.assign(session, { agent: { state: { messages: [] } } });
     }
-    if (!("sessionManager" in session)) {
+    if (!Object.hasOwn(session, "sessionManager")) {
       Object.assign(session, {
         sessionManager: {
           appendCustomMessageEntry: () => "",
@@ -391,9 +396,18 @@ describe("installResultDelivery", () => {
         });
       }
     }
-    if (!("_emit" in session)) {
+    // `_emit` is a real prototype method. This fixture must supply an own
+    // no-op event sink rather than accidentally invoking that method without
+    // AgentSession's constructed `_eventListeners` array.
+    if (!Object.hasOwn(session, "_emit")) {
       Object.assign(session, { _emit: () => {} });
     }
+    const state = session as {
+      _isAgentRunActive?: boolean;
+      _pendingCustomMessages?: unknown[];
+    };
+    if (state._isAgentRunActive == null) state._isAgentRunActive = false;
+    if (state._pendingCustomMessages == null) state._pendingCustomMessages = [];
     void (patched as (msg: unknown, opts: unknown) => unknown).call(
       session,
       message ?? { customType: "workflow-result", content: "x", display: true },
@@ -1874,6 +1888,7 @@ describe("installResultDelivery", () => {
       _isAgentRunActive: boolean;
       _pendingBashMessages: unknown[];
       _pendingNextTurnMessages: unknown[];
+      _pendingCustomMessages: unknown[];
       _extensionRunner: unknown;
       _emit: () => void;
     };
@@ -1896,6 +1911,7 @@ describe("installResultDelivery", () => {
     idleSession._isAgentRunActive = false;
     idleSession._pendingBashMessages = [];
     idleSession._pendingNextTurnMessages = [];
+    idleSession._pendingCustomMessages = [];
     idleSession._extensionRunner = {
       emit: async (e: { type: string }) => {
         settled.push(e.type);
