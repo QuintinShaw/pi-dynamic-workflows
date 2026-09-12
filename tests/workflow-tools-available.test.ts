@@ -382,7 +382,7 @@ describe("workflow extension - control tool availability", () => {
           },
           sendMessage: () => {},
         } as unknown as ExtensionAPI;
-        const { default: installExtension } = await import("../extensions/workflow.js");
+        const { default: installExtension } = await import("../src/pi-extension.js");
 
         installExtension(pi);
 
@@ -494,7 +494,7 @@ describe("workflow extension - control tool availability", () => {
             },
             sendMessage: () => {},
           } as unknown as ExtensionAPI;
-          const { default: installExtension } = await import("../extensions/workflow.js");
+          const { default: installExtension } = await import("../src/pi-extension.js");
           installExtension(pi);
 
           handlers.session_shutdown?.[0]?.(event);
@@ -575,7 +575,7 @@ describe("workflow extension - control tool availability", () => {
     const otherProject = mkdtempSync(join(tmpdir(), "pi-dw-other-resume-"));
     try {
       await withFakeHomeAsync(fakeHome, async () => {
-        const { default: installExtension } = await import("../extensions/workflow.js");
+        const { default: installExtension } = await import("../src/pi-extension.js");
         const makePi = (handlers: Record<string, Array<(...args: any[]) => any>>) =>
           ({
             registerTool: () => {},
@@ -763,7 +763,7 @@ describe("workflow extension - control tool availability", () => {
           sendMessage: () => {},
         } as unknown as ExtensionAPI;
 
-        const { default: installExtension } = await import("../extensions/workflow.js");
+        const { default: installExtension } = await import("../src/pi-extension.js");
         installExtension(pi);
 
         assert.equal(
@@ -847,7 +847,7 @@ describe("workflow extension - control tool availability", () => {
             },
             sendMessage: () => {},
           } as unknown as ExtensionAPI;
-          const { default: installExtension } = await import("../extensions/workflow.js");
+          const { default: installExtension } = await import("../src/pi-extension.js");
           installExtension(pi);
 
           assert.equal(handlers.model_select?.length, 1, "must listen for model_select");
@@ -913,7 +913,7 @@ describe("workflow extension - control tool availability", () => {
           },
           _bound: false,
         } as unknown as ExtensionAPI & { _bound: boolean };
-        const { default: installExtension } = await import("../extensions/workflow.js");
+        const { default: installExtension } = await import("../src/pi-extension.js");
         installExtension(pi);
 
         handlers.session_shutdown?.[0]?.({ reason: "reload" });
@@ -1014,7 +1014,7 @@ describe("workflow extension - control tool availability", () => {
           },
           sendMessage: () => {},
         } as unknown as ExtensionAPI;
-        const { default: installExtension } = await import("../extensions/workflow.js");
+        const { default: installExtension } = await import("../src/pi-extension.js");
         installExtension(pi);
 
         handlers.session_shutdown?.[0]?.({ reason: "reload" });
@@ -1121,7 +1121,7 @@ describe("workflow extension - control tool availability", () => {
             },
             sendMessage: () => {},
           }) as unknown as ExtensionAPI;
-        const { default: installExtension } = await import("../extensions/workflow.js");
+        const { default: installExtension } = await import("../src/pi-extension.js");
 
         const installWithLiveRun = (runId: string) => {
           discardWorkflowRuntime();
@@ -1183,7 +1183,7 @@ describe("workflow extension - control tool availability", () => {
 
 describe("sessionFileCwd (read-only header probe)", () => {
   it("reads cwd from the session header without creating sidecars", async () => {
-    const { sessionFileCwd } = await import("../extensions/workflow.js");
+    const { sessionFileCwd } = await import("../src/pi-extension.js");
     const dir = mkdtempSync(join(tmpdir(), "pi-dw-session-probe-"));
     try {
       const file = join(dir, "session.jsonl");
@@ -1209,7 +1209,7 @@ describe("sessionFileCwd (read-only header probe)", () => {
   });
 
   it("returns undefined for missing, empty, or non-session files", async () => {
-    const { sessionFileCwd } = await import("../extensions/workflow.js");
+    const { sessionFileCwd } = await import("../src/pi-extension.js");
     assert.equal(sessionFileCwd(undefined), undefined);
     assert.equal(sessionFileCwd("/no/such/file.jsonl"), undefined);
     const dir = mkdtempSync(join(tmpdir(), "pi-dw-session-probe-bad-"));
