@@ -171,7 +171,7 @@ Every exact fact below is projected from the installed extension's capability co
 
 - Classification: `runtime-global`
 - Support: `supported`
-- Signature: `checkpoint(prompt, options?) => Promise<unknown>`
+- Signature: `checkpoint(prompt, options?) \| checkpoint({ kind, checkpointId, payload }) => Promise<unknown>`
 - Option shape: `checkpoint-options`
 - `default`: unknown (optional; default: true when no UI and omitted)
 - `headless`: "default" | "abort" (optional; default: "default")
@@ -181,6 +181,10 @@ Every exact fact below is projected from the installed extension's capability co
 - Constraint: foreground confirm and headless behavior are implemented; input/select/timeout are declared-only
 - Constraint: consumes one agent slot and no tokens
 - Constraint: journaled answers replay only within an unchanged resume prefix
+- Constraint: object checkpoints accept an open kind identifier, persist their JSON payload, and pause the run
+- Constraint: a controller attaches a lossless-JSON response to the run and checkpoint before workflow_control resumes with only the exact run ID and checkpoint ID
+- Constraint: status exposes only checkpoint ID, kind, and status; the durable response never enters model-visible output
+- Constraint: durable checkpoint responses resume the same run ID, are journaled before continuation, and reject stale or conflicting delivery
 
 <a id="log"></a>
 ## log

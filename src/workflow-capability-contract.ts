@@ -450,15 +450,19 @@ const capabilities: readonly CapabilityDescriptor[] = [
     evidence: ["tests/quality-stdlib.test.ts"],
   }),
   runtimeGlobal("checkpoint", {
-    signature: "checkpoint(prompt, options?) => Promise<unknown>",
+    signature: "checkpoint(prompt, options?) | checkpoint({ kind, checkpointId, payload }) => Promise<unknown>",
     discovery: DiscoveryPlacement.WORKFLOW_AUTHORING_SKILL,
     optionShape: "checkpoint-options",
     constraints: [
       "foreground confirm and headless behavior are implemented; input/select/timeout are declared-only",
       "consumes one agent slot and no tokens",
       "journaled answers replay only within an unchanged resume prefix",
+      "object checkpoints accept an open kind identifier, persist their JSON payload, and pause the run",
+      "a controller attaches a lossless-JSON response to the run and checkpoint before workflow_control resumes with only the exact run ID and checkpoint ID",
+      "status exposes only checkpoint ID, kind, and status; the durable response never enters model-visible output",
+      "durable checkpoint responses resume the same run ID, are journaled before continuation, and reject stale or conflicting delivery",
     ],
-    evidence: ["tests/checkpoint.test.ts"],
+    evidence: ["tests/checkpoint.test.ts", "tests/workflow-manager.test.ts", "tests/workflow-control-tool.test.ts"],
   }),
   runtimeGlobal("log", { signature: "log(message) => void" }),
   runtimeGlobal("phase", {

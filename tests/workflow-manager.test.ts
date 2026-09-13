@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { once } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -2584,6 +2585,231 @@ test(
     assert.equal(await retry.resume(runId), true, "failed run can be resumed after lease release");
     await new Promise((r) => setTimeout(r, 100));
     assert.equal(retry.getRun(runId)?.status, "completed", "retry manager completed the run");
+  }),
+);
+
+test(
+  "durable checkpoint survives restart and resumes the same run exactly once",
+  withTempCwd(async (cwd) => {
+    const calls: string[] = [];
+    const agent = {
+      async run(prompt: string) {
+        calls.push(prompt);
+        return `${prompt}-done`;
+      },
+    };
+    const script = `export const meta = { name: 'durable_restart', description: 'durable restart' }
+const before = await agent('before', { label: 'before' })
+const publication = await checkpoint({ kind: 'proposal-ready', checkpointId: 'proposal-1', payload: { head: 'aaa' } })
+const after = await agent('after', { label: 'after' })
+return { before, publication, after }`;
+    const first = new WorkflowManager({ cwd, agent });
+    const started = first.startInBackground(script);
+    await assert.rejects(started.promise, /checkpoint/i);
+
+    const paused = first.getPersistence().load(started.runId);
+    assert.equal(paused?.status, "paused");
+    assert.deepEqual(paused?.checkpoint, {
+      version: 1,
+      checkpointId: "proposal-1",
+      kind: "proposal-ready",
+      status: "waiting",
+      payload: { head: "aaa" },
+      createdAt: paused?.checkpoint?.createdAt,
+    });
+    assert.deepEqual(calls, ["before"]);
+
+    const restarted = new WorkflowManager({ cwd, agent });
+    await assert.rejects(
+      () => restarted.attachCheckpointResponse(started.runId, "proposal-1", { pushedHead: Number.NaN }),
+      /lossless JSON value/,
+    );
+    await assert.rejects(
+      () => restarted.attachCheckpointResponse(started.runId, "proposal-1", { pushedHead: undefined }),
+      /lossless JSON value/,
+    );
+    const accessorResponse: unknown[] = [];
+    Object.defineProperty(accessorResponse, "0", {
+      enumerable: true,
+      get() {
+        return true;
+      },
+    });
+    accessorResponse.length = 1;
+    await assert.rejects(
+      () => restarted.attachCheckpointResponse(started.runId, "proposal-1", { values: accessorResponse }),
+      /lossless JSON value/,
+    );
+    const persistence = restarted.getPersistence();
+    const save = persistence.save.bind(persistence);
+    let failedResponseSave = false;
+    persistence.save = (state) => {
+      if (!failedResponseSave && state.checkpoint?.status === "resuming") {
+        failedResponseSave = true;
+        throw new Error("one-shot response save failure");
+      }
+      save(state);
+    };
+    await assert.rejects(
+      () => restarted.attachCheckpointResponse(started.runId, "proposal-1", { pushedHead: "bbb" }),
+      /one-shot response save failure/,
+    );
+    persistence.save = save;
+    await restarted.attachCheckpointResponse(started.runId, "proposal-1", { pushedHead: "bbb" });
+
+    const crashRestarted = new WorkflowManager({ cwd, agent });
+    const completedEvent = once(crashRestarted, "complete");
+    assert.equal(await crashRestarted.resume(started.runId, { checkpointId: "proposal-1" }), true);
+    await completedEvent;
+
+    const completed = crashRestarted.getPersistence().load(started.runId);
+    assert.equal(completed?.runId, started.runId);
+    assert.equal(completed?.status, "completed");
+    assert.equal(completed?.checkpoint?.status, "consumed");
+    assert.deepEqual(completed?.checkpoint?.response, { pushedHead: "bbb" });
+    assert.deepEqual(calls, ["before", "after"], "the pre-checkpoint agent replays from the journal");
+    assert.deepEqual((crashRestarted.getRun(started.runId)?.result?.result as Record<string, unknown>).publication, {
+      pushedHead: "bbb",
+    });
+
+    assert.equal(
+      await crashRestarted.resume(started.runId, { checkpointId: "proposal-1" }),
+      true,
+      "an identical duplicate response is idempotent",
+    );
+    await assert.rejects(
+      () => restarted.attachCheckpointResponse(started.runId, "proposal-1", { pushedHead: "conflict" }),
+      /conflict/i,
+    );
+    await assert.rejects(
+      () => restarted.attachCheckpointResponse(started.runId, "stale", { pushedHead: "bbb" }),
+      /checkpoint/i,
+    );
+  }),
+);
+
+test(
+  "checkpoint response attachment waits for suspension settlement and is not overwritten",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent() });
+    const persistence = manager.getPersistence();
+    const save = persistence.save.bind(persistence);
+    let observedWaiting: (() => void) | undefined;
+    const waitingSaved = new Promise<void>((resolve) => {
+      observedWaiting = resolve;
+    });
+    persistence.save = (state) => {
+      save(state);
+      if (state.checkpoint?.status === "waiting") observedWaiting?.();
+    };
+    const script = `export const meta = { name: 'attach_race', description: 'attach race' }
+await checkpoint({ kind: 'custom', checkpointId: 'gate-1', payload: {} })`;
+    const started = manager.startInBackground(script);
+    await waitingSaved;
+
+    const attaching = manager.attachCheckpointResponse(started.runId, "gate-1", { accepted: true });
+    await assert.rejects(started.promise, /checkpoint/i);
+    await attaching;
+
+    assert.deepEqual(persistence.load(started.runId)?.checkpoint, {
+      ...persistence.load(started.runId)?.checkpoint,
+      status: "resuming",
+      response: { accepted: true },
+    });
+  }),
+);
+
+test(
+  "concurrent controllers serialize conflicting checkpoint attachments",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent() });
+    const script = `export const meta = { name: 'attach_conflict', description: 'attach conflict' }
+await checkpoint({ kind: 'custom', checkpointId: 'gate-1', payload: {} })`;
+    const started = manager.startInBackground(script);
+    await assert.rejects(started.promise, /checkpoint/i);
+
+    const firstController = new WorkflowManager({ cwd, agent: fakeAgent() });
+    const secondController = new WorkflowManager({ cwd, agent: fakeAgent() });
+    const results = await Promise.allSettled([
+      firstController.attachCheckpointResponse(started.runId, "gate-1", { controller: "first" }),
+      secondController.attachCheckpointResponse(started.runId, "gate-1", { controller: "second" }),
+    ]);
+
+    assert.deepEqual(
+      results.map((result) => result.status),
+      ["fulfilled", "rejected"],
+    );
+    assert.match((results[1] as PromiseRejectedResult).reason.message, /conflict/i);
+    assert.deepEqual(firstController.getPersistence().load(started.runId)?.checkpoint?.response, {
+      controller: "first",
+    });
+  }),
+);
+
+test(
+  "a crash after checkpoint consumption resumes the unfinished suffix",
+  withTempCwd(async (cwd) => {
+    const blockedSuffix = deferredAgent();
+    const first = new WorkflowManager({ cwd, agent: blockedSuffix.runner });
+    const script = `export const meta = { name: 'consumed_crash', description: 'consumed crash' }
+const response = await checkpoint({ kind: 'custom', checkpointId: 'gate-1', payload: {} })
+const suffix = await agent('suffix')
+return { response, suffix }`;
+    const started = first.startInBackground(script);
+    await assert.rejects(started.promise, /checkpoint/i);
+    await first.attachCheckpointResponse(started.runId, "gate-1", { accepted: true });
+    assert.equal(await first.resume(started.runId, { checkpointId: "gate-1" }), true);
+
+    while (first.getPersistence().load(started.runId)?.checkpoint?.status !== "consumed") {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    const crashedRun = first.getRun(started.runId);
+    assert.ok(crashedRun?.lease);
+    first.getPersistence().releaseRunLease(crashedRun.lease);
+    crashedRun.controller.abort();
+    (first as unknown as { runs: Map<string, unknown> }).runs.delete(started.runId);
+
+    const restarted = new WorkflowManager({ cwd, agent: fakeAgent({}, "suffix-done") });
+    const completed = once(restarted, "complete");
+    assert.equal(await restarted.resume(started.runId, { checkpointId: "gate-1" }), true);
+    await completed;
+
+    assert.equal(restarted.getPersistence().load(started.runId)?.status, "completed");
+    assert.equal(
+      JSON.stringify(restarted.getRun(started.runId)?.result?.result),
+      JSON.stringify({ response: { accepted: true }, suffix: "suffix-done" }),
+    );
+  }),
+);
+
+test(
+  "durable checkpoint persistence failure exposes no paused checkpoint",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent() });
+    manager.on("error", () => {});
+    let pausedEvents = 0;
+    manager.on("paused", () => {
+      pausedEvents++;
+    });
+    const persistence = manager.getPersistence();
+    const save = persistence.save.bind(persistence);
+    let failedCheckpointSave = false;
+    persistence.save = (state) => {
+      if (!failedCheckpointSave && state.checkpoint?.status === "waiting") {
+        failedCheckpointSave = true;
+        throw new Error("checkpoint save failed");
+      }
+      save(state);
+    };
+    const script = `export const meta = { name: 'checkpoint_save', description: 'required persistence' }
+await checkpoint({ kind: 'proposal-ready', checkpointId: 'required', payload: {} })
+return 'unreachable'`;
+    const started = manager.startInBackground(script);
+    await assert.rejects(started.promise, /checkpoint save failed/);
+
+    assert.equal(pausedEvents, 0);
+    assert.equal(manager.getRun(started.runId)?.status, "failed");
+    assert.equal(persistence.load(started.runId)?.checkpoint, undefined);
   }),
 );
 
