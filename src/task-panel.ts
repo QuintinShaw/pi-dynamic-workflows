@@ -9,13 +9,7 @@
 import { randomUUID } from "node:crypto";
 import { closeSync, openSync, readSync } from "node:fs";
 import { join } from "node:path";
-import {
-  AgentSession,
-  type ExtensionAPI,
-  ExtensionRunner,
-  type ExtensionUIContext,
-  type Theme,
-} from "@earendil-works/pi-coding-agent";
+import { AgentSession, type ExtensionAPI, type ExtensionUIContext, type Theme } from "@earendil-works/pi-coding-agent";
 import { type Component, type TUI, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import {
   aggregateAgentUsage,
@@ -293,8 +287,14 @@ function probeHostSessionSend(pi: ExtensionAPI, sessionId: string): void {
   if (boundSessionSends.has(sessionId)) probedSessionIds.add(sessionId);
 }
 
-let agentSessionPatched = false;
-let bindCoreObserved = false;
+let hostAgentSession = AgentSession;
+const patchedSessionPrototypes = new WeakSet<object>();
+
+/** Bind delivery capture to the host loader's class, not a sibling SDK peer. */
+export function installHostSessionCapture(sessionClass: typeof AgentSession): void {
+  hostAgentSession = sessionClass;
+  patchAgentSessionCapture();
+}
 
 interface StealCandidate {
   sendCustomMessage?: DeliverySend;
@@ -544,15 +544,15 @@ function captureHostSessionSend(session: StealCandidate, probe?: boolean): void 
  * not be treated as an ACK channel. Child sessions never enter the map.
  */
 function patchAgentSessionCapture(): void {
-  if (agentSessionPatched) return;
-  agentSessionPatched = true;
   try {
-    const proto = AgentSession.prototype as unknown as StealCandidate;
+    const proto = hostAgentSession.prototype as unknown as StealCandidate;
+    if (patchedSessionPrototypes.has(proto)) return;
     const original = proto.sendCustomMessage;
     if (typeof original !== "function") {
       // AgentSession shape changed — bind stays fail-closed without steal.
       return;
     }
+    patchedSessionPrototypes.add(proto);
     // PRIMARY capture hook: `_bindExtensionCore` runs at session construction,
     // before any extension code, so a stock pi host is captured without ever
     // probing. The omp fork bundle does not expose the symbol — guard with
@@ -597,28 +597,6 @@ function patchAgentSessionCapture(): void {
     // AgentSession unavailable or shape changed — bind stays fail-closed without steal
   }
 }
-
-/** Keep ExtensionRunner observed so module load order cannot skip the patch arm. */
-function patchBindCoreObserve(): void {
-  if (bindCoreObserved) return;
-  bindCoreObserved = true;
-  try {
-    const proto = ExtensionRunner.prototype as unknown as {
-      bindCore: (...args: unknown[]) => unknown;
-    };
-    const original = proto.bindCore;
-    if (typeof original !== "function") return;
-    // No capture of void actions.sendMessage — that path is not an ACK.
-    proto.bindCore = function patchedBindCore(this: unknown, ...args: unknown[]) {
-      return original.apply(this, args);
-    };
-  } catch {
-    // ignore
-  }
-}
-
-patchAgentSessionCapture();
-patchBindCoreObserve();
 
 export const WORKFLOW_LIFECYCLE_EVENT = "pi-dynamic-workflows:lifecycle";
 
@@ -1048,7 +1026,6 @@ export function bindSessionDelivery(
 ): void {
   if (!sessionId) return;
   patchAgentSessionCapture();
-  patchBindCoreObserve();
 
   // Optional identity check — refuse to bind when sessionManager disagrees.
   try {
@@ -1247,7 +1224,6 @@ export function installResultDelivery(
   const m = deliveryManager(manager);
   m.__deliveryLoadSettings = opts.loadSettings;
   patchAgentSessionCapture();
-  patchBindCoreObserve();
 
   m.__lifecycleEventEmitter = (data) => pi.events?.emit(WORKFLOW_LIFECYCLE_EVENT, data);
   if (!m.__lifecycleEventInstalled) {

@@ -1,6 +1,8 @@
-// Pi supplies this require through its TypeScript loader. Keep the compiled
-// graph synchronous: an async ESM re-export can take jiti's native-import
-// shortcut and bypass the host's SDK aliases/virtual modules.
-const extension = require("../dist/pi-extension.js") as typeof import("../dist/pi-extension.js");
+// Resolve the host SDK through Pi's loader, but load our compiled ESM graph
+// with import semantics. Requiring the graph makes import-only SDK subpaths
+// fall through the host's prefix aliases as invalid file-system paths.
+const host = await import("@earendil-works/pi-coding-agent");
+const extension = await import("../dist/pi-extension.js");
+extension.installHostSessionCapture(host.AgentSession);
 export const sessionFileCwd = extension.sessionFileCwd;
 export default extension.default;

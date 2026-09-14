@@ -1,9 +1,40 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { createRequire } from "node:module";
 import test from "node:test";
 import { pathToFileURL } from "node:url";
 import * as hostSdk from "@earendil-works/pi-coding-agent";
 import packageJson from "../package.json" with { type: "json" };
+
+test("published extension loads through the unbundled host aliases and captures the actual host", () => {
+  // Run without tsx/source-runtime hooks: the production Node host uses aliases,
+  // not the embedded virtualModules path covered by the test below.
+  const sdkEntry = import.meta.resolve("@earendil-works/pi-coding-agent");
+  const entry = new URL(`../${packageJson.pi.extensions[0]}`, import.meta.url).pathname;
+  const script = `
+    import assert from "node:assert/strict";
+    const sdkUrl = ${JSON.stringify(sdkEntry)};
+    const sdk = await import(sdkUrl);
+    const { loadExtensions, createExtensionRuntime } = await import(new URL("core/extensions/loader.js", sdkUrl));
+    const { createEventBus } = await import(new URL("core/event-bus.js", sdkUrl));
+    const original = sdk.AgentSession.prototype.sendCustomMessage;
+    const result = await loadExtensions([${JSON.stringify(entry)}], process.cwd(), createEventBus(), createExtensionRuntime());
+    assert.deepEqual(result.errors, []);
+    assert.equal(result.extensions.length, 1);
+    assert.notEqual(sdk.AgentSession.prototype.sendCustomMessage, original);
+    const receiver = Object.create(sdk.AgentSession.prototype);
+    receiver.sessionManager = { getSessionId: () => "node-host-test" };
+    await receiver.sendCustomMessage(
+      { customType: "workflow-delivery-probe", content: "", display: false },
+      { triggerTurn: false },
+    );
+  `;
+  execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+    cwd: new URL("..", import.meta.url),
+    timeout: 60_000,
+    stdio: "pipe",
+  });
+});
 
 test("published extension patches the host SDK even when a native sibling peer is resolvable", async () => {
   // Deliberately distinct from the natively importable peer. This models the
