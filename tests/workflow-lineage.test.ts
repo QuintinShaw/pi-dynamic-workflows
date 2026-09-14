@@ -97,6 +97,7 @@ test(
     });
     manager.on("agentStart", (event: { id: string }) => starts.set(event.id, Date.now()));
 
+    const runStartedAt = Date.now();
     const result = await manager.runSync(duplicateLabelScript);
     const persisted = manager.getPersistence().load(result.runId as string);
     const agents = persisted?.agents ?? [];
@@ -106,8 +107,12 @@ test(
     for (const agent of agents) {
       const callId = agent.callId as string;
       const prompt = agent.prompt;
-      assert.equal(agent.startedAt, new Date(starts.get(callId) as number).toISOString());
-      assert.ok(new Date(agent.startedAt as string).getTime() < (usageAt.get(prompt) as number));
+      const startedAt = new Date(agent.startedAt as string).getTime();
+      // The manager records launch time before emitting agentStart; the event
+      // listener can run in the next millisecond (or later under load).
+      assert.ok(startedAt >= runStartedAt);
+      assert.ok(startedAt <= (starts.get(callId) as number));
+      assert.ok(startedAt < (usageAt.get(prompt) as number));
     }
   }),
 );
