@@ -10,6 +10,38 @@ const noopAgent = {
   },
 };
 
+for (const [name, body] of [
+  ["parallel", "await parallel([() => checkpoint(input)])"],
+  ["pipeline", "await pipeline([1], () => checkpoint(input))"],
+  ["caught", "try { await checkpoint(input) } catch {}"],
+  [
+    "caught before another agent",
+    "try { await checkpoint(input) } catch {} await agent('must not run', {label:'after'})",
+  ],
+] as const) {
+  test(`durable suspension survives ${name} without completing or starting more agents`, async () => {
+    let calls = 0;
+    const script = `export const meta = { name: 'suspension', description: 'durable pause propagation' }
+const input = { kind: 'approval', checkpointId: 'gate', payload: {} };
+${body}; return 'must not complete';`;
+    await assert.rejects(
+      () =>
+        runWorkflow(script, {
+          agent: {
+            run: async () => {
+              calls++;
+              return "unexpected";
+            },
+          },
+          persistLogs: false,
+          onWorkflowCheckpoint: () => {},
+        }),
+      WorkflowCheckpointSuspensionError,
+    );
+    assert.equal(calls, 0);
+  });
+}
+
 test("checkpoint(): headless takes the declared default and journals it", async () => {
   const journal: JournalEntry[] = [];
   const script = `export const meta = { name: 'c', description: 'checkpoint' }

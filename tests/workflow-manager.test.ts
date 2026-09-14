@@ -2720,6 +2720,41 @@ await checkpoint({ kind: 'custom', checkpointId: 'gate-1', payload: {} })`;
 );
 
 test(
+  "stop during checkpoint drain remains aborted after a non-cooperative sibling settles",
+  withTempCwd(async (cwd) => {
+    let releaseAgent!: (value: string) => void;
+    let observedStart!: () => void;
+    const agentStarted = new Promise<void>((resolve) => {
+      observedStart = resolve;
+    });
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        run: async () => {
+          observedStart();
+          return new Promise<string>((resolve) => {
+            releaseAgent = resolve;
+          });
+        },
+      },
+    });
+    const started =
+      manager.startInBackground(`export const meta = {name:'stop_checkpoint', description:'stop wins over suspension'}
+void agent('pending', {label:'pending'});
+await checkpoint({kind:'approval', checkpointId:'gate', payload:{}});`);
+    const rejected = assert.rejects(started.promise, /aborted/);
+    await agentStarted;
+    assert.equal(manager.getRun(started.runId)?.status, "paused");
+    assert.equal(manager.stop(started.runId), true);
+    releaseAgent("late");
+    await rejected;
+    assert.equal(manager.getRun(started.runId)?.status, "aborted");
+    assert.equal(manager.getPersistence().load(started.runId)?.status, "aborted");
+    assert.equal(await manager.resume(started.runId, { checkpointId: "gate" }), false);
+  }),
+);
+
+test(
   "concurrent controllers serialize conflicting checkpoint attachments",
   withTempCwd(async (cwd) => {
     const manager = new WorkflowManager({ cwd, agent: fakeAgent() });

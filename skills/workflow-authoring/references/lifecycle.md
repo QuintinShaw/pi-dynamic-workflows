@@ -8,7 +8,9 @@ Enter a phase budget with `phase("Name", { budget: N })`; phase metadata does no
 
 ## Checkpoints
 
-A checkpoint consumes an agent slot but no tokens. A workflow invocation is backgrounded by default, and background workflows are headless: they cannot display checkpoint confirmation. Use `background: false` when a checkpoint must reach the foreground host confirmation interface. Without a UI, a checkpoint returns the declared default (or `true` when omitted) unless `headless: "abort"` is selected. Confirm is implemented. Input, select, and timeout fields are declared for compatibility/future behavior but are not authoring promises.
+A checkpoint consumes an agent slot but no tokens. For the legacy `checkpoint(prompt, options?)` overload: A workflow invocation is backgrounded by default, and background workflows are headless: they cannot display checkpoint confirmation. Use `background: false` when a checkpoint must reach the foreground host confirmation interface. Without a UI, a checkpoint returns the declared default (or `true` when omitted) unless `headless: "abort"` is selected. Confirm is implemented. Input, select, and timeout fields are declared for compatibility/future behavior but are not authoring promises.
+
+The durable `checkpoint({ kind, checkpointId, payload })` overload instead pauses in either foreground or background until a host controller persists a response and resumes the exact checkpoint ID. It does not choose a headless default or display UI. See [specialized helpers](specialized-helpers.md) for the controller handoff and replay contract.
 
 Checkpoint answers are journaled and can replay during an unchanged resume prefix. Do not describe checkpoints as guaranteed arbitrary forms or as remote steering.
 

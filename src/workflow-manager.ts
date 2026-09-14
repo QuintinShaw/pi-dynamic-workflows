@@ -1055,7 +1055,7 @@ export class WorkflowManager extends EventEmitter {
 
       return result;
     } catch (error) {
-      if (error instanceof WorkflowCheckpointSuspensionError) {
+      if (error instanceof WorkflowCheckpointSuspensionError && !managed.controller.signal.aborted) {
         managed.status = "paused";
         managed.error = undefined;
         this.persistRun(managed);
@@ -1071,13 +1071,15 @@ export class WorkflowManager extends EventEmitter {
       }
 
       const workflowError =
-        error instanceof WorkflowError
-          ? error
-          : new WorkflowError(
-              error instanceof Error ? error.message : String(error),
-              WorkflowErrorCode.WORKFLOW_ABORTED,
-              { recoverable: true },
-            );
+        error instanceof WorkflowCheckpointSuspensionError && managed.controller.signal.aborted
+          ? new WorkflowError("workflow aborted", WorkflowErrorCode.WORKFLOW_ABORTED, { recoverable: true })
+          : error instanceof WorkflowError
+            ? error
+            : new WorkflowError(
+                error instanceof Error ? error.message : String(error),
+                WorkflowErrorCode.WORKFLOW_ABORTED,
+                { recoverable: true },
+              );
 
       const escapedUsageLimit = managed.usageLimitEscapedBeforeLifecycleControl;
       const usageLimitPaused =

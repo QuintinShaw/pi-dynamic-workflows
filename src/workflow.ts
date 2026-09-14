@@ -133,6 +133,8 @@ export interface SharedRuntime {
   activeCheckpointResponse: WorkflowCheckpoint | null;
   /** Every durable checkpoint ID encountered across outer and nested workflow frames. */
   seenCheckpointIds: Set<string>;
+  /** A durably accepted suspension cannot be swallowed into a successful run. */
+  checkpointSuspension?: WorkflowCheckpointSuspensionError;
   /**
    * Fires exactly once a run-fatal error is determined: an error that escaped
    * the TOP-level script's own execution completely uncaught (see runWorkflow's
@@ -647,6 +649,7 @@ export async function runWorkflow<T = unknown>(
   const isAborted = () => Boolean(options.signal?.aborted || shared.runFatalController.signal.aborted);
 
   const throwIfAborted = () => {
+    if (!options.signal?.aborted && shared.checkpointSuspension) throw shared.checkpointSuspension;
     if (isAborted()) {
       throw new WorkflowError("workflow aborted", WorkflowErrorCode.WORKFLOW_ABORTED, { recoverable: true });
     }
@@ -1107,6 +1110,7 @@ export async function runWorkflow<T = unknown>(
           try {
             return await thunk();
           } catch (error) {
+            if (error instanceof WorkflowCheckpointSuspensionError) throw error;
             if (isAborted()) throw error;
             const workflowError = wrapError(error);
             // Non-recoverable failures (token budget / agent limit exhausted) must
@@ -1149,6 +1153,7 @@ export async function runWorkflow<T = unknown>(
               value = await stage(value, item, index);
               throwIfAborted();
             } catch (error) {
+              if (error instanceof WorkflowCheckpointSuspensionError) throw error;
               if (isAborted()) throw error;
               const workflowError = wrapError(error);
               // Non-recoverable failures halt the whole run (see parallel()).
@@ -1522,7 +1527,8 @@ export async function runWorkflow<T = unknown>(
         createdAt: new Date().toISOString(),
       };
       options.onWorkflowCheckpoint?.(waiting);
-      throw new WorkflowCheckpointSuspensionError(waiting.checkpointId);
+      shared.checkpointSuspension = new WorkflowCheckpointSuspensionError(waiting.checkpointId);
+      throw shared.checkpointSuspension;
     }
 
     if (promptText === null) throw new Error("unreachable durable checkpoint branch");
@@ -1582,6 +1588,9 @@ export async function runWorkflow<T = unknown>(
   const wrapped = `${DETERMINISM_PRELUDE}\n(async () => {\n${body}\n})()`;
   try {
     const result = await new vm.Script(wrapped, { filename: `${meta.name || "workflow"}.js` }).runInContext(context);
+    // Even a script-level catch must not convert an accepted durable pause to
+    // completion. External cancellation retains priority over suspension.
+    if (shared.checkpointSuspension) throwIfAborted();
 
     // Persist logs
     const logFile = logger.persist();

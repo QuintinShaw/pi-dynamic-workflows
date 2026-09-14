@@ -45,11 +45,11 @@ export const WORKFLOW_AUTHORING_FROZEN_FILES = [
   },
   {
     path: "skills/workflow-authoring/references/specialized-helpers.md",
-    sha256: "8cf78fe0285fecd65e1a80626f29ff8c3b4977f65c7370cc1d3511ff6eda4305",
+    sha256: "ef95cc7fb9c68e55cb64cc7f63814df4059dbffa6c3d06f63f13d21819c4b863",
   },
   {
     path: "skills/workflow-authoring/references/lifecycle.md",
-    sha256: "9e1fddeb53bca20b245c3109d93f9f5cef957e5f196790652c3f35c9f0e56bfe",
+    sha256: "c3dfac1d2b0505f361f515fb21a5c55e0f97ca9d57bf7dc57eedcaab9500c580",
   },
   {
     path: "skills/workflow-authoring/references/pattern-selection.md",
@@ -162,6 +162,11 @@ const FROZEN_GUIDANCE_BY_CAPABILITY: Readonly<Record<string, readonly ProtectedG
     },
   ],
   "workflow.runtime.checkpoint": [
+    {
+      path: SPECIALIZED_HELPERS_PATH,
+      requiredText:
+        "`checkpoint({ kind, checkpointId, payload })` | Durably suspends the run until a controller attaches a JSON response for that exact ID and resumes it. Works without foreground UI; replay returns the journaled response.",
+    },
     {
       path: SPECIALIZED_HELPERS_PATH,
       requiredText:
