@@ -7,8 +7,10 @@ import {
   type CreateAgentSessionOptions,
   createAgentSession,
   createCodingTools,
+  DefaultPackageManager,
   DefaultResourceLoader,
   getAgentDir,
+  type LoadExtensionsResult,
   ModelRegistry,
   type ModelRuntime,
   SessionManager,
@@ -224,6 +226,38 @@ export function resolveAgentModelSpec(
   return undefined;
 }
 
+/** Child sessions load no host extensions unless explicitly opted in. */
+export const DEFAULT_PROVIDER_MIDDLEWARE_EXTENSIONS: readonly string[] = Object.freeze([]);
+
+const RECURSIVE_SUBAGENT_EXTENSION_NAMES = new Set(["pi-dynamic-workflows", "workflow", "pi-subagents"]);
+
+/**
+ * Keep only explicitly approved provider/auth middleware paths. Recursive
+ * orchestration extensions are always rejected, even if explicitly allowlisted.
+ */
+export function isProviderMiddlewareExtensionPath(extensionPath: string, allowlist: readonly string[]): boolean {
+  const allowed = new Set(allowlist.map((name) => name.trim().toLowerCase()).filter(Boolean));
+  const segments = extensionPath
+    .replaceAll("\\", "/")
+    .split("/")
+    .filter(Boolean)
+    .map((segment) => segment.toLowerCase());
+  const file = segments.at(-1)?.replace(/\.(?:[cm]?[jt]s)$/i, "");
+  const identities = new Set([...segments, ...(file ? [file] : [])]);
+  if ([...identities].some((name) => RECURSIVE_SUBAGENT_EXTENSION_NAMES.has(name))) return false;
+  return [...identities].some((name) => allowed.has(name));
+}
+
+export function filterProviderMiddlewareExtensions(
+  base: LoadExtensionsResult,
+  allowlist: readonly string[],
+): LoadExtensionsResult {
+  return {
+    ...base,
+    extensions: base.extensions.filter((extension) => isProviderMiddlewareExtensionPath(extension.path, allowlist)),
+  };
+}
+
 export interface WorkflowAgentOptions {
   cwd?: string;
   /** Extra tools available to the subagent in addition to the structured output tool. */
@@ -235,6 +269,11 @@ export interface WorkflowAgentOptions {
    * so a workflow subagent can't fan out through them either (#107).
    */
   excludeTools?: string[];
+  /**
+   * Trusted provider/auth middleware extension names allowed in child sessions.
+   * Defaults to [] (no host extensions). Recursive orchestration stays excluded.
+   */
+  providerMiddlewareExtensions?: string[];
   /**
    * Override createAgentSession dependencies (model, settingsManager, resourceLoader, etc.).
    * An explicit per-call cwd and the computed agent identity remain authoritative.
@@ -665,6 +704,7 @@ export class WorkflowAgent {
   private readonly baseTools: ToolDefinition[];
   /** Extra subagent tool-name denylist, merged with the always-on defaults. */
   private readonly excludeTools: string[];
+  private readonly providerMiddlewareExtensions: readonly string[];
   private readonly sessionOptions: Partial<CreateAgentSessionOptions>;
   private readonly persistAgentSessions: boolean;
   private readonly instructions?: string;
@@ -710,6 +750,7 @@ export class WorkflowAgent {
     this.cwd = options.cwd ?? process.cwd();
     this.baseTools = options.tools ?? createCodingTools(this.cwd);
     this.excludeTools = options.excludeTools ?? [];
+    this.providerMiddlewareExtensions = options.providerMiddlewareExtensions ?? DEFAULT_PROVIDER_MIDDLEWARE_EXTENSIONS;
     this.sessionOptions = options.session ?? {};
     this.persistAgentSessions = options.persistAgentSessions ?? false;
     this.instructions = options.instructions;
@@ -722,38 +763,43 @@ export class WorkflowAgent {
   /**
    * A resource loader shared per directory within this run (#109).
    *
-   * Without a resourceLoader, createAgentSession() builds a fresh
-   * DefaultResourceLoader per subagent and reloads it — re-running EVERY installed
-   * extension factory each time (verified: N subagents → N factory runs). Each
-   * such factory that arms a load-time timer/listener then roots its subagent
-   * session forever, because AgentSession.dispose() emits no session_shutdown to
-   * run the cleanup — the dominant #109 leak, and one our own extension
-   * (UsageLimitScheduler) can trigger.
+   * Without a resourceLoader, createAgentSession() builds a fresh loader per
+   * subagent and re-runs every installed extension factory. By default we keep
+   * host extensions disabled. When opted in, resolve configured paths without
+   * loading factories, then pass only allowlisted middleware paths as explicit
+   * additions to a `noExtensions: true` loader. Recursive orchestration factories
+   * never load, even if explicitly allowlisted.
    *
-   * `noExtensions: true` skips loading host extensions; skills, prompts, and
-   * AGENTS.md context still load. The subagent keeps the tools this workflow
-   * hands it via `customTools` (coding tools + any toolset like web-research) —
-   * those are unaffected. What it loses is HOST EXTENSION-REGISTERED tools (MCP
-   * bridges, browser tools, anything a host extension added via ctx.registerTool):
-   * pre-change a subagent session inherited those from the full host extension
-   * set, now it does not, so an agentType `tools` allowlist naming one matches
-   * nothing. This is a deliberate trade-off — it also structurally kills recursive
-   * orchestration in subagents (no extension runtime at all), beyond the name-level
-   * #107 denylist — and must be release-noted. `createAgentSession` with a shared
-   * resourceLoader is a supported embedding pattern. runWorkflow builds one
-   * WorkflowAgent per run, so this loader's lifetime is exactly one run: built
-   * once per directory, reused there, then dropped with the agent.
+   * Sharing prevents the per-subagent factory churn and retention fixed by #109.
+   * Skills, prompts, AGENTS.md context, and workflow-supplied `customTools` remain
+   * available. Other host extension-registered tools stay excluded. Allowlisted
+   * middleware must be trusted and safe to share across child sessions; this is
+   * not a sandbox. runWorkflow builds one WorkflowAgent per run: loaders are
+   * built once per directory, reused there, then dropped with the agent.
    */
   private getSharedResourceLoader(agentDir: string, cwd = this.cwd): Promise<DefaultResourceLoader> {
     const key = JSON.stringify([agentDir, cwd]);
     const existing = this.resourceLoaders.get(key);
     if (existing) return existing;
     const pending = (async () => {
+      const settingsManager = this.sessionOptions.settingsManager ?? SettingsManager.create(cwd, agentDir);
+      let middlewarePaths: string[] = [];
+      if (this.providerMiddlewareExtensions.length > 0) {
+        await settingsManager.reload();
+        const packageManager = new DefaultPackageManager({ cwd, agentDir, settingsManager });
+        const configured = await packageManager.resolve();
+        middlewarePaths = configured.extensions
+          .filter((extension) => extension.enabled)
+          .filter((extension) => isProviderMiddlewareExtensionPath(extension.path, this.providerMiddlewareExtensions))
+          .map((extension) => extension.path);
+      }
       const loader = new DefaultResourceLoader({
         cwd,
         agentDir,
-        settingsManager: this.sessionOptions.settingsManager ?? SettingsManager.create(cwd, agentDir),
+        settingsManager,
         noExtensions: true,
+        additionalExtensionPaths: middlewarePaths,
+        extensionsOverride: (base) => filterProviderMiddlewareExtensions(base, this.providerMiddlewareExtensions),
       });
       await loader.reload();
       return loader;
@@ -1106,7 +1152,7 @@ export class WorkflowAgent {
         // not have valid auth, causing silent empty responses.
         settingsManager: SettingsManager.create(runCwd, agentDir),
         customTools,
-        // Shared per-run loader with no host extensions (#109) — see
+        // Shared per-run loader with opt-in provider middleware (#109) — see
         // getSharedResourceLoader. An injected resourceLoader (tests / embedders)
         // wins and skips the shared build entirely; the ...this.sessionOptions
         // spread below re-applies the same injected value harmlessly.
@@ -1143,6 +1189,16 @@ export class WorkflowAgent {
       throw error;
     }
     pinChildCacheRetention(session.agent);
+    // Child sessions do not auto-bind a supplied ResourceLoader. Bind middleware
+    // before the first provider request (also supports injected resource loaders).
+    try {
+      await session.bindExtensions({});
+    } catch (error) {
+      session.dispose();
+      if (options.thread) this.restoreThreadLeaf(sessionManager, threadLeaf);
+      throw error;
+    }
+
     const usageBeforeTurn = options.thread ? session.getSessionStats() : undefined;
     // This turn's own transcript, collected from message_end events below rather
     // than sliced out of session.messages with a pre-prompt() length snapshot.

@@ -124,6 +124,32 @@ describe("workflow settings", () => {
     });
   });
 
+  it("loads the provider middleware allowlist and preserves an explicit empty list", () => {
+    withSettingsPath((settingsPath) => {
+      mkdirSync(dirname(settingsPath), { recursive: true });
+      writeFileSync(
+        settingsPath,
+        JSON.stringify({ providerMiddlewareExtensions: [" example-provider-adapter ", 42, "", "  ", null] }),
+        "utf-8",
+      );
+      assert.deepEqual(loadWorkflowSettings(settingsPath), {
+        providerMiddlewareExtensions: ["example-provider-adapter"],
+      });
+      for (const value of [[], [42, "  ", null]]) {
+        writeFileSync(settingsPath, JSON.stringify({ providerMiddlewareExtensions: value }), "utf-8");
+        assert.deepEqual(loadWorkflowSettings(settingsPath), { providerMiddlewareExtensions: [] });
+      }
+      for (const value of [null, "example-provider-adapter", {}]) {
+        writeFileSync(settingsPath, JSON.stringify({ providerMiddlewareExtensions: value }), "utf-8");
+        assert.deepEqual(loadWorkflowSettings(settingsPath), {});
+      }
+      saveWorkflowSettings({ providerMiddlewareExtensions: ["example-provider-adapter"] }, settingsPath);
+      assert.deepEqual(loadWorkflowSettings(settingsPath), {
+        providerMiddlewareExtensions: ["example-provider-adapter"],
+      });
+    });
+  });
+
   it("normalizes default concurrency and agent retries", () => {
     withSettingsPath((settingsPath) => {
       mkdirSync(dirname(settingsPath), { recursive: true });

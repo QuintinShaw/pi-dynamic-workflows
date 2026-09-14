@@ -16,6 +16,8 @@ import { Type } from "typebox";
 import type { AgentRunOptions, AgentUsage } from "../src/agent.js";
 import {
   DEFAULT_EXCLUDED_SUBAGENT_TOOLS,
+  DEFAULT_PROVIDER_MIDDLEWARE_EXTENSIONS,
+  isProviderMiddlewareExtensionPath,
   listAvailableModelSpecs,
   resolveAgentModelSpec,
   runtimeOf,
@@ -42,6 +44,7 @@ type WorkflowAgentPrivates = {
   agentIdFor(options: AgentRunOptions<any>, runCwd: string): string;
   restoreThreadLeaf(manager: SessionManager, leafId: string | null): void;
   getRegistry(perRunRegistry?: ModelRegistry): Promise<ModelRegistry>;
+  getSharedResourceLoader(agentDir: string, cwd?: string): Promise<DefaultResourceLoader>;
 };
 
 async function fauxRegistry(
@@ -459,6 +462,11 @@ test("WorkflowAgent.run keeps injected settings and resources while using the ex
         agentDir: home,
         settingsManager,
         noExtensions: true,
+        extensionFactories: [
+          (pi) => {
+            pi.on("before_agent_start", (event) => ({ systemPrompt: `${event.systemPrompt}\nINJECTED_HOOK_BOUND` }));
+          },
+        ],
       });
       await resourceLoader.reload();
       let injectedSettingsReads = 0;
@@ -491,6 +499,7 @@ test("WorkflowAgent.run keeps injected settings and resources while using the ex
 
       const initialRequest = JSON.stringify(contexts[0]);
       assert.match(initialRequest, /INJECTED_RESOURCE_LOADER_MARKER/);
+      assert.match(initialRequest, /INJECTED_HOOK_BOUND/, "injected resource loaders bypass middleware discovery");
       assert.doesNotMatch(initialRequest, /TARGET_RESOURCE_LOADER_MARKER/);
       assert.ok(injectedSettingsReads > 0, "the SDK session must retain the host-injected SettingsManager");
       assert.match(
@@ -1542,9 +1551,9 @@ test("subagentExcludedTools always includes the defaults, plus caller/session na
   assert.ok(merged.includes("session-denied") && merged.includes("extra"), "both caller lists are folded in");
 });
 
-test("the subagent resource loader is built once per directory and shared across subagents (#109)", () => {
-  // The #109 mitigation: one no-extensions loader per run, reused by every
-  // subagent, instead of createAgentSession re-running every extension factory
+test("the subagent resource loader is built once per directory and shared across subagents (#109)", async () => {
+  // The #109 mitigation: one filtered loader per directory, reused by every
+  // subagent there, instead of createAgentSession re-running every extension factory
   // (and rooting each disposed session) per subagent. Memoization is the invariant.
   const agent = new WorkflowAgent({ cwd: "/tmp" });
   type Priv = { getSharedResourceLoader(agentDir: string): Promise<unknown> };
@@ -1553,8 +1562,208 @@ test("the subagent resource loader is built once per directory and shared across
   const second = a.getSharedResourceLoader("/tmp/agentdir");
   assert.equal(first, second, "same promise — the loader is built once and shared, not rebuilt per subagent");
   // reload() may reject in a bare temp dir; we only assert memoization here.
-  first.catch(() => {});
-  second.catch(() => {});
+  await Promise.allSettled([first, second]);
+});
+
+test("provider middleware path matching uses exact identities and always denies recursion", () => {
+  const allowed = [" Example-Provider-Adapter ", "workflow", "pi-dynamic-workflows", "pi-subagents"];
+  for (const path of [
+    "/extensions/example-provider-adapter.ts",
+    "/node_modules/example-provider-adapter/src/index.js",
+    "C:\\extensions\\EXAMPLE-PROVIDER-ADAPTER.cjs",
+  ]) {
+    assert.equal(isProviderMiddlewareExtensionPath(path, allowed), true, path);
+    assert.equal(isProviderMiddlewareExtensionPath(path, []), false, path);
+  }
+  for (const path of [
+    "/extensions/not-example-provider-adapter.ts",
+    "/extensions/workflow.ts",
+    "/extensions/pi-subagents.js",
+    "/node_modules/pi-dynamic-workflows/extensions/index.ts",
+    "/example-provider-adapter/workflow.mjs",
+    "/pi-subagents/example-provider-adapter.ts",
+  ]) {
+    assert.equal(isProviderMiddlewareExtensionPath(path, allowed), false, path);
+  }
+});
+
+for (const allowlist of [
+  undefined,
+  [],
+  ["example-provider-adapter", "workflow", "pi-subagents", "pi-dynamic-workflows"],
+]) {
+  test(`child middleware binds before prompting only when opted in (${JSON.stringify(allowlist)})`, async () => {
+    const home = mkdtempSync(join(tmpdir(), "pi-dw-middleware-home-"));
+    const cwd = mkdtempSync(join(tmpdir(), "pi-dw-middleware-cwd-"));
+    const extensionDir = join(home, ".pi", "agent", "extensions");
+    const core = createFauxCore({
+      provider: "fauxtest-middleware",
+      models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 4096 }],
+    });
+    try {
+      mkdirSync(extensionDir, { recursive: true });
+      writeFileSync(
+        join(extensionDir, "example-provider-adapter.js"),
+        `export default function (pi) {
+          let started = false;
+          pi.on("session_start", () => { started = true; });
+          pi.on("before_agent_start", (event) => ({ systemPrompt: event.systemPrompt + "\\nADAPTER_BOUND" }));
+          pi.on("before_provider_request", (event) => ({ ...event.payload, adapterStarted: started }));
+        }`,
+      );
+      for (const name of ["workflow", "pi-subagents", "pi-dynamic-workflows", "unrelated-extension"]) {
+        writeFileSync(
+          join(extensionDir, `${name}.js`),
+          `export default function () { throw new Error("excluded extension factory loaded"); }`,
+        );
+      }
+      await withFakeHomeAsync(home, async () => {
+        const registry = await fauxRegistry(home, "fauxtest-middleware", core);
+        const agent = new WorkflowAgent({ cwd, modelRegistry: registry, providerMiddlewareExtensions: allowlist });
+        const loader = await (agent as unknown as WorkflowAgentPrivates).getSharedResourceLoader(
+          join(home, ".pi", "agent"),
+        );
+        const result = loader.getExtensions();
+        assert.deepEqual(DEFAULT_PROVIDER_MIDDLEWARE_EXTENSIONS, []);
+        assert.deepEqual(result.errors, [], "excluded factories must never execute");
+        assert.deepEqual(
+          result.extensions.map((entry) => entry.path),
+          allowlist?.length ? [join(extensionDir, "example-provider-adapter.js")] : [],
+        );
+        let requests = 0;
+        core.setResponses([
+          async (context, options, _state, model) => {
+            requests++;
+            assert.equal(JSON.stringify(context).includes("ADAPTER_BOUND"), Boolean(allowlist?.length));
+            // Faux transport does not serialize HTTP payloads. Exercise the SDK's
+            // actual request hook locally, without contacting an external provider.
+            assert.ok(options?.onPayload);
+            const payload = await options.onPayload({ task: "example" }, model);
+            assert.deepEqual(
+              payload,
+              allowlist?.length ? { task: "example", adapterStarted: true } : { task: "example" },
+            );
+            return fauxAssistantMessage("middleware checked", { stopReason: "stop" });
+          },
+        ]);
+        await agent.run("task", { model: "fauxtest-middleware/faux-model" });
+        assert.equal(requests, 1, "the real child SDK session must reach the faux provider");
+      });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+}
+
+test("provider middleware resolves package entrypoints without loading disabled or recursive factories", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-dw-middleware-package-"));
+  try {
+    const packageDir = join(root, "example-provider-adapter");
+    mkdirSync(packageDir);
+    writeFileSync(
+      join(packageDir, "package.json"),
+      JSON.stringify({ pi: { extensions: ["index.js", "disabled.js", "workflow.js"] } }),
+    );
+    writeFileSync(join(packageDir, "index.js"), "export default function () {}");
+    for (const file of ["disabled.js", "workflow.js"]) {
+      writeFileSync(
+        join(packageDir, file),
+        'export default function () { throw new Error("excluded factory loaded"); }',
+      );
+    }
+    const agent = new WorkflowAgent({
+      cwd: root,
+      providerMiddlewareExtensions: ["example-provider-adapter", "workflow"],
+      session: {
+        settingsManager: SettingsManager.inMemory({
+          packages: [{ source: packageDir, extensions: ["index.js", "workflow.js"] }],
+        }),
+      },
+    });
+    const loader = await (agent as unknown as WorkflowAgentPrivates).getSharedResourceLoader(join(root, "agent"));
+    assert.deepEqual(loader.getExtensions().errors, []);
+    assert.deepEqual(
+      loader.getExtensions().extensions.map((entry) => entry.path),
+      [join(packageDir, "index.js")],
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("provider middleware resolves per run cwd using injected project trust settings", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-middleware-cwd-home-"));
+  const root = mkdtempSync(join(tmpdir(), "pi-dw-middleware-cwd-"));
+  const first = join(root, "first");
+  const second = join(root, "second");
+  const core = createFauxCore({
+    provider: "fauxtest-middleware-cwd",
+    models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 4096 }],
+  });
+  try {
+    for (const [cwd, marker] of [
+      [first, "FIRST_ADAPTER_BOUND"],
+      [second, "SECOND_ADAPTER_BOUND"],
+    ]) {
+      const extensionDir = join(cwd, ".pi", "extensions");
+      mkdirSync(extensionDir, { recursive: true });
+      writeFileSync(
+        join(extensionDir, "example-provider-adapter.js"),
+        `export default function (pi) {
+          let turns = 0;
+          pi.on("before_agent_start", (event) => ({ systemPrompt: event.systemPrompt + "\\n${marker}:" + (++turns) }));
+        }`,
+      );
+    }
+    await withFakeHomeAsync(home, async () => {
+      const registry = await fauxRegistry(home, "fauxtest-middleware-cwd", core);
+      const settingsManager = SettingsManager.inMemory({}, { projectTrusted: true });
+      const agent = new WorkflowAgent({
+        cwd: first,
+        modelRegistry: registry,
+        providerMiddlewareExtensions: ["example-provider-adapter"],
+        session: { settingsManager },
+      });
+      const contexts: unknown[] = [];
+      core.setResponses(
+        [1, 2, 3].map(() => (context) => {
+          contexts.push(context);
+          return fauxAssistantMessage("cwd middleware bound", { stopReason: "stop" });
+        }),
+      );
+      const model = "fauxtest-middleware-cwd/faux-model";
+      await agent.run("first", { cwd: first, model });
+      await agent.run("second", { cwd: second, model });
+      await agent.run("first again", { cwd: first, model });
+      const requests = contexts.map((context) => JSON.stringify(context));
+      assert.match(requests[0], /FIRST_ADAPTER_BOUND:1/);
+      assert.doesNotMatch(requests[0], /SECOND_ADAPTER_BOUND/);
+      assert.match(requests[1], /SECOND_ADAPTER_BOUND:1/);
+      assert.doesNotMatch(requests[1], /FIRST_ADAPTER_BOUND/);
+      assert.match(requests[2], /FIRST_ADAPTER_BOUND:2/, "factory must be shared, not re-run per child");
+      const privateAgent = agent as unknown as WorkflowAgentPrivates;
+      const agentDir = join(home, ".pi", "agent");
+      assert.equal(
+        privateAgent.getSharedResourceLoader(agentDir, first),
+        privateAgent.getSharedResourceLoader(agentDir, first),
+      );
+      assert.notEqual(
+        privateAgent.getSharedResourceLoader(agentDir, first),
+        privateAgent.getSharedResourceLoader(agentDir, second),
+      );
+      const untrusted = new WorkflowAgent({
+        cwd: first,
+        providerMiddlewareExtensions: ["example-provider-adapter"],
+        session: { settingsManager: SettingsManager.inMemory({}, { projectTrusted: false }) },
+      });
+      const untrustedLoader = await (untrusted as unknown as WorkflowAgentPrivates).getSharedResourceLoader(agentDir);
+      assert.deepEqual(untrustedLoader.getExtensions().extensions, [], "allowlist must not bypass project trust");
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("a failed per-directory resource loader is evicted before the next attempt (#109)", async () => {

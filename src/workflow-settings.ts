@@ -54,6 +54,12 @@ export interface WorkflowSettings {
    * tool) so a subagent can't fan out through them.
    */
   excludeSubagentTools?: string[];
+  /**
+   * Trusted provider/auth middleware extension names allowed in child sessions.
+   * Omitted or [] loads no host extensions. Recursive workflow/subagent
+   * extensions are always excluded.
+   */
+  providerMiddlewareExtensions?: string[];
 }
 
 export interface WorkflowSettingsStore {
@@ -205,6 +211,11 @@ function normalizeSettings(value: unknown): WorkflowSettings {
   if (Array.isArray(raw.excludeSubagentTools)) {
     const names = raw.excludeSubagentTools.filter((t): t is string => typeof t === "string" && t.trim().length > 0);
     if (names.length) settings.excludeSubagentTools = names;
+  }
+  if (Array.isArray(raw.providerMiddlewareExtensions)) {
+    settings.providerMiddlewareExtensions = raw.providerMiddlewareExtensions
+      .filter((name): name is string => typeof name === "string" && name.trim().length > 0)
+      .map((name) => name.trim());
   }
   return settings;
 }
