@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -38,19 +38,9 @@ type WorkflowAgentPrivates = {
   buildPrompt(prompt: string, options: AgentRunOptions<any>, structured: boolean): string;
   lastAssistantText(messages: unknown[]): string;
   finalAssistantText(messages: unknown[]): string;
-  createSessionManager(
-    thread?: string,
-    cwd?: string,
-  ): {
-    isPersisted(): boolean;
-    getCwd(): string;
-    getSessionId(): string;
-    getSessionDir(): string;
-    getSessionFile(): string | undefined;
-    getLeafId(): string | null;
-    appendSessionInfo(name: string): string;
-  };
-  restoreThreadLeaf(manager: ReturnType<WorkflowAgentPrivates["createSessionManager"]>, leafId: string | null): void;
+  createSessionManager(thread?: string, cwd?: string): SessionManager;
+  agentIdFor(options: AgentRunOptions<any>, runCwd: string): string;
+  restoreThreadLeaf(manager: SessionManager, leafId: string | null): void;
   getRegistry(perRunRegistry?: ModelRegistry): Promise<ModelRegistry>;
 };
 
@@ -119,8 +109,8 @@ test("WorkflowAgent with persistAgentSessions=true creates a file-backed manager
       assert.equal(manager.isPersisted(), true, "flag must yield a file-backed session manager");
       // Sessions must be keyed by the runner's project cwd — never a per-call
       // worktree cwd — so transcripts group under the project's session dir.
-      // createSessionManager() takes no per-call cwd by design; assert the
-      // manager saw the project cwd.
+      // The optional per-call cwd validates thread continuity only; the
+      // manager must still use the project cwd.
       assert.equal(manager.getCwd(), projectCwd);
     });
   } finally {
@@ -165,6 +155,118 @@ test("agentIdFor ids never collide across separate WorkflowAgent instances", () 
     second.agentIdFor({ thread: "implementer" }, "/worktree"),
     "the same thread name on separate instances must not share an AgentRegistry id",
   );
+});
+
+test("persistent child sessions record the parentSession header without inheriting messages", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-lineage-"));
+  const projectCwd = join(dir, "project");
+  const fakeHome = join(dir, "home");
+  try {
+    withFakeHome(fakeHome, () => {
+      const parentDir = join(dir, "parent-sessions");
+      const parent = SessionManager.create(projectCwd, parentDir);
+      parent.appendMessage({ role: "assistant", content: [], timestamp: Date.now() } as never);
+      const parentSessionFile = parent.getSessionFile();
+      assert.ok(parentSessionFile);
+
+      const agent = new WorkflowAgent({ cwd: projectCwd, persistAgentSessions: true, parentSessionFile });
+      const child = (agent as unknown as WorkflowAgentPrivates).createSessionManager();
+      assert.equal(child.getHeader()?.parentSession, parentSessionFile);
+      assert.deepEqual(child.getEntries(), [], "parent messages must not be inherited");
+
+      // Pi flushes the lazily-created header when the first assistant message
+      // arrives; inspect the durable JSONL header as the graph will do.
+      child.appendMessage({ role: "assistant", content: [], timestamp: Date.now() } as never);
+      const header = JSON.parse(readFileSync(child.getSessionFile() as string, "utf8").split("\n", 1)[0]);
+      assert.equal(header.parentSession, parentSessionFile);
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("persistent and in-memory child sessions omit parentSession without a parent file", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-no-parent-"));
+  const projectCwd = join(dir, "project");
+  const fakeHome = join(dir, "home");
+  try {
+    withFakeHome(fakeHome, () => {
+      const persistent = (
+        new WorkflowAgent({ cwd: projectCwd, persistAgentSessions: true }) as unknown as WorkflowAgentPrivates
+      ).createSessionManager();
+      assert.equal(persistent.getHeader()?.parentSession, undefined);
+
+      const ephemeral = (
+        new WorkflowAgent({
+          cwd: projectCwd,
+          persistAgentSessions: false,
+          parentSessionFile: "/parent.jsonl",
+        }) as unknown as WorkflowAgentPrivates
+      ).createSessionManager();
+      assert.equal(ephemeral.isPersisted(), false);
+      assert.equal(ephemeral.getSessionFile(), undefined, "ephemeral children must not claim a session file");
+      assert.equal(ephemeral.getHeader()?.parentSession, undefined);
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("onSessionCreated reports the effective manager before prompting and preserves thread cwd and lineage", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-session-created-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-session-created-cwd-"));
+  const worktree = mkdtempSync(join(tmpdir(), "pi-dw-session-created-worktree-"));
+  const core = createFauxCore({
+    provider: "fauxtest-session-created",
+    models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 4096 }],
+  });
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const registry = await fauxRegistry(home, "fauxtest-session-created", core);
+      const injected = SessionManager.inMemory();
+      const parentSessionFile = join(home, "parent.jsonl");
+      const agent = new WorkflowAgent({
+        cwd,
+        modelRegistry: registry,
+        persistAgentSessions: true,
+        parentSessionFile,
+        session: { sessionManager: injected },
+      });
+      const identities: Array<{ sessionId: string; sessionFile?: string }> = [];
+      let prompts = 0;
+      core.setResponses(
+        [1, 2, 3].map(() => () => {
+          prompts++;
+          assert.equal(identities.length, prompts, "identity must arrive before each provider request");
+          return fauxAssistantMessage("identity captured", { stopReason: "stop" });
+        }),
+      );
+      const options = {
+        model: "fauxtest-session-created/faux-model",
+        cwd: worktree,
+        onSessionCreated: (identity: { sessionId: string; sessionFile?: string }) => identities.push(identity),
+      };
+      await agent.run("one shot", options);
+      assert.deepEqual(identities[0], { sessionId: injected.getSessionId(), sessionFile: undefined });
+      assert.ok(injected.getEntries().length > 0, "the reported injected manager must be the one prompted");
+
+      await agent.run("first threaded turn", { ...options, thread: "worker" });
+      await agent.run("second threaded turn", { ...options, thread: "worker" });
+      assert.deepEqual(identities[2], identities[1], "thread turns must report one stable identity");
+      assert.notEqual(identities[1].sessionId, injected.getSessionId());
+      const threadManager = (agent as unknown as WorkflowAgentPrivates).createSessionManager("worker", worktree);
+      assert.equal(identities[1].sessionId, threadManager.getSessionId());
+      assert.equal(identities[1].sessionFile, threadManager.getSessionFile());
+      assert.equal(threadManager.getCwd(), cwd, "persistence stays grouped by the project, not worktree");
+      assert.equal(threadManager.getHeader()?.parentSession, parentSessionFile);
+      await assert.rejects(agent.run("wrong cwd", { ...options, thread: "worker", cwd }), /cannot change cwd/);
+      assert.equal(identities.length, 3, "a rejected cwd must not announce a new child session");
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(worktree, { recursive: true, force: true });
+  }
 });
 
 test("WorkflowAgent retains one session manager per named thread", () => {

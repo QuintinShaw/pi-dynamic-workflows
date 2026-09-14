@@ -445,6 +445,8 @@ function persistedToSnapshot(p: PersistedRunState): WorkflowSnapshot {
       tokens: a.tokens,
       tokenUsage: a.tokenUsage,
       model: a.model,
+      sessionId: a.sessionId,
+      sessionFile: a.sessionFile,
     };
   });
   return {

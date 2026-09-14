@@ -156,7 +156,9 @@ test(
       }),
     );
 
-    assert.equal(rp.load("legacy-run")?.workflowName, "legacy");
+    const loaded = rp.load("legacy-run");
+    assert.equal(loaded?.workflowName, "legacy");
+    assert.equal(loaded?.parentSessionFile, undefined, "legacy files without lineage fields still load");
     assert.equal(
       rp.list().some((run) => run.runId === "legacy-run"),
       true,
@@ -1213,7 +1215,12 @@ test(
 const a = await agent('hi', { label: 'a' })
 return a`;
 
-    const m = new WorkflowManager({ cwd, sessionId: "session-A", agent: deferredAgent() });
+    const m = new WorkflowManager({
+      cwd,
+      sessionId: "session-A",
+      sessionFile: "/sessions/session-A.jsonl",
+      agent: deferredAgent(),
+    });
     m.on("error", () => {});
     const { runId } = m.startInBackground(script);
     await new Promise((r) => setTimeout(r, 30));
@@ -1221,15 +1228,23 @@ return a`;
     const live = m.getRun(runId);
     assert.ok(live);
     assert.equal(live.sessionId, "session-A", "frozen at start");
+    assert.equal(live.parentSessionId, "session-A", "parent id is frozen at start");
+    assert.equal(live.parentSessionFile, "/sessions/session-A.jsonl", "parent file is frozen at start");
     assert.deepEqual(
       m.listRuns().map((r) => r.runId),
       [runId],
     );
 
     // Switch the manager's bound session the way session_start does after /new.
-    m.setSessionId("session-B");
+    m.setSessionId("session-B", "/sessions/session-B.jsonl");
     assert.equal(m.listRuns().length, 0, "without adopt, the new session's filtered view hides the still-A-owned run");
     assert.equal(m.getRun(runId)?.sessionId, "session-A", "setSessionId must not mutate the live run");
+    assert.equal(m.getRun(runId)?.parentSessionId, "session-A", "session replacement must not change parent id");
+    assert.equal(
+      m.getRun(runId)?.parentSessionFile,
+      "/sessions/session-A.jsonl",
+      "session replacement must not change parent file",
+    );
     assert.deepEqual(
       m
         .listLiveRuns()
@@ -1243,9 +1258,16 @@ return a`;
     assert.equal(m.getRun(runId)?.status, "paused");
     // Persisted owner must still be A (pause writes managed.sessionId, not this.sessionId).
     assert.equal(m.getPersistence().load(runId)?.sessionId, "session-A");
+    assert.equal(m.getPersistence().load(runId)?.parentSessionId, "session-A");
+    assert.equal(m.getPersistence().load(runId)?.parentSessionFile, "/sessions/session-A.jsonl");
 
     // Fresh manager: start under A, switch to B, adopt — panel must see it under B.
-    const m2 = new WorkflowManager({ cwd, sessionId: "session-A", agent: deferredAgent() });
+    const m2 = new WorkflowManager({
+      cwd,
+      sessionId: "session-A",
+      sessionFile: "/sessions/session-A.jsonl",
+      agent: deferredAgent(),
+    });
     m2.on("error", () => {});
     const { runId: run2 } = m2.startInBackground(script);
     await new Promise((r) => setTimeout(r, 30));
@@ -1254,6 +1276,8 @@ return a`;
     const adopted = m2.adoptLiveRunsToSession("session-B");
     assert.equal(adopted, 1);
     assert.equal(m2.getRun(run2)?.sessionId, "session-B");
+    assert.equal(m2.getRun(run2)?.parentSessionId, "session-A");
+    assert.equal(m2.getRun(run2)?.parentSessionFile, "/sessions/session-A.jsonl");
     assert.deepEqual(
       m2.listRuns().map((r) => r.runId),
       [run2],

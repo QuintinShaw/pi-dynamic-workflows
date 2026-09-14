@@ -32,6 +32,8 @@ import { loadWorkflowSettings, saveWorkflowSettingsForCwd } from "./workflow-set
 import { createWorkflowTool } from "./workflow-tool.js";
 import { registerWorkflowModelsCommand } from "./workflows-models-command.js";
 
+export { installHostSessionCapture } from "./task-panel.js";
+
 /**
  * Bound for the read-only session-header probe (first line only). Independent of
  * pi's own ~1MiB session scan — we only need the header and keep the read small.
@@ -317,14 +319,20 @@ export default function extension(pi: ExtensionAPI) {
     // with this session and visible in its panel. Capture the previous id first
     // so completed-with-pending can be re-homed across /new / fork / switch.
     let sessionId: string | undefined;
+    let sessionFile: string | undefined;
     try {
       sessionId = ctx.sessionManager?.getSessionId();
     } catch {
       // sessionManager may be unavailable — fall back to global history.
     }
+    try {
+      sessionFile = ctx.sessionManager?.getSessionFile();
+    } catch {
+      // An ephemeral or unavailable session has no parent file.
+    }
     const previousSessionId = manager.getSessionId();
     manager.adoptLiveRunsToSession(sessionId, previousSessionId);
-    manager.setSessionId(sessionId);
+    manager.setSessionId(sessionId, sessionFile);
 
     // Runtime is bound now (session_start fires after bindCore). Register a
     // session-stable delivery endpoint for THIS session only, then flush any

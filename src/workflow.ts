@@ -272,7 +272,17 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   onPhase?: (title: string) => void;
   /** Runtime behavior trace used by diagnostics and comprehension evidence. */
   onRuntimeEvent?: (event: WorkflowRuntimeEvent) => void;
-  onAgentStart?: (event: { id: string; label: string; phase?: string; prompt: string; model?: string }) => void;
+  onAgentStart?: (event: {
+    id: string;
+    label: string;
+    phase?: string;
+    prompt: string;
+    model?: string;
+    /** True when this event is a journal replay, not a new child launch. */
+    replayed?: boolean;
+  }) => void;
+  /** Called immediately after a child SessionManager is created. */
+  onAgentSession?: (event: { callId: string; sessionId: string; sessionFile?: string }) => void;
   onAgentEnd?: (event: {
     /**
      * Unique per agent() CALL (not per label — concurrent agents routinely
@@ -827,11 +837,16 @@ export async function runWorkflow<T = unknown>(
     const hashMatches = cached != null && cached.hash === callHash;
     const cachedEmptyOutput = hashMatches && isEmptyTextAgentResult(cached.result, agentOptions.schema);
     if (!shared.resumeBarrierReached && hashMatches && !cachedEmptyOutput && callIndex < state.firstMiss) {
-      // A replayed call never runs an agent, so onModelResolved never fires for it.
-      // Use the model journaled when it originally ran; legacy entries have none and
-      // fall back to the pre-resolution guess, exactly as before this field existed.
+      // Replay preserves the journaled model and historical session identity.
       const replayModel = cached.model ?? displayModel;
-      options.onAgentStart?.({ id: deltaKey, label, phase: assignedPhase, prompt, model: replayModel });
+      options.onAgentStart?.({
+        id: deltaKey,
+        label,
+        phase: assignedPhase,
+        prompt,
+        model: replayModel,
+        replayed: true,
+      });
       options.onAgentEnd?.({
         id: deltaKey,
         label,
@@ -965,6 +980,9 @@ export async function runWorkflow<T = unknown>(
               },
               onUsageProgress: attemptUsage.reportProgress,
               onUsage: attemptUsage.reportTerminal,
+              onSessionCreated: ({ sessionId, sessionFile }: { sessionId: string; sessionFile?: string }) => {
+                options.onAgentSession?.({ callId: deltaKey, sessionId, sessionFile });
+              },
               onHistory: (history: AgentHistoryEntry[]) => {
                 options.onAgentHistory?.({ id: deltaKey, label, phase: assignedPhase, history });
               },

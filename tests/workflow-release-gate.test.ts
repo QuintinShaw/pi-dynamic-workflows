@@ -29,7 +29,7 @@ test("the published Pi extension forwards through TypeScript to the compiled pay
   assert.ok(publishableFiles().includes("dist/pi-extension.js"));
   assert.match(
     readFileSync(new URL(`../${extensionPath}`, import.meta.url), "utf8"),
-    /require\("\.\.\/dist\/pi-extension\.js"\)/,
+    /import\("\.\.\/dist\/pi-extension\.js"\)/,
   );
 });
 
