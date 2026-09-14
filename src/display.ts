@@ -27,6 +27,10 @@ export interface WorkflowAgentSnapshot {
   tokenUsage?: AgentUsage;
   /** The model this agent ran on (provider/id), when known. */
   model?: string;
+  /** Child SessionManager identity, captured before the first prompt. */
+  sessionId?: string;
+  /** Child session file, absent for in-memory child sessions. */
+  sessionFile?: string;
 }
 
 export interface WorkflowSnapshot {

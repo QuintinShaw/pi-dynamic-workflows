@@ -74,7 +74,13 @@ export type {
   PreSpawnModelResolver,
 } from "./pre-spawn-model.js";
 export { getPreSpawnModelResolver, setPreSpawnModelResolver } from "./pre-spawn-model.js";
-export type { PendingDeliveryMarker, PersistedRunState, RunPersistence, RunStatus } from "./run-persistence.js";
+export type {
+  PendingDeliveryMarker,
+  PersistedAgentState,
+  PersistedRunState,
+  RunPersistence,
+  RunStatus,
+} from "./run-persistence.js";
 export { createRunPersistence, generateRunId } from "./run-persistence.js";
 export {
   parseCommandArgs,

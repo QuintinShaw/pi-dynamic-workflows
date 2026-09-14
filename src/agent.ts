@@ -263,6 +263,8 @@ export interface WorkflowAgentOptions {
    * that are only available via extension registration.
    */
   modelRegistry?: ModelRegistry;
+  /** Persisted host session file used as the parent of persistent child sessions. */
+  parentSessionFile?: string;
   /**
    * Persist each subagent transcript as a real pi session file under the
    * standard sessions directory (keyed by the runner's project cwd), instead
@@ -520,6 +522,11 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
   tools?: ToolDefinition[];
   instructions?: string;
   signal?: AbortSignal;
+  /**
+   * Called as soon as the child SessionManager is created, before prompting.
+   * The file is absent for in-memory sessions (and for a persistence fallback).
+   */
+  onSessionCreated?: (session: { sessionId: string; sessionFile?: string }) => void;
   /** Called once before disposal with exact cumulative provider usage, when reported. */
   onUsage?: (usage: AgentUsage) => void;
   /**
@@ -665,6 +672,8 @@ export class WorkflowAgent {
   private readonly preSpawnModel?: PreSpawnModelResolver;
   /** Shared registry from the host session, when provided. */
   private readonly sharedRegistry?: ModelRegistry;
+  /** Frozen host session file used for child-session lineage in this run. */
+  private readonly parentSessionFile?: string;
   /** Lazily built once; shares the SDK's agentDir/auth so resolved models are authed. */
   private registry?: ModelRegistry;
   /**
@@ -707,6 +716,7 @@ export class WorkflowAgent {
     this.mainModel = options.mainModel;
     this.preSpawnModel = options.preSpawnModel;
     this.sharedRegistry = options.modelRegistry;
+    this.parentSessionFile = options.parentSessionFile;
   }
 
   /**
@@ -852,6 +862,12 @@ export class WorkflowAgent {
     } else {
       try {
         manager = SessionManager.create(this.cwd);
+        // SessionManager.create() starts a fresh session without lineage. Reset
+        // it before createAgentSession() so the child header records the host
+        // session, while retaining the default behavior for ephemeral parents.
+        if (this.parentSessionFile) {
+          manager.newSession({ parentSession: this.parentSessionFile });
+        }
         this.assertSessionDirWritable(manager.getSessionDir());
         warnPersistSecretsOnce(manager.getSessionDir());
       } catch (error) {
@@ -1062,6 +1078,14 @@ export class WorkflowAgent {
     // group under the project's session dir instead of scattering across
     // temporary worktree paths.
     const sessionManager = this.createSessionManager(options.thread, runCwd);
+    const effectiveSessionManager =
+      options.thread || !this.sessionOptions.sessionManager ? sessionManager : this.sessionOptions.sessionManager;
+    // Capture the child identity from SessionManager immediately, before the
+    // first prompt/usage event. In-memory sessions intentionally report no file.
+    options.onSessionCreated?.({
+      sessionId: effectiveSessionManager.getSessionId(),
+      sessionFile: effectiveSessionManager.isPersisted() ? effectiveSessionManager.getSessionFile() : undefined,
+    });
     const threadLeaf = options.thread ? sessionManager.getLeafId() : null;
     // Host split: pi >= 0.80.8 createAgentSession takes modelRuntime, not a
     // registry — hand over the registry's backing runtime so subagents share
