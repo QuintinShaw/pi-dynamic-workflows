@@ -198,6 +198,25 @@ export function emptyFleetSummary(agents: WorkflowAgentSnapshot[], maxLabels = 5
   };
 }
 
+/**
+ * One-line "started in the background" notice pointing at a progress surface
+ * that exists in the current host. The task panel and /workflows navigator are
+ * TUI components (`ui.custom()` / widget factories) that no-op in RPC hosts
+ * such as Paseo even though `ctx.hasUI` is true there — so non-TUI modes are
+ * pointed at `/workflows status <id>`, which prints plain text any host can
+ * display.
+ */
+export function backgroundStartNotice(
+  name: string,
+  runId: string,
+  mode: ExtensionContext["mode"] | undefined,
+  deliverable: "report" | "result",
+): string {
+  const where =
+    mode === "tui" ? "watch the task panel or /workflows" : `check progress with /workflows status ${runId}`;
+  return `/${name} running in the background (${runId}) — ${where}; the ${deliverable} is posted here when it finishes.`;
+}
+
 export function createWidgetWorkflowDisplay(
   ctx: Pick<ExtensionContext, "ui" | "hasUI">,
   options: WorkflowDisplayOptions = {},

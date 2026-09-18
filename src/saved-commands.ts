@@ -5,6 +5,7 @@
 
 import { createCodingTools, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { claimCommand, commandOwner, isCommandRegistered } from "./command-registry.js";
+import { backgroundStartNotice } from "./display.js";
 import { runWorkflow, type WorkflowRunResult } from "./workflow.js";
 import type { WorkflowManager } from "./workflow-manager.js";
 import type { SavedWorkflow, WorkflowStorage } from "./workflow-saved.js";
@@ -83,10 +84,7 @@ export function registerSavedWorkflow(
               liveWorkflow.script,
               parseCommandArgs(args, liveWorkflow.parameters),
             );
-            ctx.ui.notify(
-              `/${liveWorkflow.name} running in the background (${runId}) — watch the task panel or /workflows; the result is posted here when it finishes.`,
-              "info",
-            );
+            ctx.ui.notify(backgroundStartNotice(liveWorkflow.name, runId, ctx.mode, "result"), "info");
             return;
           }
           const liveCwd = getCwd();

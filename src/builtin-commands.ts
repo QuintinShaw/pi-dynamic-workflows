@@ -16,6 +16,7 @@ import type { BuiltinWorkflowInvocation } from "./builtin-workflows.js";
 import { findBuiltinWorkflow } from "./builtin-workflows.js";
 import { MAX_DIFF_CHARS } from "./code-review.js";
 import { claimCommand, isCommandRegistered } from "./command-registry.js";
+import { backgroundStartNotice } from "./display.js";
 import { parseCommandArgs } from "./saved-commands.js";
 import type { WorkflowManager } from "./workflow-manager.js";
 import { createWorkflowStorage, type WorkflowStorage } from "./workflow-saved.js";
@@ -290,10 +291,7 @@ function startBackground(
 ): void {
   try {
     const { runId } = manager.startInBackground(script, args, exec ?? {});
-    ctx.ui.notify(
-      `/${name} running in the background (${runId}) — watch the task panel or /workflows; the report is posted here when it finishes.`,
-      "info",
-    );
+    ctx.ui.notify(backgroundStartNotice(name, runId, ctx.mode, "report"), "info");
   } catch (error) {
     ctx.ui.notify(`${name} failed to start: ${error instanceof Error ? error.message : error}`, "error");
   }
