@@ -269,7 +269,19 @@ export function registerWorkflowCommands(
         }
         case "rm": {
           if (!id) return ctx.ui.notify(USAGE, "warning");
-          ctx.ui.notify(manager.deleteRun(id) ? `Removed ${id}` : `No run ${id}`, "info");
+          if (manager.deleteRun(id)) {
+            ctx.ui.notify(`Removed ${id}`, "info");
+            return;
+          }
+          // Distinguish a lease refusal from "no such run" (audit2 #16 r1
+          // MINOR 2): the run may exist but be leased by a live process
+          // (resumed/running in another session) — saying "No run" would lie
+          // while that process burns tokens.
+          const known = manager.getRun(id) ?? manager.getPersistence?.().load(id);
+          ctx.ui.notify(
+            known ? `Cannot remove ${id}: it is active in another live session` : `No run ${id}`,
+            known ? "warning" : "info",
+          );
           return;
         }
         case "save": {

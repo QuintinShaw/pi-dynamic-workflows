@@ -369,6 +369,19 @@ test("/workflows rm <id> warns when deleteRun returns false", async () => {
   );
 });
 
+test("/workflows rm <id> distinguishes a lease refusal from 'no such run' (audit2 #16 r1)", async () => {
+  const h = harness({
+    deleteRun: () => false,
+    getRun: () => ({ runId: "run-busy", status: "running" }),
+  });
+  await h.run("rm run-busy");
+  const note = h.notified.find((n) => n.message.includes("run-busy"));
+  assert.ok(note, "should notify about run-busy");
+  assert.match(note.message, /active in another live session/, "should explain the refusal");
+  assert.equal(note.type, "warning");
+  assert.ok(!h.notified.some((n) => n.message.includes("No run")), "must not claim the leased run does not exist");
+});
+
 // ═══════════════════════════════════════════════════════════════════════════
 // stop without id — warn usage
 // ═══════════════════════════════════════════════════════════════════════════

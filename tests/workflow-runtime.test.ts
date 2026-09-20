@@ -1616,10 +1616,10 @@ return { a, blocked }`;
 });
 
 test("runWorkflow initialTokenUsage integrates correctly with phase() sub-budgets (seeded baseline isn't corrupted)", async () => {
-  // phase()'s sub-budget deliberately re-bases from shared.spent AT the
-  // phase() call (see workflow.ts's phase(): "Re-declaring re-bases from the
-  // current spent"), so a seed doesn't make the phase's OWN ceiling trip any
-  // sooner than usual — it only shifts the visible baseline. This mirrors the
+  // phase()'s sub-budget bases itself on shared.spent AT the first
+  // declaration (first-declaration-wins; a persisted baseline is adopted on
+  // resume), so a seed doesn't make the phase's OWN ceiling trip any sooner
+  // than usual — it only shifts the visible baseline. This mirrors the
   // existing "phase sub-budget throws..." test's budget/spend shape exactly,
   // plus a seed, to confirm seeding doesn't corrupt that mechanism.
   const script = `export const meta = { name: 'seeded_phase_budget', description: 'seed' }
@@ -2365,4 +2365,301 @@ return main`;
   // the journal — neither runner.run() is invoked again.
   assert.equal(calls.stray, 1, "the un-awaited agent's cached result must replay, not re-run, on resume");
   assert.equal(calls.main, 1, "the awaited agent's cached result must replay, not re-run, on resume");
+});
+
+test("an aborted run's drain abandons signal-ignoring agents after drainAbortGraceMs (audit2 #3)", async () => {
+  // Un-awaited agent whose runner NEVER settles and ignores its abort signal:
+  // without the grace the drain (and the run) would wedge forever.
+  const script = `export const meta = { name: 'hung_drain', description: 'hung drain' }
+void agent('wedged', { label: 'wedged' })
+return 'script-done'`;
+  for (const abortTiming of ["during-drain", "before-drain"] as const) {
+    const controller = new AbortController();
+    const logs: string[] = [];
+    const started = Date.now();
+    let agentStarted!: () => void;
+    const agentGate = new Promise<void>((resolve) => (agentStarted = resolve));
+    const pending = runWorkflow<string>(script, {
+      agent: {
+        async run() {
+          agentStarted();
+          return new Promise<string>(() => {}); // never settles, ignores signal
+        },
+      },
+      signal: controller.signal,
+      drainAbortGraceMs: 50,
+      persistLogs: false,
+      onLog: (m) => logs.push(m),
+    });
+    await agentGate; // the hung agent is in-flight
+    if (abortTiming === "before-drain") {
+      // Abort immediately: the script may not have returned yet — the drain
+      // starts already-aborted.
+      controller.abort();
+    } else {
+      // Wait for the drain to start (its log line), then abort mid-drain.
+      for (let i = 0; i < 2000 && !logs.some((l) => l.includes("outstanding agent()")); i++) {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+      }
+      controller.abort();
+    }
+    await pending.catch(() => {});
+    assert.ok(
+      Date.now() - started < 5_000,
+      `${abortTiming}: the run settles promptly after the grace instead of wedging`,
+    );
+    assert.ok(
+      logs.some((l) => l.includes("abandoning 1 outstanding agent()")),
+      `${abortTiming}: the abandonment is logged`,
+    );
+  }
+});
+
+test("drainAbortGraceMs: Infinity restores unbounded waiting (no busy-spin) (audit2 #3)", async () => {
+  const script = `export const meta = { name: 'hung_inf', description: 'hung inf' }
+void agent('wedged', { label: 'wedged' })
+return 'script-done'`;
+  const controller = new AbortController();
+  const logs: string[] = [];
+  let agentStarted!: () => void;
+  const agentGate = new Promise<void>((resolve) => (agentStarted = resolve));
+  const pending = runWorkflow<string>(script, {
+    agent: {
+      async run() {
+        agentStarted();
+        return new Promise<string>(() => {});
+      },
+    },
+    signal: controller.signal,
+    drainAbortGraceMs: Number.POSITIVE_INFINITY,
+    persistLogs: false,
+    onLog: (m) => logs.push(m),
+  });
+  await agentGate;
+  controller.abort();
+  // With Infinity the drain must NOT abandon: it keeps waiting. Give it ample
+  // time to (wrongly) abandon or (wrongly) busy-spin, then confirm neither.
+  const settled = await Promise.race([
+    pending.then(
+      () => true,
+      () => true,
+    ),
+    new Promise((r) => setTimeout(() => r(false), 300)),
+  ]);
+  assert.equal(settled, false, "Infinity grace: the drain must not abandon the hung agent");
+  assert.ok(!logs.some((l) => l.includes("abandoning")), "no abandonment logged");
+  // Cleanup: not observable further (the run stays wedged by design) — the
+  // process exits because nothing else holds the loop (agent promise is not a
+  // handle).
+});
+
+test("a NON-abort (success) drain still waits without a bound for a slow un-awaited agent (audit2 #3)", async () => {
+  // The success-path drain must not be grace-limited: the slow sibling's
+  // result is still wanted (it journals when it completes).
+  const script = `export const meta = { name: 'slow_drain', description: 'slow drain' }
+const pending = agent('slow', { label: 'slow' })
+return 'script-done'`;
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  const started = Date.now();
+  const result = await runWorkflow<string>(script, {
+    agent: {
+      async run() {
+        setTimeout(release, 150);
+        await gate;
+        return "slow-done";
+      },
+    },
+    drainAbortGraceMs: 10, // even with a tiny grace, the success drain waits
+    persistLogs: false,
+  });
+  assert.equal(result.result, "script-done");
+  assert.ok(Date.now() - started >= 140, "the success drain waited out the slow sibling");
+});
+
+test("aborted drain finalizes reported terminal usage before flushing the returned totals", async () => {
+  const controller = new AbortController();
+  const totals: number[] = [];
+  const result = await runWorkflow(
+    `export const meta = { name: 'abandon_usage', description: 'usage' }
+void agent('reported but hung')
+return 'script-done'`,
+    {
+      agent: {
+        async run(_prompt, options) {
+          options?.onUsage?.({ input: 40, output: 2, total: 42, cost: 0, cacheRead: 0, cacheWrite: 0 });
+          return new Promise(() => {});
+        },
+      },
+      signal: controller.signal,
+      drainAbortGraceMs: 5,
+      persistLogs: false,
+      onLog: (message) => {
+        if (message.includes("outstanding agent()")) controller.abort();
+      },
+      onTokenUsage: (usage) => totals.push(usage.total),
+    },
+  );
+  assert.equal(result.tokenUsage?.total, 42);
+  assert.deepEqual(totals, [42]);
+});
+
+test("runWorkflow's final onTokenUsage flush includes agents that settle during the drain (audit2 #5)", async () => {
+  // The script returns while an un-awaited sibling is still running; the drain
+  // waits it out, and the final flush must carry the sibling's spend.
+  const script = `export const meta = { name: 'drain_flush', description: 'drain flush' }
+const pending = agent('slow-sibling', { label: 'sibling' })
+return 'script-done'`;
+  const flushes: number[] = [];
+  let releaseSibling!: () => void;
+  const siblingGate = new Promise<void>((resolve) => (releaseSibling = resolve));
+  let calls = 0;
+  const result = await runWorkflow<string>(script, {
+    agent: {
+      async run(prompt: string) {
+        calls++;
+        if (prompt === "slow-sibling") {
+          setTimeout(releaseSibling, 30);
+          await siblingGate;
+        }
+        return "done";
+      },
+    },
+    onAgentUsage: () => {},
+    onTokenUsage: (usage) => flushes.push(usage.total),
+    persistLogs: false,
+  });
+  assert.equal(result.result, "script-done");
+  assert.equal(calls, 1, "the sibling ran exactly once");
+  assert.equal(flushes.length, 1, "exactly one final flush");
+  assert.ok(flushes[0] > 0, "the drain-settled sibling's usage is in the final flush");
+  assert.equal(flushes[0], result.tokenUsage?.total, "the flush IS the final total (no partial/double accounting)");
+});
+
+test("runWorkflow initialPhaseBudgets adopts the persisted baseline instead of re-basing (audit2 #4)", async () => {
+  // Simulates resume(): the prior execution declared phase 'p' with budget 100
+  // at baseline 0 and already spent 60. The resumed script re-runs
+  // phase('p', {budget: 100}) — with re-basing the phase would get a FRESH 100
+  // allowance (120 total), with adoption the ceiling holds at 100 cumulatively.
+  const script = `export const meta = { name: 'phase_seed', description: 'phase seed' }
+phase('p', { budget: 100 })
+const a = await agent('a', { label: 'a' })
+let blocked = false
+try { await agent('b', { label: 'b' }) } catch (e) { blocked = (e && e.code) === 'TOKEN_BUDGET_EXHAUSTED' }
+return { a, blocked }`;
+  const phaseBudgetEvents: Array<Record<string, { budget: number; startSpent: number }>> = [];
+  const result = await runWorkflow<{ a: unknown; blocked: boolean }>(script, {
+    agent: fakeAgent({ input: 60, output: 0, total: 60, cost: 0 }),
+    initialTokenUsage: { input: 60, output: 0, total: 60, cost: 0, cacheRead: 0, cacheWrite: 0 },
+    runId: "seeded-run",
+    initialPhaseBudgets: { "seeded-run:p": { budget: 100, startSpent: 0 } },
+    onPhaseBudgets: (budgets) => phaseBudgetEvents.push(budgets),
+    persistLogs: false,
+  });
+  // 'a' runs (phase spent 60 < 100 → gate passes), spends 60 → phase spent 120.
+  assert.equal(result.result.a, "ok");
+  assert.equal(
+    result.result.blocked,
+    true,
+    "'b' must be blocked: the phase ceiling is cumulative across resume (60 + 60 ≥ 100 from the ORIGINAL baseline)",
+  );
+  assert.equal(
+    phaseBudgetEvents.length,
+    0,
+    "re-declaring an already-budgeted phase does not re-declare (first declaration wins)",
+  );
+});
+
+test("runWorkflow phase() first-declaration-wins and notifies once per new budget", async () => {
+  const script = `export const meta = { name: 'phase_decl', description: 'phase decl' }
+phase('p', { budget: 60 })
+const a = await agent('a', { label: 'a' })
+phase('p', { budget: 999999 })
+let blocked = false
+try { await agent('b', { label: 'b' }) } catch (e) { blocked = true }
+return { a, blocked }`;
+  const events: Array<Record<string, { budget: number }>> = [];
+  const result = await runWorkflow<{ a: unknown; blocked: boolean }>(script, {
+    agent: fakeAgent({ input: 60, output: 0, total: 60, cost: 0 }),
+    runId: "decl-run",
+    onPhaseBudgets: (budgets) => events.push(budgets),
+    persistLogs: false,
+  });
+  assert.equal(result.result.blocked, true, "the 999999 re-declaration must NOT re-base the budget away");
+  assert.equal(events.length, 1, "exactly one budget notification (the first declaration)");
+  assert.equal(events[0]?.["decl-run:p"]?.budget, 60, "emitted keys are frame-namespaced");
+});
+
+test("a nested frame ADOPTS its own persisted phase-budget slice across resume (audit2 r2 MAJOR)", async () => {
+  // The child's phase budget was persisted from the prior execution with
+  // baseline 0 and budget 60; the child already spent 60 (seeded via
+  // initialTokenUsage). On resume the child re-declares its phase — it must
+  // adopt the persisted baseline, so the ceiling is already exhausted.
+  const child = `export const meta = { name: 'child', description: 'c' }
+phase('childphase', { budget: 60 })
+let blocked = false
+try { await agent('child task', { label: 'c' }) } catch (e) { blocked = (e && e.code) === 'TOKEN_BUDGET_EXHAUSTED' }
+return { blocked }`;
+  const parent = `export const meta = { name: 'parent', description: 'p' }
+const nested = await workflow('child')
+return { nested }`;
+  const result = await runWorkflow<{ nested: { blocked: boolean } }>(parent, {
+    agent: fakeAgent({ input: 60, output: 0, total: 60, cost: 0 }),
+    persistLogs: false,
+    runId: "parent-run",
+    loadSavedWorkflow: (name) => (name === "child" ? child : undefined),
+    initialTokenUsage: { input: 60, output: 0, total: 60, cost: 0, cacheRead: 0, cacheWrite: 0 },
+    initialPhaseBudgets: { "parent-run-nested1:childphase": { budget: 60, startSpent: 0 } },
+  });
+  assert.equal(
+    result.result.nested.blocked,
+    true,
+    "the nested frame adopted its persisted baseline: 60 already spent against a 60 ceiling blocks the call",
+  );
+});
+
+test("same-title phases in parent and child frames keep independent baselines (frame-namespaced)", async () => {
+  const child = `export const meta = { name: 'child', description: 'c' }
+phase('shared-title', { budget: 1000 })
+const r = await agent('child task', { label: 'c' })
+return { child: r }`;
+  const parent = `export const meta = { name: 'parent', description: 'p' }
+phase('shared-title', { budget: 60 })
+const a = await agent('parent task', { label: 'p' })
+const nested = await workflow('child')
+let blocked = false
+try { await agent('parent tail', { label: 't' }) } catch (e) { blocked = true }
+return { a, nested, blocked }`;
+  const events: Array<Record<string, { budget: number; startSpent: number }>> = [];
+  const result = await runWorkflow<{ blocked: boolean }>(parent, {
+    agent: fakeAgent({ input: 10, output: 0, total: 10, cost: 0 }),
+    persistLogs: false,
+    runId: "parent-run",
+    loadSavedWorkflow: (name) => (name === "child" ? child : undefined),
+    onPhaseBudgets: (budgets) => events.push(budgets),
+  });
+  // Parent spent 10 in 'shared-title' (budget 60); the child's 1000-budget
+  // same-title phase must not lift the parent's ceiling for the tail call...
+  // parent tail: phaseSpent 10 (parent frame) < 60 → runs. The REAL assertion
+  // is the event table: two independent entries, never merged.
+  const merged = Object.assign({}, ...events);
+  assert.equal(merged["parent-run:shared-title"]?.budget, 60, "parent entry under the parent frame key");
+  assert.equal(merged["parent-run-nested1:shared-title"]?.budget, 1000, "child entry under the child frame key");
+  assert.equal(result.result.blocked, false, "parent tail call proceeds under its own ceiling (10 < 60)");
+});
+
+test("the phase runtime event advertises the EFFECTIVE (first-declared) budget", async () => {
+  const script = `export const meta = { name: 'phase_evt', description: 'phase evt' }
+phase('p', { budget: 60 })
+phase('p', { budget: 999999 })
+return 'done'`;
+  const budgets: Array<number | null> = [];
+  await runWorkflow(script, {
+    agent: fakeAgent(),
+    persistLogs: false,
+    onRuntimeEvent: (event) => {
+      if (event.type === "phase") budgets.push(event.budget);
+    },
+  });
+  assert.deepEqual(budgets, [60, 60], "re-declaration reports the effective budget, not the ignored value");
 });

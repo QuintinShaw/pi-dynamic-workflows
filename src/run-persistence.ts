@@ -60,6 +60,16 @@ export interface PersistedJournalEntry {
   model?: string;
 }
 
+/**
+ * Sanitize a persisted/incoming auto-resume attempt counter: corrupt or
+ * foreign values (non-number, NaN, Infinity, negative, non-integer) become
+ * undefined — a NaN/negative counter would defeat the scheduler's give-up
+ * cap and produce NaN timer delays (#207).
+ */
+export function sanitizeAutoResumeAttempts(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : undefined;
+}
+
 export interface PersistedRunState {
   runId: string;
   workflowName: string;
@@ -91,6 +101,14 @@ export interface PersistedRunState {
   /** Durable workflow-controlled suspension and its at-most-once response. */
   checkpoint?: WorkflowCheckpoint;
   phases: string[];
+  /**
+   * Per-phase soft sub-budgets declared so far in this run's lifetime, keyed by
+   * `${frameRunId}:${phaseTitle}` (nested workflow() frames have stable runIds
+   * across resume) -> ceiling + the run-wide spent baseline at declaration.
+   * Persisted so a resumed execution ADOPTS the original baseline instead of
+   * re-basing (audit2 #4) — a phase ceiling holds cumulatively across resume.
+   */
+  phaseBudgets?: Record<string, { budget: number; startSpent: number; warned?: boolean }>;
   currentPhase?: string;
   agents: PersistedAgentState[];
   logs: string[];
@@ -164,9 +182,10 @@ export interface PersistedRunState {
    */
   agentRetries?: number;
   /**
-   * Auto-resume attempt counter for the current usage_limit pause-cycle, owned
-   * and persisted by UsageLimitScheduler (best-effort). Absent/0 means no
-   * auto-resume attempt has been recorded yet.
+   * Auto-resume attempt counter for the current usage_limit pause-cycle.
+   * Owned by WorkflowManager (written on every persistRun; the scheduler
+   * records through recordAutoResumeAttempts, never a raw save — #207).
+   * Absent/0 means no auto-resume attempt has been recorded yet.
    */
   autoResumeAttempts?: number;
   /**
@@ -241,6 +260,31 @@ export const DEFAULT_MAX_TERMINAL_RUNS_ON_DISK = 300;
 export const TERMINAL_RUN_STATUSES: ReadonlySet<RunStatus> = new Set(["completed", "failed", "aborted"]);
 
 const NON_TERMINAL_AGENT_STATUSES = new Set(["queued", "running"]);
+
+const PERSISTED_AGENT_STATUSES = [
+  "queued",
+  "running",
+  "done",
+  "error",
+  "skipped",
+] as const satisfies readonly PersistedAgentState["status"][];
+
+// Exhaustiveness: adding a member to PersistedAgentState["status"] without
+// listing it above fails to compile HERE (Exclude yields a non-never).
+type AssertNever<T extends never> = T;
+export type _PersistedAgentStatusExhaustiveCheck = AssertNever<
+  Exclude<PersistedAgentState["status"], (typeof PERSISTED_AGENT_STATUSES)[number]>
+>;
+
+/** Every status a persisted agent row may validly carry — exhaustively
+ * checked against PersistedAgentState["status"] by the assertion above.
+ * Forward-compat note: resume seeding DROPS rows with out-of-union statuses
+ * (e.g. written by a newer release) — deliberate garbage-vs-unknown tradeoff:
+ * an unknown status cannot be ghost-settled or displayed safely, so the row
+ * is treated as corrupt rather than re-persisted as a lie. */
+export const VALID_PERSISTED_AGENT_STATUSES: ReadonlySet<PersistedAgentState["status"]> = new Set(
+  PERSISTED_AGENT_STATUSES,
+);
 
 /** Cause stamped onto leftover agents when a live execution is gone but the run is still paused. */
 export const INTERRUPTED_AGENT_CAUSE: { error: string; errorCode: WorkflowErrorCode } = {
@@ -473,14 +517,23 @@ export function createRunPersistence(
   const deleteRunFiles = (runId: string): boolean => {
     let deleted = false;
     for (const path of candidateRunPaths(runId)) {
-      const dir = path === primaryRunPath(runId) ? runsDir : legacyRunsDir;
-      // Best-effort cleanup of the sidecar files alongside the primary.
-      for (const sidecar of [`${path}.bak`, `${path}.tmp`, lockPath(dir, runId)]) {
+      // Delete every readable recovery candidate before releasing either lock:
+      // a foreign resume that acquires between those operations must never find
+      // a surviving primary, backup, or legacy record to resurrect.
+      for (const sidecar of [`${path}.bak`, `${path}.tmp`]) {
         unlinkIfExistsSafe(fs, sidecar);
         fileStateCache.delete(sidecar);
       }
       if (unlinkIfExistsSafe(fs, path)) deleted = true;
       fileStateCache.delete(path);
+    }
+    // Locks come LAST, after both primary and legacy data/recovery candidates
+    // have been removed. deleteRun() deliberately holds its acquired lease
+    // across this sequence, so opening this final release window sooner would
+    // let another process resume a record that is about to be deleted.
+    for (const lock of [primaryLockPath(runId), legacyLockPath(runId)]) {
+      unlinkIfExistsSafe(fs, lock);
+      fileStateCache.delete(lock);
     }
     return deleted;
   };

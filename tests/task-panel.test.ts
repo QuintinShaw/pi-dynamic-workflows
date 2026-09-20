@@ -330,10 +330,12 @@ describe("installResultDelivery", () => {
   function createMockPi(): ExtensionAPI & {
     _calls: DeliveryCall[];
     emit?: (event: string, ...args: unknown[]) => void;
+    _onCount: (event: string) => number;
   } {
     const calls: DeliveryCall[] = [];
     const events = new EventEmitter();
     const handlers = new Map<string, Array<(...args: unknown[]) => void>>();
+    const registrations = new Map<string, number>();
     const obj = {
       events: {
         emit: (channel: string, data: unknown) => events.emit(channel, data),
@@ -350,6 +352,7 @@ describe("installResultDelivery", () => {
       },
       registerTool: () => {},
       on: (event: string, handler: (...args: unknown[]) => void) => {
+        registrations.set(event, (registrations.get(event) ?? 0) + 1);
         const list = handlers.get(event) ?? [];
         list.push(handler);
         handlers.set(event, list);
@@ -363,6 +366,7 @@ describe("installResultDelivery", () => {
           handler(...args);
         }
       },
+      _onCount: (event: string) => registrations.get(event) ?? 0,
       getActiveTools: () => [],
       setActiveTools: () => {},
       reload: () => Promise.resolve(),
@@ -1536,6 +1540,127 @@ describe("installResultDelivery", () => {
 
     // The stale send resolution must not have cleared the pending marker
     assert.equal(run.pendingDelivery?.deliveryId, deliveryId, "stale generation send cannot ACK");
+  });
+
+  it("registers turn_end once per process and dispatches to the CURRENT manager (audit2 #33)", async () => {
+    const pi = createMockPi();
+    // m1 = the OLD project's manager; m2 = current after a cross-project
+    // session_start rebuild. Per-manager registration would stack one handler
+    // per rebuild, each closing over its own (stale) manager.
+    const m1 = createMockManager(makeRun());
+    m1.setSessionId("sess-old");
+    const m2 = createMockManager(makeRun());
+    m2.setSessionId("sess-new");
+
+    mod.installResultDelivery(pi, m1);
+    mod.installResultDelivery(pi, m2);
+
+    // Stolen sends for BOTH sessions: any handler that fires and resolves a
+    // sid will bind an endpoint for it. A stacked stale handler would bind
+    // sess-old too; the single process-wide dispatch must bind ONLY sess-new.
+    const stableSend: StableSend = () => Promise.resolve();
+    mod._registerBoundSessionSendForTests("sess-old", stableSend);
+    mod._registerBoundSessionSendForTests("sess-new", stableSend);
+
+    pi.emit?.("turn_end", {}, {});
+    await Promise.resolve();
+
+    assert.ok(mod._getSessionDeliveryEndpointForTests("sess-new"), "turn_end dispatched to the current manager");
+    assert.equal(
+      mod._getSessionDeliveryEndpointForTests("sess-old"),
+      undefined,
+      "no stacked stale handler binding the old manager's session",
+    );
+  });
+
+  it("registers turn_end per ExtensionAPI generation, not once per process (audit2 #33 r1)", async () => {
+    // r1 MAJOR 2: the built dist module is cached across pi session
+    // generations while pi re-runs the factory with a NEW ExtensionAPI — a
+    // bare module-level boolean would leave generations 2+ with NO turn_end
+    // handler (fail-closed deliveries never re-probed until session_start).
+    const pi1 = createMockPi();
+    const pi2 = createMockPi();
+    const m1 = createMockManager(makeRun());
+    m1.setSessionId("sess-g1");
+    const m2 = createMockManager(makeRun());
+    m2.setSessionId("sess-g2");
+
+    mod.installResultDelivery(pi1, m1);
+    mod.installResultDelivery(pi2, m2); // generation 2: same module, NEW pi
+
+    const stableSend: StableSend = () => Promise.resolve();
+    mod._registerBoundSessionSendForTests("sess-g2", stableSend);
+
+    pi2.emit?.("turn_end", {}, {});
+    await Promise.resolve();
+
+    assert.ok(mod._getSessionDeliveryEndpointForTests("sess-g2"), "generation-2 pi must have its own turn_end handler");
+  });
+
+  it("keeps A/B/A turn_end handlers per instance and dispatches each to its latest manager", async () => {
+    const piA = createMockPi();
+    const piB = createMockPi();
+    const oldA = createMockManager(makeRun());
+    oldA.setSessionId("sess-a-old");
+    const managerB = createMockManager(makeRun());
+    managerB.setSessionId("sess-b");
+    const latestA = createMockManager(makeRun());
+    latestA.setSessionId("sess-a-new");
+
+    mod.installResultDelivery(piA, oldA);
+    mod.installResultDelivery(piB, managerB);
+    mod.installResultDelivery(piA, latestA);
+
+    assert.equal(piA._onCount("turn_end"), 1, "A registers turn_end once across A/B/A installs");
+    assert.equal(piB._onCount("turn_end"), 1, "B registers turn_end once");
+
+    const stableSend: StableSend = () => Promise.resolve();
+    mod._registerBoundSessionSendForTests("sess-a-old", stableSend);
+    mod._registerBoundSessionSendForTests("sess-a-new", stableSend);
+    mod._registerBoundSessionSendForTests("sess-b", stableSend);
+
+    // No ctx means each callback must obtain the manager stored for ITS pi.
+    piA.emit?.("turn_end", {}, {});
+    piB.emit?.("turn_end", {}, {});
+    await Promise.resolve();
+
+    assert.ok(mod._getSessionDeliveryEndpointForTests("sess-a-new"), "A uses A's newest manager");
+    assert.ok(mod._getSessionDeliveryEndpointForTests("sess-b"), "B keeps B's own manager");
+    assert.equal(
+      mod._getSessionDeliveryEndpointForTests("sess-a-old"),
+      undefined,
+      "A's stale manager is never consulted",
+    );
+  });
+
+  it("refreshes a live same-pi endpoint to a newly installed manager without rebinding transport", async () => {
+    const pi = createMockPi();
+    const first = createMockManager(makeRun({ sessionId: SESSION }));
+    first.setSessionId(SESSION);
+    let sends = 0;
+    const stableSend: StableSend = () => {
+      sends++;
+      return Promise.resolve();
+    };
+    mod.installResultDelivery(pi, first);
+    mod.bindSessionDelivery(SESSION, pi, { manager: first, stableSend });
+    const endpointBefore = mod._getSessionDeliveryEndpointForTests(SESSION);
+    assert.ok(endpointBefore?.hasSend, "first manager binds the live session transport");
+
+    const second = createMockManager(
+      makeRun({ sessionId: SESSION, pendingDelivery: { kind: "text", text: "second-manager pending" } }),
+    );
+    second.setSessionId(SESSION);
+    mod.installResultDelivery(pi, second);
+
+    // No bind follows: turn_end must use the replacement manager but leave the
+    // current session endpoint's transport/generation/suspension untouched.
+    pi.emit?.("turn_end", {}, {});
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    assert.equal(sends, 1, "turn_end flushes the replacement manager's pending run");
+    assert.equal(second.getRun("test-run-1")?.pendingDelivery, undefined, "replacement manager receives the ACK");
+    assert.deepEqual(mod._getSessionDeliveryEndpointForTests(SESSION), endpointBefore);
   });
 
   it("recovers and flushes pending delivery on turn_end when sender becomes available", async () => {

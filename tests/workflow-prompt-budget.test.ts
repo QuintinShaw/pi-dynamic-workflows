@@ -132,7 +132,7 @@ async function withRenderedWorkflow(
         assert.ok(wrappedWorkflow, "Pi should expose the wrapped workflow tool");
 
         await inspect({
-          systemPrompt: session.agent.state.systemPrompt,
+          systemPrompt: session.systemPrompt,
           promptLines: [
             `- workflow: ${workflow.promptSnippet}`,
             ...workflow.promptGuidelines.map((guideline) => `- ${guideline}`),

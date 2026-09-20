@@ -609,7 +609,6 @@ export interface WorkflowLifecycleEvent {
 
 type DeliveryManager = WorkflowManager & {
   __deliveryInstalled?: boolean;
-  __deliveryTurnEndInstalled?: boolean;
   __lifecycleEventInstalled?: boolean;
   __lifecycleEventEmitter?: (data: WorkflowLifecycleEvent) => void;
   /** Last loadSettings seen on install — used when binding endpoints. */
@@ -1216,6 +1215,12 @@ export function resumeResultDelivery(manager: WorkflowManager): void {
  * replacement the manager (and these listeners) survive via the handoff path;
  * each new generation calls {@link bindSessionDelivery} on session_start.
  */
+// Register turn_end once for each ExtensionAPI instance. The handler looks up
+// its own latest manager rather than a process-global one: multiple live pi
+// instances can interleave A/B/A installs, and each callback must stay scoped
+// to the instance that emitted it.
+let turnEndDeliveryManagers = new WeakMap<ExtensionAPI, { manager: WorkflowManager }>();
+
 export function installResultDelivery(
   pi: ExtensionAPI,
   manager: WorkflowManager,
@@ -1254,14 +1259,24 @@ export function installResultDelivery(
     manager.on("stopped", emitLifecycle("stopped"));
   }
 
-  if (!m.__deliveryTurnEndInstalled) {
-    m.__deliveryTurnEndInstalled = true;
+  // Per-instance turn_end dispatch (audit2 #33): within one pi generation,
+  // per-manager registration would stack a handler per cross-project rebuild
+  // (pi.on has no off()). Register once per pi, updating only that pi's latest
+  // manager on repeat installs.
+  const existingTurnEnd = turnEndDeliveryManagers.get(pi);
+  if (existingTurnEnd) {
+    existingTurnEnd.manager = manager;
+  } else {
+    turnEndDeliveryManagers.set(pi, { manager });
     pi.on?.("turn_end", (_event: unknown, ctx?: { sessionManager?: { getSessionId?: () => string } }) => {
+      const activeManager = turnEndDeliveryManagers.get(pi)?.manager;
+      if (!activeManager) return;
+      const active = deliveryManager(activeManager);
       let sid: string | undefined;
       try {
-        sid = ctx?.sessionManager?.getSessionId?.() ?? manager.getSessionId?.();
+        sid = ctx?.sessionManager?.getSessionId?.() ?? activeManager.getSessionId?.();
       } catch {
-        sid = manager.getSessionId?.();
+        sid = activeManager.getSessionId?.();
       }
       if (!sid) return;
 
@@ -1271,8 +1286,8 @@ export function installResultDelivery(
         const stolen = boundSessionSends.get(sid);
         if (stolen) {
           bindSessionDelivery(sid, pi, {
-            loadSettings: opts.loadSettings ?? m.__deliveryLoadSettings,
-            manager,
+            loadSettings: active.__deliveryLoadSettings,
+            manager: activeManager,
             sessionManager: ctx?.sessionManager,
           });
           endpoint = sessionEndpoints.get(sid);
@@ -1285,20 +1300,19 @@ export function installResultDelivery(
     });
   }
 
-  if (m.__deliveryInstalled) {
-    // Listeners survive session replacement. Refresh loadSettings / manager
-    // pointers only — do NOT mutate send, generation, or suspended here.
-    // Factory runs before bindCore; session_start calls bindSessionDelivery.
-    const sid = manager.getSessionId?.();
-    if (sid) {
-      const endpoint = sessionEndpoints.get(sid);
-      if (endpoint) {
-        endpoint.loadSettings = opts.loadSettings ?? endpoint.loadSettings;
-        endpoint.manager = manager;
-      }
+  // A newly-created manager can replace the current project while this pi and
+  // session endpoint remain live. Refresh only the routing pointers; preserve
+  // the session transport, generation, and suspension state until bindCore.
+  const sid = manager.getSessionId?.();
+  if (sid) {
+    const endpoint = sessionEndpoints.get(sid);
+    if (endpoint) {
+      endpoint.loadSettings = opts.loadSettings ?? endpoint.loadSettings;
+      endpoint.manager = manager;
     }
-    return;
   }
+
+  if (m.__deliveryInstalled) return;
   m.__deliveryInstalled = true;
 
   manager.on("complete", ({ runId }: { runId: string }) => {
@@ -1369,6 +1383,7 @@ export function _resetDeliveryRegistriesForTests(): void {
   deliveredAwaitingClear.clear();
   inFlightSeq = 0;
   probedSessionIds.clear();
+  turnEndDeliveryManagers = new WeakMap<ExtensionAPI, { manager: WorkflowManager }>();
 }
 
 export function _setStreamingAckTimeoutForTests(timeoutMs: number): void {

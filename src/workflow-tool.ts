@@ -157,16 +157,27 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
   const fallbackCwd = options.cwd ?? process.cwd();
   const fallbackStorage = options.storage ?? createWorkflowStorage(fallbackCwd);
   const defaults = resolveWorkflowToolDefaults(options, fallbackCwd);
-  const fallbackManager =
-    options.manager ??
-    new WorkflowManager({
-      cwd: options.cwd,
-      concurrency: defaults.concurrency,
-      loadSavedWorkflow: (name: string) => fallbackStorage.load(name)?.script,
-      defaultAgentTimeoutMs: defaults.agentTimeoutMs,
-      defaultAgentRetries: defaults.agentRetries,
-    });
-  const getManager = () => options.getManager?.() ?? fallbackManager;
+  // Lazy (audit2 #38): WorkflowManager's constructor scans — and on stale-run
+  // recovery, REWRITES — the cwd's run store. Callers that only need the
+  // tool's schema/description (context measurement, release gate) must not
+  // touch the developer's real global store as a side effect.
+  let fallbackManager: WorkflowManager | undefined;
+  const getManager = () => {
+    const provided = options.getManager?.() ?? options.manager;
+    if (provided) return provided;
+    if (!fallbackManager) {
+      fallbackManager = new WorkflowManager({
+        // Bind to the factory-time cwd, not a re-read of process.cwd() at
+        // execute time (r1 NIT: split-brain with fallbackStorage).
+        cwd: options.cwd ?? fallbackCwd,
+        concurrency: defaults.concurrency,
+        loadSavedWorkflow: (name: string) => fallbackStorage.load(name)?.script,
+        defaultAgentTimeoutMs: defaults.agentTimeoutMs,
+        defaultAgentRetries: defaults.agentRetries,
+      });
+    }
+    return fallbackManager;
+  };
   const getStorage = () => options.getStorage?.() ?? fallbackStorage;
   const getCwd = () => options.getCwd?.() ?? fallbackCwd;
 

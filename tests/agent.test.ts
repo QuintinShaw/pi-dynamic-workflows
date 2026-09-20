@@ -32,6 +32,7 @@ import {
 } from "../src/model-tier-config.js";
 import { type JournalEntry, runWorkflow } from "../src/workflow.js";
 import { withFakeHome, withFakeHomeAsync } from "./helpers/fake-home.js";
+import { readProviderSystemPrompt } from "./helpers/pi-context.js";
 
 // Private methods used for testing - cast to this type to access them without `any`
 type WorkflowAgentPrivates = {
@@ -44,29 +45,38 @@ type WorkflowAgentPrivates = {
   getRegistry(perRunRegistry?: ModelRegistry): Promise<ModelRegistry>;
 };
 
+async function fauxRegistryFor(
+  home: string,
+  entries: ReadonlyArray<readonly [string, ReturnType<typeof createFauxCore>]>,
+): Promise<ModelRegistry> {
+  const runtime = await ModelRuntime.create({ authPath: join(home, "auth.json"), modelsPath: null });
+  for (const [provider, core] of entries) {
+    runtime.registerProvider(provider, {
+      name: `Faux Test ${provider}`,
+      baseUrl: "http://127.0.0.1:9/faux",
+      apiKey: "faux-dummy-key-not-used",
+      api: core.api,
+      streamSimple: core.streamSimple as never,
+      models: core.models.map((model) => ({
+        id: model.id,
+        name: model.name ?? model.id,
+        reasoning: model.reasoning ?? false,
+        input: ["text"] as ("text" | "image")[],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: model.contextWindow ?? 128000,
+        maxTokens: model.maxTokens ?? 4096,
+      })),
+    });
+  }
+  return new ModelRegistry(runtime);
+}
+
 async function fauxRegistry(
   home: string,
   provider: string,
   core: ReturnType<typeof createFauxCore>,
 ): Promise<ModelRegistry> {
-  const runtime = await ModelRuntime.create({ authPath: join(home, "auth.json"), modelsPath: null });
-  runtime.registerProvider(provider, {
-    name: "Faux Test",
-    baseUrl: "http://127.0.0.1:9/faux",
-    apiKey: "faux-dummy-key-not-used",
-    api: core.api,
-    streamSimple: core.streamSimple as never,
-    models: core.models.map((model) => ({
-      id: model.id,
-      name: model.name ?? model.id,
-      reasoning: false,
-      input: ["text"] as ("text" | "image")[],
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: model.contextWindow ?? 128000,
-      maxTokens: model.maxTokens ?? 4096,
-    })),
-  });
-  return new ModelRegistry(runtime);
+  return fauxRegistryFor(home, [[provider, core]]);
 }
 
 function bashToolResultText(context: unknown): string {
@@ -542,7 +552,7 @@ test("WorkflowAgent.run lets the default resource loader use an injected Setting
 
       assert.match(result, /settings loader marker observed/);
       assert.match(
-        (contexts[0] as { systemPrompt?: string }).systemPrompt ?? "",
+        readProviderSystemPrompt(contexts[0]),
         new RegExp(marker),
         "the default loader must read project APPEND_SYSTEM.md using the injected trust settings",
       );
@@ -1426,11 +1436,20 @@ test("WorkflowAgent.run(): an untagged agent's IMPLICIT default medium tier degr
       ]);
 
       const fallbacks: Array<{ tier: string; requestedSpec: string }> = [];
+      const resolvedModels: string[] = [];
       const agent = new WorkflowAgent({ cwd, modelRegistry: registry });
       const onModelFallback = (info: { tier: string; requestedSpec: string }) => fallbacks.push(info);
 
-      const first = await agent.run("task one", { label: "untagged-1", onModelFallback });
-      const second = await agent.run("task two", { label: "untagged-2", onModelFallback });
+      const first = await agent.run("task one", {
+        label: "untagged-1",
+        onModelFallback,
+        onModelResolved: (id) => resolvedModels.push(id),
+      });
+      const second = await agent.run("task two", {
+        label: "untagged-2",
+        onModelFallback,
+        onModelResolved: (id) => resolvedModels.push(id),
+      });
 
       assert.ok(first.includes("untagged-first"), "first untagged agent should still complete via session default");
       assert.ok(second.includes("untagged-second"), "second untagged agent should still complete via session default");
@@ -1439,6 +1458,243 @@ test("WorkflowAgent.run(): an untagged agent's IMPLICIT default medium tier degr
         [{ tier: "medium", requestedSpec: "deadprov/ghost-model" }],
         "onModelFallback fires exactly once across both run() calls on the same instance",
       );
+      assert.deepEqual(
+        resolvedModels,
+        ["fauxtest-implicit/faux-model", "fauxtest-implicit/faux-model"],
+        "a degraded agent must still report the model it ACTUALLY runs on, not the dead spec or the mainModel guess",
+      );
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("WorkflowAgent.run(): an untagged agent reports the REAL session model (settings default), not the mainModel guess", async () => {
+  // Regression test for the display divergence: with no model, no tier, and no
+  // model-tiers.json, an untagged agent binds the settings.json default — but
+  // the run display showed mainModel forever because onModelResolved only fired
+  // for agents WITH a resolvable spec. It must now fire post-creation with the
+  // session's real model.
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-truthful-display-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-truthful-display-cwd-"));
+  const defaultCore = createFauxCore({
+    provider: "fauxtest-default",
+    models: [{ id: "default-model", name: "Default Model", contextWindow: 128000, maxTokens: 4096 }],
+  });
+  const mainCore = createFauxCore({
+    provider: "fauxtest-main",
+    models: [{ id: "main-model", name: "Main Model", contextWindow: 128000, maxTokens: 4096 }],
+  });
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const agentDir = join(home, ".pi", "agent");
+      mkdirSync(agentDir, { recursive: true });
+      // The settings default is a DIFFERENT model than the session's main model,
+      // so the actual binding is observable in both the response and the report.
+      writeFileSync(
+        join(agentDir, "settings.json"),
+        JSON.stringify({ defaultProvider: "fauxtest-default", defaultModel: "default-model" }),
+      );
+
+      const registry = await fauxRegistryFor(home, [
+        ["fauxtest-default", defaultCore],
+        ["fauxtest-main", mainCore],
+      ]);
+      defaultCore.setResponses([fauxAssistantMessage("ran-on-settings-default", { stopReason: "stop" })]);
+      mainCore.setResponses([fauxAssistantMessage("ran-on-main-model", { stopReason: "stop" })]);
+
+      const resolved: string[] = [];
+      const agent = new WorkflowAgent({ cwd, modelRegistry: registry, mainModel: "fauxtest-main/main-model" });
+      const result = await agent.run("task", { label: "untagged", onModelResolved: (id) => resolved.push(id) });
+
+      assert.ok(
+        result.includes("ran-on-settings-default"),
+        "routing is unchanged: untagged binds the settings default",
+      );
+      assert.deepEqual(
+        resolved,
+        ["fauxtest-default/default-model"],
+        "onModelResolved must report the model the session ACTUALLY bound, correcting the mainModel guess",
+      );
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("WorkflowAgent.run(): the real-model report keeps the caller's thinking suffix", async () => {
+  // The spec'd path appends `:level` when the caller set `thinking`; the
+  // post-creation report must mirror that or a thinking-aware display still
+  // under-reports what the provider actually received.
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-truthful-thinking-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-truthful-thinking-cwd-"));
+  const defaultCore = createFauxCore({
+    provider: "fauxtest-default",
+    models: [{ id: "default-model", name: "Default Model", reasoning: true, contextWindow: 128000, maxTokens: 4096 }],
+  });
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const agentDir = join(home, ".pi", "agent");
+      mkdirSync(agentDir, { recursive: true });
+      writeFileSync(
+        join(agentDir, "settings.json"),
+        JSON.stringify({ defaultProvider: "fauxtest-default", defaultModel: "default-model" }),
+      );
+      const registry = await fauxRegistryFor(home, [["fauxtest-default", defaultCore]]);
+      defaultCore.setResponses([fauxAssistantMessage("ok", { stopReason: "stop" })]);
+
+      const resolved: string[] = [];
+      const agent = new WorkflowAgent({ cwd, modelRegistry: registry, mainModel: "fauxtest-main/main-model" });
+      await agent.run("task", { label: "untagged", thinking: "high", onModelResolved: (id) => resolved.push(id) });
+
+      assert.deepEqual(resolved, ["fauxtest-default/default-model:high"]);
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("WorkflowAgent.run(): a throwing onModelResolved propagates but still disposes the session (finally runs)", async () => {
+  // The real-model report sits inside the lifecycle try so a throwing host
+  // callback cannot leak the session. Lock the invariant: run() rejects with
+  // the host's error AND the finally still emits history (which sits directly
+  // above session.dispose() — its firing proves the disposal path ran).
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-throwing-callback-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-throwing-callback-cwd-"));
+  const core = createFauxCore({
+    provider: "fauxtest-throw",
+    models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 4096 }],
+  });
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const registry = await fauxRegistry(home, "fauxtest-throw", core);
+      core.setResponses([fauxAssistantMessage("ok", { stopReason: "stop" })]);
+      const sentinel = new Error("host callback blew up");
+      const histories: unknown[] = [];
+      const agent = new WorkflowAgent({ cwd, modelRegistry: registry });
+      await assert.rejects(
+        agent.run("task", {
+          label: "untagged",
+          onModelResolved: () => {
+            throw sentinel;
+          },
+          onHistory: (history) => histories.push(history),
+        }),
+        (error) => error === sentinel,
+      );
+      assert.equal(
+        histories.length,
+        1,
+        "the finally must still emit history, proving it ran (non-threaded run here, so dispose is the next unguarded statement)",
+      );
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("WorkflowAgent.run(): named-thread turns each report the real bound model", async () => {
+  // The fire site is once per attempt/turn; a reused thread session must not
+  // suppress (or duplicate) the truthful report on later turns.
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-truthful-thread-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-truthful-thread-cwd-"));
+  const defaultCore = createFauxCore({
+    provider: "fauxtest-default",
+    models: [{ id: "default-model", name: "Default Model", contextWindow: 128000, maxTokens: 4096 }],
+  });
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const agentDir = join(home, ".pi", "agent");
+      mkdirSync(agentDir, { recursive: true });
+      writeFileSync(
+        join(agentDir, "settings.json"),
+        JSON.stringify({ defaultProvider: "fauxtest-default", defaultModel: "default-model" }),
+      );
+      const registry = await fauxRegistryFor(home, [["fauxtest-default", defaultCore]]);
+      defaultCore.setResponses([
+        fauxAssistantMessage("turn-1", { stopReason: "stop" }),
+        fauxAssistantMessage("turn-2", { stopReason: "stop" }),
+      ]);
+
+      const resolved: string[] = [];
+      const agent = new WorkflowAgent({ cwd, modelRegistry: registry, mainModel: "fauxtest-main/main-model" });
+      const turn1 = await agent.run("turn one", {
+        label: "worker",
+        thread: "worker",
+        onModelResolved: (id) => resolved.push(id),
+      });
+      const turn2 = await agent.run("turn two", {
+        label: "worker",
+        thread: "worker",
+        onModelResolved: (id) => resolved.push(id),
+      });
+
+      assert.equal(turn1, "turn-1");
+      assert.equal(turn2, "turn-2");
+      assert.deepEqual(resolved, ["fauxtest-default/default-model", "fauxtest-default/default-model"]);
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("runWorkflow(): an untagged agent's row, end record, and journal all carry the real bound model", async () => {
+  // End-to-end through the workflow context: onAgentStart still carries the
+  // pre-resolution mainModel guess, then onAgentModel corrects the running row
+  // and onAgentEnd/onAgentJournal persist the model that actually ran.
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-truthful-run-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-truthful-run-cwd-"));
+  const defaultCore = createFauxCore({
+    provider: "fauxtest-default",
+    models: [{ id: "default-model", name: "Default Model", contextWindow: 128000, maxTokens: 4096 }],
+  });
+  const mainCore = createFauxCore({
+    provider: "fauxtest-main",
+    models: [{ id: "main-model", name: "Main Model", contextWindow: 128000, maxTokens: 4096 }],
+  });
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const agentDir = join(home, ".pi", "agent");
+      mkdirSync(agentDir, { recursive: true });
+      writeFileSync(
+        join(agentDir, "settings.json"),
+        JSON.stringify({ defaultProvider: "fauxtest-default", defaultModel: "default-model" }),
+      );
+      const registry = await fauxRegistryFor(home, [
+        ["fauxtest-default", defaultCore],
+        ["fauxtest-main", mainCore],
+      ]);
+      defaultCore.setResponses([fauxAssistantMessage("ran-on-settings-default", { stopReason: "stop" })]);
+
+      const starts: Array<{ label: string; model?: string }> = [];
+      const corrections: string[] = [];
+      const ends: Array<{ label: string; model?: string }> = [];
+      const journalModels: Array<string | undefined> = [];
+      const result = await runWorkflow(
+        `export const meta = { name: "truthful_display_demo", description: "one untagged agent" }
+await agent("task", { label: "untagged" });
+return "done";`,
+        {
+          cwd,
+          modelRegistry: registry,
+          mainModel: "fauxtest-main/main-model",
+          onAgentStart: (event) => starts.push({ label: event.label, model: event.model }),
+          onAgentModel: (event) => corrections.push(event.model),
+          onAgentEnd: (event) => ends.push({ label: event.label, model: event.model }),
+          onAgentJournal: (entry) => journalModels.push(entry.model),
+        },
+      );
+
+      assert.equal(result.result, "done");
+      assert.deepEqual(starts, [{ label: "untagged", model: "fauxtest-main/main-model" }]);
+      assert.deepEqual(corrections, ["fauxtest-default/default-model"]);
+      assert.deepEqual(ends, [{ label: "untagged", model: "fauxtest-default/default-model" }]);
+      assert.deepEqual(journalModels, ["fauxtest-default/default-model"]);
     });
   } finally {
     rmSync(home, { recursive: true, force: true });

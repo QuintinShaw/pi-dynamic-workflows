@@ -147,7 +147,7 @@ async function withRenderedWorkflow(
         const wrappedWorkflow = session.agent.state.tools.find((tool) => tool.name === "workflow");
         assert.ok(wrappedWorkflow, "Pi should expose the wrapped workflow tool");
         await inspect({
-          systemPrompt: session.agent.state.systemPrompt,
+          systemPrompt: session.systemPrompt,
           promptLines: [
             `- workflow: ${workflow.promptSnippet}`,
             ...(workflow.promptGuidelines ?? []).map((guideline) => `- ${guideline}`),
