@@ -235,7 +235,11 @@ const RECURSIVE_SUBAGENT_EXTENSION_NAMES = new Set(["pi-dynamic-workflows", "wor
  * Keep only explicitly approved provider/auth middleware paths. Recursive
  * orchestration extensions are always rejected, even if explicitly allowlisted.
  */
-export function isProviderMiddlewareExtensionPath(extensionPath: string, allowlist: readonly string[]): boolean {
+export function isProviderMiddlewareExtensionPath(
+  extensionPath: string,
+  allowlist: readonly string[],
+  packageSource?: string,
+): boolean {
   const allowed = new Set(allowlist.map((name) => name.trim().toLowerCase()).filter(Boolean));
   const segments = extensionPath
     .replaceAll("\\", "/")
@@ -243,7 +247,28 @@ export function isProviderMiddlewareExtensionPath(extensionPath: string, allowli
     .filter(Boolean)
     .map((segment) => segment.toLowerCase());
   const file = segments.at(-1)?.replace(/\.(?:[cm]?[jt]s)$/i, "");
-  const identities = new Set([...segments, ...(file ? [file] : [])]);
+  if ([...segments, file ?? ""].some((name) => RECURSIVE_SUBAGENT_EXTENSION_NAMES.has(name))) return false;
+  // Ancestor directory names are not extension identities: an allowlisted
+  // name appearing in a project/home path must not approve all descendants.
+  const identities = new Set(file ? [file] : []);
+  const moduleIndex = segments.lastIndexOf("node_modules");
+  const packageName = segments[moduleIndex + 1];
+  if (moduleIndex >= 0 && packageName) {
+    identities.add(packageName.startsWith("@") ? `${packageName}/${segments[moduleIndex + 2] ?? ""}` : packageName);
+  }
+  if (packageSource) {
+    const source = packageSource.replaceAll("\\", "/").toLowerCase();
+    const npmName = /^npm:((?:@[^/]+\/)?[^@]+)(?:@.*)?$/.exec(source)?.[1];
+    const sourceName =
+      npmName ??
+      source
+        .replace(/[?#].*$/, "")
+        .replace(/\/+$/, "")
+        .split("/")
+        .at(-1)
+        ?.replace(/\.git$/, "");
+    if (sourceName) identities.add(sourceName);
+  }
   if ([...identities].some((name) => RECURSIVE_SUBAGENT_EXTENSION_NAMES.has(name))) return false;
   return [...identities].some((name) => allowed.has(name));
 }
@@ -251,10 +276,13 @@ export function isProviderMiddlewareExtensionPath(extensionPath: string, allowli
 export function filterProviderMiddlewareExtensions(
   base: LoadExtensionsResult,
   allowlist: readonly string[],
+  packageSources: ReadonlyMap<string, string> = new Map(),
 ): LoadExtensionsResult {
   return {
     ...base,
-    extensions: base.extensions.filter((extension) => isProviderMiddlewareExtensionPath(extension.path, allowlist)),
+    extensions: base.extensions.filter((extension) =>
+      isProviderMiddlewareExtensionPath(extension.path, allowlist, packageSources.get(extension.path)),
+    ),
   };
 }
 
@@ -764,7 +792,9 @@ export class WorkflowAgent {
     this.cwd = options.cwd ?? process.cwd();
     this.baseTools = options.tools ?? createCodingTools(this.cwd);
     this.excludeTools = options.excludeTools ?? [];
-    this.providerMiddlewareExtensions = options.providerMiddlewareExtensions ?? DEFAULT_PROVIDER_MIDDLEWARE_EXTENSIONS;
+    this.providerMiddlewareExtensions = [
+      ...(options.providerMiddlewareExtensions ?? DEFAULT_PROVIDER_MIDDLEWARE_EXTENSIONS),
+    ];
     this.sessionOptions = options.session ?? {};
     this.persistAgentSessions = options.persistAgentSessions ?? false;
     this.instructions = options.instructions;
@@ -784,27 +814,33 @@ export class WorkflowAgent {
    * additions to a `noExtensions: true` loader. Recursive orchestration factories
    * never load, even if explicitly allowlisted.
    *
-   * Sharing prevents the per-subagent factory churn and retention fixed by #109.
+   * Extension-free loaders remain shared to avoid the churn fixed by #109.
    * Skills, prompts, AGENTS.md context, and workflow-supplied `customTools` remain
    * available. Other host extension-registered tools stay excluded. Allowlisted
-   * middleware must be trusted and safe to share across child sessions; this is
-   * not a sandbox. runWorkflow builds one WorkflowAgent per run: loaders are
-   * built once per directory, reused there, then dropped with the agent.
+   * middleware must be trusted and child-safe; this is not a sandbox. Opted-in
+   * loaders are session-local: the SDK binds session actions into their runtime,
+   * so sharing one would send a child's extension actions into another child.
    */
   private getSharedResourceLoader(agentDir: string, cwd = this.cwd): Promise<DefaultResourceLoader> {
     const key = JSON.stringify([agentDir, cwd]);
-    const existing = this.resourceLoaders.get(key);
+    const shared = this.providerMiddlewareExtensions.length === 0;
+    const existing = shared ? this.resourceLoaders.get(key) : undefined;
     if (existing) return existing;
     const pending = (async () => {
       const settingsManager = this.sessionOptions.settingsManager ?? SettingsManager.create(cwd, agentDir);
       let middlewarePaths: string[] = [];
+      const packageSources = new Map<string, string>();
       if (this.providerMiddlewareExtensions.length > 0) {
         await settingsManager.reload();
         const packageManager = new DefaultPackageManager({ cwd, agentDir, settingsManager });
         const configured = await packageManager.resolve();
         middlewarePaths = configured.extensions
           .filter((extension) => extension.enabled)
-          .filter((extension) => isProviderMiddlewareExtensionPath(extension.path, this.providerMiddlewareExtensions))
+          .filter((extension) => {
+            const source = extension.metadata.origin === "package" ? extension.metadata.source : undefined;
+            if (source) packageSources.set(extension.path, source);
+            return isProviderMiddlewareExtensionPath(extension.path, this.providerMiddlewareExtensions, source);
+          })
           .map((extension) => extension.path);
       }
       const loader = new DefaultResourceLoader({
@@ -813,7 +849,8 @@ export class WorkflowAgent {
         settingsManager,
         noExtensions: true,
         additionalExtensionPaths: middlewarePaths,
-        extensionsOverride: (base) => filterProviderMiddlewareExtensions(base, this.providerMiddlewareExtensions),
+        extensionsOverride: (base) =>
+          filterProviderMiddlewareExtensions(base, this.providerMiddlewareExtensions, packageSources),
       });
       await loader.reload();
       return loader;
@@ -821,10 +858,10 @@ export class WorkflowAgent {
       // Don't let a transient build failure (e.g. EMFILE during reload's disk
       // I/O) poison every subagent AND every retry of this run — clear the memo
       // so the next caller rebuilds instead of replaying the same rejection.
-      this.resourceLoaders.delete(key);
+      if (shared && this.resourceLoaders.get(key) === pending) this.resourceLoaders.delete(key);
       throw err;
     });
-    this.resourceLoaders.set(key, pending);
+    if (shared) this.resourceLoaders.set(key, pending);
     return pending;
   }
 
@@ -1203,12 +1240,23 @@ export class WorkflowAgent {
       throw error;
     }
     pinChildCacheRetention(session.agent);
+    const disposeSession = async () => {
+      try {
+        // dispose() alone does not emit shutdown; give opted-in factories a
+        // chance to release session-local listeners and other resources.
+        await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+      } catch {
+        // Cleanup must not replace the original result or failure.
+      } finally {
+        session.dispose();
+      }
+    };
     // Child sessions do not auto-bind a supplied ResourceLoader. Bind middleware
     // before the first provider request (also supports injected resource loaders).
     try {
       await session.bindExtensions({});
     } catch (error) {
-      session.dispose();
+      await disposeSession();
       if (options.thread) this.restoreThreadLeaf(sessionManager, threadLeaf);
       throw error;
     }
@@ -1372,7 +1420,7 @@ export class WorkflowAgent {
           // Usage is best-effort; never let stats failure mask the real result/error.
         }
       }
-      session.dispose();
+      await disposeSession();
     }
   }
 

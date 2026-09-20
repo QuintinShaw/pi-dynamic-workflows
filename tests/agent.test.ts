@@ -1821,6 +1821,27 @@ test("the subagent resource loader is built once per directory and shared across
   await Promise.allSettled([first, second]);
 });
 
+test("provider middleware approval does not inherit from unrelated ancestor directories", () => {
+  const allowed = ["example-provider-adapter"];
+  assert.equal(isProviderMiddlewareExtensionPath("/example-provider-adapter/project/unrelated.js", allowed), false);
+  assert.equal(
+    isProviderMiddlewareExtensionPath("/node_modules/@other/example-provider-adapter/index.js", allowed),
+    false,
+  );
+  assert.equal(
+    isProviderMiddlewareExtensionPath("/packages/adapter/index.js", allowed, "npm:example-provider-adapter@1.0.0"),
+    true,
+  );
+  assert.equal(
+    isProviderMiddlewareExtensionPath("/packages/adapter/index.js", allowed, "/local/example-provider-adapter"),
+    true,
+  );
+  assert.equal(
+    isProviderMiddlewareExtensionPath("/packages/adapter/index.js", allowed, "/example-provider-adapter/unrelated"),
+    false,
+  );
+});
+
 test("provider middleware path matching uses exact identities and always denies recursion", () => {
   const allowed = [" Example-Provider-Adapter ", "workflow", "pi-dynamic-workflows", "pi-subagents"];
   for (const path of [
@@ -1997,17 +2018,20 @@ test("provider middleware resolves per run cwd using injected project trust sett
       assert.doesNotMatch(requests[0], /SECOND_ADAPTER_BOUND/);
       assert.match(requests[1], /SECOND_ADAPTER_BOUND:1/);
       assert.doesNotMatch(requests[1], /FIRST_ADAPTER_BOUND/);
-      assert.match(requests[2], /FIRST_ADAPTER_BOUND:2/, "factory must be shared, not re-run per child");
+      assert.match(
+        requests[2],
+        /FIRST_ADAPTER_BOUND:1/,
+        "each child needs its own extension runtime and factory state",
+      );
       const privateAgent = agent as unknown as WorkflowAgentPrivates;
       const agentDir = join(home, ".pi", "agent");
-      assert.equal(
+      const [firstLoader, repeatedLoader, secondLoader] = await Promise.all([
         privateAgent.getSharedResourceLoader(agentDir, first),
-        privateAgent.getSharedResourceLoader(agentDir, first),
-      );
-      assert.notEqual(
         privateAgent.getSharedResourceLoader(agentDir, first),
         privateAgent.getSharedResourceLoader(agentDir, second),
-      );
+      ]);
+      assert.notEqual(firstLoader, repeatedLoader);
+      assert.notEqual(firstLoader, secondLoader);
       const untrusted = new WorkflowAgent({
         cwd: first,
         providerMiddlewareExtensions: ["example-provider-adapter"],
