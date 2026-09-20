@@ -2,6 +2,7 @@ import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent
 import { type Static, Type } from "typebox";
 import { aggregateAgentUsage, tokenFigures, type WorkflowAgentSnapshot, type WorkflowSnapshot } from "./display.js";
 import type { PersistedRunState, RunStatus } from "./run-persistence.js";
+import { runSummary } from "./run-record-store.js";
 import type { WorkflowManager } from "./workflow-manager.js";
 
 // A tool's top-level parameter schema must be a JSON Schema object (`type:
@@ -228,25 +229,31 @@ function allowedActions(status: RunStatus): string[] {
 }
 
 function summarizeRun(run: PersistedRunState, live?: WorkflowSnapshot | null): WorkflowControlRunDetails {
-  const agents = live?.agents ?? run.agents;
-  const counts = countAgents(agents);
+  const summary = runSummary(run);
+  const agents = live?.agents ?? [];
+  const counts = live
+    ? countAgents(agents)
+    : {
+        total: summary.total,
+        done: summary.done,
+        running: summary.running,
+        queued: summary.queued,
+        error: summary.error,
+        skipped: summary.skipped,
+      };
   const liveUsage = tokenFigures(live?.tokenUsage);
   const persistedUsage = tokenFigures(run.tokenUsage);
-  const agentUsage = aggregateAgentUsage(agents);
+  const agentUsage = live ? aggregateAgentUsage(agents) : summary.usage;
   return {
     runId: run.runId,
     workflowName: live?.name ?? run.workflowName,
     status: run.status,
     phase: live?.currentPhase ?? run.currentPhase ?? null,
-    checkpoint: run.checkpoint
-      ? {
-          checkpointId: run.checkpoint.checkpointId,
-          kind: run.checkpoint.kind,
-          status: run.checkpoint.status,
-        }
-      : null,
+    checkpoint: summary.checkpoint,
     counts,
-    activeLabels: agents.filter((agent) => agent.status === "running").map((agent) => agent.label),
+    activeLabels: live
+      ? agents.filter((agent) => agent.status === "running").map((agent) => agent.label)
+      : summary.activeLabels,
     tokenTotal: Math.max(
       liveUsage.fresh + liveUsage.cacheRead,
       persistedUsage.fresh + persistedUsage.cacheRead,

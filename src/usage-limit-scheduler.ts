@@ -516,7 +516,8 @@ export class UsageLimitScheduler {
 
   private safeLoad(runId: string): PersistedRunState | undefined {
     try {
-      return this.manager.getPersistence().load(runId) ?? undefined;
+      const persistence = this.manager.getPersistence();
+      return (persistence.loadPreview ? persistence.loadPreview(runId) : persistence.load(runId)) ?? undefined;
     } catch (err) {
       this.diagnostic(`[usage-limit-scheduler] ${runId}: persistence load failed`, err);
       return undefined;

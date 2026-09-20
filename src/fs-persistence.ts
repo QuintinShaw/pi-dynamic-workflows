@@ -20,18 +20,28 @@
  */
 
 import {
+  closeSync,
   existsSync,
+  linkSync,
   mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
+  readSync,
   renameSync,
   statSync,
+  truncateSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
 
 /** Filesystem operations used by JSON persistence. Exposed for testing. */
 export type PersistenceFsLayer = {
+  linkSync: typeof linkSync;
+  openSync: typeof openSync;
+  readSync: typeof readSync;
+  closeSync: typeof closeSync;
+  truncateSync: typeof truncateSync;
   existsSync: typeof existsSync;
   mkdirSync: typeof mkdirSync;
   readdirSync: typeof readdirSync;
@@ -44,7 +54,21 @@ export type PersistenceFsLayer = {
 
 /** The real node:fs implementations. */
 export function defaultPersistenceFs(): PersistenceFsLayer {
-  return { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync };
+  return {
+    linkSync,
+    openSync,
+    readSync,
+    closeSync,
+    truncateSync,
+    existsSync,
+    mkdirSync,
+    readdirSync,
+    readFileSync,
+    renameSync,
+    statSync,
+    unlinkSync,
+    writeFileSync,
+  };
 }
 
 /** Merge a partial test override on top of the real node:fs implementations. */
