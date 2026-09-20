@@ -1665,6 +1665,52 @@ test("component saved detail exposes confirmation before delete", async () => {
   assert.equal(deleted, 1);
 });
 
+test("a manager event with the target unchanged does NOT cancel a pending confirmation (audit2 #22)", async () => {
+  const { ui, getComponent } = fakeUiCapturingComponent();
+  const run = {
+    runId: "run-live",
+    workflowName: "live",
+    status: "running",
+    phases: [],
+    agents: [],
+    logs: [],
+  } as unknown as PersistedRunState;
+  const listeners = new Map<string, () => void>();
+  let stopped = 0;
+  const manager = {
+    on: (event: string, listener: () => void) => listeners.set(event, listener),
+    off: () => {},
+    listRuns: () => [run],
+    getRun: () => undefined,
+    stop: () => {
+      stopped++;
+      return true;
+    },
+    pause: () => true,
+    resume: () => true,
+    deleteRun: () => true,
+  } as unknown as WorkflowManager;
+  const storage = {
+    list: () => [],
+    delete: () => true,
+  } as unknown as WorkflowStorage;
+
+  openWorkflowNavigator({} as ExtensionAPI, manager, ui, { storage }).catch(() => {});
+  await Promise.resolve();
+  await Promise.resolve();
+  const component = getComponent();
+  assert.ok(component);
+
+  component.handleInput("x");
+  assert.match((component.render?.(80) ?? []).join("\n"), /confirm stop/);
+  // Streaming progress events (the row unchanged) must not cancel the pending
+  // confirmation — previously ANY manager event did, making double-x unusable.
+  listeners.get("tokenUsage")?.();
+  listeners.get("agentModel")?.();
+  component.handleInput("x");
+  assert.equal(stopped, 1, "the second x confirms after unrelated manager events");
+});
+
 test("NavigatorModel carries the estimate flag onto run and phase rows (#209)", () => {
   const base = fakeManager();
   const manager: Pick<WorkflowManager, "listRuns" | "getRun"> = {

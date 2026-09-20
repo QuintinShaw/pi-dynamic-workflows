@@ -159,7 +159,10 @@ export function fmtCost(cost: number): string {
 }
 
 /** Full (non-compact) number style for print/text surfaces: locale-grouped digits. */
-export const fmtFull = (n: number): string => n.toLocaleString();
+// Reuse one formatter across render calls. No locale argument means the
+// runtime default, matching toLocaleString() semantics.
+const FULL_NUMBER_FORMAT = new Intl.NumberFormat();
+export const fmtFull = (n: number): string => FULL_NUMBER_FORMAT.format(n);
 
 export function createWorkflowSnapshot(meta: WorkflowMeta): WorkflowSnapshot {
   return {
@@ -330,7 +333,13 @@ export function renderWorkflowLines(
   options: WorkflowDisplayOptions = {},
   theme: ThemeLike = NO_THEME,
 ): string[] {
-  const maxAgents = options.maxAgents ?? 8;
+  // A non-positive cap falls back to the default (mirrors clampMaxAgents in
+  // the task panel): slice(-0) === slice(0) would otherwise render ALL agents
+  // (audit2 #31).
+  // Math.floor: a fractional cap like 0.5 would pass the >0 guard yet
+  // slice(-0.5) → slice(0) renders ALL agents — same bug class as #31.
+  const maxAgents =
+    options.maxAgents !== undefined && options.maxAgents > 0 ? Math.max(1, Math.floor(options.maxAgents)) : 8;
   const showResultPreviews = options.showResultPreviews ?? false;
   const state =
     snapshot.errorCount > 0
@@ -352,8 +361,24 @@ export function renderWorkflowLines(
     : unique(snapshot.agents.map((agent) => agent.phase).filter(Boolean) as string[]);
   const rendered = new Set<WorkflowAgentSnapshot>();
 
+  // Single-pass phase bucketing (audit2 #24): per-phase filter() loops made
+  // every render O(phases × agents), which dominates at large fleets.
+  const agentsByPhase = new Map<string, WorkflowAgentSnapshot[]>();
+  for (const agent of snapshot.agents) {
+    // Degenerate case: an agent whose phase is "" renders under "Unphased"
+    // even when meta.phases declares a ""-titled phase (the phase row then
+    // reads 0/0) — same as the pre-bucketing behavior for untitled agents.
+    if (!agent.phase) continue;
+    let bucket = agentsByPhase.get(agent.phase);
+    if (!bucket) {
+      bucket = [];
+      agentsByPhase.set(agent.phase, bucket);
+    }
+    bucket.push(agent);
+  }
+
   for (const phase of phaseNames) {
-    const agents = snapshot.agents.filter((agent) => agent.phase === phase);
+    const agents = agentsByPhase.get(phase) ?? [];
     for (const agent of agents) rendered.add(agent);
     const done = agents.filter((agent) => agent.status === "done").length;
     const running = agents.filter((agent) => agent.status === "running").length;

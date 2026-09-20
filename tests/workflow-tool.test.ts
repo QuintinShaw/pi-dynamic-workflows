@@ -653,3 +653,63 @@ test(
     );
   }),
 );
+
+test(
+  "workflow tool: a failing script leaves no pending progress render behind (audit2 r1 m1/m2)",
+  withToolTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: toolFakeAgent() });
+    const tool = createWorkflowTool({ cwd, manager });
+    const updates: unknown[] = [];
+    // log() arms the coalesced render timer; the script never calls agent() →
+    // the tool throws agentCount===0 — no stray post-failure update may fire.
+    const logOnlyScript = `export const meta = { name: 'log_only', description: 'log only' }
+log('progress without agents')
+return 'never reaches agents'`;
+    await assert.rejects(() =>
+      tool.execute(
+        "tl1",
+        { script: logOnlyScript, background: false },
+        undefined,
+        (u: unknown) => updates.push(u),
+        undefined,
+      ),
+    );
+    const updatesAtThrow = updates.length;
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.equal(updates.length, updatesAtThrow, "no stray render after the tool already rejected");
+  }),
+);
+
+test(
+  "workflow tool: the non-abort error path renders the latest coalesced progress frame (audit2 r1 m2)",
+  withToolTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run() {
+          throw new WorkflowError("boom", WorkflowErrorCode.AGENT_FAILED, { recoverable: false });
+        },
+      },
+    });
+    manager.on("error", () => {});
+    const tool = createWorkflowTool({ cwd, manager });
+    const updates: string[] = [];
+    // log() then a non-recoverable agent failure inside the 100ms coalesce
+    // window: flushProgress must render the pending frame, not drop it.
+    const failScript = `export const meta = { name: 'fail_fast', description: 'fail fast' }
+log('about to fail')
+await agent('x')
+return 'unreachable'`;
+    await assert.rejects(() =>
+      tool.execute(
+        "tl2",
+        { script: failScript, background: false },
+        undefined,
+        (u: { content?: Array<{ text?: string }> }) => updates.push(u?.content?.[0]?.text ?? ""),
+        undefined,
+      ),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.ok(updates.length >= 1, "the pending coalesced frame was flushed (rendered) on the error path");
+  }),
+);

@@ -296,6 +296,20 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
         showResultPreviews: false,
       });
 
+      // Coalesced progress rendering state (see onProgress below).
+      let latestProgress: WorkflowSnapshot | undefined;
+      let progressRenderTimer: ReturnType<typeof setTimeout> | undefined;
+      const flushProgress = () => {
+        if (progressRenderTimer) {
+          clearTimeout(progressRenderTimer);
+          progressRenderTimer = undefined;
+          if (latestProgress) {
+            snapshot = recomputeWorkflowSnapshot(latestProgress);
+            display.update(snapshot); // the last frame must not be 100ms stale
+          }
+        }
+      };
+
       let result: WorkflowRunResult;
       try {
         result = await manager.runSync(script, params.args, {
@@ -309,11 +323,23 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           confirm,
           externalSignal: signal,
           onProgress(live) {
-            snapshot = recomputeWorkflowSnapshot(live);
-            display.update(snapshot);
+            // Trailing-edge coalescing (audit2 #24): with many concurrent
+            // agents, progress events fire hundreds of times per second and a
+            // full recompute+render each time stalls the host event loop.
+            latestProgress = live;
+            if (!progressRenderTimer) {
+              progressRenderTimer = setTimeout(() => {
+                progressRenderTimer = undefined;
+                if (latestProgress) {
+                  snapshot = recomputeWorkflowSnapshot(latestProgress);
+                  display.update(snapshot);
+                }
+              }, 100);
+            }
           },
         });
       } catch (error) {
+        flushProgress();
         if (signal?.aborted || (error instanceof WorkflowError && error.code === WorkflowErrorCode.WORKFLOW_ABORTED)) {
           for (const agent of snapshot.agents) {
             if (agent.status === "running") {
@@ -328,12 +354,14 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
         throw error;
       }
 
+      flushProgress(); // no stray timer may survive ANY exit, incl. this throw
       if (result.agentCount === 0) {
         throw new Error(
           "workflow scripts must call agent() at least once; this workflow declared phases but did not run any subagents",
         );
       }
 
+      flushProgress();
       snapshot.result = result.result;
       snapshot.durationMs = result.durationMs;
       snapshot = recomputeWorkflowSnapshot(snapshot);

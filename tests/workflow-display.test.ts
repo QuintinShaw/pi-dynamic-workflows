@@ -128,6 +128,16 @@ describe("renderWorkflowText", () => {
     assert.ok(text.includes("1 errors"), "should show error count");
   });
 
+  it("maxAgents: 0 falls back to the default cap instead of rendering ALL agents (audit2 #31)", async () => {
+    const { createWorkflowSnapshot, renderWorkflowLines, recomputeWorkflowSnapshot } = await loadDisplay();
+    const snap = recomputeWorkflowSnapshot(createWorkflowSnapshot(fakeMeta()));
+    snap.agents = Array.from({ length: 12 }, (_, i) => agent(i + 1, `a${i + 1}`, "done", "Research")) as never[];
+    const text = renderWorkflowLines(recomputeWorkflowSnapshot(snap), { maxAgents: 0 }).join("\n");
+    // slice(-0) === slice(0) would render all 12; the fallback caps at 8.
+    assert.ok(!text.includes("a1") || text.includes("earlier agents"), "the cap applies");
+    assert.ok(text.includes("earlier agents"), "truncation note rendered");
+  });
+
   it("shows running count in header", async () => {
     const { createWorkflowSnapshot, renderWorkflowLines, recomputeWorkflowSnapshot } = await loadDisplay();
     const snap = recomputeWorkflowSnapshot(createWorkflowSnapshot(fakeMeta()));
