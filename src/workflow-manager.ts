@@ -326,8 +326,14 @@ export interface WorkflowManagerOptions {
   loadSavedWorkflow?: (name: string) => string | undefined;
   /** Inject a custom agent runner (tests); defaults to a real subagent session. */
   agent?: Pick<WorkflowAgent, "run">;
-  /** The session's main model (provider/id), for auto-tiering explore agents. */
+  /** The session's main model (provider/id), for auto-tiering explore agents and inheritMainModel routing. */
   mainModel?: string;
+  /**
+   * Route untagged agents (no `model`/`tier`) to the session's main model
+   * instead of the implicit medium tier / settings default. Mirrors the
+   * inheritMainModel user setting; default false (legacy routing).
+   */
+  inheritMainModel?: boolean;
   /**
    * The host Pi session's model registry. When provided, workflow subagents
    * resolve models against the same registry as the main session, including
@@ -389,6 +395,7 @@ export type WorkflowManagerReloadOptions = Pick<
   | "excludeSubagentTools"
   | "providerMiddlewareExtensions"
   | "persistAgentSessions"
+  | "inheritMainModel"
 >;
 
 /**
@@ -474,7 +481,7 @@ export class WorkflowManager extends EventEmitter {
   private concurrency: number;
   private loadSavedWorkflow?: (name: string) => string | undefined;
   private agent?: Pick<WorkflowAgent, "run">;
-  /** The session's main model (provider/id), for auto-tiering explore agents. */
+  /** The session's main model (provider/id), for auto-tiering explore agents and inheritMainModel routing. */
   private mainModel?: string;
   /** The host Pi session's model registry, shared with subagents. */
   private modelRegistry?: ModelRegistry;
@@ -489,6 +496,7 @@ export class WorkflowManager extends EventEmitter {
   private excludeSubagentTools?: string[];
   private providerMiddlewareExtensions?: string[];
   private persistAgentSessions: boolean;
+  private inheritMainModel: boolean;
 
   constructor(options: WorkflowManagerOptions = {}) {
     super();
@@ -507,6 +515,7 @@ export class WorkflowManager extends EventEmitter {
     this.excludeSubagentTools = options.excludeSubagentTools;
     this.providerMiddlewareExtensions = options.providerMiddlewareExtensions;
     this.persistAgentSessions = options.persistAgentSessions ?? false;
+    this.inheritMainModel = options.inheritMainModel ?? false;
     this.maxTerminalRunsInMemory = options.maxTerminalRunsInMemory ?? DEFAULT_MAX_TERMINAL_RUNS_IN_MEMORY;
     this.persistence = createRunPersistence(this.cwd);
     this.recoverStaleRuns();
@@ -637,6 +646,7 @@ export class WorkflowManager extends EventEmitter {
     this.excludeSubagentTools = options.excludeSubagentTools;
     this.providerMiddlewareExtensions = options.providerMiddlewareExtensions;
     this.persistAgentSessions = options.persistAgentSessions ?? false;
+    this.inheritMainModel = options.inheritMainModel ?? false;
   }
 
   /** Set the session's main model (provider/id). Used to auto-tier explore agents. */
@@ -936,6 +946,7 @@ export class WorkflowManager extends EventEmitter {
         mainModel: this.mainModel,
         modelRegistry: this.modelRegistry,
         persistAgentSessions: this.persistAgentSessions,
+        inheritMainModel: this.inheritMainModel,
         parentSessionFile: managed.parentSessionFile,
         signal: managed.controller.signal,
         concurrency: resolvedConcurrency,
@@ -2355,6 +2366,7 @@ export class WorkflowManager extends EventEmitter {
     // process may then have resumed and rewritten the disk record. Persisting a
     // whole stale ManagedRun from here would clobber that newer status/journal.
     if (managed?.lease) {
+      if ((managed.autoResumeAttempts ?? 0) === attempts) return;
       managed.autoResumeAttempts = attempts;
       this.persistRun(managed);
       return;
@@ -2364,7 +2376,9 @@ export class WorkflowManager extends EventEmitter {
     try {
       const current = this.persistence.load(runId);
       if (!current) return;
-      this.persistence.save({ ...current, autoResumeAttempts: attempts });
+      if ((current.autoResumeAttempts ?? 0) !== attempts) {
+        this.persistence.save({ ...current, autoResumeAttempts: attempts });
+      }
       // A local entry without a lease is only a cache. Once the lease-guarded
       // merge succeeds, bring that cache up to date without making it an
       // authority for any other persisted field.

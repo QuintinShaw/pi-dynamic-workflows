@@ -194,7 +194,12 @@ export async function resolveStructuredOutput<T>(
  *      phase model, which the workflow layer folds into options.model).
  *   2. options.tier  — resolved via the model-tiers config, falling back to the
  *      session's main model when the tier has no configured entry.
- *   3. DEFAULT TIER — when neither is set but the user has a model-tiers config,
+ *   3. SESSION MODEL (opt-in) — with the inheritMainModel setting, untagged
+ *      agents instead inherit the orchestrating session's main model as of
+ *      run start (no tier config needed). With no main model set, the legacy
+ *      route below applies. An unavailable inherited model still degrades
+ *      loudly via onModelFallback rather than throwing.
+ *   4. DEFAULT TIER — when neither is set but the user has a model-tiers config,
  *      untagged agents default to the "medium" tier so a configured tier set
  *      actually affects the whole workflow (not just agents the script tagged).
  *      Fresh-install medium == the session model, so this is a no-op until the
@@ -209,16 +214,20 @@ export function resolveAgentModelSpec(
   mainModel: string | undefined,
   loadConfig: () => ModelTierConfig | null = loadModelTierConfig,
   onTierWithoutConfig?: (tier: string) => void,
+  routing?: { inheritMainModel?: boolean },
 ): string | undefined {
   if (options.model) return options.model;
-  const config = loadConfig();
   if (options.tier) {
     // Tier requested but unconfigured → it silently falls back to mainModel.
     // Let the caller surface that (once) so the no-op is discoverable.
+    const config = loadConfig();
     if (!config) onTierWithoutConfig?.(options.tier);
     return (config ? resolveTierModel(options.tier, config) : undefined) ?? mainModel;
   }
+  // Untagged agent with inheritance enabled: the session's current main model.
+  if (routing?.inheritMainModel && mainModel) return mainModel;
   // Untagged agent: default to the configured medium tier when one exists.
+  const config = loadConfig();
   if (config) {
     const medium = resolveTierModel("medium", config);
     if (medium) return medium;
@@ -311,11 +320,21 @@ export interface WorkflowAgentOptions {
   instructions?: string;
   /**
    * The session's main model (`provider/modelId`). Used as a fallback when
-   * resolving opts.tier and no model-tiers.json config exists. Without this,
-   * a workflow using `{ tier: "small" }` would log a warning and fall through
-   * to the session default when no config is saved yet.
+   * resolving opts.tier and no model-tiers.json config exists, and as the
+   * routing target for untagged agents when `inheritMainModel` is on.
+   * Without this, a workflow using `{ tier: "small" }` would log a warning
+   * and fall through to the session default when no config is saved yet.
    */
   mainModel?: string;
+  /**
+   * When true, untagged agents (no `model`, no `tier`) inherit `mainModel` —
+   * the orchestrating session's model as of run start — instead of the
+   * implicit medium tier (when configured) or the settings default. Mirrors
+   * the inheritMainModel user setting; explicit model/tier tags are
+   * unaffected, and an unavailable inherited model degrades to the settings
+   * default with a run-visible warning instead of throwing.
+   */
+  inheritMainModel?: boolean;
   /**
    * Optional host policy run after DW model-intent resolution and before
    * createAgentSession. Per-instance; a per-run `AgentRunOptions.preSpawnModel`
@@ -661,14 +680,17 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
   onModelResolved?: (modelId: string) => void;
   /**
    * Called (at most once per WorkflowAgent instance) when an UNTAGGED agent's
-   * implicit default "medium" tier resolves to a model spec that isn't
-   * available. This is the one case that degrades to the session default
-   * instead of throwing MODEL_NOT_FOUND (see `tier` above) — but the degrade
-   * must still land in the run's own log/event stream, not just a
-   * console.warn, or a broken default tier silently drifts every untagged
-   * agent's model with zero trace in the run itself.
+   * implicit route — the default "medium" tier, or the inherited main model
+   * when the inheritMainModel setting is on (source discriminates which) —
+   * resolves to a model spec that isn't available. This is the one case that
+   * degrades to the session default instead of throwing MODEL_NOT_FOUND (see
+   * `tier` above) — but the degrade must still land in the run's own
+   * log/event stream, not just a console.warn, or a broken implicit route
+   * silently drifts every untagged agent's model with zero trace in the run
+   * itself. In the payload, `tier` is the legacy medium-tier field and is only
+   * meaningful when `source === "medium-tier"`; key on `source` instead.
    */
-  onModelFallback?: (info: { tier: string; requestedSpec: string }) => void;
+  onModelFallback?: (info: { tier: string; requestedSpec: string; source: "medium-tier" | "inherit-main" }) => void;
   /** Called with a compact snapshot of this subagent's message/tool history. */
   onHistory?: (history: AgentHistoryEntry[]) => void;
   /** Run this agent in a different working directory (e.g. an isolated worktree). */
@@ -751,6 +773,7 @@ export class WorkflowAgent {
   private readonly persistAgentSessions: boolean;
   private readonly instructions?: string;
   private readonly mainModel?: string;
+  private readonly inheritMainModel: boolean;
   private readonly preSpawnModel?: PreSpawnModelResolver;
   /** Shared registry from the host session, when provided. */
   private readonly sharedRegistry?: ModelRegistry;
@@ -771,13 +794,15 @@ export class WorkflowAgent {
   private readonly resourceLoaders = new Map<string, Promise<DefaultResourceLoader>>();
   /**
    * Emitted at most once per instance (~= once per run, see the class-level
-   * lifetime note above): the untagged/default "medium" tier resolved to a
-   * model spec that isn't available. Deliberately per-instance rather than a
-   * MODEL_NOT_FOUND throw — an untagged agent never asked for that specific
-   * model, so a broken default tier shouldn't fail every untagged agent in the
-   * run. See onModelFallback below for the (still-loud) degrade path.
+   * lifetime note above): an untagged agent's implicit route — the default
+   * "medium" tier, or the inherited main model when inheritMainModel is on —
+   * resolved to a model spec that isn't available. Deliberately per-instance
+   * rather than a MODEL_NOT_FOUND throw — an untagged agent never asked for
+   * that specific model, so a broken implicit route shouldn't fail every
+   * untagged agent in the run. See onModelFallback below for the (still-loud)
+   * degrade path.
    */
-  private warnedDefaultTierUnavailable = false;
+  private warnedImplicitRouteUnavailable = false;
   /**
    * Named conversations live for this WorkflowAgent instance. Production creates
    * one instance per workflow invocation; embedders that inject and reuse an
@@ -799,6 +824,7 @@ export class WorkflowAgent {
     this.persistAgentSessions = options.persistAgentSessions ?? false;
     this.instructions = options.instructions;
     this.mainModel = options.mainModel;
+    this.inheritMainModel = options.inheritMainModel ?? false;
     this.preSpawnModel = options.preSpawnModel;
     this.sharedRegistry = options.modelRegistry;
     this.parentSessionFile = options.parentSessionFile;
@@ -825,7 +851,35 @@ export class WorkflowAgent {
     const key = JSON.stringify([agentDir, cwd]);
     const shared = this.providerMiddlewareExtensions.length === 0;
     const existing = shared ? this.resourceLoaders.get(key) : undefined;
-    if (existing) return existing;
+    if (existing) {
+      // LRU-by-touch: keep hot entries (base cwd) resident ahead of one-off
+      // worktree loaders when pruneSharedResourceLoaders evicts.
+      this.resourceLoaders.delete(key);
+      this.resourceLoaders.set(key, existing);
+      return existing;
+    }
+    return this.buildSharedResourceLoader(agentDir, cwd, key);
+  }
+
+  /**
+   * Bound the loader memo (audit2 #41): worktree isolation gives every agent
+   * a unique cwd, so N worktree agents would otherwise retain N
+   * fully-reloaded loaders until run end. LRU-by-touch (hits re-insert in
+   * getSharedResourceLoader) keeps the hot entries — the base cwd is touched
+   * by every default call — while one-off worktree loaders are evicted first.
+   */
+  private static readonly MAX_SHARED_RESOURCE_LOADERS = 8;
+
+  private pruneSharedResourceLoaders(): void {
+    while (this.resourceLoaders.size > WorkflowAgent.MAX_SHARED_RESOURCE_LOADERS) {
+      const oldest = this.resourceLoaders.keys().next().value;
+      if (oldest === undefined) return;
+      this.resourceLoaders.delete(oldest);
+    }
+  }
+
+  private buildSharedResourceLoader(agentDir: string, cwd: string, key: string): Promise<DefaultResourceLoader> {
+    const shared = this.providerMiddlewareExtensions.length === 0;
     const pending = (async () => {
       const settingsManager = this.sessionOptions.settingsManager ?? SettingsManager.create(cwd, agentDir);
       let middlewarePaths: string[] = [];
@@ -858,10 +912,14 @@ export class WorkflowAgent {
       // Don't let a transient build failure (e.g. EMFILE during reload's disk
       // I/O) poison every subagent AND every retry of this run — clear the memo
       // so the next caller rebuilds instead of replaying the same rejection.
+      // An evicted older build must not delete a newer entry for this key.
       if (shared && this.resourceLoaders.get(key) === pending) this.resourceLoaders.delete(key);
       throw err;
     });
-    if (shared) this.resourceLoaders.set(key, pending);
+    if (shared) {
+      this.resourceLoaders.set(key, pending);
+      this.pruneSharedResourceLoaders();
+    }
     return pending;
   }
 
@@ -1074,7 +1132,8 @@ export class WorkflowAgent {
     // resolution, and the subagent session's runtime below.
     const modelRegistry = await this.getRegistry(options.modelRegistry);
 
-    // Resolve the model spec (explicit model > tier > session default). This
+    // Resolve the model spec (explicit model > tier > inherited main model /
+    // implicit medium tier > session default). This
     // composes with phase-based routing in workflow.ts, which only supplies
     // options.model when a phase pattern matches — so an explicit model wins.
     let modelSpec = resolveAgentModelSpec(
@@ -1082,6 +1141,7 @@ export class WorkflowAgent {
       this.mainModel,
       () => this.loadTierConfig(),
       () => warnTierUnconfiguredOnce(this.mainModel, modelRegistry),
+      { inheritMainModel: this.inheritMainModel },
     );
 
     const modelSource = classifyModelSource({
@@ -1122,11 +1182,14 @@ export class WorkflowAgent {
     //     (or unauthenticated) model while the caller believes its pin/tier was
     //     honored.
     //   - neither was set: the agent is UNTAGGED and only got routed through
-    //     the implicit default "medium" tier because *some other* agent's tier
-    //     is configured (see resolveAgentModelSpec). This agent never asked for
-    //     that model, so a broken default tier degrades to the session default
-    //     instead of failing every untagged agent in the run — but the degrade
-    //     still needs to be loud (onModelFallback), not a silent continuation.
+    //     an implicit route — the default "medium" tier (consulted because
+    //     *some other* agent's tier is configured), or the inherited main
+    //     model when inheritMainModel is on (see resolveAgentModelSpec). This
+    //     agent never asked for that model, so a broken implicit route
+    //     degrades to the session default instead of failing every untagged
+    //     agent in the run — but the degrade still needs to be loud
+    //     (onModelFallback, with source naming the route), not a silent
+    //     continuation.
     const isExplicitRequest = pinAfterPolicy;
     let resolvedModel: Model<any> | undefined;
     let resolvedThinkingLevel: CreateAgentSessionOptions["thinkingLevel"] | undefined;
@@ -1150,9 +1213,13 @@ export class WorkflowAgent {
             agentLabel: options.label,
           });
         }
-        if (!this.warnedDefaultTierUnavailable) {
-          this.warnedDefaultTierUnavailable = true;
-          options.onModelFallback?.({ tier: "medium", requestedSpec: modelSpec });
+        if (!this.warnedImplicitRouteUnavailable) {
+          this.warnedImplicitRouteUnavailable = true;
+          options.onModelFallback?.({
+            tier: "medium",
+            requestedSpec: modelSpec,
+            source: this.inheritMainModel && this.mainModel ? "inherit-main" : "medium-tier",
+          });
         }
       } else {
         resolvedModel = resolved.model;

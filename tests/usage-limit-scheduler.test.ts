@@ -127,12 +127,257 @@ function makeRun(overrides: Partial<PersistedRunState> = {}): PersistedRunState 
   };
 }
 
-const TUNABLES = { maxAttempts: 3, minDelayMs: 60_000, fallbackDelayMs: 300_000, maxDelayMs: 6 * 3_600_000 };
+const TUNABLES = {
+  maxAttempts: 3,
+  minDelayMs: 60_000,
+  fallbackDelayMs: 300_000,
+  maxDelayMs: 6 * 3_600_000,
+  jitterRatio: 0,
+};
 
 // ---- parseResetHintMs ---------------------------------------------------------
 
 test("parseResetHintMs: hours", () => {
   assert.equal(parseResetHintMs("Resets in 3h"), 3 * 3_600_000);
+});
+
+test("parseResetHintMs: day and week units (audit2 #14)", () => {
+  assert.equal(parseResetHintMs("Resets in 2d"), 2 * 86_400_000);
+  assert.equal(parseResetHintMs("Resets in 1 week"), 7 * 86_400_000);
+  assert.equal(parseResetHintMs("resets in 3 days"), 3 * 86_400_000);
+});
+
+test("parseResetHintMs: invalid clock hints do not normalize into a different reset time", () => {
+  for (const hint of ["Try again at 13:20 PM", "Try again at 0:30 AM", "Reset at 3:99 PM; retry in 600 seconds"]) {
+    assert.equal(parseResetHintMs(hint), undefined);
+  }
+});
+
+test("parseResetHintMs: absolute ISO reset timestamp (audit2 #10)", () => {
+  const now = Date.parse("2026-09-17T13:00:00+08:00");
+  // The verbatim Ark/Codex quota message shape.
+  assert.equal(
+    parseResetHintMs("You have exceeded the 5-hour usage quota. It will reset at 2026-09-17 13:20:54 +0800 CST", now),
+    1_254_000, // 20m54s
+  );
+  // A timestamp already in the past clamps to 0 rather than going negative.
+  assert.equal(parseResetHintMs("It will reset at 2026-09-17 12:00:00 +0800", now), 0);
+});
+
+test("parseResetHintMs: absolute clock time rolls over to tomorrow (audit2 #10)", () => {
+  const now = Date.parse("2026-09-17T15:00:00"); // 3:00 PM local
+  const expected = new Date(now);
+  expected.setHours(15, 20, 0, 0);
+  assert.equal(parseResetHintMs("Try again at 3:20 PM", now), expected.getTime() - now);
+  const rolled = new Date(now);
+  rolled.setHours(9, 0, 0, 0);
+  rolled.setDate(rolled.getDate() + 1);
+  assert.equal(parseResetHintMs("Try again at 9:00 AM", now), rolled.getTime() - now);
+});
+
+test("parseResetHintMs: T-form with a space before the offset, and double-space forms", () => {
+  const now = Date.parse("2026-09-17T13:00:00+08:00");
+  assert.equal(parseResetHintMs("It will reset at 2026-09-17T13:20:54 +0800", now), 1_254_000);
+  assert.equal(parseResetHintMs("It will reset at 2026-09-17 13:20:54  +0800", now), 1_254_000);
+});
+
+test("parseResetHintMs: 'resetting at' clock form", () => {
+  const now = Date.parse("2026-09-17T15:00:00"); // 3:00 PM local
+  const expected = new Date(now);
+  expected.setHours(15, 20, 0, 0);
+  assert.equal(parseResetHintMs("Quota resetting at 3:20 PM", now), expected.getTime() - now);
+});
+
+test("parseResetHintMs: Z-suffixed ISO timestamps parse as UTC, not local", () => {
+  const now = Date.parse("2026-09-17T13:00:00Z");
+  assert.equal(parseResetHintMs("It will reset at 2026-09-17T13:20:54Z", now), 1_254_000);
+  assert.equal(parseResetHintMs("It will reset at 2026-09-17 13:20:54.123Z", now), 1_254_123);
+});
+
+test("parseResetHintMs: an unparseable absolute match does not fall through to unrelated units", () => {
+  // The absolute regex matched but the timestamp is garbage: the "600 seconds"
+  // elsewhere in the message must NOT be returned (callers fall back instead).
+  assert.equal(parseResetHintMs("It will reset at 2026-13-45 99:99 +0800. Retry-After: 600 seconds", 0), undefined);
+});
+
+test("parseResetHintMs: an explicit date pins the clock branch's day", () => {
+  const now = Date.parse("2026-09-17T15:00:00"); // 3:00 PM local
+  const expected = new Date(now);
+  expected.setFullYear(2026, 8, 20);
+  expected.setHours(15, 20, 0, 0);
+  assert.equal(parseResetHintMs("Try again at 3:20 PM on 2026-09-20", now), expected.getTime() - now);
+  // A minute-truncated hint delivered within the same minute must not roll a day.
+  const within = new Date(now);
+  within.setHours(15, 20, 30, 500);
+  assert.equal(parseResetHintMs("Try again at 3:20 PM", within.getTime()), 0);
+});
+
+test("jitter never breaches the maxDelayMs ceiling (and ceiling-hit delays spread downward)", () => {
+  const armed = computeAutoResumeDelayMs({
+    resetHint: "resets in 99h",
+    attempts: 1,
+    elapsedMs: 0,
+    minDelayMs: 60_000,
+    fallbackDelayMs: 300_000,
+    maxDelayMs: 3_600_000,
+    jitterRatio: 0.1,
+    random: () => 0.999999,
+  });
+  assert.ok(armed <= 3_600_000, "the documented ceiling holds on the armed delay");
+  assert.ok(armed < 3_600_000, "ceiling-hit delays spread downward so same-event runs decorrelate");
+  assert.ok(armed >= 60_000, "the floor still holds");
+});
+
+test("cold start with an ABSOLUTE reset hint arms the true remaining, not the floor", async () => {
+  // Paused at t=0 with a reset at t+20m54s; the process restarts 10m in.
+  // The re-arm must be ~10.9m (reset - now), not the 60s floor from
+  // double-subtracting elapsed (audit2 r1 B1).
+  const manager = new FakeManager();
+  const clock = createFakeClock(0);
+  manager.persistence.seed(
+    makeRun({
+      status: "paused",
+      pauseReason: "usage_limit",
+      resetHint: "It will reset at 2026-09-17T13:20:54Z",
+      autoResumeAttempts: 1,
+      updatedAt: new Date(Date.parse("2026-09-17T13:00:00Z")).toISOString(),
+    }),
+  );
+  clock.advance(10 * 60_000);
+  const pausedNow = Date.parse("2026-09-17T13:00:00Z") + 10 * 60_000;
+  const scheduler = new UsageLimitScheduler(manager, {
+    now: () => pausedNow,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    ...TUNABLES,
+  });
+  await flush();
+  assert.deepEqual(clock.pendingDelays(), [1_254_000 - 10 * 60_000], "true remaining (reset - now), not the floor");
+  scheduler.dispose();
+});
+
+test("cold start with an absent counter WRITES the armed attempt through the non-live path (audit2 r1 m5)", async () => {
+  const manager = new FakeManager();
+  const clock = createFakeClock();
+  manager.persistence.seed(
+    makeRun({
+      status: "paused",
+      pauseReason: "usage_limit",
+      resetHint: "resets in 10m",
+      // autoResumeAttempts deliberately absent (pre-#207 record)
+    }),
+  );
+  const scheduler = new UsageLimitScheduler(manager, {
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    ...TUNABLES,
+  });
+  await flush();
+  assert.equal(
+    manager.persistence.get("run-1")?.autoResumeAttempts,
+    1,
+    "arming attempt 1 over an absent counter is a changed value and must persist",
+  );
+  scheduler.dispose();
+});
+
+test("scheduler-level: jitter never arms above maxDelayMs, and ceiling-hit delays still spread", async () => {
+  const manager = new FakeManager();
+  manager.persistence.seed(makeRun({ resetHint: "resets in 99h" }));
+  const clock = createFakeClock();
+  const scheduler = new UsageLimitScheduler(manager, {
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    ...TUNABLES,
+    maxDelayMs: 3_600_000,
+    jitterRatio: 0.1,
+    random: () => 0.999999,
+  });
+  manager.emit("paused", { runId: "run-1", reason: "usage_limit", resetHint: "resets in 99h" });
+  const [armed] = clock.pendingDelays();
+  assert.ok(armed <= 3_600_000, `armed delay ${armed} must not exceed the ceiling`);
+  assert.ok(armed < 3_600_000, "a ceiling-hit delay still spreads downward (decorrelates the herd)");
+  assert.ok(armed >= 60_000, "the floor still holds");
+  scheduler.dispose();
+});
+
+test("jitter: a backoff exactly AT the cap still spreads (no point mass at maxDelayMs)", () => {
+  const delays = new Set<number>();
+  for (const sample of [0, 0.25, 0.5, 0.75, 0.999999]) {
+    delays.add(
+      computeAutoResumeDelayMs({
+        resetHint: "resets in 1h",
+        attempts: 1,
+        elapsedMs: 0,
+        minDelayMs: 60_000,
+        fallbackDelayMs: 300_000,
+        maxDelayMs: 3_600_000, // backoff == cap exactly
+        jitterRatio: 0.1,
+        random: () => sample,
+      }),
+    );
+  }
+  assert.ok(
+    [...delays].every((d) => d <= 3_600_000),
+    "ceiling holds in every sample",
+  );
+  assert.ok(delays.size > 1, "same-cap cohorts decorrelate instead of piling onto maxDelayMs");
+  assert.ok(
+    [...delays].every((d) => d < 3_600_000),
+    "no sample piles exactly at the cap",
+  );
+});
+
+test("jitter spreads identical arms deterministically with an injected random (audit2 #13)", () => {
+  const manager = new FakeManager();
+  manager.persistence.seed(makeRun({ resetHint: "resets in 10m" }));
+  const clock = createFakeClock();
+  const scheduler = new UsageLimitScheduler(manager, {
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    ...TUNABLES,
+    jitterRatio: 0.1,
+    random: () => 0.75, // fixed spread factor: 10m * (0.9 + 0.15) = 10.5m
+  });
+  manager.emit("paused", { runId: "run-1", reason: "usage_limit", resetHint: "resets in 10m" });
+  assert.deepEqual(clock.pendingDelays(), [Math.round(10 * 60_000 * 1.05)]);
+  scheduler.dispose();
+});
+
+test("refused-resume re-arms are capped instead of polling forever (audit2 #12)", async () => {
+  const manager = new FakeManager();
+  manager.resume = async () => false; // structurally refused (e.g. lease held elsewhere)
+  manager.persistence.seed(makeRun({ status: "running", resetHint: "resets in 10m" }));
+  const clock = createFakeClock();
+  const diagnostics: string[] = [];
+  const scheduler = new UsageLimitScheduler(manager, {
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    onDiagnostic: (m) => diagnostics.push(m),
+    ...TUNABLES,
+    maxRefusals: 2,
+  });
+
+  manager.emit("paused", { runId: "run-1", reason: "usage_limit", resetHint: "resets in 10m" });
+  // Fire the armed timer: refused → re-arm at minDelayMs (refusal 1).
+  clock.fireAll();
+  await flush();
+  assert.equal(clock.pendingCount(), 1, "first refusal re-arms");
+  clock.fireAll();
+  await flush();
+  assert.equal(clock.pendingCount(), 1, "second refusal re-arms");
+  clock.fireAll();
+  await flush();
+  assert.equal(clock.pendingCount(), 0, "third refusal exceeds maxRefusals → gives up");
+  assert.ok(
+    diagnostics.some((m) => m.includes("giving up after 3 refused auto-resume poll(s)")),
+    "give-up diagnostic names the ACTUAL refusal count (3 with maxRefusals 2)",
+  );
+  scheduler.dispose();
 });
 
 test("parseResetHintMs: approx hours (~3h)", () => {
@@ -175,6 +420,29 @@ test("computeAutoResumeDelayMs: delay floor is enforced", () => {
     maxDelayMs: 3_600_000,
   });
   assert.equal(delay, 60_000, "1s base is below the floor, floor wins");
+});
+
+test("cold-start elapsed time is subtracted after backoff and the original delay ceiling", () => {
+  const params = {
+    resetHint: "resets in 10m",
+    attempts: 2,
+    elapsedMs: 5 * 60_000,
+    minDelayMs: 1_000,
+    maxDelayMs: 60 * 60_000,
+    fallbackDelayMs: 300_000,
+    jitterRatio: 0,
+  };
+  assert.equal(computeAutoResumeDelayMs(params), 15 * 60_000, "20m original delay minus 5m elapsed");
+  assert.equal(
+    computeAutoResumeDelayMs({ ...params, attempts: 10, elapsedMs: 30 * 60_000 }),
+    30 * 60_000,
+    "a capped one-hour arm has only 30m left after 30m elapsed",
+  );
+  assert.equal(
+    computeAutoResumeDelayMs({ ...params, attempts: 10, elapsedMs: 61 * 60_000 }),
+    1_000,
+    "an overdue capped arm uses only the retry floor",
+  );
 });
 
 test("computeAutoResumeDelayMs: backoff grows with attempts and is capped by maxDelayMs", () => {
@@ -314,14 +582,14 @@ test("cold start past the cap: no growth, no timer, no repeated give-up log (#10
   );
 });
 
-test("cold start crossing the cap logs give-up exactly once, then freezes (#106)", async () => {
+test("cold start crossing the cap logs give-up exactly once, then freezes (#106, audit2 #11)", async () => {
   const manager = new FakeManager();
   manager.persistence.seed(
     makeRun({
       status: "paused",
       pauseReason: "usage_limit",
       resetHint: "resets in 1m",
-      autoResumeAttempts: 3, // exactly at maxAttempts — the next arm crosses the cap
+      autoResumeAttempts: 3, // attempt 3 was ARMED but never fired — the restart re-arms it
     }),
   );
   const diagnostics: string[] = [];
@@ -338,7 +606,14 @@ test("cold start crossing the cap logs give-up exactly once, then freezes (#106)
     return { clock, scheduler };
   };
 
+  // The re-armed attempt is NOT a cap crossing (audit2 #11: the restart doesn't
+  // consume a fresh attempt) — it arms a timer for the already-counted attempt.
   const first = await boot();
+  assert.equal(first.clock.pendingCount(), 1, "re-arms the armed-but-unfired attempt, no give-up yet");
+  assert.equal(manager.persistence.get("run-1")?.autoResumeAttempts, 3, "rearm does not burn a fresh attempt");
+
+  // That attempt fires and the run hits the wall again → the NEXT pause crosses.
+  manager.emit("paused", { runId: "run-1", reason: "usage_limit", resetHint: "resets in 1m" });
   assert.equal(first.clock.pendingCount(), 0, "crossing the cap arms no timer");
   first.scheduler.dispose();
   const second = await boot();
@@ -767,6 +1042,7 @@ test("real manager restart: cold-start rearm continues the backoff via the non-l
       },
     });
     managerB.on("error", () => {});
+    const updatedAtBeforeRestart = managerB.getPersistence().load(runId)?.updatedAt;
     const clockB = createFakeClock();
     const schedulerB = new UsageLimitScheduler(managerB, {
       now: clockB.now,
@@ -776,13 +1052,40 @@ test("real manager restart: cold-start rearm continues the backoff via the non-l
     });
     await flush();
 
+    const persistedAfter = managerB.getPersistence().load(runId);
     assert.equal(
-      managerB.getPersistence().load(runId)?.autoResumeAttempts,
-      2,
-      "a restart continues the backoff counter instead of resetting it",
+      persistedAfter?.autoResumeAttempts,
+      1,
+      "a restart re-arms the already-counted attempt — it does not burn the give-up budget (audit2 #11)",
+    );
+    assert.equal(
+      persistedAfter?.updatedAt,
+      updatedAtBeforeRestart,
+      "the equal-value re-persist is skipped by the real manager's non-live guard (audit2 #15, r2 R5)",
     );
     assert.equal(clockB.pendingCount(), 1, "auto-resume re-armed after restart");
     schedulerB.dispose();
+  });
+});
+
+test("recordAutoResumeAttempts skips equal-value writes (audit2 #15)", async () => {
+  await withRealManagerCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: quotaAgent() });
+    manager.on("error", () => {});
+    const { runId, promise } = manager.startInBackground(QUOTA_SCRIPT);
+    await promise.catch(() => {});
+    const persisted1 = manager.getPersistence().load(runId);
+    assert.ok(persisted1, "paused run persisted");
+    await new Promise((resolve) => setTimeout(resolve, 5)); // ensure a restamp would differ
+    manager.recordAutoResumeAttempts(runId, persisted1?.autoResumeAttempts ?? 0);
+    assert.equal(
+      manager.getPersistence().load(runId)?.updatedAt,
+      persisted1?.updatedAt,
+      "an equal-value write is skipped entirely (updatedAt not restamped)",
+    );
+    const next = (persisted1?.autoResumeAttempts ?? 0) + 1;
+    manager.recordAutoResumeAttempts(runId, next);
+    assert.equal(manager.getPersistence().load(runId)?.autoResumeAttempts, next, "a changed value persists");
   });
 });
 

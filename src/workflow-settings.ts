@@ -42,6 +42,17 @@ export interface WorkflowSettings {
    */
   persistAgentSessions?: boolean;
   /**
+   * Route UNTAGGED agent() calls (no `model`, no `tier`) to the orchestrating
+   * session's main model instead of the implicit medium tier (when
+   * configured) or the settings default. Default false (legacy routing).
+   * Explicit `model`/`tier` tags are unaffected. Applies when the session has
+   * a main model; with none set, legacy routing applies. The inherited model
+   * is the main model in effect when the RUN starts; a mid-run /model switch
+   * applies to subsequent runs. An unavailable inherited model degrades to
+   * the settings default with a run-visible warning instead of throwing.
+   */
+  inheritMainModel?: boolean;
+  /**
    * Character cap on a delivered background-run result's JSON-dump fallback
    * before truncation (default 400). String results and `verdict`/`report`/
    * `summary`/`synthesis` fields are never truncated.
@@ -205,6 +216,9 @@ function normalizeSettings(value: unknown): WorkflowSettings {
   }
   if (typeof raw.persistAgentSessions === "boolean") {
     settings.persistAgentSessions = raw.persistAgentSessions;
+  }
+  if (typeof raw.inheritMainModel === "boolean") {
+    settings.inheritMainModel = raw.inheritMainModel;
   }
   const deliveredResultMaxChars = normalizeInteger(raw.deliveredResultMaxChars, 1, 1_000_000);
   if (deliveredResultMaxChars !== undefined) settings.deliveredResultMaxChars = deliveredResultMaxChars;

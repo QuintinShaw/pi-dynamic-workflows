@@ -103,6 +103,7 @@ function buildManagerOptions(cwd: string, storage: WorkflowStorage) {
     concurrency: settings.defaultConcurrency,
     defaultAgentRetries: settings.defaultAgentRetries,
     persistAgentSessions: settings.persistAgentSessions,
+    inheritMainModel: settings.inheritMainModel,
   };
 }
 

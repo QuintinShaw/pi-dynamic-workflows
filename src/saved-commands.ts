@@ -94,6 +94,9 @@ export function registerSavedWorkflow(
             args: parseCommandArgs(args, liveWorkflow.parameters),
             tools: createCodingTools(liveCwd),
             onPhase: (title) => ctx.ui.setStatus(`wf:${liveWorkflow.name}`, `${liveWorkflow.name}: ${title}`),
+            // Manager-less fallback (production always goes through getManager):
+            // legacy routing only — no mainModel/inheritMainModel plumbing, so
+            // untagged agents follow the implicit medium tier / settings default.
           });
           ctx.ui.setStatus(`wf:${liveWorkflow.name}`, undefined);
           await pi.sendMessage({

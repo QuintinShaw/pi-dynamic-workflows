@@ -386,6 +386,50 @@ describe("workflow settings", () => {
     });
   });
 
+  it("saves, loads, and normalizes inheritMainModel", () => {
+    withSettingsPath((settingsPath) => {
+      saveWorkflowSettings({ inheritMainModel: true }, settingsPath);
+      assert.deepEqual(loadWorkflowSettings(settingsPath), { inheritMainModel: true });
+
+      saveWorkflowSettings({ inheritMainModel: false }, settingsPath);
+      assert.deepEqual(loadWorkflowSettings(settingsPath), { inheritMainModel: false });
+
+      writeFileSync(settingsPath, JSON.stringify({ inheritMainModel: "true" }), "utf-8");
+      assert.deepEqual(loadWorkflowSettings(settingsPath), {});
+
+      writeFileSync(settingsPath, JSON.stringify({ inheritMainModel: 1 }), "utf-8");
+      assert.deepEqual(loadWorkflowSettings(settingsPath), {});
+    });
+  });
+
+  it("applies inheritMainModel through the repo-local and project overlays", () => {
+    withSettingsPath((settingsPath) => {
+      const projectLocalSettingsPath = join(dirname(settingsPath), "repo-settings.json");
+      const projectSettingsPath = join(dirname(settingsPath), "project-settings.json");
+      const options = { settingsPath, projectLocalSettingsPath, projectSettingsPath };
+      saveWorkflowSettings({ inheritMainModel: true }, settingsPath);
+
+      assert.deepEqual(loadWorkflowSettings(options), { inheritMainModel: true });
+
+      // A repo-local explicit false cancels the global opt-in.
+      writeFileSync(projectLocalSettingsPath, JSON.stringify({ inheritMainModel: false }));
+      assert.deepEqual(loadWorkflowSettings(options), { inheritMainModel: false });
+      assert.deepEqual(loadWorkflowSettings(settingsPath), { inheritMainModel: true });
+
+      // Invalid overlay values must not clobber the global setting.
+      for (const value of [{ inheritMainModel: "true" }, { inheritMainModel: 1 }, [], null]) {
+        writeFileSync(projectLocalSettingsPath, JSON.stringify(value));
+        assert.deepEqual(loadWorkflowSettings(options), { inheritMainModel: true });
+      }
+
+      // An external project overlay wins over the repo-local file.
+      writeFileSync(projectLocalSettingsPath, JSON.stringify({ inheritMainModel: true }));
+      saveWorkflowSettings({ inheritMainModel: false }, { ...options, scope: "project" });
+      assert.deepEqual(loadWorkflowSettings(options), { inheritMainModel: false });
+      assert.deepEqual(JSON.parse(readFileSync(projectLocalSettingsPath, "utf-8")), { inheritMainModel: true });
+    });
+  });
+
   it("clamps and floors deliveredResultMaxChars into [1, 1000000]", () => {
     withSettingsPath((settingsPath) => {
       mkdirSync(dirname(settingsPath), { recursive: true });

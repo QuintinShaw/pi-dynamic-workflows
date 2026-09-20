@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { isDeepStrictEqual } from "node:util";
+import { createFauxCore, fauxAssistantMessage } from "@earendil-works/pi-ai";
 import type { AgentUsage } from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import type { PersistedAgentState, PersistedRunState } from "../src/run-persistence.js";
@@ -12,6 +13,7 @@ import { UsageLimitScheduler } from "../src/usage-limit-scheduler.js";
 import { _setPausedExecutionSettleTimeoutForTests, WorkflowManager } from "../src/workflow-manager.js";
 import { NavigatorModel, NavigatorState, renderNavigator } from "../src/workflow-ui.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
+import { fauxRegistryFor } from "./helpers/faux-registry.js";
 
 /** Agent runner that reports fixed usage so token accounting is exercised. */
 function fakeAgent(usage: Partial<AgentUsage> = {}, result: unknown = "ok") {
@@ -4613,6 +4615,94 @@ test(
     assert.equal(result.agentCount, 1);
   }),
 );
+
+test(
+  "inheritMainModel is captured at construction and defaults to false",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent(), inheritMainModel: true });
+    // The manager forwards the flag on every runWorkflow call; the flag is
+    // captured at construction and defaults to false when omitted.
+    assert.equal((manager as unknown as { inheritMainModel: boolean }).inheritMainModel, true);
+
+    const defaulted = new WorkflowManager({ cwd, agent: fakeAgent() });
+    assert.equal((defaulted as unknown as { inheritMainModel: boolean }).inheritMainModel, false);
+
+    const result = await manager.runSync(oneAgentScript);
+    assert.equal(result.agentCount, 1);
+  }),
+);
+
+test(
+  "reconfigureAfterReload carries inheritMainModel",
+  withTempCwd(async (cwd) => {
+    // Settings are re-read on every extension reload, so a flag edit must
+    // reach the live manager without replacing it.
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent(), inheritMainModel: true });
+    manager.reconfigureAfterReload({ inheritMainModel: false });
+    assert.equal((manager as unknown as { inheritMainModel: boolean }).inheritMainModel, false);
+    manager.reconfigureAfterReload({ inheritMainModel: true });
+    assert.equal((manager as unknown as { inheritMainModel: boolean }).inheritMainModel, true);
+  }),
+);
+
+test("inheritMainModel forwards through the manager and actually routes the subagent (end-to-end)", async () => {
+  // Behavioral proof of the workflow-manager.ts → runWorkflow → WorkflowAgent
+  // hop (the private-field test above cannot catch a dropped forwarding line):
+  // with the flag on, the untagged agent must run on the manager's mainModel;
+  // with it off, on the settings default.
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-mgr-inherit-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-mgr-inherit-cwd-"));
+  const mainCore = createFauxCore({
+    provider: "fauxtest-main",
+    models: [{ id: "main-model", name: "Main Model", contextWindow: 128000, maxTokens: 4096 }],
+  });
+  const defaultCore = createFauxCore({
+    provider: "fauxtest-default",
+    models: [{ id: "default-model", name: "Default Model", contextWindow: 128000, maxTokens: 4096 }],
+  });
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const agentDir = join(home, ".pi", "agent");
+      mkdirSync(agentDir, { recursive: true });
+      writeFileSync(
+        join(agentDir, "settings.json"),
+        JSON.stringify({ defaultProvider: "fauxtest-default", defaultModel: "default-model" }),
+      );
+      const registry = await fauxRegistryFor(home, [
+        ["fauxtest-main", mainCore],
+        ["fauxtest-default", defaultCore],
+      ]);
+
+      const inheritManager = new WorkflowManager({
+        cwd,
+        mainModel: "fauxtest-main/main-model",
+        modelRegistry: registry,
+        inheritMainModel: true,
+      });
+      mainCore.setResponses([fauxAssistantMessage("ran-on-main-model", { stopReason: "stop" })]);
+      const inheritResult = await inheritManager.runSync(oneAgentScript);
+      assert.ok(
+        JSON.stringify(inheritResult.result).includes("ran-on-main-model"),
+        "with the flag on, the untagged agent must run on the manager's mainModel",
+      );
+
+      const legacyManager = new WorkflowManager({
+        cwd,
+        mainModel: "fauxtest-main/main-model",
+        modelRegistry: registry,
+      });
+      defaultCore.setResponses([fauxAssistantMessage("ran-on-settings-default", { stopReason: "stop" })]);
+      const legacyResult = await legacyManager.runSync(oneAgentScript);
+      assert.ok(
+        JSON.stringify(legacyResult.result).includes("ran-on-settings-default"),
+        "with the flag omitted, legacy routing (settings default) is unchanged",
+      );
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
 
 test(
   "agents receive an identifiable sessionName (workflow:<runId> <label>) for persisted sessions",

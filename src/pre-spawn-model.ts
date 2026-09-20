@@ -7,7 +7,9 @@ import type { ModelThinkingLevel } from "./model-spec.js";
  * - explicit: script `model` or agentType `model`
  * - tier: script `tier` with no explicit model
  * - phase: workflow phase/meta routing (`phases[].model` or `meta.model`)
- * - default: untagged implicit medium-tier routing (not a user pin)
+ * - default: untagged implicit routing — the configured medium tier, or the
+ *   inherited main model when the inheritMainModel setting is on (not a
+ *   script-level pin)
  * - session: no resolved spec; createAgentSession will use the session default
  */
 export type ModelSource = "explicit" | "tier" | "phase" | "default" | "session";

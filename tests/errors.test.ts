@@ -7,6 +7,7 @@ import {
   WorkflowErrorCode,
   wrapError,
 } from "../src/errors.js";
+import { parseResetHintMs } from "../src/usage-limit-scheduler.js";
 
 describe("classifyProviderLimit", () => {
   it("matches the documented provider usage/quota/rate-limit wordings", () => {
@@ -43,6 +44,18 @@ describe("classifyProviderLimit", () => {
       "resets at 2026-06-20T06:00:00Z",
     );
     assert.equal(classifyProviderLimit("insufficient_quota").resetHint, undefined);
+  });
+
+  it("extracts the pi-ai Codex 'Try again in ~N min' hint (audit2 #10)", () => {
+    assert.equal(
+      classifyProviderLimit("You have hit your ChatGPT usage limit (plus plan). Try again in ~299 min.").resetHint,
+      "Try again in ~299 min",
+    );
+    // The extracted hint feeds the scheduler's parser end-to-end.
+    assert.equal(
+      parseResetHintMs(classifyProviderLimit("usage limit reached. Try again in ~299 min.").resetHint),
+      299 * 60_000,
+    );
   });
 });
 

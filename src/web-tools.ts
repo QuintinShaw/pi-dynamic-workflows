@@ -13,15 +13,49 @@ import { Type } from "typebox";
 const UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36";
 
+/** Read cap for fetched pages (audit2 #42): htmlToText runs ~10 regex passes
+ * over whatever we buffer — an unbounded multi-MB body stalls the host event
+ * loop on every agent's progress pipeline. 2MB is far above any documentation
+ * page's readable content. */
+const MAX_FETCH_BODY_BYTES = 2 * 1024 * 1024;
+
 async function fetchText(url: string, timeoutMs = 15000): Promise<{ status: number; body: string }> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(url, { headers: { "user-agent": UA }, signal: controller.signal, redirect: "follow" });
-    return { status: res.status, body: await res.text() };
+    return { status: res.status, body: await readBodyCapped(res) };
   } finally {
     clearTimeout(timer);
   }
+}
+
+/** Read the response body, stopping at MAX_FETCH_BODY_BYTES. */
+export async function readBodyCapped(res: Response): Promise<string> {
+  if (!res.body) return res.text();
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      chunks.push(value);
+      if (total >= MAX_FETCH_BODY_BYTES) break;
+    }
+  } finally {
+    if (total >= MAX_FETCH_BODY_BYTES) await reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+  const merged = new Uint8Array(Math.min(total, MAX_FETCH_BODY_BYTES));
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk.subarray(0, merged.length - offset), offset);
+    offset += Math.min(chunk.byteLength, merged.length - offset);
+    if (offset >= merged.length) break;
+  }
+  return new TextDecoder().decode(merged);
 }
 
 export function htmlToText(html: string): string {

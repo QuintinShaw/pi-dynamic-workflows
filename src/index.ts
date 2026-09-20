@@ -212,5 +212,5 @@ export {
   type ViewKind,
 } from "./workflow-ui.js";
 export { registerWorkflowModelsCommand } from "./workflows-models-command.js";
-export type { Worktree } from "./worktree.js";
+export type { Worktree, WorktreeExecOptions } from "./worktree.js";
 export { createWorktree, removeWorktree } from "./worktree.js";

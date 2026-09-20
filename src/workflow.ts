@@ -200,7 +200,7 @@ export interface WorkflowCheckpoint extends WorkflowCheckpointInput {
 export interface WorkflowRunOptions extends WorkflowAgentOptions {
   args?: unknown;
   agent?: WorkflowAgentRunner;
-  /** The session's main model (provider/id), shown in /workflows for default agents. */
+  /** The session's main model (provider/id); the pre-resolution display guess and, with inheritMainModel on, the untagged routing target. */
   mainModel?: string;
   /**
    * Named subagent definitions for `agent({ agentType })`. Snapshotted once per
@@ -367,9 +367,12 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
    * (this call's explicit/phase spec, else the session's main model), which is wrong
    * for every tier-routed agent: an explicit `tier` deliberately defers the choice to
    * the agent layer, and an untagged agent is implicitly routed through the "medium"
-   * tier whenever model-tiers.json exists (see resolveAgentModelSpec). Without this
-   * channel those agents display the main session model for their whole lifetime and
-   * only flip to the truth once they finish. Fires once per ATTEMPT (and per turn for
+   * tier when model-tiers.json exists, or inherits the session's main model when the
+   * inheritMainModel setting is on (see resolveAgentModelSpec). Without this channel
+   * those agents display the main session model for their whole lifetime and only flip
+   * to the truth once they finish — and when the implicit route DEGRADES to the
+   * settings default (unavailable tier or inherited model), no spec resolves at
+   * all, so nothing in this resolution path fires a correction. Fires once per ATTEMPT (and per turn for
    * a named thread), so treat it as idempotent, not once-per-agent. `id` is the same
    * per-CALL id as onAgentStart/onAgentEnd/onAgentHistory/onAgentUsage.
    */
@@ -875,9 +878,13 @@ export async function runWorkflow<T = unknown>(
     // For display in /workflows: a PRE-RESOLUTION guess — this agent's explicit/phase
     // spec, else the session's main model. It is only a guess: a `tier` deliberately
     // leaves modelSpec undefined so the agent layer picks, and an untagged agent is
-    // implicitly routed through the "medium" tier when model-tiers.json exists. The
-    // real resolved id replaces it via onModelResolved below, which also pushes the
-    // correction out on onAgentModel so a RUNNING agent's row stops showing the guess.
+    // implicitly routed through the "medium" tier when model-tiers.json exists, or
+    // inherits the main model when the inheritMainModel setting is on. The real
+    // resolved id replaces it via onModelResolved below, which also pushes the
+    // correction out on onAgentModel so a RUNNING agent's row stops showing the
+    // guess. When the implicit route degrades to the settings default, no spec
+    // resolves, so nothing in this resolution path fires a correction (the
+    // degrade itself is still logged via onModelFallback).
     let displayModel = modelSpec ?? options.mainModel;
 
     // Deterministic resume key: assigned at lexical call time, before the limiter,
@@ -1114,13 +1121,27 @@ export async function runWorkflow<T = unknown>(
                 // the persisted snapshot stay consistent with this push.
                 options.onAgentModel?.({ id: deltaKey, label, phase: assignedPhase, model: id });
               },
-              onModelFallback: ({ tier, requestedSpec }: { tier: string; requestedSpec: string }) => {
+              onModelFallback: ({
+                tier,
+                requestedSpec,
+                source,
+              }: {
+                tier: string;
+                requestedSpec: string;
+                source: "medium-tier" | "inherit-main";
+              }) => {
                 if (shared.agentCallbacksClosed) return;
-                // Untagged agents' implicit default tier degrading to the session
-                // default must stay visible in the run's own log/event stream, not
-                // just a console.warn (#131) — an explicit model/tier pin instead
-                // throws MODEL_NOT_FOUND and never reaches this callback.
-                log(`default "${tier}" tier model "${requestedSpec}" unavailable — using the session default`);
+                // An untagged agent's implicit route degrading to the session
+                // default must stay visible in the run's own log/event stream,
+                // not just a console.warn (#131) — an explicit model/tier pin
+                // instead throws MODEL_NOT_FOUND and never reaches this
+                // callback. Name the route honestly: with inheritMainModel on
+                // the unavailable spec is the inherited main model, not a tier.
+                log(
+                  source === "inherit-main"
+                    ? `inherited main model "${requestedSpec}" unavailable — using the session default`
+                    : `default "${tier}" tier model "${requestedSpec}" unavailable — using the session default`,
+                );
               },
               onUsageProgress: attemptUsage.reportProgress,
               onUsage: attemptUsage.reportTerminal,
