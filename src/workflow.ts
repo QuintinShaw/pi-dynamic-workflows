@@ -262,6 +262,18 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
    * finalized run accounting. Do not combine those cumulative callbacks with this delta.
    */
   onRetrySpend?: (tokens: number) => void;
+  /**
+   * Backoff (ms) before retry attempt N (1-based — the attempt that just
+   * failed). Default: min(250 * 2^(N-1), 2000) — immediate retries let a whole
+   * parallel() batch hammer the provider synchronously. The retry keeps its
+   * concurrency slot during the backoff. Return 0 to disable; negative,
+   * NaN, or non-finite returns fall back to the default; a throwing callback
+   * is ignored (default used). Finite positive values are honored up to
+   * 2000ms (above that, clamped — a multi-day park would ignore aborts for
+   * its whole duration); abort latency during the wait is bounded by the
+   * effective value.
+   */
+  agentRetryBackoffMs?: (failedAttempt: number) => number;
   /** Internal: shared runtime inherited by a nested workflow() call. */
   sharedRuntime?: SharedRuntime;
   /**
@@ -446,7 +458,12 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
    * and falls back to default tools/model (with the name as a prose hint).
    */
   agentType?: string;
-  /** Override timeout for this specific agent. null means no hard timeout. */
+  /**
+   * Override timeout for this specific agent. null means no hard timeout.
+   * Must be a finite number in [1, 2^31-1] — anything else (0, negatives,
+   * NaN, Infinity) throws SCRIPT_VALIDATION_ERROR instead of
+   * spawn-then-instantly-aborting a real session.
+   */
   timeoutMs?: number | null;
   /** Retry attempts after a recoverable failure for this specific agent. */
   retries?: number;
@@ -534,7 +551,23 @@ export async function runWorkflow<T = unknown>(
   // Per-phase model routing from meta.phases[].model, with meta.model as the default.
   const routingConfig = parseModelRoutingFromMeta(meta.phases, meta.model);
   const maxAgents = options.maxAgents ?? MAX_AGENTS_PER_RUN;
-  const agentTimeoutMs = options.agentTimeoutMs !== undefined ? options.agentTimeoutMs : DEFAULT_AGENT_TIMEOUT_MS;
+  // A persisted legacy agentTimeoutMs of 0/NaN would make an old run
+  // unresumable if rejected outright — coerce to the default and log instead.
+  // Call-level timeoutMs IS rejected (see agent()); the run-level option is
+  // also a persisted-resume surface, which the call level is not.
+  let agentTimeoutMs = options.agentTimeoutMs !== undefined ? options.agentTimeoutMs : DEFAULT_AGENT_TIMEOUT_MS;
+  if (
+    agentTimeoutMs !== null &&
+    (typeof agentTimeoutMs !== "number" ||
+      !Number.isFinite(agentTimeoutMs) ||
+      agentTimeoutMs < 1 ||
+      agentTimeoutMs > 2_147_483_647)
+  ) {
+    options.onLog?.(
+      `ignoring invalid agentTimeoutMs (${String(options.agentTimeoutMs)}); using the configured default instead`,
+    );
+    agentTimeoutMs = DEFAULT_AGENT_TIMEOUT_MS;
+  }
   const runId = options.runId ?? `run-${started.toString(36)}`;
   const baseCwd = options.cwd ?? process.cwd();
   // Snapshot the agentType registry ONCE per run so two agent() calls can't
@@ -733,6 +766,24 @@ export async function runWorkflow<T = unknown>(
   };
 
   const agent = (prompt: string, agentOptions: AgentOptions = {}): Promise<unknown> => {
+    if (
+      agentOptions.timeoutMs !== undefined &&
+      agentOptions.timeoutMs !== null &&
+      (typeof agentOptions.timeoutMs !== "number" ||
+        !Number.isFinite(agentOptions.timeoutMs) ||
+        agentOptions.timeoutMs < 1 ||
+        agentOptions.timeoutMs > 2_147_483_647)
+    ) {
+      // timeoutMs <= 0 / NaN / Infinity / overflow would spawn-then-instantly-
+      // abort a real session on every retry attempt (#8) — fail fast instead of
+      // burning sessions. Throw SYNCHRONOUSLY: a fire-and-forget `void
+      // agent(...)` call must not surface this as an unhandled rejection.
+      throw new WorkflowError(
+        "agent() timeoutMs must be a finite number of milliseconds in [1, 2^31-1]",
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        { recoverable: false },
+      );
+    }
     const rawThread = agentOptions.thread;
     const thread = rawThread === undefined ? undefined : typeof rawThread === "string" ? rawThread.trim() : "";
     let call: Promise<unknown>;
@@ -1102,7 +1153,7 @@ export async function runWorkflow<T = unknown>(
               });
             }
 
-            const usageCommit = attemptUsage.commitWithFallback(estimateTokens(result) + estimateTokens(prompt));
+            const usageCommit = attemptUsage.commitWithFallback(() => estimateTokens(result) + estimateTokens(prompt));
             if (!agentOptions.thread) {
               options.onAgentJournal?.({
                 index: callIndex,
@@ -1145,7 +1196,7 @@ export async function runWorkflow<T = unknown>(
               await runPromise.catch(() => undefined);
             }
             logger.error(`agent ${label} attempt ${attempt}/${maxAttempts} failed: ${workflowError.message}`);
-            const usageCommit = attemptUsage.commitWithFallback(estimateTokens(prompt));
+            const usageCommit = attemptUsage.commitWithFallback(() => estimateTokens(prompt));
             // This attempt's store writes must not survive it — a failed
             // attempt shares this call's deltaKey with every other attempt
             // (retried or not), so without rolling back here its writes would
@@ -1167,6 +1218,31 @@ export async function runWorkflow<T = unknown>(
               // the final attempt does), so report it on the dedicated channel
               // instead (see WorkflowRunOptions.onRetrySpend).
               options.onRetrySpend?.(usageCommit.tokens);
+              // Small capped backoff between attempts (audit2 #7) — an
+              // immediate retry storms the provider when a parallel() batch
+              // fails together. The abort check after the wait keeps pause/stop
+              // responsive (bounded by the 2s cap).
+              const defaultBackoffMs = Math.min(250 * 2 ** (attempt - 1), 2_000);
+              let backoffMs = defaultBackoffMs;
+              if (options.agentRetryBackoffMs) {
+                try {
+                  const injected = options.agentRetryBackoffMs(attempt);
+                  // 0 disables (documented); negative/NaN/Infinity fall back to
+                  // the default — a non-finite value clamped to 2^31-1 would
+                  // otherwise park the retry for ~24.8 days.
+                  backoffMs =
+                    injected === 0
+                      ? 0
+                      : typeof injected === "number" && Number.isFinite(injected) && injected > 0
+                        ? Math.min(injected, 2_000) // capped: setTimeout overflows >2^31-1, and a
+                        : // multi-day park would ignore aborts for its whole duration
+                          defaultBackoffMs;
+                } catch {
+                  backoffMs = defaultBackoffMs; // a throwing callback must not abandon the retry
+                }
+              }
+              if (backoffMs > 0) await new Promise((resolve) => setTimeout(resolve, backoffMs));
+              throwIfAborted();
               continue;
             }
 
@@ -1345,6 +1421,11 @@ export async function runWorkflow<T = unknown>(
           // mint the same child runId (and hence colliding deltaKeys/event ids)
           // for two different children.
           runId: `${runId}-nested${++shared.nestedCallSeq}`,
+          // The registry is snapshotted ONCE per run (:500): forward the
+          // already-loaded registry so a mid-run .md edit can't change
+          // agentDefinitionKey for nested-frame calls only (those journal
+          // entries would cache-miss on resume, nondeterministically).
+          agentRegistry,
           persistLogs: false,
         }),
       );

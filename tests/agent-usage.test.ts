@@ -31,7 +31,10 @@ test("agent call usage tracker reconciles provisional estimates to exact termina
   attempt.reportProgress({ ...createEmptyAgentUsage(), output: 10, total: 10 });
   const exactUsage = { ...createEmptyAgentUsage(), input: 4, output: 3, total: 7, cost: 0.2 };
   attempt.reportTerminal(exactUsage);
-  assert.deepEqual(attempt.commitWithFallback(99), { tokens: 7, tokenUsage: exactUsage });
+  assert.deepEqual(
+    attempt.commitWithFallback(() => 99),
+    { tokens: 7, tokenUsage: exactUsage },
+  );
   attempt.reportProgress({ ...createEmptyAgentUsage(), output: 100, total: 100 });
 
   assert.deepEqual(updates, [
@@ -51,16 +54,22 @@ test("agent call usage tracker accumulates retries and exposes each committed de
   const firstAttempt = tracker.startAttempt();
   const firstTerminal = { ...createEmptyAgentUsage(), output: 40, total: 40 };
   firstAttempt.reportTerminal(firstTerminal);
-  assert.deepEqual(firstAttempt.commitWithFallback(1), { tokens: 40, tokenUsage: firstTerminal });
+  assert.deepEqual(
+    firstAttempt.commitWithFallback(() => 1),
+    { tokens: 40, tokenUsage: firstTerminal },
+  );
 
   const secondAttempt = tracker.startAttempt();
   secondAttempt.reportProgress({ ...createEmptyAgentUsage(), output: 30, total: 30 });
   const secondTerminal = { ...createEmptyAgentUsage(), output: 25, total: 25 };
   secondAttempt.reportTerminal(secondTerminal);
-  assert.deepEqual(secondAttempt.commitWithFallback(1), {
-    tokens: 65,
-    tokenUsage: { ...createEmptyAgentUsage(), output: 65, total: 65 },
-  });
+  assert.deepEqual(
+    secondAttempt.commitWithFallback(() => 1),
+    {
+      tokens: 65,
+      tokenUsage: { ...createEmptyAgentUsage(), output: 65, total: 65 },
+    },
+  );
 
   assert.deepEqual(
     updates.filter((update) => update.committedUsage).map((update) => update.committedUsage?.total),
@@ -92,6 +101,31 @@ test("agent call usage tracker aborts estimates but commits cost-only terminal u
   assert.deepEqual(updates.at(-1)?.tokenUsage, { ...createEmptyAgentUsage(), cost: 0.5 });
 });
 
+test("closed or superseded attempts never evaluate a fallback estimate", () => {
+  const tracker = createAgentCallUsageTracker(() => {});
+  const closed = tracker.startAttempt();
+  closed.commitTerminalUsage();
+  const superseded = tracker.startAttempt();
+  tracker.startAttempt();
+  const unexpected = () => {
+    throw new Error("a closed attempt evaluated its fallback");
+  };
+  assert.deepEqual(closed.commitWithFallback(unexpected), { tokens: 0 });
+  assert.deepEqual(superseded.commitWithFallback(unexpected), { tokens: 0 });
+});
+
+test("an open attempt with all-zero SDK terminal stats still evaluates its fallback", () => {
+  const attempt = createAgentCallUsageTracker(() => {}).startAttempt();
+  attempt.reportTerminal(createEmptyAgentUsage());
+  let calls = 0;
+  const result = attempt.commitWithFallback(() => {
+    calls++;
+    return 7;
+  });
+  assert.equal(calls, 1);
+  assert.equal(result.tokens, 7);
+});
+
 test("agent usage equality compares every accounting field", () => {
   assert.equal(agentUsageEquals(FIRST_USAGE, { ...FIRST_USAGE }), true);
   assert.equal(agentUsageEquals(FIRST_USAGE, { ...FIRST_USAGE, cacheRead: 3 }), false);
@@ -103,7 +137,7 @@ test("commitWithFallback tags a fabricated total as estimated (#209)", () => {
   const attempt = tracker.startAttempt();
   // No provider usage at all: the fallback total comes from a character
   // heuristic and must be flagged so it never persists/renders as measured.
-  const commit = attempt.commitWithFallback(37);
+  const commit = attempt.commitWithFallback(() => 37);
   assert.equal(commit.tokens, 37);
   assert.equal(commit.tokenUsage?.total, 37);
   assert.equal(commit.tokenUsage?.estimated, true, "fabricated fallback total carries the estimate flag");

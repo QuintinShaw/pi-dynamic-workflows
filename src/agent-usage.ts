@@ -93,14 +93,16 @@ export function createAgentCallUsageTracker(onUpdate: (update: AgentCallUsageUpd
             emitProgress();
           }
         },
-        commitWithFallback(fallbackTotal: number) {
+        commitWithFallback(fallbackTotal: () => number) {
+          if (!isOpen()) return { tokens: 0 };
           if (terminalUsage && (terminalUsage.total > 0 || terminalUsage.cost > 0)) {
             return commitUsage(terminalUsage);
           }
-          // The provider never reported usage: fabricate a total from a
-          // character heuristic and TAG it — this must never be persisted or
-          // rendered as a measurement (#209).
-          return commitUsage({ ...createEmptyAgentUsage(), total: Math.max(0, fallbackTotal), estimated: true });
+          // Lazy: the fallback estimate JSON.stringifies the full result+prompt
+          // — only pay that when no nonzero terminal tokens/cost were reported.
+          // A missing provider usage report can surface as all-zero SDK stats.
+          // Keep the heuristic explicitly tagged throughout persistence/display.
+          return commitUsage({ ...createEmptyAgentUsage(), total: Math.max(0, fallbackTotal()), estimated: true });
         },
         commitTerminalUsage() {
           if (!terminalUsage) {

@@ -2367,6 +2367,237 @@ return main`;
   assert.equal(calls.main, 1, "the awaited agent's cached result must replay, not re-run, on resume");
 });
 
+test("nested workflow() frames use the run's registry snapshot (audit2 #6)", async () => {
+  // REAL scenario: no injected registry — the registry is loaded from
+  // <cwd>/.pi/agents at run start. The fake runner DELETES the .md mid-run
+  // (during the parent's first call); the nested frame must still resolve the
+  // sentinel definition from the forwarded snapshot, not re-load from disk.
+  const cwd = mkdtempSync(join(tmpdir(), "pdw-registry-"));
+  const agentsDir = join(cwd, ".pi", "agents");
+  mkdirSync(agentsDir, { recursive: true });
+  const defPath = join(agentsDir, "sentinel.md");
+  writeFileSync(defPath, "---\nname: sentinel\ndescription: temp\n---\nSENTINEL-INSTRUCTIONS\n");
+  const child = `export const meta = { name: 'child', description: 'c' }
+const r = await agent('child task', { agentType: 'sentinel' })
+return { child: r }`;
+  const parent = `export const meta = { name: 'parent', description: 'p' }
+await agent('parent task')
+const nested = await workflow('child')
+return { nested }`;
+  const seenInstructions: (string | undefined)[] = [];
+  let calls = 0;
+  try {
+    const result = await runWorkflow<{ nested: { child: string } }>(parent, {
+      cwd,
+      agent: {
+        async run(_prompt: string, options: { instructions?: string }) {
+          calls++;
+          seenInstructions.push(options.instructions);
+          if (calls === 1) rmSync(defPath); // mid-run registry edit
+          return "ok";
+        },
+      },
+      loadSavedWorkflow: (name) => (name === "child" ? child : undefined),
+      persistLogs: false,
+    });
+    assert.equal(result.result.nested.child, "ok");
+    const childInstructions = seenInstructions[1];
+    assert.ok(
+      childInstructions?.includes("SENTINEL-INSTRUCTIONS"),
+      `nested frame resolved the run-start registry snapshot, got: ${childInstructions?.slice(0, 120)}`,
+    );
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("agent() retries back off between attempts (audit2 #7)", async () => {
+  const script = `export const meta = { name: 'retry_bo', description: 'retry backoff' }
+const r = await agent('flaky', { label: 'flaky' })
+return r`;
+  const backoffs: number[] = [];
+  let attempts = 0;
+  const started = Date.now();
+  const result = await runWorkflow<string>(script, {
+    agent: {
+      async run() {
+        attempts++;
+        if (attempts < 3) {
+          throw new WorkflowError("empty", WorkflowErrorCode.AGENT_EMPTY_OUTPUT, { recoverable: true });
+        }
+        return "recovered";
+      },
+    },
+    agentRetries: 3,
+    agentRetryBackoffMs: (failedAttempt) => {
+      backoffs.push(failedAttempt);
+      return 40;
+    },
+    persistLogs: false,
+  });
+  assert.equal(result.result, "recovered");
+  assert.deepEqual(backoffs, [1, 2], "backoff consulted per failed attempt");
+  assert.ok(Date.now() - started >= 75, "the waits actually elapsed (2 × 40ms)");
+});
+
+test("agent() uses the default 250ms backoff for the first retry when no callback is injected", async () => {
+  const script = `export const meta = { name: 'retry_default', description: 'default backoff' }
+return await agent('flaky')`;
+  let attempts = 0;
+  const started = Date.now();
+  const result = await runWorkflow<string>(script, {
+    agent: {
+      async run() {
+        attempts++;
+        if (attempts === 1) {
+          throw new WorkflowError("empty", WorkflowErrorCode.AGENT_EMPTY_OUTPUT, { recoverable: true });
+        }
+        return "recovered";
+      },
+    },
+    agentRetries: 1,
+    persistLogs: false,
+  });
+  assert.equal(result.result, "recovered");
+  assert.ok(
+    Date.now() - started >= 240,
+    `default first-retry backoff (~250ms) elapsed (took ${Date.now() - started}ms)`,
+  );
+});
+
+test("agent() rejects timeoutMs <= 0 instead of spawn-aborting sessions (audit2 #8)", async () => {
+  const script = `export const meta = { name: 'bad_timeout', description: 'bad timeout' }
+return await agent('x', { timeoutMs: 0 })`;
+  await assert.rejects(
+    () => runWorkflow(script, { agent: fakeAgent({}), persistLogs: false }),
+    (e: unknown) => e instanceof WorkflowError && e.code === WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+  );
+  // Call-level NaN/Infinity/sub-1/overflow are rejected too (all spawn-then-instant-abort).
+  for (const bad of ["NaN", "Infinity", "0.5", "2 ** 32"]) {
+    const badScript = `export const meta = { name: 'bt', description: 'bt' }
+return await agent('x', { timeoutMs: ${bad} })`;
+    await assert.rejects(
+      () => runWorkflow(badScript, { agent: fakeAgent({}), persistLogs: false }),
+      (e: unknown) => e instanceof WorkflowError && e.code === WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+      `timeoutMs ${bad} rejected`,
+    );
+  }
+});
+
+test("a run-level invalid agentTimeoutMs coerces to the default (legacy resume compatibility)", async () => {
+  // A persisted legacy 0 must not make an old run unresumable; coerce + log.
+  const script = `export const meta = { name: 't3', description: 't3' }
+return await agent('x')`;
+  const logs: string[] = [];
+  const result = await runWorkflow<string>(script, {
+    agent: fakeAgent({}),
+    agentTimeoutMs: 0,
+    persistLogs: false,
+    onLog: (m) => logs.push(m),
+  });
+  assert.equal(result.result, "ok");
+  assert.ok(
+    logs.some((l) => l.includes("ignoring invalid agentTimeoutMs")),
+    "the coercion is logged",
+  );
+});
+
+test("the usage fallback estimate is LAZY when the provider reported terminal usage (audit2 #9)", async () => {
+  // A result whose JSON.stringify throws: if the fallback estimate were
+  // computed eagerly, the run would crash even though real usage exists.
+  const script = `export const meta = { name: 'lazy_est', description: 'lazy estimate' }
+return await agent('x')`;
+  const poisoned = {
+    toJSON() {
+      throw new Error("stringify must not run");
+    },
+  };
+  const result = await runWorkflow(script, {
+    agent: {
+      async run(_p: string, o: { onUsage?: (u: AgentUsage) => void }) {
+        o.onUsage?.({ input: 5, output: 5, cacheRead: 0, cacheWrite: 0, total: 10, cost: 0 });
+        return poisoned;
+      },
+    },
+    persistLogs: false,
+  });
+  assert.equal(result.result, poisoned, "the agent call itself succeeded — an eager stringify would have failed it");
+  assert.equal(result.tokenUsage?.total, 10, "real usage committed without ever stringifying the result");
+});
+
+test("agentRetryBackoffMs guard: 0 disables, Infinity/throwing fall back to the default", async () => {
+  const script = `export const meta = { name: 'bo_guard', description: 'bo guard' }
+return await agent('flaky')`;
+  const flaky = () => {
+    let attempts = 0;
+    return {
+      state: { attempts: 0 },
+      async run() {
+        attempts++;
+        this.state.attempts = attempts;
+        if (attempts === 1) {
+          throw new WorkflowError("empty", WorkflowErrorCode.AGENT_EMPTY_OUTPUT, { recoverable: true });
+        }
+        return "recovered";
+      },
+    };
+  };
+  // 0 disables: no wait at all.
+  {
+    const started = Date.now();
+    const result = await runWorkflow<string>(script, {
+      agent: flaky(),
+      agentRetries: 1,
+      agentRetryBackoffMs: () => 0,
+      persistLogs: false,
+    });
+    assert.equal(result.result, "recovered");
+    assert.ok(Date.now() - started < 100, "0 disables the backoff");
+  }
+  // Infinity falls back to the default (a 2^31-1 clamp would park ~24.8 days).
+  for (const injected of [
+    () => Number.POSITIVE_INFINITY,
+    () => {
+      throw new Error("boom");
+    },
+    () => 1e12, // finite but huge: clamped to the 2000ms cap, NOT a ~1ms overflow storm
+  ]) {
+    const started = Date.now();
+    const result = await runWorkflow<string>(script, {
+      agent: flaky(),
+      agentRetries: 1,
+      agentRetryBackoffMs: injected as () => number,
+      persistLogs: false,
+    });
+    assert.equal(result.result, "recovered");
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed >= 240 && elapsed < 5_000, `default backoff used (${elapsed}ms)`);
+  }
+});
+
+test("the timeoutMs validation throws SYNCHRONOUSLY (no leaked rejection for void agent())", async () => {
+  // Regression pin for the sync-throw property: a Promise.reject would surface
+  // as an unhandled rejection for fire-and-forget calls and the run would
+  // RESOLVE instead of rejecting.
+  const script = `export const meta = { name: 'sync_throw', description: 'sync throw' }
+void agent('x', { timeoutMs: 0 })
+return 'frame-returned'`;
+  let unhandled = 0;
+  const onUnhandled = () => unhandled++;
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    await assert.rejects(
+      () => runWorkflow(script, { agent: fakeAgent({}), persistLogs: false }),
+      (e: unknown) => e instanceof WorkflowError && e.code === WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+      "the run rejects (a Promise.reject would let it resolve 'frame-returned')",
+    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(unhandled, 0, "no unhandled rejection leaked");
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
+});
+
 test("an aborted run's drain abandons signal-ignoring agents after drainAbortGraceMs (audit2 #3)", async () => {
   // Un-awaited agent whose runner NEVER settles and ignores its abort signal:
   // without the grace the drain (and the run) would wedge forever.
