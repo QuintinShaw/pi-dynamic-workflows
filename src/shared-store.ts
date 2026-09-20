@@ -10,7 +10,18 @@
  * each agent result in the journal. On resume, `store.applyDelta(delta)` rebuilds
  * the store state additively in callSeq order, so parallel-agent writes are
  * replayed correctly without the last-complete-wins ordering bug that a
- * whole-Map restore() would cause.
+ * whole-Map restore() would cause. Known limitation: when two PARALLEL agents
+ * write the SAME key, live resolution follows last-WRITE order while replay
+ * follows callSeq order, so the final value can differ between live and resume
+ * (the deltas themselves are journaled and replayed faithfully; only the
+ * same-key ordering is not reconstructible).
+ *
+ * Aliasing (#208): values are structured-cloned on write AND on read, so a
+ * caller can never mutate store state through a live reference — the journaled
+ * delta and any rollback-restored value always match what resume replays.
+ * Values must be structured-cloneable (functions/symbols throw at write time)
+ * AND JSON-serializable for journal persistence (BigInt/cycles fail that) —
+ * the two classes overlap but differ; both constraints apply.
  *
  * `deltaKey` must be unique across every run that shares this store instance,
  * not just within one run's callSeq. A nested `workflow()` call restarts its own
@@ -32,19 +43,63 @@ export class SharedStore {
   // `${runId}:${callIndex}` string (see class doc) so nested workflow() runs
   // sharing this store can't collide on a bare callIndex.
   private readonly agentDeltas = new Map<string, Record<string, unknown>>();
-  // Pre-write shadow values for the CURRENT delta-key's in-progress writes,
-  // so a failed retry attempt's mutations can be rolled back (see
-  // `discardDelta`) instead of leaking into the live store or a later
-  // successful attempt's recorded delta. Populated lazily by `trackPut` (only
-  // the first write to a given key within the current delta window is
-  // shadowed — later writes to the same key within the same attempt are
-  // already covered by that first shadow) and cleared whenever the delta is
-  // finalized, either way, via `commitDelta`/`discardDelta`.
-  private readonly priorValues = new Map<string, Map<string, { existed: boolean; value: unknown }>>();
+  // Per-key write history implementing event-log undo semantics for
+  // discardDelta (#208): each tracked write pushes an entry tagged with its
+  // window; untracked put()/applyDelta() writes push untagged entries that no
+  // discard can remove. Discarding a window removes ITS entries, and the
+  // visible value recomputes as the last surviving write (or the captured
+  // base). Value/stamp comparisons cannot express this: a sibling's overwrite
+  // with an Object.is-equal value is still a write that must survive, and a
+  // discarded window's shadow must never resurface — the log makes both
+  // exact. Retention is bounded per key by the number of DISTINCT live windows
+  // plus one permanent entry: trackPut keeps only its window's latest entry
+  // (moved to the top, preserving last-write order), and compaction (see
+  // compactHistory) drops everything below the topmost permanent write.
+  private readonly keyHistories = new Map<string, { writes: Array<{ window?: string; value: unknown }> }>();
+
+  private historyFor(key: string) {
+    let history = this.keyHistories.get(key);
+    if (!history) {
+      history = { writes: [] };
+      this.keyHistories.set(key, history);
+    }
+    return history;
+  }
+
+  /**
+   * Drop entries below the topmost untagged (permanent) write: an untagged
+   * entry can never be removed by a discard, so everything below it is
+   * unobservable and would otherwise grow the log without bound (#208 M1).
+   */
+  private compactHistory(history: { writes: Array<{ window?: string; value: unknown }> }): void {
+    let floor = -1;
+    for (let i = history.writes.length - 1; i >= 0; i--) {
+      if (history.writes[i].window === undefined) {
+        floor = i;
+        break;
+      }
+    }
+    if (floor > 0) history.writes = history.writes.slice(floor);
+  }
+
+  /** Recompute a key's visible value as its last surviving write (or absent). */
+  private recompute(key: string, history: { writes: Array<{ value: unknown }> }): void {
+    const top = history.writes.at(-1);
+    if (top) this.map.set(key, top.value);
+    else this.map.delete(key);
+    if (history.writes.length === 0) this.keyHistories.delete(key);
+  }
 
   /** Store a value under `key`. Overwrites any existing value. */
   put(key: string, value: unknown): void {
-    this.map.set(key, value);
+    // Untracked (direct-API) write: survives every window discard. One clone,
+    // shared by the log entry and the map (recompute relies on that sharing),
+    // so caller-side mutation can never alias into the store (#208).
+    const stored = structuredClone(value);
+    const history = this.historyFor(key);
+    history.writes.push({ value: stored });
+    this.compactHistory(history);
+    this.map.set(key, stored);
   }
 
   /**
@@ -54,32 +109,51 @@ export class SharedStore {
    * writes can be journaled and replayed independently.
    */
   trackPut(key: string, value: unknown, deltaKey: string): void {
-    let priors = this.priorValues.get(deltaKey);
-    if (!priors) {
-      priors = new Map();
-      this.priorValues.set(deltaKey, priors);
+    // A non-string deltaKey would tag the entry window === undefined — PERMANENT,
+    // un-rollbackable — and key the delta map with "undefined". Refuse it.
+    if (typeof deltaKey !== "string") {
+      throw new TypeError(`trackPut requires a string deltaKey, got ${String(deltaKey)}`);
     }
-    // Only shadow the value from BEFORE this delta window started writing to
-    // this key — a second write to the same key within the same attempt must
-    // not overwrite the shadow with its own (already-in-window) value.
-    if (!priors.has(key)) {
-      priors.set(
-        key,
-        this.map.has(key) ? { existed: true, value: this.map.get(key) } : { existed: false, value: undefined },
-      );
-    }
-    this.map.set(key, value);
+    // Clone both copies BEFORE any state mutation: a throwing second clone
+    // (hostile getter) must not leave a live write with an empty delta, which
+    // no discard could roll back.
+    const stored = structuredClone(value);
+    const journaled = structuredClone(stored);
+    const history = this.historyFor(key);
+    // Keep only this window's LATEST entry, moved to the top: a discard removes
+    // every entry of the window anyway, so earlier same-window entries are never
+    // observable, and the entry's position must reflect last-write order. This
+    // bounds the per-key log by the number of DISTINCT live windows (plus one
+    // permanent entry), even under interleaved writes.
+    history.writes = history.writes.filter((write) => write.window !== deltaKey);
+    history.writes.push({ window: deltaKey, value: stored });
+    this.map.set(key, stored);
     let delta = this.agentDeltas.get(deltaKey);
     if (!delta) {
       delta = {};
       this.agentDeltas.set(deltaKey, delta);
     }
-    delta[key] = value;
+    // defineProperty, not assignment: "__proto__" (or any prototype-setter key)
+    // must register as an OWN enumerable property so the Object.keys(delta)
+    // loops in commitDelta/discardDelta see it; JSON round-trips it fine.
+    // A second, separate clone for the journaled delta: commitDelta hands the
+    // delta to the caller, so it must not share references with store state.
+    Object.defineProperty(delta, key, {
+      value: journaled,
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
   }
 
-  /** Retrieve the value for `key`, or `undefined` when absent. */
+  /**
+   * Retrieve a structured CLONE of the value for `key`, or `undefined` when
+   * absent. Callers receive their own copy: in-place mutation through the
+   * returned reference must never leak into the store, the journaled delta,
+   * or a value a later rollback restores (#208).
+   */
   get(key: string): unknown {
-    return this.map.get(key);
+    return structuredClone(this.map.get(key));
   }
 
   /** Whether `key` is present in the store. */
@@ -94,12 +168,27 @@ export class SharedStore {
 
   /**
    * Extract and clear the write delta accumulated for `deltaKey`.
-   * Called after an agent completes to get the set of keys it wrote.
+   * Called after an agent completes to get the set of keys it wrote. The
+   * window's write-log entries stay: a committed write is permanent history
+   * that later discards must not remove (resume replay re-applies it). A
+   * later discardDelta for the same key is a no-op — the delta bookkeeping
+   * is gone — so committed entries are unreachable by rollbacks.
    */
   commitDelta(deltaKey: string): Record<string, unknown> {
     const delta = this.agentDeltas.get(deltaKey) ?? {};
     this.agentDeltas.delete(deltaKey);
-    this.priorValues.delete(deltaKey);
+    // Detach this window's surviving log entries (they are permanent history
+    // now) so a LATER write under the same deltaKey starts a fresh generation:
+    // a discard of that generation must never remove committed entries.
+    for (const key of Object.keys(delta)) {
+      const history = this.keyHistories.get(key);
+      if (!history) continue;
+      for (const write of history.writes) {
+        if (write.window === deltaKey) write.window = undefined;
+      }
+      // The freshly-detached entries may make older history unobservable.
+      this.compactHistory(history);
+    }
     return delta;
   }
 
@@ -107,51 +196,55 @@ export class SharedStore {
    * Undo the writes recorded for `deltaKey` and discard its bookkeeping,
    * without touching any other key. Used when a retry attempt fails: that
    * attempt's writes must not remain visible in the live store (e.g. to a
-   * concurrently-running sibling agent's store_get, or to script code reading
-   * `store.get` directly) and must not merge into the delta eventually
+   * concurrently-running sibling agent's store_get, or to embedder code
+   * reading `store.get` directly) and must not merge into the delta eventually
    * recorded when a later attempt of the SAME call succeeds — otherwise a
    * failed attempt's mutations would silently survive into the run's live
    * state while being absent from the journaled delta that resume replay
    * reconstructs from, leaving live execution and replay permanently
-   * inconsistent. Each key touched during this delta window is restored to
-   * whatever it held immediately before the window started (or deleted, if
-   * it did not exist yet) — never to some other attempt's or caller's value.
+   * inconsistent.
    *
-   * Per-key guard: a key is only rolled back if the store STILL holds this
-   * attempt's own last write to it (checked with `Object.is` against the
-   * value recorded in `delta`). If a concurrently-running sibling (a
-   * different `deltaKey`, e.g. another agent in the same parallel() batch)
-   * legitimately overwrote the same key AFTER this attempt wrote it but
-   * BEFORE it failed, that sibling's write is left untouched — rolling back
-   * unconditionally would silently erase a live, unrelated write that this
-   * attempt never made and has no business undoing.
+   * Exact undo semantics (#208): the attempt's entries are removed from each
+   * key's write log and the visible value recomputes as the last SURVIVING
+   * write — a concurrent sibling's later write (even an Object.is-equal one)
+   * survives, an untracked put()/replay applyDelta() survives, and a shadowed
+   * write by an earlier window resurfaces only if that window itself is still
+   * live or committed.
    *
    * A no-op if `deltaKey` never wrote anything (nothing to roll back).
    */
   discardDelta(deltaKey: string): void {
+    // Guard against undefined/non-string callers: untagged entries have
+    // window === undefined, and a filter on an undefined key would silently
+    // delete permanent history.
+    if (typeof deltaKey !== "string") return;
     const delta = this.agentDeltas.get(deltaKey);
     if (!delta) return;
-    const priors = this.priorValues.get(deltaKey);
     for (const key of Object.keys(delta)) {
-      // Someone else already overwrote this key since our last write to it —
-      // leave their write in place instead of clobbering it with our rollback.
-      if (!Object.is(this.map.get(key), delta[key])) continue;
-      const prior = priors?.get(key);
-      if (prior?.existed) this.map.set(key, prior.value);
-      else this.map.delete(key);
+      const history = this.keyHistories.get(key);
+      if (!history) continue;
+      history.writes = history.writes.filter((write) => write.window !== deltaKey);
+      this.recompute(key, history);
     }
     this.agentDeltas.delete(deltaKey);
-    this.priorValues.delete(deltaKey);
   }
 
   /**
    * Apply a write delta additively — sets each key without clearing others.
    * Used during resume replay so parallel-agent deltas applied in callSeq
    * order accumulate correctly regardless of original completion order.
+   * Replay writes are untagged log entries: they belong to no live window and
+   * no window's discard may remove them.
    */
   applyDelta(delta: Record<string, unknown>): void {
-    for (const [k, v] of Object.entries(delta)) {
-      this.map.set(k, v);
+    // Clone everything first: a clone failure mid-loop must not leave the
+    // store half-applied.
+    const entries = Object.entries(delta).map(([k, v]) => [k, structuredClone(v)] as const);
+    for (const [k, stored] of entries) {
+      const history = this.historyFor(k);
+      history.writes.push({ value: stored });
+      this.compactHistory(history);
+      this.map.set(k, stored);
     }
   }
 
@@ -160,9 +253,17 @@ export class SharedStore {
    * Prefer `applyDelta` for resume replay — see journal integration above.
    */
   restore(snap: Record<string, unknown>): void {
+    // Clone everything BEFORE clearing: a clone failure must leave the current
+    // state untouched rather than half-restored.
+    const entries = Object.entries(snap).map(([k, v]) => [k, structuredClone(v)] as const);
     this.map.clear();
-    for (const [k, v] of Object.entries(snap)) {
-      this.map.set(k, v);
+    this.keyHistories.clear();
+    this.agentDeltas.clear();
+    // Seed each entry as an untagged (permanent) write — cloned, like every
+    // other write path, so the caller's snapshot object cannot alias in.
+    for (const [k, stored] of entries) {
+      this.historyFor(k).writes.push({ value: stored });
+      this.map.set(k, stored);
     }
   }
 
@@ -170,7 +271,7 @@ export class SharedStore {
   dispose(): void {
     this.map.clear();
     this.agentDeltas.clear();
-    this.priorValues.clear();
+    this.keyHistories.clear();
   }
 }
 

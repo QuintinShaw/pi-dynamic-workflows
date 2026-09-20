@@ -7,6 +7,7 @@ import {
   readFileSync,
   rmSync,
   type statSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1061,6 +1062,53 @@ test(
     assert.ok(lease, "lease exists before delete");
     rp.delete("delete-lock");
     assert.equal(existsSync(join(workflowProjectPaths(cwd).runsDir, "delete-lock.lock")), false, "lock cleaned up");
+  }),
+);
+
+test(
+  "delete removes primary and legacy recovery records before releasing either lock",
+  withTempCwd(async (cwd) => {
+    const runId = "delete-lock-last";
+    let rp!: ReturnType<typeof createRunPersistence>;
+    const recordsVisibleWhenLockReleased: Array<{ path: string; record: PersistedRunState | null }> = [];
+    rp = createRunPersistence(cwd, {
+      unlinkSync(path) {
+        const file = String(path);
+        if (file.endsWith(`${runId}.lock`)) {
+          recordsVisibleWhenLockReleased.push({ path: file, record: rp.load(runId) });
+        }
+        unlinkSync(path);
+      },
+    });
+    const state = {
+      runId,
+      workflowName: "w",
+      status: "paused",
+      phases: [],
+      agents: [],
+      logs: [],
+    } as PersistedRunState;
+    rp.save(state);
+
+    const { runsDir, legacyRunsDir } = workflowProjectPaths(cwd);
+    mkdirSync(legacyRunsDir, { recursive: true });
+    for (const path of [
+      join(runsDir, `${runId}.json.tmp`),
+      join(legacyRunsDir, `${runId}.json`),
+      join(legacyRunsDir, `${runId}.json.bak`),
+      join(legacyRunsDir, `${runId}.json.tmp`),
+    ]) {
+      writeFileSync(path, JSON.stringify(state));
+    }
+    const lease = rp.acquireRunLease(runId);
+    assert.ok(lease, "primary lock exists before delete");
+    writeFileSync(join(legacyRunsDir, `${runId}.lock`), "legacy lock");
+
+    assert.equal(rp.delete(runId), true);
+    assert.equal(recordsVisibleWhenLockReleased.length, 2, "both primary and legacy locks are released last");
+    for (const observed of recordsVisibleWhenLockReleased) {
+      assert.equal(observed.record, null, `${observed.path} is released only after no run record is loadable`);
+    }
   }),
 );
 

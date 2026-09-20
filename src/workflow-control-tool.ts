@@ -64,6 +64,9 @@ export interface WorkflowControlRunDetails {
   };
   activeLabels: string[];
   tokenTotal: number;
+  /** True when tokenTotal includes character-heuristic estimates (#209). */
+  /** Always emitted by the built-in tool; optional only for external constructors of this exported shape. */
+  tokenTotalEstimated?: boolean;
 }
 
 type ControlResult = {
@@ -249,6 +252,7 @@ function summarizeRun(run: PersistedRunState, live?: WorkflowSnapshot | null): W
       persistedUsage.fresh + persistedUsage.cacheRead,
       agentUsage.fresh + agentUsage.cacheRead,
     ),
+    tokenTotalEstimated: liveUsage.estimated || persistedUsage.estimated || agentUsage.estimated,
   };
 }
 
@@ -266,7 +270,7 @@ function countAgents(agents: Array<Pick<WorkflowAgentSnapshot, "status">>): Work
 function formatRun(run: WorkflowControlRunDetails): string {
   const active = run.activeLabels.join(",") || "-";
   const checkpoint = JSON.stringify(run.checkpoint ?? null);
-  return `runId=${run.runId} name=${quote(run.workflowName)} status=${run.status} phase=${quote(run.phase ?? "-")} checkpoint=${checkpoint} total=${run.counts.total} done=${run.counts.done} running=${run.counts.running} queued=${run.counts.queued} error=${run.counts.error} skipped=${run.counts.skipped} active=${quote(active)} tokens=${run.tokenTotal}`;
+  return `runId=${run.runId} name=${quote(run.workflowName)} status=${run.status} phase=${quote(run.phase ?? "-")} checkpoint=${checkpoint} total=${run.counts.total} done=${run.counts.done} running=${run.counts.running} queued=${run.counts.queued} error=${run.counts.error} skipped=${run.counts.skipped} active=${quote(active)} tokens=${run.tokenTotalEstimated ? "~" : ""}${run.tokenTotal}`;
 }
 
 function quote(value: string): string {

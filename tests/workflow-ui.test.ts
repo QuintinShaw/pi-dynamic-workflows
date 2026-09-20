@@ -213,6 +213,7 @@ test("NavigatorModel reads runs, phases, agents, and detail", () => {
 
 test("NavigatorModel handles unknown runId gracefully", () => {
   const model = new NavigatorModel(fakeManager());
+
   assert.deepEqual(model.phases("unknown"), []);
   assert.deepEqual(model.agents("unknown", "Scan"), []);
   assert.equal(model.agentDetail("unknown", 1), undefined);
@@ -1662,4 +1663,51 @@ test("component saved detail exposes confirmation before delete", async () => {
   assert.match(confirming.join("\n"), /confirm delete/);
   component.handleInput("x");
   assert.equal(deleted, 1);
+});
+
+test("NavigatorModel carries the estimate flag onto run and phase rows (#209)", () => {
+  const base = fakeManager();
+  const manager: Pick<WorkflowManager, "listRuns" | "getRun"> = {
+    listRuns: base.listRuns,
+    getRun: (id) => {
+      const run = base.getRun(id);
+      if (!run) return run;
+      // One agent's figures are heuristic-derived; the run aggregate is
+      // metered but SMALLER, so the flagged agent sum wins the row's size
+      // comparison — the row flag must come from the CHOSEN (displayed)
+      // source, not blanket-ORed from the aggregate.
+      const snapshot = {
+        ...run.snapshot,
+        tokenUsage: { input: 0, output: 0, total: 100, cost: 0, cacheRead: 0, cacheWrite: 0 },
+        agents: run.snapshot.agents.map((a, i) =>
+          i === 0
+            ? {
+                ...a,
+                tokenUsage: {
+                  input: 0,
+                  output: 100,
+                  cacheRead: 0,
+                  cacheWrite: 0,
+                  total: 100,
+                  cost: 0,
+                  estimated: true,
+                },
+              }
+            : a,
+        ),
+      };
+      return { ...run, snapshot } as unknown as ManagedRun;
+    },
+  };
+  const model = new NavigatorModel(manager);
+  assert.equal(model.runs()[0]?.estimated, true, "run row flags estimate-derived figures");
+  assert.equal(model.phases("run-1")[0]?.estimated, true, "phase row flags estimate-derived figures");
+
+  // The two-pane header ORs its phase flags into the header's ~ marker. Assert
+  // the header's own summary line (line 1: status + totals) — agent/phase rows
+  // below also render ~, so a whole-render regex would mask a broken header OR.
+  const state = new NavigatorState();
+  assert.ok(state.drill(model), "drill into phases");
+  const rendered = renderNavigator(state, model, 80);
+  assert.match(rendered[1] ?? "", /~\d/, "header summary line marks estimate-derived totals with ~");
 });

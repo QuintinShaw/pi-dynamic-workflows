@@ -24,7 +24,7 @@ Every exact fact below is projected from the installed extension's capability co
 - `cwd`: string (optional; non-empty absolute existing directory; resolved to its real path; coding tools and session cwd use the target directory; settings and AGENTS/skill resources also use it unless explicitly injected by the embedding host; cannot combine with worktree isolation)
 - `thread`: string (optional; non-empty name; same-name calls must be sequential)
 - `agentType`: string (optional; must come from provided context; dynamic reference: agent-types)
-- `timeoutMs`: number | null (optional; default: run timeout; null disables)
+- `timeoutMs`: number | null (optional; default: run timeout, finite ms in [1, 2^31-1]; null disables)
 - `retries`: number (optional; default: run retry count; finite values are floored and clamped to 0..3)
 - Constraint: recoverable failures return null after retries; nonrecoverable failures throw
 - Constraint: schema noncompliance after bounded structured-output repair is nonrecoverable and bypasses agent retries

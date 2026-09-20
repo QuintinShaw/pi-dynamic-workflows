@@ -374,6 +374,28 @@ test("built-in handlers start a background run and return immediately (#104)", a
   assert.ok(notified[0].message.includes("background"), "start notice should say it runs in the background");
 });
 
+test("background start notice is mode-aware: TUI points at the task panel, other hosts at /workflows status", async () => {
+  const { pi, commands } = makeCommandRegistryPi();
+  const { manager } = makeFakeManager();
+  registerBuiltinWorkflows(pi, { cwd: "/tmp", manager });
+  const handler = commands.find((c) => c.name === "adversarial-review")?.handler;
+  assert.ok(handler);
+
+  const tui = makeNotifyCtx("tui");
+  await handler("audit the error paths", tui.ctx);
+  assert.ok(tui.notified[0].message.includes("task panel"), "TUI notice should point at the task panel");
+
+  // RPC hosts (e.g. Paseo) cannot render the TUI task panel or navigator —
+  // the notice must point at the plain-text status command instead.
+  const rpc = makeNotifyCtx("rpc");
+  await handler("audit the error paths", rpc.ctx);
+  assert.ok(!rpc.notified[0].message.includes("task panel"), "RPC notice must not mention the task panel");
+  assert.ok(
+    rpc.notified[0].message.includes("/workflows status run-test-2"),
+    `RPC notice should point at /workflows status <id>, got: ${rpc.notified[0].message}`,
+  );
+});
+
 test("deep-research passes web tools on top of coding tools to its run", async () => {
   const { pi, commands } = makeCommandRegistryPi();
   const { manager, started } = makeFakeManager();

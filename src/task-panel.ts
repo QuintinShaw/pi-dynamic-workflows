@@ -609,7 +609,6 @@ export interface WorkflowLifecycleEvent {
 
 type DeliveryManager = WorkflowManager & {
   __deliveryInstalled?: boolean;
-  __deliveryTurnEndInstalled?: boolean;
   __lifecycleEventInstalled?: boolean;
   __lifecycleEventEmitter?: (data: WorkflowLifecycleEvent) => void;
   /** Last loadSettings seen on install — used when binding endpoints. */
@@ -1216,6 +1215,12 @@ export function resumeResultDelivery(manager: WorkflowManager): void {
  * replacement the manager (and these listeners) survive via the handoff path;
  * each new generation calls {@link bindSessionDelivery} on session_start.
  */
+// Register turn_end once for each ExtensionAPI instance. The handler looks up
+// its own latest manager rather than a process-global one: multiple live pi
+// instances can interleave A/B/A installs, and each callback must stay scoped
+// to the instance that emitted it.
+let turnEndDeliveryManagers = new WeakMap<ExtensionAPI, { manager: WorkflowManager }>();
+
 export function installResultDelivery(
   pi: ExtensionAPI,
   manager: WorkflowManager,
@@ -1254,14 +1259,24 @@ export function installResultDelivery(
     manager.on("stopped", emitLifecycle("stopped"));
   }
 
-  if (!m.__deliveryTurnEndInstalled) {
-    m.__deliveryTurnEndInstalled = true;
+  // Per-instance turn_end dispatch (audit2 #33): within one pi generation,
+  // per-manager registration would stack a handler per cross-project rebuild
+  // (pi.on has no off()). Register once per pi, updating only that pi's latest
+  // manager on repeat installs.
+  const existingTurnEnd = turnEndDeliveryManagers.get(pi);
+  if (existingTurnEnd) {
+    existingTurnEnd.manager = manager;
+  } else {
+    turnEndDeliveryManagers.set(pi, { manager });
     pi.on?.("turn_end", (_event: unknown, ctx?: { sessionManager?: { getSessionId?: () => string } }) => {
+      const activeManager = turnEndDeliveryManagers.get(pi)?.manager;
+      if (!activeManager) return;
+      const active = deliveryManager(activeManager);
       let sid: string | undefined;
       try {
-        sid = ctx?.sessionManager?.getSessionId?.() ?? manager.getSessionId?.();
+        sid = ctx?.sessionManager?.getSessionId?.() ?? activeManager.getSessionId?.();
       } catch {
-        sid = manager.getSessionId?.();
+        sid = activeManager.getSessionId?.();
       }
       if (!sid) return;
 
@@ -1271,8 +1286,8 @@ export function installResultDelivery(
         const stolen = boundSessionSends.get(sid);
         if (stolen) {
           bindSessionDelivery(sid, pi, {
-            loadSettings: opts.loadSettings ?? m.__deliveryLoadSettings,
-            manager,
+            loadSettings: active.__deliveryLoadSettings,
+            manager: activeManager,
             sessionManager: ctx?.sessionManager,
           });
           endpoint = sessionEndpoints.get(sid);
@@ -1285,20 +1300,19 @@ export function installResultDelivery(
     });
   }
 
-  if (m.__deliveryInstalled) {
-    // Listeners survive session replacement. Refresh loadSettings / manager
-    // pointers only — do NOT mutate send, generation, or suspended here.
-    // Factory runs before bindCore; session_start calls bindSessionDelivery.
-    const sid = manager.getSessionId?.();
-    if (sid) {
-      const endpoint = sessionEndpoints.get(sid);
-      if (endpoint) {
-        endpoint.loadSettings = opts.loadSettings ?? endpoint.loadSettings;
-        endpoint.manager = manager;
-      }
+  // A newly-created manager can replace the current project while this pi and
+  // session endpoint remain live. Refresh only the routing pointers; preserve
+  // the session transport, generation, and suspension state until bindCore.
+  const sid = manager.getSessionId?.();
+  if (sid) {
+    const endpoint = sessionEndpoints.get(sid);
+    if (endpoint) {
+      endpoint.loadSettings = opts.loadSettings ?? endpoint.loadSettings;
+      endpoint.manager = manager;
     }
-    return;
   }
+
+  if (m.__deliveryInstalled) return;
   m.__deliveryInstalled = true;
 
   manager.on("complete", ({ runId }: { runId: string }) => {
@@ -1369,6 +1383,7 @@ export function _resetDeliveryRegistriesForTests(): void {
   deliveredAwaitingClear.clear();
   inFlightSeq = 0;
   probedSessionIds.clear();
+  turnEndDeliveryManagers = new WeakMap<ExtensionAPI, { manager: WorkflowManager }>();
 }
 
 export function _setStreamingAckTimeoutForTests(timeoutMs: number): void {
@@ -1445,15 +1460,18 @@ export function renderPanel(manager: WorkflowManager, theme: Theme, width?: numb
 const RATE_WINDOW_MS = 10_000;
 /** Per-run (timestamp, cumulative total) samples, keyed by the persisted runId so
  *  the rolling rate survives pause→resume. Cleared when a run ends. */
-const tokenSamples = new Map<string, Array<{ ts: number; total: number }>>();
+const tokenSamples = new Map<string, Array<{ ts: number; total: number; estimated: boolean }>>();
 
 /** Record a token-total sample for `runId` at time `now` (ms). */
-export function sampleTokens(runId: string, total: number, now: number): void {
+export function sampleTokens(runId: string, total: number, now: number, estimated = false): void {
   const samples = tokenSamples.get(runId) ?? [];
   const last = samples[samples.length - 1];
   // Collapse repeat renders within the same instant (e.g. width recalcs).
-  if (last && last.ts === now && last.total === total) return;
-  samples.push({ ts: now, total });
+  if (last && last.ts === now && last.total === total) {
+    last.estimated = estimated;
+    return;
+  }
+  samples.push({ ts: now, total, estimated });
   // Drop samples beyond the rolling window, always keeping ≥2 so a rate is computable.
   while (samples.length > 2 && now - samples[0].ts > RATE_WINDOW_MS) samples.shift();
   tokenSamples.set(runId, samples);
@@ -1470,6 +1488,15 @@ export function tokensPerSecond(runId: string): number {
   const delta = newest.total - oldest.total;
   if (delta <= 0) return 0;
   return (delta / elapsedMs) * 1000;
+}
+
+/** Whether the two samples that define the current positive token rate include a heuristic estimate. */
+function tokenRateIsEstimated(runId: string): boolean {
+  const samples = tokenSamples.get(runId);
+  if (!samples || samples.length < 2) return false;
+  const oldest = samples[0];
+  const newest = samples[samples.length - 1];
+  return oldest.estimated || newest.estimated;
 }
 
 /** Forget a run's samples (call when it finishes) so the map can't grow unbounded. */
@@ -1577,7 +1604,7 @@ export function renderPanelDetailed(
     // lull rather than merely waiting for a long-running agent to return. Paused
     // runs do not accrue tokens, so their rate is suppressed.
     const runUsage = aggregateAgentUsage(agents);
-    sampleTokens(r.runId, runUsage.fresh + runUsage.cacheRead, now);
+    sampleTokens(r.runId, runUsage.fresh + runUsage.cacheRead, now, runUsage.estimated);
     const rate = r.status === "running" ? tokensPerSecond(r.runId) : 0;
     const meta = [
       `${done}/${agents.length} agents`,
@@ -1585,7 +1612,7 @@ export function renderPanelDetailed(
       fmtTokenSegment(runUsage, fmtTokensShort),
       // (cost is only known once the run finalizes its usage.)
       usage?.cost ? fmtCost(usage.cost) : "",
-      rate > 0 ? `${Math.round(rate)} tok/s` : "",
+      rate > 0 ? `${tokenRateIsEstimated(r.runId) ? "~" : ""}${Math.round(rate)} tok/s` : "",
     ]
       .filter(Boolean)
       .join(" · ");

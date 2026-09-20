@@ -53,6 +53,8 @@ export interface WorkflowSnapshot {
     cost?: number;
     cacheRead?: number;
     cacheWrite?: number;
+    /** True when the totals include character-heuristic estimates (#209). */
+    estimated?: boolean;
   };
   runId?: string;
 }
@@ -88,26 +90,29 @@ export interface WorkflowDisplayOptions {
 export function tokenFigures(
   usage: Partial<AgentUsage> | undefined,
   scalarTokens?: number,
-): { fresh: number; cacheRead: number } {
+): { fresh: number; cacheRead: number; estimated: boolean } {
   const cacheRead = usage?.cacheRead ?? 0;
   const reported = (usage?.input ?? 0) + (usage?.output ?? 0) + (usage?.cacheWrite ?? 0);
   const estimate = Math.max(scalarTokens ?? 0, usage?.total ?? 0);
-  return { fresh: Math.max(reported, estimate - cacheRead), cacheRead };
+  return { fresh: Math.max(reported, estimate - cacheRead), cacheRead, estimated: usage?.estimated === true };
 }
 
 /** Sum a set of agents into fresh vs cacheRead totals, via {@link tokenFigures}. */
 export function aggregateAgentUsage(agents: ReadonlyArray<Pick<WorkflowAgentSnapshot, "tokens" | "tokenUsage">>): {
   fresh: number;
   cacheRead: number;
+  estimated: boolean;
 } {
   let fresh = 0;
   let cacheRead = 0;
+  let estimated = false;
   for (const a of agents) {
     const f = tokenFigures(a.tokenUsage, a.tokens);
     fresh += f.fresh;
     cacheRead += f.cacheRead;
+    if (f.estimated) estimated = true;
   }
-  return { fresh, cacheRead };
+  return { fresh, cacheRead, estimated };
 }
 
 /**
@@ -127,10 +132,21 @@ export function fmtTokenCount(fresh: number, cacheRead: number, fmt: (n: number)
  * Like {@link fmtTokenCount}, but "" when nothing is known yet (both figures 0),
  * so surfaces omit the segment instead of rendering a false "0 tok" — e.g. for a
  * journal-replayed resume or a run whose agents were all skipped. Every surface
- * should use this rather than re-implementing the zero guard.
+ * should use this rather than re-implementing the zero guard. When
+ * `figures.estimated` is set the segment is prefixed with `~` (#209) so a
+ * heuristic-derived total never renders as metered. The marker covers the whole
+ * segment (fresh + cached) even when only one component is heuristic —
+ * conservative by design.
  */
-export function fmtTokenSegment(figures: { fresh: number; cacheRead: number }, fmt: (n: number) => string): string {
-  return figures.fresh + figures.cacheRead > 0 ? fmtTokenCount(figures.fresh, figures.cacheRead, fmt) : "";
+export function fmtTokenSegment(
+  figures: { fresh: number; cacheRead: number; estimated?: boolean },
+  fmt: (n: number) => string,
+): string {
+  if (figures.fresh + figures.cacheRead <= 0) return "";
+  const rendered = fmtTokenCount(figures.fresh, figures.cacheRead, fmt);
+  // "~" marks character-heuristic figures so an estimate never reads as a
+  // metered total (#209).
+  return figures.estimated ? `~${rendered}` : rendered;
 }
 
 /**
@@ -196,6 +212,25 @@ export function emptyFleetSummary(agents: WorkflowAgentSnapshot[], maxLabels = 5
     doneCount,
     emptyLabels: empty.slice(0, maxLabels).map((agent) => agent.label || `agent #${agent.id}`),
   };
+}
+
+/**
+ * One-line "started in the background" notice pointing at a progress surface
+ * that exists in the current host. The task panel and /workflows navigator are
+ * TUI components (`ui.custom()` / widget factories) that no-op in RPC hosts
+ * such as Paseo even though `ctx.hasUI` is true there — so non-TUI modes are
+ * pointed at `/workflows status <id>`, which prints plain text any host can
+ * display.
+ */
+export function backgroundStartNotice(
+  name: string,
+  runId: string,
+  mode: ExtensionContext["mode"] | undefined,
+  deliverable: "report" | "result",
+): string {
+  const where =
+    mode === "tui" ? "watch the task panel or /workflows" : `check progress with /workflows status ${runId}`;
+  return `/${name} running in the background (${runId}) — ${where}; the ${deliverable} is posted here when it finishes.`;
 }
 
 export function createWidgetWorkflowDisplay(

@@ -194,19 +194,13 @@ export function registerWorkflowCommands(
         }
         case "ui":
         case "list": {
-          // Interactive navigator when a UI is available; plain text otherwise
-          // (print/RPC mode) or when the user explicitly asks for `list`.
-          if (sub !== "list" && ctx.hasUI) {
-            await openWorkflowNavigator(pi, manager, ctx.ui, {
-              storage: getStorage(),
-              cwd: getCwd(),
-              getStorage,
-              getCwd,
-              getManager,
-            });
-            return;
-          }
-          if (parts.length === 0 && ctx.hasUI) {
+          // Interactive navigator only in the TUI — it is a ui.custom()
+          // component, which no-ops in RPC hosts even though ctx.hasUI is true
+          // there (dialogs and notifications work over the RPC extension-UI
+          // protocol; custom components do not). Everything else, including
+          // an explicit `list`, gets the plain-text run list.
+          const wantsNavigator = sub !== "list" || parts.length === 0;
+          if (wantsNavigator && ctx.mode === "tui") {
             await openWorkflowNavigator(pi, manager, ctx.ui, {
               storage: getStorage(),
               cwd: getCwd(),
@@ -233,7 +227,12 @@ export function registerWorkflowCommands(
           // A running run streams live progress to the status bar and prints the
           // final snapshot when it finishes — no need to re-run the command.
           if (watchRun(manager, pi, ctx, id)) {
-            ctx.ui.notify(`Watching ${id} — live progress in the status bar; result prints when it finishes.`, "info");
+            ctx.ui.notify(
+              ctx.mode === "tui"
+                ? `Watching ${id} — live progress in the status bar; result prints when it finishes.`
+                : `Watching ${id} — the final status prints here when it finishes.`,
+              "info",
+            );
             return;
           }
           const live = manager.getSnapshot(id);
@@ -270,7 +269,19 @@ export function registerWorkflowCommands(
         }
         case "rm": {
           if (!id) return ctx.ui.notify(USAGE, "warning");
-          ctx.ui.notify(manager.deleteRun(id) ? `Removed ${id}` : `No run ${id}`, "info");
+          if (manager.deleteRun(id)) {
+            ctx.ui.notify(`Removed ${id}`, "info");
+            return;
+          }
+          // Distinguish a lease refusal from "no such run" (audit2 #16 r1
+          // MINOR 2): the run may exist but be leased by a live process
+          // (resumed/running in another session) — saying "No run" would lie
+          // while that process burns tokens.
+          const known = manager.getRun(id) ?? manager.getPersistence?.().load(id);
+          ctx.ui.notify(
+            known ? `Cannot remove ${id}: it is active in another live session` : `No run ${id}`,
+            known ? "warning" : "info",
+          );
           return;
         }
         case "save": {

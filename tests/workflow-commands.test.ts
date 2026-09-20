@@ -72,9 +72,9 @@ function harness(
 
   registerWorkflowCommands(pi as unknown as ExtensionAPI, manager as unknown as WorkflowManager, commandOptions);
   const ctx = { ui: { notify: (message: string, type?: string) => notified.push({ message, type }) } };
-  const run = (args: string) => {
+  const run = (args: string, ctxOverrides: Record<string, unknown> = {}) => {
     if (!handler) throw new Error("command not registered");
-    return handler(args, ctx);
+    return handler(args, { ...ctx, ...ctxOverrides });
   };
   return { run, printed, sent, notified, calls, activeTools };
 }
@@ -92,6 +92,42 @@ test("/workflows (no args) defaults to list", async () => {
   await h.run("");
   assert.match(h.printed[0], /Workflow runs:/);
   assert.match(h.printed[0], /run-1/);
+});
+
+test("/workflows (no args) in RPC mode prints the text list even though hasUI is true", async () => {
+  // RPC hosts (e.g. Paseo) report hasUI=true because dialogs and notifications
+  // work over the extension-UI protocol — but the navigator is a ui.custom()
+  // TUI component that no-ops there. The command must fall back to plain text.
+  const h = harness({
+    listRuns: () => [{ runId: "run-1", workflowName: "demo", status: "completed", phases: [], agents: [], logs: [] }],
+  });
+  await h.run("", { mode: "rpc", hasUI: true });
+  assert.match(h.printed[0], /Workflow runs:/);
+  assert.match(h.printed[0], /run-1/);
+});
+
+test("/workflows ui in RPC mode falls back to the text list", async () => {
+  const h = harness();
+  await h.run("ui", { mode: "rpc", hasUI: true });
+  assert.match(h.printed[0], /No workflow runs yet/);
+});
+
+test("/workflows (no args) in TUI mode opens the navigator", async () => {
+  let customCalled = false;
+  const h = harness();
+  await h.run("", {
+    mode: "tui",
+    hasUI: true,
+    ui: {
+      notify: () => {},
+      custom: () => {
+        customCalled = true;
+        return Promise.resolve();
+      },
+    },
+  });
+  assert.equal(customCalled, true, "should open the ui.custom() navigator in the TUI");
+  assert.equal(h.printed.length, 0, "should not print the text list when the navigator opened");
 });
 
 test("/workflows run without prompt warns usage", async () => {
@@ -331,6 +367,19 @@ test("/workflows rm <id> warns when deleteRun returns false", async () => {
     h.notified.some((n) => n.message.includes("No run")),
     "should show No run",
   );
+});
+
+test("/workflows rm <id> distinguishes a lease refusal from 'no such run' (audit2 #16 r1)", async () => {
+  const h = harness({
+    deleteRun: () => false,
+    getRun: () => ({ runId: "run-busy", status: "running" }),
+  });
+  await h.run("rm run-busy");
+  const note = h.notified.find((n) => n.message.includes("run-busy"));
+  assert.ok(note, "should notify about run-busy");
+  assert.match(note.message, /active in another live session/, "should explain the refusal");
+  assert.equal(note.type, "warning");
+  assert.ok(!h.notified.some((n) => n.message.includes("No run")), "must not claim the leased run does not exist");
 });
 
 // ═══════════════════════════════════════════════════════════════════════════

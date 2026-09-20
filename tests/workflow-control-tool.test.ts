@@ -130,6 +130,7 @@ test("list and status return stable lifecycle and observability fields", async (
         counts: { total: 4, done: 0, running: 1, queued: 1, error: 1, skipped: 1 },
         activeLabels: ["active scan"],
         tokenTotal: 30,
+        tokenTotalEstimated: false,
       },
     ],
   });
@@ -326,4 +327,65 @@ test("unknown IDs and illegal transitions return explicit errors with allowed ac
   const stopAborted = text(await execute(fixture.manager, { action: "stop", runId: "live-123" }));
   assert.match(stopAborted, /cannot stop run with status aborted/);
   assert.match(stopAborted, /allowed=status/);
+});
+
+test("status marks heuristic-estimated token totals with ~ and a details flag (#209)", async () => {
+  const estimatedRun: PersistedRunState = {
+    ...run("completed"),
+    tokenUsage: { input: 0, output: 0, total: 200, estimated: true },
+  };
+  const { manager } = fakeManager([estimatedRun]);
+  const status = await execute(manager, { action: "status", runId: "audit-abc123" });
+  assert.match(text(status), /tokens=~200$/, "a char-heuristic total never renders as metered");
+  assert.equal((status.details.run as { tokenTotalEstimated: boolean }).tokenTotalEstimated, true);
+});
+
+test("status marks a LIVE snapshot's estimated totals with ~ (#209)", async () => {
+  const live: WorkflowSnapshot = {
+    name: "audit",
+    phases: ["Inspect"],
+    currentPhase: "Inspect",
+    logs: [],
+    agents: [],
+    agentCount: 1,
+    runningCount: 1,
+    doneCount: 0,
+    errorCount: 0,
+    tokenUsage: { input: 0, output: 0, total: 640, estimated: true },
+  } as WorkflowSnapshot;
+  const { manager } = fakeManager([run("running")], { "audit-abc123": live });
+  const status = await execute(manager, { action: "status", runId: "audit-abc123" });
+  assert.match(text(status), /tokens=~640$/, "the live-usage branch carries the flag");
+  assert.equal((status.details.run as { tokenTotalEstimated: boolean }).tokenTotalEstimated, true);
+});
+
+test("status marks an agent-sum-derived estimated total with ~ (#209)", async () => {
+  // Only the per-AGENT figures are flagged; the run aggregate is unflagged and
+  // smaller, so the agent sum wins the display — its flag must come along.
+  const live = {
+    name: "audit",
+    phases: ["Inspect"],
+    currentPhase: "Inspect",
+    logs: [],
+    agents: [
+      {
+        id: 1,
+        label: "scan",
+        phase: "Inspect",
+        prompt: "scan",
+        status: "running",
+        tokens: 0,
+        tokenUsage: { input: 0, output: 80, cacheRead: 0, cacheWrite: 0, total: 80, cost: 0, estimated: true },
+      },
+    ],
+    agentCount: 1,
+    runningCount: 1,
+    doneCount: 0,
+    errorCount: 0,
+    tokenUsage: { input: 5, output: 5, total: 10 },
+  } as unknown as WorkflowSnapshot;
+  const { manager } = fakeManager([run("running")], { "audit-abc123": live });
+  const status = await execute(manager, { action: "status", runId: "audit-abc123" });
+  assert.match(text(status), /tokens=~80$/, "the agent-usage branch carries the flag");
+  assert.equal((status.details.run as { tokenTotalEstimated?: boolean }).tokenTotalEstimated, true);
 });

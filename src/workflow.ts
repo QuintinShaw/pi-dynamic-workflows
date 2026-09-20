@@ -107,6 +107,10 @@ export interface SharedRuntime {
   agentCount: number;
   spent: number;
   tokenUsage: AgentUsage;
+  /** Set after the top-level drain seals abandoned agent callbacks. */
+  agentCallbacksClosed?: boolean;
+  /** Active attempts whose usage must be finalized when an abort drain abandons them. */
+  pendingUsageFinalizers?: Set<() => void>;
   /** @deprecated Nesting depth is async-context scoped; retained for injected runtime compatibility. */
   depth: number;
   /**
@@ -214,6 +218,23 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   maxAgents?: number;
   /** Timeout per agent in milliseconds. null/omitted means no hard timeout. */
   agentTimeoutMs?: number | null;
+  /**
+   * Grace period (ms) for the terminal drain once this run is ABORT-SIGNALED
+   * (external abort or the run-fatal seal). A durable checkpoint suspension
+   * alone does not abort its paid siblings. Agents are signaled at abort,
+   * but the signal is cooperative — a signal-ignoring runner would otherwise
+   * wedge the drain, and with it the run's terminal transition, forever
+   * (audit2 #3). After the grace expires the drain stops waiting: the store is
+   * disposed below (late writes re-populate a store nobody reads), no journal
+   * can follow (the completion path's abort check precedes journaling), and
+   * the manager's persist/emit paths are staleness-gated.
+   *
+   * Does NOT apply to the SUCCESS drain, which waits unbounded — those results
+   * are still wanted. Default 10_000; Infinity restores unbounded waiting for
+   * aborted runs too. Finite values in [1, 2^31-1] are rounded down; invalid
+   * values (including NaN, 0, negatives, and overflow) use the default.
+   */
+  drainAbortGraceMs?: number;
   /** Whether to persist logs to disk. Default: true */
   persistLogs?: boolean;
   /** Run ID for persistence. Auto-generated if not provided. */
@@ -241,6 +262,18 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
    * finalized run accounting. Do not combine those cumulative callbacks with this delta.
    */
   onRetrySpend?: (tokens: number) => void;
+  /**
+   * Backoff (ms) before retry attempt N (1-based — the attempt that just
+   * failed). Default: min(250 * 2^(N-1), 2000) — immediate retries let a whole
+   * parallel() batch hammer the provider synchronously. The retry keeps its
+   * concurrency slot during the backoff. Return 0 to disable; negative,
+   * NaN, or non-finite returns fall back to the default; a throwing callback
+   * is ignored (default used). Finite positive values are honored up to
+   * 2000ms (above that, clamped — a multi-day park would ignore aborts for
+   * its whole duration); abort latency during the wait is bounded by the
+   * effective value.
+   */
+  agentRetryBackoffMs?: (failedAttempt: number) => number;
   /** Internal: shared runtime inherited by a nested workflow() call. */
   sharedRuntime?: SharedRuntime;
   /**
@@ -270,6 +303,21 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   confirm?: (promptText: string, options: CheckpointOptions) => Promise<unknown>;
   onLog?: (message: string) => void;
   onPhase?: (title: string) => void;
+  /**
+   * Persisted per-phase sub-budgets from a previous execution (resume() only),
+   * keyed by `${frameRunId}:${phaseTitle}` (a nested workflow()'s frame runId
+   * is stable across resume — `${parentRunId}-nested${seq}`). Each frame adopts
+   * only ITS slice on first re-declaration, so a phase ceiling holds
+   * CUMULATIVELY across a pause/resume cycle (audit2 #4) instead of silently
+   * re-granting the full allowance per resume — and frames can never
+   * cross-contaminate each other's baselines.
+   */
+  initialPhaseBudgets?: Record<string, { budget: number; startSpent: number; warned?: boolean }>;
+  /**
+   * Fired whenever this frame's phase-budget table changes, so the manager can
+   * persist it. Keys are already frame-namespaced (`${frameRunId}:${title}`).
+   */
+  onPhaseBudgets?: (budgets: Record<string, { budget: number; startSpent: number; warned: boolean }>) => void;
   /** Runtime behavior trace used by diagnostics and comprehension evidence. */
   onRuntimeEvent?: (event: WorkflowRuntimeEvent) => void;
   onAgentStart?: (event: {
@@ -333,12 +381,16 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
     cost: number;
     cacheRead?: number;
     cacheWrite?: number;
+    /** True when the totals include character-heuristic estimates (#209). */
+    estimated?: boolean;
   }) => void;
   /**
    * Top-level workflow error observed before runWorkflow drains in-flight agents.
    * This preserves error provenance for hosts whose own lifecycle control can race
    * with that cooperative drain. Observational only: callback failures (sync or
-   * async) are ignored.
+   * async) are ignored. A durable checkpoint suspension does NOT invoke this —
+   * an intentional human-in-the-loop pause is not a fatal error (in-flight
+   * siblings are waited out, not aborted).
    */
   onRunFatal?: (error: unknown) => void | PromiseLike<void>;
 }
@@ -358,6 +410,8 @@ export interface WorkflowRunResult<T = unknown> {
     cost: number;
     cacheRead?: number;
     cacheWrite?: number;
+    /** True when the totals include character-heuristic estimates (#209). */
+    estimated?: boolean;
   };
 }
 
@@ -404,7 +458,12 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
    * and falls back to default tools/model (with the name as a prose hint).
    */
   agentType?: string;
-  /** Override timeout for this specific agent. null means no hard timeout. */
+  /**
+   * Override timeout for this specific agent. null means no hard timeout.
+   * Must be a finite number in [1, 2^31-1] — anything else (0, negatives,
+   * NaN, Infinity) throws SCRIPT_VALIDATION_ERROR instead of
+   * spawn-then-instantly-aborting a real session.
+   */
   timeoutMs?: number | null;
   /** Retry attempts after a recoverable failure for this specific agent. */
   retries?: number;
@@ -492,7 +551,23 @@ export async function runWorkflow<T = unknown>(
   // Per-phase model routing from meta.phases[].model, with meta.model as the default.
   const routingConfig = parseModelRoutingFromMeta(meta.phases, meta.model);
   const maxAgents = options.maxAgents ?? MAX_AGENTS_PER_RUN;
-  const agentTimeoutMs = options.agentTimeoutMs !== undefined ? options.agentTimeoutMs : DEFAULT_AGENT_TIMEOUT_MS;
+  // A persisted legacy agentTimeoutMs of 0/NaN would make an old run
+  // unresumable if rejected outright — coerce to the default and log instead.
+  // Call-level timeoutMs IS rejected (see agent()); the run-level option is
+  // also a persisted-resume surface, which the call level is not.
+  let agentTimeoutMs = options.agentTimeoutMs !== undefined ? options.agentTimeoutMs : DEFAULT_AGENT_TIMEOUT_MS;
+  if (
+    agentTimeoutMs !== null &&
+    (typeof agentTimeoutMs !== "number" ||
+      !Number.isFinite(agentTimeoutMs) ||
+      agentTimeoutMs < 1 ||
+      agentTimeoutMs > 2_147_483_647)
+  ) {
+    options.onLog?.(
+      `ignoring invalid agentTimeoutMs (${String(options.agentTimeoutMs)}); using the configured default instead`,
+    );
+    agentTimeoutMs = DEFAULT_AGENT_TIMEOUT_MS;
+  }
   const runId = options.runId ?? `run-${started.toString(36)}`;
   const baseCwd = options.cwd ?? process.cwd();
   // Snapshot the agentType registry ONCE per run so two agent() calls can't
@@ -515,7 +590,18 @@ export async function runWorkflow<T = unknown>(
     // explicit phase() (or agent({ phase })) overrides this.
     phases: meta.phases?.[0]?.title ? [meta.phases[0].title] : [],
     currentPhase: meta.phases?.[0]?.title,
-    phaseBudgets: new Map(),
+    // Adopt this frame's slice of the persisted table (keys are
+    // `${frameRunId}:${title}` — a nested frame's own runId prefix selects its
+    // entries, so frames never cross-contaminate). The slice keys are stripped
+    // back to bare titles for the frame-local map.
+    phaseBudgets: new Map(
+      Object.entries(options.initialPhaseBudgets ?? {})
+        .filter(([key]) => key.startsWith(`${runId}:`))
+        .map(([key, pb]) => [
+          key.slice(runId.length + 1),
+          { budget: pb.budget, startSpent: pb.startSpent, warned: pb.warned ?? false },
+        ]),
+    ),
     callSeq: 0,
     firstMiss: Number.POSITIVE_INFINITY,
   };
@@ -558,6 +644,11 @@ export async function runWorkflow<T = unknown>(
     activeThreads: new Set<string>(),
     resumeBarrierReached: false,
   };
+  if (!shared.pendingUsageFinalizers) {
+    shared.pendingUsageFinalizers = new Set<() => void>();
+  }
+  const pendingUsageFinalizers = shared.pendingUsageFinalizers;
+  shared.agentCallbacksClosed ??= false;
   const limiter = shared.limiter;
   // This frame created `shared` fresh (rather than inheriting a parent
   // workflow()'s) — i.e. it's the true top-level run, the only frame allowed
@@ -577,20 +668,29 @@ export async function runWorkflow<T = unknown>(
     logger.log(text);
   };
 
+  const emitPhaseBudgets = () => {
+    options.onPhaseBudgets?.(
+      Object.fromEntries([...state.phaseBudgets].map(([title, pb]) => [`${runId}:${title}`, pb])),
+    );
+  };
+
   const phase = (title: string, phaseOptions?: { budget?: number }) => {
     state.currentPhase = title;
     if (!state.phases.includes(title)) state.phases.push(title);
     // Carve a soft sub-budget from the run total for work done under this phase.
-    // Re-declaring re-bases from the current spent (idempotent across resume: the
-    // script re-runs phase() and the ceiling is recomputed from live spent).
-    if (typeof phaseOptions?.budget === "number" && phaseOptions.budget > 0) {
+    // First declaration wins for the run's whole lifetime (including across
+    // resume, via the persisted initialPhaseBudgets seed): re-declaring a phase
+    // keeps its original baseline so the ceiling is cumulative, not per-resume
+    // (audit2 #4 — re-basing on resume silently re-granted the full allowance).
+    if (typeof phaseOptions?.budget === "number" && phaseOptions.budget > 0 && !state.phaseBudgets.has(title)) {
       state.phaseBudgets.set(title, { budget: phaseOptions.budget, startSpent: shared.spent, warned: false });
+      emitPhaseBudgets();
     }
     options.onPhase?.(title);
     options.onRuntimeEvent?.({
       type: "phase",
       title,
-      budget: typeof phaseOptions?.budget === "number" && phaseOptions.budget > 0 ? phaseOptions.budget : null,
+      budget: state.phaseBudgets.get(title)?.budget ?? null,
     });
   };
 
@@ -666,6 +766,24 @@ export async function runWorkflow<T = unknown>(
   };
 
   const agent = (prompt: string, agentOptions: AgentOptions = {}): Promise<unknown> => {
+    if (
+      agentOptions.timeoutMs !== undefined &&
+      agentOptions.timeoutMs !== null &&
+      (typeof agentOptions.timeoutMs !== "number" ||
+        !Number.isFinite(agentOptions.timeoutMs) ||
+        agentOptions.timeoutMs < 1 ||
+        agentOptions.timeoutMs > 2_147_483_647)
+    ) {
+      // timeoutMs <= 0 / NaN / Infinity / overflow would spawn-then-instantly-
+      // abort a real session on every retry attempt (#8) — fail fast instead of
+      // burning sessions. Throw SYNCHRONOUSLY: a fire-and-forget `void
+      // agent(...)` call must not surface this as an unhandled rejection.
+      throw new WorkflowError(
+        "agent() timeoutMs must be a finite number of milliseconds in [1, 2^31-1]",
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        { recoverable: false },
+      );
+    }
     const rawThread = agentOptions.thread;
     const thread = rawThread === undefined ? undefined : typeof rawThread === "string" ? rawThread.trim() : "";
     let call: Promise<unknown>;
@@ -732,35 +850,7 @@ export async function runWorkflow<T = unknown>(
     // agents short-circuit before their real API call (see the limiter body).
     ensureAgentCapacity();
 
-    if (budget.total !== null && budget.remaining() <= 0) {
-      throw new WorkflowError("workflow token budget exhausted", WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED, {
-        recoverable: false,
-      });
-    }
-
     const assignedPhase = agentOptions.phase ?? state.currentPhase;
-
-    // Per-phase soft sub-budget gate: a noisy phase can exhaust its own ceiling
-    // without touching the run's overall budget. Soft (spent accrues post-agent),
-    // warns once at ~80%, throws at 100%. Scripts can try/catch around a phase's
-    // work so later phases still proceed.
-    if (assignedPhase) {
-      const pb = state.phaseBudgets.get(assignedPhase);
-      if (pb) {
-        const phaseSpent = shared.spent - pb.startSpent;
-        if (phaseSpent >= pb.budget) {
-          throw new WorkflowError(
-            `phase "${assignedPhase}" token sub-budget exhausted (${pb.budget})`,
-            WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED,
-            { recoverable: false },
-          );
-        }
-        if (!pb.warned && phaseSpent >= pb.budget * 0.8) {
-          pb.warned = true;
-          log(`phase "${assignedPhase}" at ${Math.round((phaseSpent / pb.budget) * 100)}% of its token sub-budget`);
-        }
-      }
-    }
 
     const requestedLabel = agentOptions.label?.trim();
 
@@ -816,11 +906,15 @@ export async function runWorkflow<T = unknown>(
     // below) with callIndex makes the key unique across the whole store.
     const deltaKey = `${runId}:${callIndex}`;
 
-    // Reserve the agent slot synchronously — atomic with the limit/budget gate
-    // above (no await in between) — so a parallel() fan-out can't all observe the
-    // same agentCount and overshoot maxAgents. (Token budget stays a soft gate:
-    // spent accrues after each agent, matching Claude Code; in-flight agents may
-    // push slightly past total, then further agent() calls throw.)
+    // Reserve the agent slot synchronously (no await between this and the
+    // capacity check) so a parallel() fan-out can't all observe the same
+    // agentCount and overshoot maxAgents. The increment precedes the budget
+    // gates deliberately: callIndex/agentCount must stay lexical for
+    // replay-key stability, and a budget-blocked call consumes its slot
+    // uniformly (resume replays count identically). (Token budget stays a
+    // soft gate: spent accrues after each agent, matching Claude Code;
+    // in-flight agents may push slightly past total, then further agent()
+    // calls throw.)
     shared.agentCount++;
     const label = requestedLabel || defaultAgentLabel(assignedPhase, shared.agentCount);
     // Longest-unchanged-prefix resume: replay a cached result only while the
@@ -867,7 +961,47 @@ export async function runWorkflow<T = unknown>(
       state.firstMiss = Math.min(state.firstMiss, callIndex);
     }
 
+    // Budget gates, deliberately AFTER the replay lookup: a journaled cache hit
+    // is free (replay commits no usage), so an exhausted budget must not strand
+    // a resumable run at a replayable call (audit2 #1 — with the gate before
+    // the lookup, a budgeted run paused past its cap was permanently
+    // unresumable, since resume() cannot raise the budget). Both gates still
+    // fire before every LIVE (paid) call.
+    if (budget.total !== null && budget.remaining() <= 0) {
+      throw new WorkflowError("workflow token budget exhausted", WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED, {
+        recoverable: false,
+      });
+    }
+    // Per-phase soft sub-budget gate: a noisy phase can exhaust its own ceiling
+    // without touching the run's overall budget. Soft (spent accrues post-agent),
+    // warns once at ~80%, throws at 100%. Scripts can try/catch around a phase's
+    // work so later phases still proceed.
+    if (assignedPhase) {
+      const pb = state.phaseBudgets.get(assignedPhase);
+      if (pb) {
+        const phaseSpent = shared.spent - pb.startSpent;
+        if (phaseSpent >= pb.budget) {
+          throw new WorkflowError(
+            `phase "${assignedPhase}" token sub-budget exhausted (${pb.budget})`,
+            WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED,
+            { recoverable: false },
+          );
+        }
+        if (!pb.warned && phaseSpent >= pb.budget * 0.8) {
+          pb.warned = true;
+          emitPhaseBudgets();
+          log(`phase "${assignedPhase}" at ${Math.round((phaseSpent / pb.budget) * 100)}% of its token sub-budget`);
+        }
+      }
+    }
+
     return limiter(async () => {
+      // A queued call can obtain its slot after the top-level abort drain has
+      // already abandoned it. Do not create a worktree or announce a new agent
+      // for an execution whose callbacks have been closed.
+      if (shared.agentCallbacksClosed) {
+        throw new WorkflowError("workflow aborted", WorkflowErrorCode.WORKFLOW_ABORTED, { recoverable: true });
+      }
       const timeout = agentOptions.timeoutMs !== undefined ? agentOptions.timeoutMs : agentTimeoutMs;
       const retryAttempts = normalizeAgentRetries(agentOptions.retries ?? options.agentRetries ?? 0);
       const maxAttempts = retryAttempts + 1;
@@ -891,6 +1025,7 @@ export async function runWorkflow<T = unknown>(
       // The tracker keeps provisional estimates separate from committed usage,
       // accumulates retries, and rejects callbacks from attempts that already settled.
       const usageTracker = createAgentCallUsageTracker((update) => {
+        if (shared.agentCallbacksClosed) return;
         if (update.committedUsage) {
           shared.tokenUsage = sumAgentUsage(shared.tokenUsage, update.committedUsage);
           shared.spent += update.committedUsage.total;
@@ -899,9 +1034,16 @@ export async function runWorkflow<T = unknown>(
       });
 
       try {
+        // Worktree creation above is asynchronous; abandonment may have
+        // occurred while it was pending, before this first observer event.
+        if (shared.agentCallbacksClosed) {
+          throw new WorkflowError("workflow aborted", WorkflowErrorCode.WORKFLOW_ABORTED, { recoverable: true });
+        }
         options.onAgentStart?.({ id: deltaKey, label, phase: assignedPhase, prompt, model: displayModel });
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
           const attemptUsage = usageTracker.startAttempt();
+          const finalizeAttemptUsage = () => attemptUsage.commitTerminalUsage();
+          pendingUsageFinalizers.add(finalizeAttemptUsage);
           const externalSignal = options.signal;
           let onExternalAbort: (() => void) | undefined;
           let onRunFatal: (() => void) | undefined;
@@ -965,6 +1107,7 @@ export async function runWorkflow<T = unknown>(
               systemTools: createAgentStoreTools(store, deltaKey),
               cwd: runCwd,
               onModelResolved: (id: string) => {
+                if (shared.agentCallbacksClosed) return;
                 displayModel = id;
                 // Correct what /workflows shows for an agent that is STILL RUNNING.
                 // onAgentEnd keeps carrying the same value so late subscribers and
@@ -972,6 +1115,7 @@ export async function runWorkflow<T = unknown>(
                 options.onAgentModel?.({ id: deltaKey, label, phase: assignedPhase, model: id });
               },
               onModelFallback: ({ tier, requestedSpec }: { tier: string; requestedSpec: string }) => {
+                if (shared.agentCallbacksClosed) return;
                 // Untagged agents' implicit default tier degrading to the session
                 // default must stay visible in the run's own log/event stream, not
                 // just a console.warn (#131) — an explicit model/tier pin instead
@@ -981,9 +1125,11 @@ export async function runWorkflow<T = unknown>(
               onUsageProgress: attemptUsage.reportProgress,
               onUsage: attemptUsage.reportTerminal,
               onSessionCreated: ({ sessionId, sessionFile }: { sessionId: string; sessionFile?: string }) => {
+                if (shared.agentCallbacksClosed) return;
                 options.onAgentSession?.({ callId: deltaKey, sessionId, sessionFile });
               },
               onHistory: (history: AgentHistoryEntry[]) => {
+                if (shared.agentCallbacksClosed) return;
                 options.onAgentHistory?.({ id: deltaKey, label, phase: assignedPhase, history });
               },
               thread: agentOptions.thread,
@@ -993,7 +1139,13 @@ export async function runWorkflow<T = unknown>(
             void runPromise.catch(() => undefined);
             const result = await withTimeout(runPromise, timeout, label, () => agentController.abort());
 
-            throwIfAborted();
+            // Abort-only check, deliberately NOT throwIfAborted(): the result is
+            // paid for at this point, so a pending durable checkpoint suspension
+            // must not discard it un-journaled (audit2 #2 — the suspension
+            // re-checks at the next script-level gate and at the top level).
+            if (isAborted()) {
+              throw new WorkflowError("workflow aborted", WorkflowErrorCode.WORKFLOW_ABORTED, { recoverable: true });
+            }
             if (isEmptyTextAgentResult(result, agentOptions.schema)) {
               throw new WorkflowError("Subagent produced no assistant output", WorkflowErrorCode.AGENT_EMPTY_OUTPUT, {
                 recoverable: true,
@@ -1001,7 +1153,7 @@ export async function runWorkflow<T = unknown>(
               });
             }
 
-            const usageCommit = attemptUsage.commitWithFallback(estimateTokens(result) + estimateTokens(prompt));
+            const usageCommit = attemptUsage.commitWithFallback(() => estimateTokens(result) + estimateTokens(prompt));
             if (!agentOptions.thread) {
               options.onAgentJournal?.({
                 index: callIndex,
@@ -1044,7 +1196,7 @@ export async function runWorkflow<T = unknown>(
               await runPromise.catch(() => undefined);
             }
             logger.error(`agent ${label} attempt ${attempt}/${maxAttempts} failed: ${workflowError.message}`);
-            const usageCommit = attemptUsage.commitWithFallback(estimateTokens(prompt));
+            const usageCommit = attemptUsage.commitWithFallback(() => estimateTokens(prompt));
             // This attempt's store writes must not survive it — a failed
             // attempt shares this call's deltaKey with every other attempt
             // (retried or not), so without rolling back here its writes would
@@ -1066,6 +1218,31 @@ export async function runWorkflow<T = unknown>(
               // the final attempt does), so report it on the dedicated channel
               // instead (see WorkflowRunOptions.onRetrySpend).
               options.onRetrySpend?.(usageCommit.tokens);
+              // Small capped backoff between attempts (audit2 #7) — an
+              // immediate retry storms the provider when a parallel() batch
+              // fails together. The abort check after the wait keeps pause/stop
+              // responsive (bounded by the 2s cap).
+              const defaultBackoffMs = Math.min(250 * 2 ** (attempt - 1), 2_000);
+              let backoffMs = defaultBackoffMs;
+              if (options.agentRetryBackoffMs) {
+                try {
+                  const injected = options.agentRetryBackoffMs(attempt);
+                  // 0 disables (documented); negative/NaN/Infinity fall back to
+                  // the default — a non-finite value clamped to 2^31-1 would
+                  // otherwise park the retry for ~24.8 days.
+                  backoffMs =
+                    injected === 0
+                      ? 0
+                      : typeof injected === "number" && Number.isFinite(injected) && injected > 0
+                        ? Math.min(injected, 2_000) // capped: setTimeout overflows >2^31-1, and a
+                        : // multi-day park would ignore aborts for its whole duration
+                          defaultBackoffMs;
+                } catch {
+                  backoffMs = defaultBackoffMs; // a throwing callback must not abandon the retry
+                }
+              }
+              if (backoffMs > 0) await new Promise((resolve) => setTimeout(resolve, backoffMs));
+              throwIfAborted();
               continue;
             }
 
@@ -1091,6 +1268,7 @@ export async function runWorkflow<T = unknown>(
             }
             throw workflowError;
           } finally {
+            pendingUsageFinalizers.delete(finalizeAttemptUsage);
             // Drop this attempt's abort listeners so they don't accrue one entry
             // per attempt on the run's signal / runFatalController for the whole
             // run (#109 hygiene).
@@ -1243,6 +1421,11 @@ export async function runWorkflow<T = unknown>(
           // mint the same child runId (and hence colliding deltaKeys/event ids)
           // for two different children.
           runId: `${runId}-nested${++shared.nestedCallSeq}`,
+          // The registry is snapshotted ONCE per run (:500): forward the
+          // already-loaded registry so a mid-run .md edit can't change
+          // agentDefinitionKey for nested-frame calls only (those journal
+          // entries would cache-miss on resume, nondeterministically).
+          agentRegistry,
           persistLogs: false,
         }),
       );
@@ -1604,6 +1787,11 @@ export async function runWorkflow<T = unknown>(
   });
 
   const wrapped = `${DETERMINISM_PRELUDE}\n(async () => {\n${body}\n})()`;
+  let runSucceeded = false;
+  // The returned object is captured so the finally can refresh its tokenUsage
+  // AFTER the drain — agents settling during the drain commit usage last, and
+  // the result payload must reflect the true final total (audit2 #5).
+  let successResult: WorkflowRunResult<T> | undefined;
   try {
     const result = await new vm.Script(wrapped, { filename: `${meta.name || "workflow"}.js` }).runInContext(context);
     // Even a script-level catch must not convert an accepted durable pause to
@@ -1616,10 +1804,8 @@ export async function runWorkflow<T = unknown>(
       log(`Logs persisted to ${logFile}`);
     }
 
-    // Emit final token usage
-    options.onTokenUsage?.(shared.tokenUsage);
-
-    return {
+    runSucceeded = true;
+    successResult = {
       meta,
       result: result as T,
       logs: state.logs,
@@ -1629,6 +1815,7 @@ export async function runWorkflow<T = unknown>(
       runId,
       tokenUsage: shared.tokenUsage,
     };
+    return successResult;
   } catch (error) {
     // This error just escaped THIS frame's own vm script execution completely
     // uncaught. For the top-level frame that means nothing anywhere in the
@@ -1653,7 +1840,13 @@ export async function runWorkflow<T = unknown>(
     // journal — this stops burning an already-exhausted budget right now, at
     // the cost of that sibling's work being thrown away and re-run live when
     // the paused run resumes (it was never journaled, so it isn't cached).
-    if (isTopLevelRun) {
+    // A durable checkpoint suspension is an intentional pause, not a fatal
+    // error: do NOT seal the run for it. Sealing would abort every in-flight
+    // sibling mid-call — their paid work is discarded un-journaled and re-run
+    // (double-paid) on resume. The finally drain below waits them out so their
+    // results journal for free before the suspension propagates.
+    const isCheckpointSuspension = shared.checkpointSuspension !== undefined && error === shared.checkpointSuspension;
+    if (isTopLevelRun && !isCheckpointSuspension) {
       // Notify the host before the cooperative drain below. A pause/stop can be
       // requested while siblings settle, but it must not erase a provider-limit
       // error that had already escaped this top-level workflow.
@@ -1683,20 +1876,111 @@ export async function runWorkflow<T = unknown>(
       // (not a single Promise.allSettled) because draining can itself let a
       // still-running call schedule further work that adds to the set.
       //
-      // Caveat: this can block indefinitely. A run-fatal abort (see the catch
+      // Caveat: without an abort the SUCCESS drain still blocks indefinitely —
+      // those results are wanted, including paid siblings at a checkpoint.
+      // Once the run's abort has fired the wait is bounded by
+      // drainAbortGraceMs (default 10s): a run-fatal abort (see the catch
       // above) aborts the AbortSignal passed to each in-flight agent, but that
       // is cooperative — an agent runner that ignores its signal (or one still
       // waiting out a real subagent process that won't die) never settles on
       // its own. Combined with agentTimeoutMs: null (no hard timeout, the
-      // default), a single hung, signal-ignoring, un-awaited agent() call can
-      // wedge this drain — and therefore the whole run's completion — forever.
-      // Configure a finite agentTimeoutMs (run- or per-agent-level) for any
-      // workflow where this is a real risk; there is no drain-side timeout.
+      // default), a single hung, signal-ignoring, un-awaited agent() call would
+      // otherwise wedge this drain — and therefore the whole run's completion —
+      // forever (audit2 #3).
       if (shared.inFlight.size > 0) {
         log(`waiting for ${shared.inFlight.size} outstanding agent() call(s) to settle before this run completes`);
       }
-      while (shared.inFlight.size > 0) {
-        await Promise.allSettled(Array.from(shared.inFlight));
+      const graceOption = options.drainAbortGraceMs;
+      const drainAbortGraceMs =
+        graceOption === undefined
+          ? 10_000
+          : graceOption === Number.POSITIVE_INFINITY
+            ? Number.POSITIVE_INFINITY
+            : typeof graceOption === "number" && graceOption >= 1 && graceOption <= 2_147_483_647
+              ? Math.floor(graceOption)
+              : 10_000; // NaN/0/negative/overflow → default
+      // Wakes the drain loop the moment the run aborts (either source), so a
+      // drain that started un-aborted re-enters promptly and the grace clock
+      // starts instead of blocking on allSettled forever.
+      let wakeAbort: () => void = () => {};
+      const abortWake = new Promise<void>((resolve) => {
+        wakeAbort = resolve;
+      });
+      const externalWake = () => wakeAbort();
+      const fatalWake = () => wakeAbort();
+      options.signal?.addEventListener("abort", externalWake, { once: true });
+      shared.runFatalController.signal.addEventListener("abort", fatalWake, { once: true });
+      try {
+        while (shared.inFlight.size > 0) {
+          const pending = Array.from(shared.inFlight);
+          if (!isAborted() || drainAbortGraceMs === Number.POSITIVE_INFINITY) {
+            // Not aborted: wait, but wake promptly if the abort fires
+            // mid-wait. Already-aborted with an unbounded grace: plain wait —
+            // racing the (already-resolved) abortWake here would busy-spin
+            // the microtask queue and starve the event loop (r1 B1).
+            if (isAborted()) {
+              await Promise.allSettled(pending);
+            } else {
+              await Promise.race([Promise.allSettled(pending), abortWake]);
+            }
+            continue;
+          }
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          const grace = new Promise<"timeout">((resolve) => {
+            // Deliberately ref'd (no unref): this timer is load-bearing for
+            // the run's terminal transition — an unref'd one would let the
+            // process exit before the run settles when nothing else holds the
+            // loop open.
+            timer = setTimeout(() => resolve("timeout"), drainAbortGraceMs);
+          });
+          const winner = await Promise.race([Promise.allSettled(pending).then(() => "settled" as const), grace]);
+          if (timer) clearTimeout(timer);
+          if (winner === "timeout") {
+            // Leave the calls behind. No rejection-swallowing needed here:
+            // every inFlight promise already carries a noop catch from its
+            // creation site (:712), so a late rejection is handled. The store
+            // disposes below; no journal can follow (the completion path's
+            // abort check precedes journaling); manager persists are
+            // staleness-gated.
+            log(
+              `abandoning ${pending.length} outstanding agent() call(s) that did not settle within ${drainAbortGraceMs}ms of the drain's abort grace`,
+            );
+            break;
+          }
+        }
+      } finally {
+        options.signal?.removeEventListener("abort", externalWake);
+        shared.runFatalController.signal.removeEventListener("abort", fatalWake);
+      }
+      // A bounded abort drain can intentionally leave a signal-ignoring runner
+      // in flight. Reconcile the latest terminal/provisional usage while the
+      // manager is still live, then seal every callback retained by that runner.
+      for (const finalizeUsage of pendingUsageFinalizers) {
+        try {
+          finalizeUsage();
+        } catch {
+          // A finalizer is best-effort; one broken callback cannot leave later
+          // attempts open or prevent the terminal drain from completing.
+        }
+      }
+      pendingUsageFinalizers.clear();
+      shared.agentCallbacksClosed = true;
+      // Final token-usage flush, deliberately AFTER the drain: agents that
+      // settle during the drain commit their usage last, and a pre-drain flush
+      // would silently drop them from the run's final accounting (audit2 #5).
+      // Success path only — error/abort accounting is owned by the catch
+      // paths (e.g. the provisional-usage rollback), and firing here would
+      // clobber their deliberately-empty records.
+      if (runSucceeded) {
+        // Refresh the result payload to the post-drain totals too — it was
+        // captured before the drain (audit2 #5's result-payload half).
+        if (successResult) successResult.tokenUsage = { ...shared.tokenUsage };
+        try {
+          options.onTokenUsage?.(shared.tokenUsage);
+        } catch {
+          // Instrumentation must never break teardown (dispose below) or mask
+          // the run's own outcome.
+        }
       }
       store.dispose();
     }

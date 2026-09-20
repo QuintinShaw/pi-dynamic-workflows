@@ -52,9 +52,10 @@ export interface NotifyCtx {
 }
 
 /** A command context that captures ui.notify calls and no-ops the rest. */
-export function makeNotifyCtx(): NotifyCtx {
+export function makeNotifyCtx(mode?: "tui" | "rpc" | "json" | "print"): NotifyCtx {
   const notified: Array<{ message: string; type?: string }> = [];
   const ctx = {
+    ...(mode ? { mode, hasUI: mode === "tui" || mode === "rpc" } : {}),
     ui: {
       notify: (message: string, type?: string) => notified.push({ message, type }),
       setStatus: () => {},

@@ -632,13 +632,21 @@ return { a, b }`;
       // Resume
       const resumed = await manager.resume(runId);
       assert.equal(resumed, true);
-      while ((manager.getRun(runId)?.snapshot.agents.length ?? 0) < 2) {
+      // resume() seeds the snapshot from the persisted agents (#206): the
+      // pre-pause pair (done + skipped) is present immediately, so wait for
+      // the LIVE re-execution of agent 2 to push the third entry.
+      let waitSpin = 0;
+      while ((manager.getRun(runId)?.snapshot.agents.length ?? 0) < 3 && waitSpin++ < 2000) {
         await new Promise((resolve) => setTimeout(resolve, 0));
       }
-      da.resolve("second-result");
-
-      // Wait for resumed run to complete (agent 1 replayed from journal, agent 2 live)
-      await new Promise((r) => setTimeout(r, 50));
+      assert.equal(manager.getRun(runId)?.snapshot.agents.length, 3, "the live retry pushed its own entry");
+      // The snapshot entry is pushed at onAgentStart, before the runner has
+      // registered its deferred attempt — keep resolving until the live call
+      // actually picks it up and the run completes.
+      for (let i = 0; i < 100 && manager.getRun(runId)?.status === "running"; i++) {
+        da.resolve("second-result");
+        await new Promise((r) => setTimeout(r, 5));
+      }
 
       const finalRun = manager.getRun(runId);
       assert.equal(finalRun?.status, "completed", "resumed multi-agent run should complete");

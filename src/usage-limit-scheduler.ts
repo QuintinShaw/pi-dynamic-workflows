@@ -9,14 +9,20 @@
  * the provider's quota is likely to have refilled — with exponential backoff if
  * it keeps hitting the wall, and a hard attempt cap so it never retries forever.
  *
+ * Seam note: the authoritative attempt counter lives in memory here and on
+ * ManagedRun/persisted records (written through recordAutoResumeAttempts); the
+ * two can drift briefly when the manager's lease-guarded disk merge skips on
+ * contention — harmless, since the owning process then persists the record.
+ *
  * Deliberately standalone: it consumes ONLY WorkflowManager's public surface
- * (on/off, listAllRuns, resume, getPersistence) so it stays decoupled from
- * manager/persistence internals. It owns its own timers and its own bookkeeping
- * (in-memory, best-effort persisted) — it does not rely on manager.stop(), which
- * only operates on in-memory runs.
+ * (on/off, listAllRuns, resume, getPersistence, recordAutoResumeAttempts) so it
+ * stays decoupled from manager/persistence internals. It owns its own timers
+ * and its own bookkeeping (in-memory, best-effort persisted) — it does not
+ * rely on manager.stop(), which only operates on in-memory runs.
  */
 
 import type { PersistedRunState, RunPersistence, RunStatus } from "./run-persistence.js";
+import { sanitizeAutoResumeAttempts } from "./run-persistence.js";
 
 /** Narrow surface this scheduler depends on — satisfied by WorkflowManager. */
 export interface SchedulableWorkflowManager {
@@ -25,6 +31,12 @@ export interface SchedulableWorkflowManager {
   listAllRuns(): PersistedRunState[];
   resume(runId: string): Promise<boolean>;
   getPersistence(): RunPersistence;
+  /**
+   * Record the auto-resume backoff counter THROUGH the manager so the next
+   * manager persist carries it — a raw persistence.save side-channel gets
+   * erased by writeRunToDisk (#207).
+   */
+  recordAutoResumeAttempts(runId: string, attempts: number): void;
 }
 
 /** Opaque timer handle so tests can inject a fake clock/timer. */
@@ -234,7 +246,10 @@ export class UsageLimitScheduler {
       return;
     }
 
-    const priorAttempts = this.state.get(runId)?.attempts ?? persisted?.autoResumeAttempts ?? 0;
+    // Validate the persisted counter too (corrupt/foreign JSON): an invalid
+    // value would defeat the give-up cap and produce NaN timer delays.
+    const priorAttempts =
+      this.state.get(runId)?.attempts ?? sanitizeAutoResumeAttempts(persisted?.autoResumeAttempts) ?? 0;
     this.arm(runId, {
       attempts: priorAttempts + 1,
       resetHint: event.resetHint ?? persisted?.resetHint,
@@ -271,7 +286,9 @@ export class UsageLimitScheduler {
       if (run.autoResume === false) continue;
       if (this.state.has(run.runId)) continue;
 
-      const priorAttempts = run.autoResumeAttempts ?? 0;
+      // Validate the persisted counter: a corrupt/foreign value (NaN, string,
+      // negative) would defeat the give-up cap and produce NaN timer delays.
+      const priorAttempts = sanitizeAutoResumeAttempts(run.autoResumeAttempts) ?? 0;
       const updatedAtMs = Date.parse(run.updatedAt);
       const elapsedMs = Number.isFinite(updatedAtMs) ? Math.max(0, this.now() - updatedAtMs) : 0;
       this.arm(run.runId, {
@@ -394,27 +411,19 @@ export class UsageLimitScheduler {
   /**
    * Best-effort persist of the in-memory attempt counter, so a cold start after
    * a crash can approximately resume the backoff sequence instead of restarting
-   * it. Deferred to a microtask so it lands AFTER the manager's own persistRun()
-   * write for this same pause (which happens synchronously, right after the
-   * "paused" event we're reacting to returns control to executeRun()) — writing
-   * synchronously here would just get clobbered, since persistRun() writes a
-   * fresh PersistedRunState object literal that doesn't know about this field.
-   * This is still inherently racy across process crashes (see class docs); it
-   * is a best-effort durability aid, not a correctness requirement for the live
-   * (in-memory) path.
+   * it. Goes through the manager, which owns the field: for a live run it sets
+   * ManagedRun.autoResumeAttempts so every later writeRunToDisk carries it
+   * (#207); for a disk-only run it merges the persisted record under a lease.
+   * Synchronous is safe: the manager write is atomic in-process, and the
+   * pause-settle persist that follows this event reads the live field.
    */
   private persistAttempts(runId: string, attempts: number): void {
-    queueMicrotask(() => {
-      if (this.disposed) return;
-      try {
-        const persistence = this.manager.getPersistence();
-        const current = persistence.load(runId);
-        if (!current) return;
-        persistence.save({ ...current, autoResumeAttempts: attempts });
-      } catch (err) {
-        this.diagnostic(`[usage-limit-scheduler] ${runId}: failed to persist autoResumeAttempts`, err);
-      }
-    });
+    if (this.disposed) return;
+    try {
+      this.manager.recordAutoResumeAttempts(runId, attempts);
+    } catch (err) {
+      this.diagnostic(`[usage-limit-scheduler] ${runId}: failed to persist autoResumeAttempts`, err);
+    }
   }
 
   private safe(fn: () => void | Promise<void>): void {

@@ -512,7 +512,16 @@ function estimateStreamingAssistantUsage(event: AgentSessionEvent): AgentUsage |
   }
 
   const estimatedOutput = Math.max(1, Math.ceil(streamedCharacters / 4));
-  return { input: 0, output: estimatedOutput, cacheRead: 0, cacheWrite: 0, total: estimatedOutput, cost: 0 };
+  // Character heuristic, not a provider measurement — tag it (#209).
+  return {
+    input: 0,
+    output: estimatedOutput,
+    cacheRead: 0,
+    cacheWrite: 0,
+    total: estimatedOutput,
+    cost: 0,
+    estimated: true,
+  };
 }
 
 type SessionUsageStats = Parameters<typeof usageFromStats>[0];
@@ -615,7 +624,12 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
   modelSource?: ModelSource;
   /** Per-run host policy; overrides the instance and process resolvers. */
   preSpawnModel?: PreSpawnModelResolver;
-  /** Called with the resolved model id once known (for display/telemetry). */
+  /** Called with the resolved model id once known (for display/telemetry).
+   * Also fires right after session creation with the session's REAL model when
+   * no spec resolved (an untagged agent's settings-default binding, an
+   * implicit-route degrade, or a requested tier that resolved to nothing) —
+   * otherwise those agents would keep displaying the pre-resolution mainModel
+   * guess for their whole lifetime. */
   onModelResolved?: (modelId: string) => void;
   /**
    * Called (at most once per WorkflowAgent instance) when an UNTAGGED agent's
@@ -1275,6 +1289,20 @@ export class WorkflowAgent {
       }
     };
     try {
+      // When no spec resolved (untagged → settings-default binding, an
+      // implicit-route degrade, or a requested tier that resolved to
+      // nothing), the display so far shows the pre-resolution mainModel guess
+      // and nothing corrects it — onModelResolved above only fires for agents
+      // WITH a resolvable spec. Report the session's REAL bound model now
+      // that it exists, so /workflows, the persisted run record, and the
+      // journal stop displaying a model the agent never ran (#167's fix
+      // covered the spec'd paths only). Inside the lifecycle try so a
+      // throwing host callback cannot leak the session (finally disposes it).
+      if (!resolvedModel && session.model) {
+        options.onModelResolved?.(
+          formatModelSpecWithThinking(canonicalModelSpec(session.model), resolvedThinkingLevel),
+        );
+      }
       if (options.signal?.aborted) throw new Error("Subagent was aborted");
       if (options.signal) {
         const onAbort = () => void session.abort();
