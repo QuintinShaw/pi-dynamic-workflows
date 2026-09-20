@@ -3245,7 +3245,7 @@ describe("renderPanelDetailed", () => {
   // `blueTokens` drives the first agent's live token count; the run aggregate and
   // token/s are summed from per-agent tokens (the run-level tokenUsage aggregate is
   // not live — see renderPanelDetailed), so growing blueTokens grows the rate.
-  function detailedManager(blueTokens: number, status = "running") {
+  function detailedManager(blueTokens: number, status = "running", estimated = false) {
     const snapshot = {
       name: "auth_audit",
       phases: ["Scan", "Review"],
@@ -3258,6 +3258,19 @@ describe("renderPanelDetailed", () => {
           status: "done",
           phase: "Scan",
           tokens: blueTokens,
+          ...(estimated
+            ? {
+                tokenUsage: {
+                  input: 0,
+                  output: blueTokens,
+                  total: blueTokens,
+                  cacheRead: 0,
+                  cacheWrite: 0,
+                  cost: 0,
+                  estimated: true,
+                },
+              }
+            : {}),
           model: "anthropic/claude-haiku-4-5",
         },
         { id: 2, label: "audit_auth", status: "running", phase: "Scan", tokens: 1800 },
@@ -3406,6 +3419,49 @@ describe("renderPanelDetailed", () => {
       lines.some((l) => /2000 tok\/s/.test(l)),
       `expected a tok/s readout, got:\n${lines.join("\n")}`,
     );
+  });
+
+  it("keeps token-rate estimate provenance for its rolling-window endpoints", async () => {
+    const { renderPanelDetailed, clearTokenSamples } = await import("../src/task-panel.js");
+
+    clearTokenSamples("r1");
+    renderPanelDetailed(detailedManager(2100, "running", true) as never, theme as never, undefined, 8, 1000);
+    let lines = renderPanelDetailed(
+      detailedManager(4100, "running", true) as never,
+      theme as never,
+      undefined,
+      8,
+      2000,
+    );
+    assert.ok(
+      lines.some((line) => /~2000 tok\/s/.test(line)),
+      "estimated → estimated rate is marked",
+    );
+
+    clearTokenSamples("r1");
+    renderPanelDetailed(detailedManager(2100, "running", true) as never, theme as never, undefined, 8, 1000);
+    lines = renderPanelDetailed(detailedManager(4100) as never, theme as never, undefined, 8, 2000);
+    assert.ok(
+      lines.some((line) => /~2000 tok\/s/.test(line)),
+      "estimated → exact rate remains marked",
+    );
+
+    // The initial estimated endpoint ages out, leaving two exact endpoints for
+    // the rate. The marker must then clear rather than sticking to the run.
+    lines = renderPanelDetailed(detailedManager(6100) as never, theme as never, undefined, 8, 12001);
+    assert.ok(
+      lines.some((line) => /200 tok\/s/.test(line)),
+      "two exact endpoints still render a rate",
+    );
+    assert.ok(!lines.some((line) => /~\d+ tok\/s/.test(line)), "two exact endpoints clear the estimate marker");
+
+    // A duplicate render can correct its provenance without changing either
+    // timestamp or total; retain one sample, but replace its marker.
+    clearTokenSamples("r1");
+    renderPanelDetailed(detailedManager(2100, "running", true) as never, theme as never, undefined, 8, 1000);
+    renderPanelDetailed(detailedManager(2100) as never, theme as never, undefined, 8, 1000);
+    lines = renderPanelDetailed(detailedManager(4100) as never, theme as never, undefined, 8, 2000);
+    assert.ok(!lines.some((line) => /~\d+ tok\/s/.test(line)), "same-timestamp correction updates the endpoint marker");
   });
 
   it("caps agents per phase and reports the overflow", async () => {

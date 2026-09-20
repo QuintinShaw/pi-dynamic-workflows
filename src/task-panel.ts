@@ -1460,15 +1460,18 @@ export function renderPanel(manager: WorkflowManager, theme: Theme, width?: numb
 const RATE_WINDOW_MS = 10_000;
 /** Per-run (timestamp, cumulative total) samples, keyed by the persisted runId so
  *  the rolling rate survives pause→resume. Cleared when a run ends. */
-const tokenSamples = new Map<string, Array<{ ts: number; total: number }>>();
+const tokenSamples = new Map<string, Array<{ ts: number; total: number; estimated: boolean }>>();
 
 /** Record a token-total sample for `runId` at time `now` (ms). */
-export function sampleTokens(runId: string, total: number, now: number): void {
+export function sampleTokens(runId: string, total: number, now: number, estimated = false): void {
   const samples = tokenSamples.get(runId) ?? [];
   const last = samples[samples.length - 1];
   // Collapse repeat renders within the same instant (e.g. width recalcs).
-  if (last && last.ts === now && last.total === total) return;
-  samples.push({ ts: now, total });
+  if (last && last.ts === now && last.total === total) {
+    last.estimated = estimated;
+    return;
+  }
+  samples.push({ ts: now, total, estimated });
   // Drop samples beyond the rolling window, always keeping ≥2 so a rate is computable.
   while (samples.length > 2 && now - samples[0].ts > RATE_WINDOW_MS) samples.shift();
   tokenSamples.set(runId, samples);
@@ -1485,6 +1488,15 @@ export function tokensPerSecond(runId: string): number {
   const delta = newest.total - oldest.total;
   if (delta <= 0) return 0;
   return (delta / elapsedMs) * 1000;
+}
+
+/** Whether the two samples that define the current positive token rate include a heuristic estimate. */
+function tokenRateIsEstimated(runId: string): boolean {
+  const samples = tokenSamples.get(runId);
+  if (!samples || samples.length < 2) return false;
+  const oldest = samples[0];
+  const newest = samples[samples.length - 1];
+  return oldest.estimated || newest.estimated;
 }
 
 /** Forget a run's samples (call when it finishes) so the map can't grow unbounded. */
@@ -1592,7 +1604,7 @@ export function renderPanelDetailed(
     // lull rather than merely waiting for a long-running agent to return. Paused
     // runs do not accrue tokens, so their rate is suppressed.
     const runUsage = aggregateAgentUsage(agents);
-    sampleTokens(r.runId, runUsage.fresh + runUsage.cacheRead, now);
+    sampleTokens(r.runId, runUsage.fresh + runUsage.cacheRead, now, runUsage.estimated);
     const rate = r.status === "running" ? tokensPerSecond(r.runId) : 0;
     const meta = [
       `${done}/${agents.length} agents`,
@@ -1600,7 +1612,7 @@ export function renderPanelDetailed(
       fmtTokenSegment(runUsage, fmtTokensShort),
       // (cost is only known once the run finalizes its usage.)
       usage?.cost ? fmtCost(usage.cost) : "",
-      rate > 0 ? `${Math.round(rate)} tok/s` : "",
+      rate > 0 ? `${tokenRateIsEstimated(r.runId) ? "~" : ""}${Math.round(rate)} tok/s` : "",
     ]
       .filter(Boolean)
       .join(" · ");

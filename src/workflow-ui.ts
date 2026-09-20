@@ -143,6 +143,8 @@ interface RunRow {
   fresh: number;
   /** Cache-read tokens for the whole run. */
   cacheRead: number;
+  /** True when the displayed figures include character-heuristic estimates (#209). */
+  estimated: boolean;
   cost: number;
 }
 interface PhaseRow {
@@ -153,6 +155,8 @@ interface PhaseRow {
   fresh: number;
   /** Cache-read tokens summed across the phase's agents. */
   cacheRead: number;
+  /** True when any of the phase's agents reported heuristic-estimated figures (#209). */
+  estimated: boolean;
 }
 interface AgentRow {
   id: number;
@@ -281,6 +285,7 @@ export class NavigatorModel {
         total: agents.length,
         fresh: figures.fresh,
         cacheRead: figures.cacheRead,
+        estimated: figures.estimated,
         cost: usage?.cost ?? 0,
       };
     });
@@ -374,6 +379,7 @@ export class NavigatorModel {
         total: agents.length,
         fresh: usage.fresh,
         cacheRead: usage.cacheRead,
+        estimated: usage.estimated,
       };
     });
   }
@@ -1569,18 +1575,20 @@ function twoPaneHeader(
   let total = 0;
   let fresh = 0;
   let cacheRead = 0;
+  let estimated = false;
   for (const p of phases) {
     done += p.done;
     total += p.total;
     fresh += p.fresh;
     cacheRead += p.cacheRead;
+    if (p.estimated) estimated = true;
   }
   // Line 0 — name (accent + bold), truncated to width if needed.
   const nameText = truncateToWidth(name, width, ELLIPSIS, false);
   const line0 = theme.fg("accent", theme.bold(nameText));
 
   // Line 1 — left status, right summary.
-  const headerSegment = fmtTokenSegment({ fresh, cacheRead }, compactTokens);
+  const headerSegment = fmtTokenSegment({ fresh, cacheRead, estimated }, compactTokens);
   const rightRaw = `${done}/${total} ${pluralize("agent", total)}${headerSegment ? ` · ${headerSegment}` : ""}`;
   const rightW = visibleWidth(rightRaw);
   const gap = 2;

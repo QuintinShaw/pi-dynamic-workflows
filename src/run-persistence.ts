@@ -124,6 +124,8 @@ export interface PersistedRunState {
     cost?: number;
     cacheRead?: number;
     cacheWrite?: number;
+    /** True when the totals include character-heuristic estimates (#209). */
+    estimated?: boolean;
   };
   /**
    * Cached agent/checkpoint results for resume, keyed by deterministic call

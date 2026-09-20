@@ -6,6 +6,13 @@ export interface AgentUsage {
   cacheWrite: number;
   total: number;
   cost: number;
+  /**
+   * True when these figures come from a character-count heuristic because the
+   * provider reported no usage — NOT a measurement. Propagates through
+   * sumAgentUsage into run totals so persistence and display never present an
+   * estimate as metered fact (#209). Rendering uses a "~" prefix.
+   */
+  estimated?: boolean;
 }
 
 /** Create an independent zero-valued agent usage record. */
@@ -23,6 +30,7 @@ export function sumAgentUsage(...records: AgentUsage[]): AgentUsage {
     total.cacheWrite += usage.cacheWrite;
     total.total += usage.total;
     total.cost += usage.cost;
+    if (usage.estimated) total.estimated = true;
   }
   return total;
 }
@@ -89,7 +97,10 @@ export function createAgentCallUsageTracker(onUpdate: (update: AgentCallUsageUpd
           if (terminalUsage && (terminalUsage.total > 0 || terminalUsage.cost > 0)) {
             return commitUsage(terminalUsage);
           }
-          return commitUsage({ ...createEmptyAgentUsage(), total: Math.max(0, fallbackTotal) });
+          // The provider never reported usage: fabricate a total from a
+          // character heuristic and TAG it — this must never be persisted or
+          // rendered as a measurement (#209).
+          return commitUsage({ ...createEmptyAgentUsage(), total: Math.max(0, fallbackTotal), estimated: true });
         },
         commitTerminalUsage() {
           if (!terminalUsage) {
@@ -118,6 +129,9 @@ export function agentUsageEquals(left: AgentUsage, right: AgentUsage): boolean {
     left.cacheRead === right.cacheRead &&
     left.cacheWrite === right.cacheWrite &&
     left.total === right.total &&
-    left.cost === right.cost
+    left.cost === right.cost &&
+    // The flag is part of the value: replacing an estimate with exact figures
+    // (same numbers) must still emit an update so the stale flag clears.
+    !left.estimated === !right.estimated
   );
 }

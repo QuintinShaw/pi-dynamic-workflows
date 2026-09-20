@@ -473,7 +473,16 @@ function estimateStreamingAssistantUsage(event: AgentSessionEvent): AgentUsage |
   }
 
   const estimatedOutput = Math.max(1, Math.ceil(streamedCharacters / 4));
-  return { input: 0, output: estimatedOutput, cacheRead: 0, cacheWrite: 0, total: estimatedOutput, cost: 0 };
+  // Character heuristic, not a provider measurement — tag it (#209).
+  return {
+    input: 0,
+    output: estimatedOutput,
+    cacheRead: 0,
+    cacheWrite: 0,
+    total: estimatedOutput,
+    cost: 0,
+    estimated: true,
+  };
 }
 
 type SessionUsageStats = Parameters<typeof usageFromStats>[0];

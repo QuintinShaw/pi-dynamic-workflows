@@ -369,6 +369,8 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
     cost: number;
     cacheRead?: number;
     cacheWrite?: number;
+    /** True when the totals include character-heuristic estimates (#209). */
+    estimated?: boolean;
   }) => void;
   /**
    * Top-level workflow error observed before runWorkflow drains in-flight agents.
@@ -396,6 +398,8 @@ export interface WorkflowRunResult<T = unknown> {
     cost: number;
     cacheRead?: number;
     cacheWrite?: number;
+    /** True when the totals include character-heuristic estimates (#209). */
+    estimated?: boolean;
   };
 }
 

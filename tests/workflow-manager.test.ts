@@ -943,6 +943,77 @@ test(
 );
 
 test(
+  "the estimate flag survives accumulation across commits and a pause/resume cycle (#209)",
+  withTempCwd(async (cwd) => {
+    // 'first' reports nothing (its committed total is a fabricated estimate);
+    // 'second' reports exact usage. The run-level aggregate must stay flagged
+    // through the second commit AND through pause/resume seeding.
+    let secondAttempts = 0;
+    let markSecondStarted: () => void = () => {};
+    const secondStarted = new Promise<void>((resolve) => {
+      markSecondStarted = resolve;
+    });
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt, options) {
+          if (prompt === "first") return "a-done"; // no onUsage: fallback estimate
+          secondAttempts++;
+          if (secondAttempts === 1) {
+            markSecondStarted();
+            await new Promise<void>((_resolve, reject) => {
+              options?.signal?.addEventListener("abort", () => reject(new Error("paused")), { once: true });
+            });
+          }
+          options?.onUsage?.({ input: 40, output: 2, cacheRead: 0, cacheWrite: 0, total: 42, cost: 0.01 });
+          return "b-done";
+        },
+      },
+    });
+    manager.on("error", () => {});
+
+    const { runId, promise } = manager.startInBackground(twoAgentScript);
+    promise.catch(() => {});
+    await secondStarted;
+    assert.equal(
+      manager.getRun(runId)?.snapshot.tokenUsage?.estimated,
+      true,
+      "aggregate stays flagged after an exact commit lands on an estimated one",
+    );
+    assert.equal(manager.pause(runId), true);
+    assert.equal(manager.getPersistence().load(runId)?.tokenUsage?.estimated, true, "the flag persists at pause");
+
+    assert.equal(await manager.resume(runId), true);
+    while (manager.getRun(runId)?.status === "running") {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    const completed = manager.getPersistence().load(runId);
+    assert.equal(completed?.status, "completed");
+    assert.equal(completed?.tokenUsage?.estimated, true, "the flag survives resume seeding and terminal persist");
+  }),
+);
+
+test(
+  "fabricated fallback usage persists with the estimate flag, exact usage without it (#209)",
+  withTempCwd(async (cwd) => {
+    // fakeAgent() reports all-zero usage, so the commit falls back to the
+    // character-heuristic total — that figure is an estimate and must be
+    // flagged everywhere it persists.
+    const estimated = new WorkflowManager({ cwd, agent: fakeAgent() });
+    const estimatedResult = await estimated.runSync(oneAgentScript);
+    const estimatedRun = estimated.getPersistence().load(estimatedResult.runId);
+    assert.ok((estimatedRun?.tokenUsage?.total ?? 0) > 0, "fallback fabricated a positive total");
+    assert.equal(estimatedRun?.tokenUsage?.estimated, true, "fabricated total persisted as an estimate");
+
+    const exact = new WorkflowManager({ cwd, agent: fakeAgent({ input: 40, output: 2, total: 42, cost: 0.01 }) });
+    const exactResult = await exact.runSync(oneAgentScript);
+    const exactRun = exact.getPersistence().load(exactResult.runId);
+    assert.equal(exactRun?.tokenUsage?.total, 42);
+    assert.equal(exactRun?.tokenUsage?.estimated, undefined, "metered usage carries no estimate flag");
+  }),
+);
+
+test(
   "resume re-resolves the run's toolset tag and keeps its start-time tokenBudget",
   withTempCwd(async (cwd) => {
     // Agent where 'first' completes (journaling it) and 'second' hangs on its
@@ -5108,6 +5179,84 @@ test(
     const statusRow = new NavigatorModel(manager).runs().find((run) => run.runId === runId);
     assert.equal(statusRow?.fresh, 0, "status-facing usage must reflect committed usage only");
     assert.equal(statusRow?.cacheRead, 0);
+  }),
+);
+
+test(
+  "an exact commit merging onto an estimated aggregate keeps the run flagged — no pause involved (#209)",
+  withTempCwd(async (cwd) => {
+    // The terminal onTokenUsage flush also carries the flag, so this test pins
+    // the END-TO-END invariant; the manager-side merge (commitFinalizedAgentUsage)
+    // is pinned separately by the pause-after-exact-commit test below.
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt, options) {
+          if (prompt === "first") return "a-done"; // no onUsage: fallback estimate
+          options?.onUsage?.({ input: 40, output: 2, cacheRead: 0, cacheWrite: 0, total: 42, cost: 0.01 });
+          return "b-done";
+        },
+      },
+    });
+    manager.on("error", () => {});
+    const { runId, promise } = manager.startInBackground(twoAgentScript);
+    const result = await promise;
+    assert.ok(result);
+    assert.equal(
+      manager.getRun(runId)?.snapshot.tokenUsage?.estimated,
+      true,
+      "the live aggregate stays flagged after an exact commit lands on an estimated one",
+    );
+    assert.equal(
+      manager.getPersistence().load(runId)?.tokenUsage?.estimated,
+      true,
+      "the terminal persist keeps the flag",
+    );
+  }),
+);
+
+test(
+  "a pause after an exact commit lands keeps the run flagged in the paused record (#209)",
+  withTempCwd(async (cwd) => {
+    // commitFinalizedAgentUsage is the ONLY writer of snapshot.tokenUsage on the
+    // pause path (the terminal onTokenUsage flush never runs), so this pins its
+    // prior-flag merge: drop it and the paused record reads unflagged.
+    let thirdStarted: () => void = () => {};
+    const thirdAgentStarted = new Promise<void>((resolve) => {
+      thirdStarted = resolve;
+    });
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt, options) {
+          if (prompt === "first") return "a-done"; // no onUsage: fallback estimate
+          if (prompt === "second") {
+            options?.onUsage?.({ input: 40, output: 2, cacheRead: 0, cacheWrite: 0, total: 42, cost: 0.01 });
+            return "b-done"; // exact commit lands BEFORE the pause
+          }
+          thirdStarted();
+          await new Promise<void>((_resolve, reject) => {
+            options?.signal?.addEventListener("abort", () => reject(new Error("paused")), { once: true });
+          });
+          return "unreachable";
+        },
+      },
+    });
+    manager.on("error", () => {});
+    const threeAgentScript = `export const meta = { name: 'three_agent_demo', description: 'three agents' }
+await agent('first')
+await agent('second')
+await agent('third')`;
+    const { runId, promise } = manager.startInBackground(threeAgentScript);
+    promise.catch(() => {});
+    await thirdAgentStarted;
+    assert.equal(manager.pause(runId), true);
+    await promise.catch(() => {});
+    assert.equal(
+      manager.getPersistence().load(runId)?.tokenUsage?.estimated,
+      true,
+      "paused record: exact commit merged onto an estimated aggregate keeps the flag",
+    );
   }),
 );
 
