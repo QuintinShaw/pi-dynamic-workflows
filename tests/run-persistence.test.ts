@@ -648,7 +648,7 @@ test(
 );
 
 test(
-  "createRunPersistence list() re-reads disk again once the TTL has elapsed (not cached forever)",
+  "createRunPersistence list() skips unchanged directory scans but reconciles external edits",
   withTempCwd(async (cwd) => {
     let readdirCalls = 0;
     const rp = createRunPersistence(cwd, {
@@ -663,12 +663,17 @@ test(
     rp.list();
     assert.equal(readdirCalls, 1);
 
-    // Wait past the TTL window (well beyond any reasonable short cache) and
-    // confirm a later call does read disk again — this is a cache, not a
-    // permanent snapshot.
     await new Promise((r) => setTimeout(r, 400));
     rp.list();
-    assert.ok(readdirCalls >= 2, "list() should read disk again once the TTL has elapsed");
+    assert.equal(readdirCalls, 1, "unchanged directories do not require per-run stat calls");
+    const originalNow = Date.now;
+    try {
+      Date.now = () => originalNow() + 6000;
+      rp.list();
+      assert.ok(readdirCalls >= 2, "in-place external edits are periodically reconciled");
+    } finally {
+      Date.now = originalNow;
+    }
   }),
 );
 

@@ -2,6 +2,7 @@
  * Workflow run state persistence for pause/resume support.
  */
 
+import { createHash, randomUUID } from "node:crypto";
 import { join } from "node:path";
 import type { AgentUsage } from "./agent.js";
 import type { AgentHistoryEntry } from "./agent-history.js";
@@ -10,11 +11,18 @@ import {
   ensureDir as ensureDirFs,
   listJsonFilesSafe,
   type PersistenceFsLayer,
-  readJsonWithBackupRecovery,
   resolvePersistenceFs,
   unlinkIfExistsSafe,
-  writeJsonAtomicWithBackup,
 } from "./fs-persistence.js";
+import { settleInterruptedPersistedAgents } from "./run-agent-settlement.js";
+import { createRunRecordStore } from "./run-record-store.js";
+
+export {
+  agentHasNonTerminalStatus,
+  INTERRUPTED_AGENT_CAUSE,
+  settleInterruptedPersistedAgents,
+} from "./run-agent-settlement.js";
+
 import type { WorkflowCheckpoint } from "./workflow.js";
 import { workflowProjectPaths } from "./workflow-paths.js";
 
@@ -208,8 +216,20 @@ export type PendingDeliveryMarker =
   | { kind: "text"; text: string; deliveryId?: string };
 
 export interface RunPersistence {
+  /** Immutable, directly readable result artifact for conversation delivery. */
+  exportResult?(runId: string, result: unknown): string;
+  /** Read routing metadata without hydrating history; detail fields are lazy. */
+  loadPreview?(runId: string): PersistedRunState | null;
+  /** Under the caller's run lease, settle orphaned agents using a log delta. */
+  recoverInterrupted?(runId: string): boolean;
   /** Save current run state. */
   save(state: PersistedRunState): void;
+  /** Merge small delivery/ownership fields without hydrating the run history. */
+  updateMetadata?(
+    runId: string,
+    patch: Partial<Pick<PersistedRunState, "sessionId" | "pendingDelivery" | "autoResumeAttempts">>,
+    expectedDeliveryId?: string,
+  ): boolean;
   /** Load a persisted run by ID. */
   load(runId: string): PersistedRunState | null;
   /** List all persisted runs. */
@@ -261,8 +281,6 @@ export const DEFAULT_MAX_TERMINAL_RUNS_ON_DISK = 300;
 
 export const TERMINAL_RUN_STATUSES: ReadonlySet<RunStatus> = new Set(["completed", "failed", "aborted"]);
 
-const NON_TERMINAL_AGENT_STATUSES = new Set(["queued", "running"]);
-
 const PERSISTED_AGENT_STATUSES = [
   "queued",
   "running",
@@ -288,16 +306,6 @@ export const VALID_PERSISTED_AGENT_STATUSES: ReadonlySet<PersistedAgentState["st
   PERSISTED_AGENT_STATUSES,
 );
 
-/** Cause stamped onto leftover agents when a live execution is gone but the run is still paused. */
-export const INTERRUPTED_AGENT_CAUSE: { error: string; errorCode: WorkflowErrorCode } = {
-  error: "interrupted",
-  errorCode: WorkflowErrorCode.WORKFLOW_ABORTED,
-};
-
-export function agentHasNonTerminalStatus(status: PersistedAgentState["status"]): boolean {
-  return NON_TERMINAL_AGENT_STATUSES.has(status);
-}
-
 /** Cause stamped onto leftover in-flight agents when a run reaches a terminal status. */
 export function terminalRunInterruptCause(
   status: RunStatus,
@@ -313,28 +321,6 @@ export function terminalRunInterruptCause(
     };
   }
   return { error: "run completed" };
-}
-
-/**
- * Rewrite leftover queued/running agents to skipped. Replay ignores
- * `agents[].status` (journal-keyed), so this is display-only.
- */
-export function settleInterruptedPersistedAgents(
-  agents: PersistedAgentState[],
-  cause: { error: string; errorCode?: WorkflowErrorCode },
-  endedAt: string,
-): PersistedAgentState[] {
-  return agents.map((agent) => {
-    if (!NON_TERMINAL_AGENT_STATUSES.has(agent.status)) return agent;
-    return {
-      ...agent,
-      status: "skipped",
-      error: cause.error,
-      errorCode: cause.errorCode,
-      recoverable: false,
-      endedAt: agent.endedAt ?? endedAt,
-    };
-  });
 }
 
 /**
@@ -357,14 +343,8 @@ export interface RunPersistenceOptions {
 }
 
 /**
- * `list()` does a full readdirSync + per-file readFileSync + JSON.parse of the
- * entire lifetime run history. It is called on essentially every progress tick
- * (task-panel re-render → WorkflowManager.listRuns()/listAllRuns()), so an
- * unbounded number of ticks each re-walked and re-parsed every run file on
- * disk. Cache the computed list for a short TTL — long enough to absorb a
- * burst of same-tick reads, short enough that a read from a DIFFERENT process
- * (or a mutation this instance doesn't own) still shows up quickly. Mirrors
- * the ~1s settings-read TTL cache in task-panel.ts.
+ * Absorb same-tick list reads before checking directory stamps and reconciling
+ * lightweight per-file views. Full histories are hydrated only on demand.
  */
 const LIST_CACHE_TTL_MS = 300;
 
@@ -374,6 +354,7 @@ export function createRunPersistence(
   options?: RunPersistenceOptions,
 ): RunPersistence {
   const fs = resolvePersistenceFs(fsOverride);
+  const records = createRunRecordStore(fs);
   const _existsSync = fs.existsSync;
   const _readFileSync = fs.readFileSync;
   const _statSync = fs.statSync;
@@ -415,6 +396,62 @@ export function createRunPersistence(
   };
 
   const readLock = (runId: string): LockFile | null => readLockAt(primaryLockPath(runId));
+  // Short writer mutex serializes append + head commit, including metadata
+  // writes while a long-lived execution lease is held. Never busy-wait.
+  const mutate = <T>(runId: string, fn: () => T): T => {
+    ensureDir();
+    const path = `${primaryRunPath(runId)}.write-lock`;
+    const token = `${process.pid}-${Date.now()}-${Math.random()}`;
+    const ownerFile = `${path}.${randomUUID()}.owner`;
+    const release = (target: string) => {
+      if (readLockAt(target)?.token === token) unlinkIfExistsSafe(fs, target);
+    };
+    const claim = (target: string, depth = 0): void => {
+      if (depth > 8) throw new Error("Run writer recovery chain is too deep");
+      for (let attempt = 0; ; attempt++) {
+        try {
+          fs.linkSync(ownerFile, target);
+          return;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "EEXIST" || attempt > 0) throw error;
+          const existing = readLockAt(target);
+          if (
+            !existing ||
+            typeof existing.token !== "string" ||
+            !Number.isInteger(existing.pid) ||
+            existing.pid <= 0 ||
+            pidIsAlive(existing.pid)
+          )
+            throw error;
+          // Serialize reapers of this exact dead-owner incarnation. Without
+          // this guard, a second reaper could unlink a new live mutex after
+          // both had observed the same stale owner.
+          const key = createHash("sha256").update(`${target}\0${existing.token}`).digest("hex");
+          const guard = `${path}.reap-${key}`;
+          claim(guard, depth + 1);
+          try {
+            if (readLockAt(target)?.token === existing.token) _unlinkSync(target);
+          } finally {
+            release(guard);
+          }
+        }
+      }
+    };
+    // Publish a fully written owner atomically. A process dying between open
+    // and write can leave only an unlinked candidate, never an empty mutex.
+    try {
+      _writeFileSync(ownerFile, JSON.stringify({ pid: process.pid, token }), { flag: "wx" });
+      claim(path);
+    } finally {
+      unlinkIfExistsSafe(fs, ownerFile);
+    }
+    try {
+      return fn();
+    } finally {
+      release(path);
+      invalidateListCache();
+    }
+  };
 
   // list() cache: recomputed lazily, invalidated synchronously by every
   // mutation this instance performs (save()/delete()) so a stale read can
@@ -423,6 +460,19 @@ export function createRunPersistence(
   // elapses, same as before this cache existed on the next un-cached call.
   let listCache: PersistedRunState[] | undefined;
   let listCacheAt = 0;
+  let directoryStamp = "";
+  let reconciledAt = 0;
+  const directoryVersion = () =>
+    [runsDir, legacyRunsDir]
+      .map((dir) => {
+        try {
+          const s = fs.statSync(dir);
+          return `${s.ino}:${s.mtimeMs}:${s.ctimeMs}`;
+        } catch {
+          return "missing";
+        }
+      })
+      .join("|");
   const invalidateListCache = () => {
     listCache = undefined;
   };
@@ -481,7 +531,8 @@ export function createRunPersistence(
             if (!byRunId.has(cached.state.runId)) byRunId.set(cached.state.runId, cached.state);
             continue;
           }
-          const state = JSON.parse(_readFileSync(path, "utf-8")) as PersistedRunState;
+          const record = JSON.parse(_readFileSync(path, "utf-8"));
+          const state = records.preview(path, record);
           fileStateCache.set(path, { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino, state });
           if (!byRunId.has(state.runId)) byRunId.set(state.runId, state);
         } catch {
@@ -511,23 +562,57 @@ export function createRunPersistence(
     const excess = terminal.length - maxTerminalRunsOnDisk;
     if (excess <= 0) return;
     for (const run of terminal.slice(0, excess)) {
-      deleteRunFiles(run.runId);
+      try {
+        mutate(run.runId, () => {
+          if (
+            [primaryLockPath(run.runId), legacyLockPath(run.runId)].some((path) => {
+              const lock = readLockAt(path);
+              return lock && pidIsAlive(lock.pid);
+            })
+          )
+            return;
+          const fresh = records.peek(primaryRunPath(run.runId)) ?? records.peek(legacyRunPath(run.runId));
+          if (fresh && TERMINAL_RUN_STATUSES.has(fresh.status) && !fresh.pendingDelivery) deleteRunFiles(run.runId);
+        });
+      } catch {
+        // Contended or unreadable records remain available for the next pass.
+      }
     }
     invalidateListCache();
   };
 
   const deleteRunFiles = (runId: string): boolean => {
     let deleted = false;
+    const unlinkData = (path: string): boolean => {
+      try {
+        _unlinkSync(path);
+        return true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+        throw error;
+      }
+    };
     for (const path of candidateRunPaths(runId)) {
       // Delete every readable recovery candidate before releasing either lock:
       // a foreign resume that acquires between those operations must never find
       // a surviving primary, backup, or legacy record to resurrect.
-      for (const sidecar of [`${path}.bak`, `${path}.tmp`]) {
-        unlinkIfExistsSafe(fs, sidecar);
+      for (const sidecar of [`${path}.bak`, `${path}.tmp`, records.logPath(path)]) {
+        unlinkData(sidecar);
         fileStateCache.delete(sidecar);
       }
-      if (unlinkIfExistsSafe(fs, path)) deleted = true;
+      if (unlinkData(path)) deleted = true;
       fileStateCache.delete(path);
+      records.forget(path);
+    }
+    for (const dir of [runsDir, legacyRunsDir]) {
+      if (!_existsSync(dir)) continue;
+      for (const name of fs.readdirSync(dir)) {
+        if (
+          name.startsWith(`${runId}.json.result-`) ||
+          (name.startsWith(`${runId}.json.write-lock.`) && (name.endsWith(".owner") || name.includes(".reap-")))
+        )
+          unlinkData(join(dir, name));
+      }
     }
     // Locks come LAST, after both primary and legacy data/recovery candidates
     // have been removed. deleteRun() deliberately holds its acquired lease
@@ -541,6 +626,24 @@ export function createRunPersistence(
   };
 
   return {
+    exportResult(runId, result) {
+      return mutate(runId, () => {
+        if (!candidateRunPaths(runId).some((path) => _existsSync(path)))
+          throw new Error("Run disappeared before result export");
+        const json = JSON.stringify({ runId, result }, null, 2);
+        const hash = createHash("sha256").update(json).digest("hex");
+        const path = `${primaryRunPath(runId)}.result-${hash}`;
+        if (_existsSync(path)) return path;
+        const temporary = `${path}.${randomUUID()}.tmp`;
+        try {
+          _writeFileSync(temporary, json, { flush: true });
+          fs.renameSync(temporary, path);
+        } finally {
+          unlinkIfExistsSafe(fs, temporary);
+        }
+        return path;
+      });
+    },
     save(state: PersistedRunState) {
       ensureDir();
       state.updatedAt = new Date().toISOString();
@@ -548,7 +651,7 @@ export function createRunPersistence(
       // Atomic write: a crash mid-write can't corrupt the live file (tmp+rename is
       // atomic on the same filesystem). A .bak from the previous good save is the
       // recovery fallback if the primary is somehow truncated.
-      writeJsonAtomicWithBackup(fs, path, state);
+      mutate(state.runId, () => records.save(path, state));
       invalidateListCache();
       // Only a terminal write can grow the terminal-run count, so only check
       // the cap then — a "running"/"paused" save is on the hot path (every
@@ -556,10 +659,42 @@ export function createRunPersistence(
       if (TERMINAL_RUN_STATUSES.has(state.status)) enforceRetention();
     },
 
+    loadPreview(runId) {
+      for (const path of candidateRunPaths(runId)) {
+        const record = records.peek(path);
+        if (record) return record;
+      }
+      return null;
+    },
+
+    recoverInterrupted(runId) {
+      return mutate(runId, () => {
+        for (const path of candidateRunPaths(runId)) {
+          if (_existsSync(path) || _existsSync(`${path}.bak`)) return records.recoverInterrupted(path);
+        }
+        return false;
+      });
+    },
+
+    updateMetadata(runId, patch, expectedDeliveryId) {
+      return mutate(runId, () => {
+        for (const path of candidateRunPaths(runId)) {
+          if (_existsSync(path) || _existsSync(`${path}.bak`))
+            return records.updateMetadata(path, patch, expectedDeliveryId);
+        }
+        return false;
+      });
+    },
+
     load(runId: string): PersistedRunState | null {
       // Try the primary, then the .bak — so a corrupt primary doesn't lose the run.
       for (const path of candidateRunPaths(runId)) {
-        const state = readJsonWithBackupRecovery<PersistedRunState>(fs, path);
+        let state: PersistedRunState | null;
+        try {
+          state = records.read(path);
+        } catch {
+          return null;
+        }
         if (state) return state;
       }
       return null;
@@ -573,15 +708,24 @@ export function createRunPersistence(
       if (listCache && now - listCacheAt < LIST_CACHE_TTL_MS) {
         return [...listCache];
       }
+      // Cooperative writers replace heads atomically, changing the directory
+      // stamp. Reconcile in-place external edits at most every five seconds.
+      const stamp = directoryVersion();
+      if (listCache && stamp === directoryStamp && now - reconciledAt < 5000) {
+        listCacheAt = now;
+        return [...listCache];
+      }
       const result = computeList();
       listCache = result;
       listCacheAt = now;
+      reconciledAt = now;
+      directoryStamp = stamp;
       return [...result];
     },
 
     delete(runId: string): boolean {
       try {
-        return deleteRunFiles(runId);
+        return mutate(runId, () => deleteRunFiles(runId));
       } finally {
         invalidateListCache();
       }

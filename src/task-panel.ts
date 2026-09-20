@@ -22,6 +22,7 @@ import {
   type WorkflowSnapshot,
 } from "./display.js";
 import type { PendingDeliveryMarker, PersistedRunState } from "./run-persistence.js";
+import { runSummary } from "./run-record-store.js";
 import type { ManagedRun, WorkflowManager } from "./workflow-manager.js";
 import type { WorkflowStorage } from "./workflow-saved.js";
 import type { WorkflowSettings } from "./workflow-settings.js";
@@ -123,9 +124,12 @@ export function deliverText(run: ManagedRun, opts: { resultPath?: string; maxCha
 
 /** Absolute path to a run's persisted result JSON. Undefined if the persistence
  *  layer can't be resolved — delivery must never throw in the complete handler. */
-function persistedResultPath(manager: WorkflowManager, runId: string): string | undefined {
+function persistedResultPath(manager: WorkflowManager, runId: string, result?: unknown): string | undefined {
   try {
-    return join(manager.getPersistence().getRunsDir(), `${runId}.json`);
+    const persistence = manager.getPersistence();
+    return persistence.exportResult
+      ? persistence.exportResult(runId, result)
+      : join(persistence.getRunsDir(), `${runId}.json`);
   } catch {
     return undefined;
   }
@@ -705,12 +709,19 @@ function clearRunPending(
 
     const persistence = manager.getPersistence?.();
     if (persistence) {
-      const state = persistence.load(runId);
-      if (!state) throw new Error("persisted run disappeared before delivery ACK");
-      if (state.pendingDelivery?.deliveryId && state.pendingDelivery.deliveryId !== deliveryId) return "stale";
-      if (state.pendingDelivery) {
-        const { pendingDelivery: _drop, ...rest } = state;
-        persistence.save(rest as PersistedRunState);
+      if (persistence.updateMetadata) {
+        if (!persistence.updateMetadata(runId, { pendingDelivery: undefined }, deliveryId)) {
+          if (!persistence.loadPreview?.(runId)) throw new Error("persisted run disappeared before delivery ACK");
+          return "stale";
+        }
+      } else {
+        const state = persistence.load(runId);
+        if (!state) throw new Error("persisted run disappeared before delivery ACK");
+        if (state.pendingDelivery?.deliveryId && state.pendingDelivery.deliveryId !== deliveryId) return "stale";
+        if (state.pendingDelivery) {
+          const { pendingDelivery: _drop, ...rest } = state;
+          persistence.save(rest as PersistedRunState);
+        }
       }
     }
     if (live) live.pendingDelivery = undefined;
@@ -732,6 +743,8 @@ function persistRunPending(manager: WorkflowManager, run: ManagedRun): boolean {
     // minimal marker-bearing record; the subsequent manager write overwrites.
     const persistence = manager.getPersistence?.();
     if (!persistence) return true;
+    if (persistence.updateMetadata?.(run.runId, { pendingDelivery: run.pendingDelivery, sessionId: run.sessionId }))
+      return true;
     const existing = persistence.load(run.runId);
     if (existing) {
       persistence.save({ ...existing, pendingDelivery: run.pendingDelivery, sessionId: run.sessionId });
@@ -777,7 +790,7 @@ function contentForPending(
   // complete — recompute from live run or disk so we never store the body twice
   if (run) {
     return deliverText(run, {
-      resultPath: persistedResultPath(manager, runId),
+      resultPath: persistedResultPath(manager, runId, run.result?.result),
       maxChars: deliveredMaxChars({ loadSettings }),
     });
   }
@@ -793,7 +806,7 @@ function contentForPending(
         },
       } as ManagedRun,
       {
-        resultPath: persistedResultPath(manager, runId),
+        resultPath: persistedResultPath(manager, runId, persisted.result),
         maxChars: deliveredMaxChars({ loadSettings }),
       },
     );
@@ -992,9 +1005,11 @@ function deliverAndAck(
     .finally(() => {
       releaseDelivery(runId, token);
       const liveRun = manager.getRun?.(runId);
+      const persistence = manager.getPersistence?.();
       const owner = liveRun
         ? resolveDeliverySessionId(liveRun, manager)
-        : (manager.getPersistence?.().load(runId)?.sessionId ?? sessionId);
+        : ((persistence?.loadPreview ? persistence.loadPreview(runId) : persistence?.load(runId))?.sessionId ??
+          sessionId);
       const current = owner ? sessionEndpoints.get(owner) : undefined;
       // A rebind may have tried to flush while this send still owned the lock.
       // Hand off after either settlement, including a successful stale ACK.
@@ -1178,8 +1193,13 @@ function flushSessionDiskPending(manager: WorkflowManager, sessionId: string, en
       if (run) run.pendingDelivery = identified;
       try {
         const persistence = manager.getPersistence?.();
-        const state = persisted ?? persistence?.load(runId);
-        if (persistence && state) persistence.save({ ...state, pendingDelivery: identified });
+        if (persistence?.updateMetadata) {
+          if (!persistence.updateMetadata(runId, { pendingDelivery: identified }))
+            throw new Error("persisted run disappeared before delivery");
+        } else {
+          const state = persisted ?? persistence?.load(runId);
+          if (persistence && state) persistence.save({ ...state, pendingDelivery: identified });
+        }
       } catch {
         warnDelivery(sessionId, `Workflow ${runId}: delivery deferred because its marker could not be saved.`);
         return;
@@ -1285,7 +1305,12 @@ export function installResultDelivery(
       (status: WorkflowLifecycleEvent["status"]) =>
       ({ runId }: { runId: string }) => {
         const run = manager.getRun(runId);
-        const persisted = run ? undefined : manager.getPersistence().load(runId);
+        const persistence = manager.getPersistence();
+        const persisted = run
+          ? undefined
+          : persistence.loadPreview
+            ? persistence.loadPreview(runId)
+            : persistence.load(runId);
         const lifecycle = run?.background
           ? { name: run.snapshot.name, sessionId: resolveDeliverySessionId(run, manager) }
           : persisted
@@ -1371,7 +1396,7 @@ export function installResultDelivery(
     const sessionId = resolveDeliverySessionId(run, manager);
     const endpoint = sessionId ? sessionEndpoints.get(sessionId) : undefined;
     const content = deliverText(run, {
-      resultPath: persistedResultPath(manager, runId),
+      resultPath: persistedResultPath(manager, runId, run.result?.result),
       maxChars: deliveredMaxChars({
         loadSettings: endpoint?.loadSettings ?? m.__deliveryLoadSettings,
       }),
@@ -1480,11 +1505,12 @@ export function renderPanel(manager: WorkflowManager, theme: Theme, width?: numb
   if (!active.length && !pending.length) return [];
   const rows = active.map((r) => {
     const live = manager.getRun(r.runId);
-    const agents = live?.snapshot.agents ?? r.agents;
-    const done = agents.filter((a) => a.status === "done").length;
+    const summary = runSummary(r);
+    const agents = live?.snapshot.agents;
+    const done = agents ? agents.filter((a) => a.status === "done").length : summary.done;
     const icon = r.status === "paused" ? "⏸" : "◆";
     const phase = live?.snapshot.currentPhase ? ` · ${live.snapshot.currentPhase}` : "";
-    return `  ${icon} ${r.workflowName}  ${done}/${agents.length} agents${phase}`;
+    return `  ${icon} ${r.workflowName}  ${done}/${agents?.length ?? summary.total} agents${phase}`;
   });
   const pendingRows = pending.map((r) => `  ⏳ ${r.workflowName}  ${r.status}, result delivery pending`);
   // Finished runs leave this live panel but are kept in the navigator. Tell the
@@ -1643,19 +1669,20 @@ export function renderPanelDetailed(
   for (const r of active) {
     const live = manager.getRun(r.runId);
     const snap = live?.snapshot;
-    const agents = (snap?.agents ?? r.agents) as WorkflowAgentSnapshot[];
-    const done = agents.filter((a) => a.status === "done").length;
+    const summary = runSummary(r);
+    const agents = (snap?.agents ?? []) as WorkflowAgentSnapshot[];
+    const done = snap ? agents.filter((a) => a.status === "done").length : summary.done;
     const icon = r.status === "paused" ? "⏸" : "◆";
     const usage = snap?.tokenUsage ?? r.tokenUsage;
     // Per-agent figures stream while agents run, so aggregate them for the same
     // fresh+cacheRead sum the header displays. A flat rate now indicates a real
     // lull rather than merely waiting for a long-running agent to return. Paused
     // runs do not accrue tokens, so their rate is suppressed.
-    const runUsage = aggregateAgentUsage(agents);
+    const runUsage = snap ? aggregateAgentUsage(agents) : summary.usage;
     sampleTokens(r.runId, runUsage.fresh + runUsage.cacheRead, now, runUsage.estimated);
     const rate = r.status === "running" ? tokensPerSecond(r.runId) : 0;
     const meta = [
-      `${done}/${agents.length} agents`,
+      `${done}/${snap ? agents.length : summary.total} agents`,
       snap?.currentPhase || "",
       fmtTokenSegment(runUsage, fmtTokensShort),
       // (cost is only known once the run finalizes its usage.)

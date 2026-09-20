@@ -14,6 +14,7 @@ import {
 } from "./display.js";
 import { type EffortState, effortDirective } from "./effort-command.js";
 import type { PersistedRunState } from "./run-persistence.js";
+import { runSummary } from "./run-record-store.js";
 import { registerSavedWorkflow } from "./saved-commands.js";
 import { buildForcedWorkflowPrompt, WORKFLOW_TOOL_NAME } from "./workflow-editor.js";
 import type { WorkflowManager } from "./workflow-manager.js";
@@ -36,8 +37,7 @@ const RUN_USAGE = "Usage: /workflows run <prompt> — force a dynamic workflow f
 
 function summarizeRun(run: PersistedRunState): string {
   const icon = STATUS_ICON[run.status] ?? "?";
-  const done = run.agents.filter((a) => a.status === "done").length;
-  const total = run.agents.length;
+  const { done, total } = runSummary(run);
   const segment = fmtTokenSegment(tokenFigures(run.tokenUsage), fmtFull);
   const tokens = segment ? ` · ${segment}` : "";
   return `${icon} ${run.runId}  ${run.workflowName} [${run.status}] ${done}/${total} agents${tokens}`;

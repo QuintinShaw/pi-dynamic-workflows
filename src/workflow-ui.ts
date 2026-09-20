@@ -27,6 +27,7 @@ import type { AgentUsage } from "./agent.js";
 import type { ThemeLike, WorkflowAgentSnapshot, WorkflowSnapshot } from "./display.js";
 import { aggregateAgentUsage, fmtCost, fmtTokenSegment, tokenFigures } from "./display.js";
 import type { PersistedRunState } from "./run-persistence.js";
+import { runSummary } from "./run-record-store.js";
 import { registerSavedWorkflow, savedWorkflowCommandAvailability } from "./saved-commands.js";
 import type { WorkflowManager } from "./workflow-manager.js";
 import {
@@ -251,7 +252,7 @@ export class NavigatorModel {
   // (audit2 #25): avoid re-stringifying every agent's full result when
   // browsing the same unchanged persisted record in subsequent frames.
   // A fresh disk parse yields a new object, so invalidation is automatic.
-  private rehydratedSnapshots = new WeakMap<PersistedRunState, { snapshot: WorkflowSnapshot; status: string }>();
+  private rehydratedSnapshot?: { record: PersistedRunState; value: { snapshot: WorkflowSnapshot; status: string } };
 
   private snapshot(runId: string): { snapshot: WorkflowSnapshot; status: string } | undefined {
     if (this.frameDepth > 0 && this.frameSnapshots.has(runId)) return this.frameSnapshots.get(runId);
@@ -261,10 +262,10 @@ export class NavigatorModel {
       : (() => {
           const p = this.persistedRuns().find((r) => r.runId === runId);
           if (!p) return undefined;
-          let cached = this.rehydratedSnapshots.get(p);
+          let cached = this.rehydratedSnapshot?.record === p ? this.rehydratedSnapshot.value : undefined;
           if (!cached) {
             cached = { snapshot: persistedToSnapshot(p), status: p.status };
-            this.rehydratedSnapshots.set(p, cached);
+            this.rehydratedSnapshot = { record: p, value: cached };
           }
           return cached;
         })();
@@ -278,7 +279,8 @@ export class NavigatorModel {
       // Array guard (#110): a structurally corrupt persisted run (agents not an
       // array) would otherwise throw "agents is not iterable" here and crash the
       // runs list itself — i.e. /workflows would fail to open at all.
-      const rawAgents = live?.snapshot.agents ?? p.agents;
+      const summary = runSummary(p);
+      const rawAgents = live?.snapshot.agents ?? [];
       const agents = (Array.isArray(rawAgents) ? rawAgents : []) as WorkflowAgentSnapshot[];
       const usage = live?.snapshot.tokenUsage ?? p.tokenUsage;
       // The run-level aggregate is authoritative but only lands when the run
@@ -286,15 +288,15 @@ export class NavigatorModel {
       // tokens, so live runs show a count in the list (agreeing with the phase
       // view) and finished/legacy runs keep the final aggregate.
       const fromUsage = tokenFigures(usage);
-      const fromAgents = aggregateAgentUsage(agents);
+      const fromAgents = live ? aggregateAgentUsage(agents) : summary.usage;
       const figures =
         fromAgents.fresh + fromAgents.cacheRead > fromUsage.fresh + fromUsage.cacheRead ? fromAgents : fromUsage;
       return {
         runId: p.runId,
         name: asText(live?.snapshot.name ?? p.workflowName),
         status: live?.status ?? p.status,
-        done: agents.filter((a) => a.status === "done").length,
-        total: agents.length,
+        done: live ? agents.filter((a) => a.status === "done").length : summary.done,
+        total: live ? agents.length : summary.total,
         fresh: figures.fresh,
         cacheRead: figures.cacheRead,
         estimated: figures.estimated,

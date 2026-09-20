@@ -33,6 +33,7 @@ import {
   terminalRunInterruptCause,
   VALID_PERSISTED_AGENT_STATUSES,
 } from "./run-persistence.js";
+import { runSummary } from "./run-record-store.js";
 import {
   cloneDurableJsonValue,
   type JournalEntry,
@@ -588,7 +589,9 @@ export class WorkflowManager extends EventEmitter {
         if (this.runs.has(state.runId)) continue;
         if (state.sessionId === sessionId) continue;
         if (prev == null || state.sessionId !== prev) continue;
-        this.persistence.save({ ...state, sessionId });
+        if (this.persistence.updateMetadata) {
+          if (!this.persistence.updateMetadata(state.runId, { sessionId })) continue;
+        } else this.persistence.save({ ...state, sessionId });
         adopted++;
       }
     } catch {
@@ -608,18 +611,23 @@ export class WorkflowManager extends EventEmitter {
       for (const p of this.listAllRuns()) {
         if (this.runs.has(p.runId)) continue;
         const staleRunning = p.status === "running";
-        const pausedWithGhostAgents =
-          p.status === "paused" && p.agents.some((agent) => agentHasNonTerminalStatus(agent.status));
+        const pausedWithGhostAgents = p.status === "paused" && runSummary(p).active > 0;
         if (!staleRunning && !pausedWithGhostAgents) continue;
         const lease = this.persistence.acquireRunLease(p.runId);
         if (!lease) continue;
         try {
+          if (this.persistence.recoverInterrupted) {
+            this.persistence.recoverInterrupted(p.runId);
+            continue;
+          }
+          const fresh = this.persistence.load(p.runId);
+          if (!fresh || (fresh.status !== "running" && fresh.status !== "paused")) continue;
           const endedAt = new Date().toISOString();
           this.persistence.save({
-            ...p,
+            ...fresh,
             status: "paused",
             updatedAt: endedAt,
-            agents: settleInterruptedPersistedAgents(p.agents, INTERRUPTED_AGENT_CAUSE, endedAt),
+            agents: settleInterruptedPersistedAgents(fresh.agents, INTERRUPTED_AGENT_CAUSE, endedAt),
           });
         } finally {
           this.persistence.releaseRunLease(lease);
@@ -1505,8 +1513,8 @@ export class WorkflowManager extends EventEmitter {
    * Coalesce rapid progress persists (currently: onAgentJournal, which fires
    * once per completed agent and can burst under concurrency) to at most one
    * disk write per PERSIST_THROTTLE_MS (trailing edge) instead of one write
-   * per tick — persistRun() does a full JSON.stringify of the run plus up to
-   * 3 sync writes, so firing it once per agent in a long run is O(N^2).
+   * per tick. Delta persistence still compares the current state and performs
+   * synchronous log/head writes, so concurrent completions should share work.
    *
    * Lifecycle-critical writes (status transitions, run end, pause/resume/stop)
    * must NOT use this — call persistRun() directly, which flushes (and cancels)
@@ -2381,10 +2389,12 @@ export class WorkflowManager extends EventEmitter {
     const lease = this.persistence.acquireRunLease(runId);
     if (!lease) return;
     try {
-      const current = this.persistence.load(runId);
+      const current = this.persistence.loadPreview ? this.persistence.loadPreview(runId) : this.persistence.load(runId);
       if (!current) return;
       if ((current.autoResumeAttempts ?? 0) !== attempts) {
-        this.persistence.save({ ...current, autoResumeAttempts: attempts });
+        if (this.persistence.updateMetadata) {
+          if (!this.persistence.updateMetadata(runId, { autoResumeAttempts: attempts })) return;
+        } else this.persistence.save({ ...current, autoResumeAttempts: attempts });
       }
       // A local entry without a lease is only a cache. Once the lease-guarded
       // merge succeeds, bring that cache up to date without making it an
