@@ -6629,3 +6629,38 @@ return { a, nested }`;
     assert.equal(persisted?.phaseBudgets?.[`${runId}-nested1:childphase`]?.budget, 50);
   }),
 );
+
+test(
+  'deleteRun emits "deleted" so watchers can tear down (audit2 #34)',
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent({}) });
+    manager.on("error", () => {});
+    const script = `export const meta = { name: 'del_emit', description: 'del emit' }
+return await agent('x')`;
+    const { runId, promise } = manager.startInBackground(script);
+    await promise;
+    const events: string[] = [];
+    manager.on("deleted", ({ runId: id }: { runId: string }) => events.push(id));
+    assert.equal(manager.deleteRun(runId), true);
+    assert.deepEqual(events, [runId], "deleteRun notifies watchers");
+    assert.equal(manager.getPersistence().load(runId), null);
+  }),
+);
+
+test(
+  'deleteRun emits "deleted" for an in-memory run whose file vanished out-of-band (audit2 #34 r2)',
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent({}) });
+    manager.on("error", () => {});
+    const script = `export const meta = { name: 'del_oob', description: 'del oob' }
+return await agent('x')`;
+    const { runId, promise } = manager.startInBackground(script);
+    await promise;
+    // Out-of-band deletion: the file is gone before deleteRun runs.
+    manager.getPersistence().delete(runId);
+    const events: string[] = [];
+    manager.on("deleted", ({ runId: id }: { runId: string }) => events.push(id));
+    assert.equal(manager.deleteRun(runId), false, "nothing left to delete on disk");
+    assert.deepEqual(events, [runId], "watchers still get the lifecycle fact");
+  }),
+);

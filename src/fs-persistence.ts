@@ -95,6 +95,51 @@ function writeJsonAtomic(fs: PersistenceFsLayer, path: string, data: unknown, st
 }
 
 /**
+ * Atomic write that preserves the file's PREVIOUS content as `.bak`
+ * (version-history semantics, not crash-mirror semantics): an accidental
+ * same-name overwrite leaves the prior version recoverable instead of
+ * destroying it with zero remaining bytes (audit2 #36). Recovery via
+ * readJsonWithBackupRecovery() then yields the previous version when the new
+ * primary is unreadable — strictly better than an unrecoverable loss.
+ *
+ * The previous content is only used when it READS and PARSES: a corrupt
+ * primary must not poison the backup (a later corruption would then lose
+ * everything), and an unreadable primary must not fail the save (tmp+rename
+ * needs no read permission) — in both cases the existing `.bak` is preserved
+ * if it still parses, else replaced with the new content.
+ */
+export function writeJsonAtomicPreservingPreviousBackup(fs: PersistenceFsLayer, path: string, data: unknown): void {
+  let previous: string | undefined;
+  try {
+    if (fs.existsSync(path)) {
+      const raw = fs.readFileSync(path, "utf8");
+      JSON.parse(raw); // validate — corrupt bytes are not a recoverable version
+      previous = raw;
+    }
+  } catch {
+    previous = undefined; // preserve the existing .bak instead of copying garbage
+  }
+  const json = JSON.stringify(data, null, 2);
+  fs.writeFileSync(`${path}.tmp`, json);
+  fs.renameSync(`${path}.tmp`, path);
+  if (previous === undefined && fs.existsSync(`${path}.bak`)) {
+    // Keep the existing backup only when it still parses — a corrupt .bak is
+    // not a recovery source, and the new content is strictly better (r2 NIT).
+    try {
+      JSON.parse(fs.readFileSync(`${path}.bak`, "utf8"));
+      return; // keep the last good backup
+    } catch {
+      // fall through and mirror the new content
+    }
+  }
+  try {
+    fs.writeFileSync(`${path}.bak`, previous ?? json);
+  } catch {
+    // Backup is best-effort; the primary write already succeeded.
+  }
+}
+
+/**
  * Read JSON from `path`, falling back to `path.bak` if the primary is
  * missing or fails to parse. Returns null if neither candidate parses.
  */
