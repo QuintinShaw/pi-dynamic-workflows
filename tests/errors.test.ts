@@ -19,6 +19,7 @@ describe("classifyProviderLimit", () => {
       "Error 429: too many requests",
       "rate limit exceeded",
       "GoUsageLimitError",
+      "You're out of extra usage. Add more at claude.ai/settings/usage and keep going.",
     ];
     for (const text of cases) {
       assert.equal(classifyProviderLimit(text).matched, true, `should match: ${text}`);

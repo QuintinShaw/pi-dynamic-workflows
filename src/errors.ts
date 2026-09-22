@@ -156,7 +156,7 @@ export function isProviderUsageLimit(error: unknown): error is WorkflowError {
 export function classifyProviderLimit(text: string | undefined): { matched: boolean; resetHint?: string } {
   if (!text) return { matched: false };
   const matched =
-    /usage limit|limit reached|insufficient[_\s]?quota|quota exceeded|exceeded your current quota|out of budget|available balance|\bquota\b|rate.?limit|too many requests|\b429\b|GoUsageLimitError|FreeUsageLimitError|\bbilling\b/i.test(
+    /usage limit|limit reached|insufficient[_\s]?quota|quota exceeded|exceeded your current quota|out of budget|out of (?:extra )?usage|available balance|\bquota\b|rate.?limit|too many requests|\b429\b|GoUsageLimitError|FreeUsageLimitError|\bbilling\b/i.test(
       text,
     );
   if (!matched) return { matched: false };
