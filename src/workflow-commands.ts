@@ -241,7 +241,8 @@ export function registerWorkflowCommands(
           }
           const live = manager.getSnapshot(id);
           if (live) {
-            await print(renderWorkflowText(recomputeWorkflowSnapshot(live), false));
+            const completed = manager.getRun(id)?.status === "completed";
+            await print(renderWorkflowText(recomputeWorkflowSnapshot(live), completed));
             return;
           }
           const run = manager.listRuns().find((r) => r.runId === id);

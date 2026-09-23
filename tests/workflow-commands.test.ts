@@ -205,6 +205,29 @@ test("/workflows status <id> renders a persisted run", async () => {
   assert.match(h.printed[0], /scan files/);
 });
 
+test("/workflows status <id> labels a completed live snapshot as completed", async () => {
+  const snapshot = {
+    name: "audit",
+    phases: ["Scan"],
+    currentPhase: "Scan",
+    logs: [],
+    agents: [{ id: 1, label: "scan files", status: "done", prompt: "x" }],
+    agentCount: 1,
+    runningCount: 0,
+    doneCount: 1,
+    errorCount: 0,
+  };
+  const h = harness({
+    getRun: () => ({ runId: "run-7", status: "completed", snapshot }),
+    getSnapshot: () => snapshot,
+  });
+
+  await h.run("status run-7");
+
+  assert.match(h.printed[0], /Workflow completed/);
+  assert.doesNotMatch(h.printed[0], /Workflow running/);
+});
+
 test("/workflows status without id warns", async () => {
   const h = harness();
   await h.run("status");
