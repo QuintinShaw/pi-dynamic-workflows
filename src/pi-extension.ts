@@ -32,6 +32,7 @@ import { loadWorkflowSettings, saveWorkflowSettingsForCwd } from "./workflow-set
 import { createWorkflowTool } from "./workflow-tool.js";
 import { registerWorkflowModelsCommand } from "./workflows-models-command.js";
 
+export { installHostCreateAgentSession } from "./agent.js";
 export { installHostSessionCapture } from "./task-panel.js";
 
 /**

@@ -21,8 +21,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createFauxCore, fauxAssistantMessage } from "@earendil-works/pi-ai";
-import { ModelRegistry, ModelRuntime } from "@earendil-works/pi-coding-agent";
-import { runtimeOf, WorkflowAgent } from "../src/agent.js";
+import { createAgentSession, ModelRegistry, ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { installHostCreateAgentSession, runtimeOf, WorkflowAgent } from "../src/agent.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
 test("runtimeOf reaches the ModelRuntime behind pi's real ModelRegistry facade (pi-internals contract)", async () => {
@@ -50,6 +50,11 @@ test("runtimeOf degrades to undefined (no throw) on a registry without a runtime
 test("a shared host ModelRegistry routes subagents to extension-registered providers (no session override)", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-dw-routing-home-"));
   const cwd = mkdtempSync(join(tmpdir(), "pi-dw-routing-cwd-"));
+  let hostFactoryCalls = 0;
+  installHostCreateAgentSession((options) => {
+    hostFactoryCalls++;
+    return createAgentSession(options);
+  });
   const core = createFauxCore({
     provider: "fauxtest",
     models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 4096 }],
@@ -86,8 +91,10 @@ test("a shared host ModelRegistry routes subagents to extension-registered provi
         typeof text === "string" && text.includes("routed-through-extension-provider"),
         `subagent did not stream through the extension-registered provider (got: ${String(text).slice(0, 120)})`,
       );
+      assert.equal(hostFactoryCalls, 1, "subagent creation must use the factory installed by the host SDK");
     });
   } finally {
+    installHostCreateAgentSession(createAgentSession);
     rmSync(home, { recursive: true, force: true });
     rmSync(cwd, { recursive: true, force: true });
   }

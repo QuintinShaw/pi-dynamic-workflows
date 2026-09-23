@@ -52,6 +52,14 @@ import { createStructuredOutputTool, type StructuredOutputCapture } from "./stru
 
 const LIVE_USAGE_EMIT_INTERVAL_MS = 250;
 
+type AgentSessionFactory = typeof createAgentSession;
+let agentSessionFactory: AgentSessionFactory = createAgentSession;
+
+/** Use the host Pi SDK to create children so its ModelRuntime protocol matches. */
+export function installHostCreateAgentSession(factory: AgentSessionFactory): void {
+  agentSessionFactory = factory;
+}
+
 /**
  * Find a JSON object/array in free-form text: a fenced ```json block if present,
  * else the first balanced {...} or [...]. Best-effort (the schema check is the
@@ -1260,7 +1268,7 @@ export class WorkflowAgent {
     const modelRuntime = runtimeOf(modelRegistry) as ModelRuntime | undefined;
     let session: Awaited<ReturnType<typeof createAgentSession>>["session"];
     try {
-      ({ session } = await createAgentSession({
+      ({ session } = await agentSessionFactory({
         cwd: runCwd,
         agentDir,
         sessionManager,
