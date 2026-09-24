@@ -1601,6 +1601,24 @@ test(
 );
 
 test(
+  "cold completed runs retain long agent reports when the script returns null",
+  withTempCwd(async (cwd) => {
+    const expected = `${"report paragraph\n".repeat(500)}END_OF_FULL_REPORT`;
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent({}, expected) });
+    const result =
+      await manager.runSync(`export const meta = { name: 'long_report', description: 'full report retention' }
+await agent('report', { label: 'report' });
+return null;`);
+    const cold = new WorkflowManager({ cwd });
+    const persisted = cold.getPersistence().load(result.runId);
+    assert.equal(persisted?.result, null);
+    assert.equal(persisted?.agents[0]?.result, expected);
+    assert.ok((persisted?.agents[0]?.resultPreview?.length ?? 0) < expected.length);
+    assert.equal(new NavigatorModel(cold).agentDetail(result.runId, 1)?.result, expected);
+  }),
+);
+
+test(
   "cold persisted resumable runs restore full agent results from the journal",
   withTempCwd(async (cwd) => {
     const expected = {

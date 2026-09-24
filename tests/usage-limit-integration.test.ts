@@ -23,13 +23,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createFauxCore, fauxAssistantMessage } from "@earendil-works/pi-ai";
-import { ModelRuntime } from "@earendil-works/pi-coding-agent";
-import { WorkflowAgent } from "../src/agent.js";
+import { createAgentSession, ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
+import { installHostCreateAgentSession, WorkflowAgent } from "../src/agent.js";
 import { WorkflowErrorCode } from "../src/errors.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
 const USAGE_LIMIT_MSG = "Codex usage limit reached (plus plan). Resets in ~3h.";
+const UPSTREAM_ERROR_MSG = "402 Insufficient account funds";
 
 /**
  * Run `fn` with an isolated HOME and a scripted faux provider registered on a
@@ -113,6 +115,76 @@ test("a successful real turn whose text merely mentions 'rate limit' is NOT misc
     const agent = new WorkflowAgent({ cwd, session: { model: model as never, modelRuntime } });
     const text = await agent.run("do the task", { label: "ok" });
     assert.ok(typeof text === "string" && text.includes("Done."), `expected normal text, got ${String(text)}`);
+  }));
+
+for (const schema of [undefined, Type.Object({ word: Type.String() })]) {
+  test(`a terminal upstream error preserves its message (${schema ? "schema" : "text"})`, () =>
+    withFauxSession(async ({ cwd, model, modelRuntime, setResponses, fauxAssistantMessage }) => {
+      setResponses([fauxAssistantMessage("partial output", { stopReason: "error", errorMessage: UPSTREAM_ERROR_MSG })]);
+      const agent = new WorkflowAgent({ cwd, session: { model: model as never, modelRuntime } });
+      await assert.rejects(agent.run("do the task", { label: "upstream", schema }), {
+        code: WorkflowErrorCode.AGENT_EXECUTION_ERROR,
+        message: UPSTREAM_ERROR_MSG,
+        recoverable: true,
+        agentLabel: "upstream",
+      });
+    }));
+}
+
+test("a real schema repair preserves upstream errors instead of extracting stale prose", () =>
+  withFauxSession(async ({ cwd, model, modelRuntime, setResponses, fauxAssistantMessage }) => {
+    setResponses([
+      fauxAssistantMessage('{"word":"stale"}', { stopReason: "stop" }),
+      fauxAssistantMessage("", { stopReason: "error", errorMessage: UPSTREAM_ERROR_MSG }),
+    ]);
+    const agent = new WorkflowAgent({ cwd, session: { model: model as never, modelRuntime } });
+    await assert.rejects(agent.run("do the task", { schema: Type.Object({ word: Type.String() }) }), {
+      code: WorkflowErrorCode.AGENT_EXECUTION_ERROR,
+      message: UPSTREAM_ERROR_MSG,
+    });
+  }));
+
+test("historical assistant errors do not leak into an empty current turn or schema repair", () =>
+  withFauxSession(async ({ cwd, model, modelRuntime, fauxAssistantMessage }) => {
+    installHostCreateAgentSession(async (options) => {
+      const created = await createAgentSession(options);
+      created.session.messages.push(
+        fauxAssistantMessage("", { stopReason: "error", errorMessage: "historical provider failure" }),
+      );
+      created.session.prompt = async () => {};
+      return created;
+    });
+    try {
+      const agent = new WorkflowAgent({ cwd, session: { model: model as never, modelRuntime } });
+      await assert.rejects(agent.run("empty turn"), { code: WorkflowErrorCode.AGENT_EMPTY_OUTPUT });
+      for (const maxSchemaRetries of [0, 1]) {
+        await assert.rejects(
+          agent.run("empty schema turn", { schema: Type.Object({ word: Type.String() }), maxSchemaRetries }),
+          { code: WorkflowErrorCode.SCHEMA_NONCOMPLIANCE },
+        );
+      }
+    } finally {
+      installHostCreateAgentSession(createAgentSession);
+    }
+  }));
+
+test("the manager persists the original upstream error in the run log", () =>
+  withFauxSession(async ({ cwd, model, modelRuntime, setResponses, fauxAssistantMessage }) => {
+    setResponses([fauxAssistantMessage("", { stopReason: "error", errorMessage: UPSTREAM_ERROR_MSG })]);
+    const manager = new WorkflowManager({
+      cwd,
+      agent: new WorkflowAgent({ cwd, session: { model: model as never, modelRuntime } }),
+    });
+    manager.on("error", () => {});
+    const { runId, promise } = manager.startInBackground(
+      `export const meta = { name: 'upstream_error', description: 'preserve upstream failures' }; return await agent('task', { retries: 0 });`,
+    );
+    await promise.catch(() => {});
+    const persisted = manager.getPersistence().load(runId);
+    assert.equal(persisted?.agents[0]?.status, "error");
+    assert.equal(persisted?.agents[0]?.errorCode, WorkflowErrorCode.AGENT_EXECUTION_ERROR);
+    assert.ok(persisted?.logs.some((line) => line.includes(UPSTREAM_ERROR_MSG)));
+    assert.ok(!persisted?.logs.some((line) => line.includes("AGENT_EMPTY_OUTPUT")));
   }));
 
 test("through the manager: a usage limit pauses the run (not fails) and resume replays the journal", () =>
