@@ -137,7 +137,19 @@ export function throwIfProviderLimit(messages: unknown[], label?: string): void 
   );
 }
 
-/** Minimal session surface resolveStructuredOutput needs (real session or a test double). */
+/** Preserve terminal provider errors instead of treating their missing text as empty output. */
+function throwIfAssistantError(messages: unknown[], label?: string): void {
+  throwIfProviderLimit(messages, label);
+  const err = lastAssistantError(messages);
+  if (err?.stopReason !== "error") return;
+  throw new WorkflowError(
+    err.errorMessage || "Provider ended the assistant turn with an error",
+    WorkflowErrorCode.AGENT_EXECUTION_ERROR,
+    { recoverable: true, agentLabel: label },
+  );
+}
+
+/** Minimal session surface for schema repair; messages must contain only the current turn and its repairs. */
 export interface StructuredSession {
   prompt(text: string): Promise<void>;
   setActiveToolsByName?(names: string[]): void;
@@ -173,6 +185,7 @@ export async function resolveStructuredOutput<T>(
     await session.prompt(
       "You did not call the structured_output tool. Call structured_output now as your only action, with the required fields filled in. Do not write a prose answer.",
     );
+    throwIfAssistantError(session.messages, options.label);
   }
   if (capture.called) return capture.value as T;
 
@@ -184,9 +197,8 @@ export async function resolveStructuredOutput<T>(
     return extracted;
   }
 
-  // A repair re-prompt can itself hit the provider limit. Surface that as the real
-  // (recoverable) cause instead of the misleading non-recoverable SCHEMA_NONCOMPLIANCE.
-  throwIfProviderLimit(session.messages, options.label);
+  // Also preserve terminal errors when no repair attempts were requested.
+  throwIfAssistantError(session.messages, options.label);
 
   throw new WorkflowError(
     "Subagent did not produce valid structured_output after repair attempts",
@@ -1443,15 +1455,22 @@ export class WorkflowAgent {
 
       if (options.signal?.aborted) throw new Error("Subagent was aborted");
 
-      // The SDK buries a provider usage/quota limit in the assistant message rather
-      // than throwing; detect it here (before the schema/empty-text branches) so it
-      // is classified as a recoverable checkpoint, not a SCHEMA_NONCOMPLIANCE failure
-      // (schema path) or a silent empty-output null (non-schema path).
-      throwIfProviderLimit(session.messages, options.label);
+      // The SDK can report provider failures in a terminal assistant message
+      // without rejecting prompt(). Inspect only this turn so restored history
+      // cannot turn a genuinely empty response into an old provider failure.
+      throwIfAssistantError(turnMessages, options.label);
 
       if (options.schema) {
-        const result = (await resolveStructuredOutput(session, capture, options.schema, options, () =>
-          this.lastAssistantText(turnMessages),
+        const result = (await resolveStructuredOutput(
+          {
+            prompt: (text) => session.prompt(text),
+            setActiveToolsByName: (names) => session.setActiveToolsByName(names),
+            messages: turnMessages,
+          },
+          capture,
+          options.schema,
+          options,
+          (messages) => this.lastAssistantText(messages),
         )) as AgentRunResult<TSchemaDef>;
         threadTurnSucceeded = true;
         return result;
