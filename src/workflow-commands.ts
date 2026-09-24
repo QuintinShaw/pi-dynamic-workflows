@@ -87,7 +87,7 @@ function watchRun(manager: WorkflowManager, pi: ExtensionAPI, ctx: ExtensionComm
       if (run) {
         pi.sendMessage({
           customType: "workflows",
-          content: renderWorkflowText(recomputeWorkflowSnapshot(run.snapshot), true),
+          content: renderWorkflowText(recomputeWorkflowSnapshot(run.snapshot), run.status),
           display: true,
         });
       }
@@ -241,7 +241,8 @@ export function registerWorkflowCommands(
           }
           const live = manager.getSnapshot(id);
           if (live) {
-            await print(renderWorkflowText(recomputeWorkflowSnapshot(live), false));
+            const status = manager.getRun(id)?.status ?? "running";
+            await print(renderWorkflowText(recomputeWorkflowSnapshot(live), status));
             return;
           }
           const run = manager.listRuns().find((r) => r.runId === id);
