@@ -333,7 +333,6 @@ interface StealCandidate {
 function hostSessionIdToSteal(session: StealCandidate, probe?: boolean): string | undefined {
   const sm = session.sessionManager;
   if (!sm) return undefined;
-  if (session._resourceLoader?.noExtensions === true) return undefined;
   try {
     const name = sm.getSessionName?.();
     if (typeof name === "string" && name.startsWith("workflow:")) return undefined;
@@ -342,16 +341,13 @@ function hostSessionIdToSteal(session: StealCandidate, probe?: boolean): string 
   }
   if (typeof session.sendCustomMessage !== "function") return undefined;
   const sid = sm.getSessionId?.();
-  // PROBE EXCEPTION: the probe bypasses ONLY this persistence gate; the
-  // sessionManager presence, noExtensions, and workflow:-name gates above
-  // still apply. Justification: unnamed in-memory workflow children are
-  // excluded by noExtensions/isPersisted at the bindCore hook (probe=false),
-  // and a probe is only ever sent through the pi.sendMessage of the session
-  // running this extension — it cannot reach a foreign or child session. omp
-  // print-mode hosts report isSessionOnDisk()===false at session_start
-  // (persisted lazily after bind), so the gate must not reject a probe-bearing
-  // send (#109).
+  // A probe is sent only through the pi.sendMessage of the session running
+  // this extension, so it cannot reach a foreign or child session. Bypass the
+  // noExtensions flag because hosts started with `--no-extensions -e <path>`
+  // still load this extension explicitly. Also bypass persistence because omp
+  // print-mode hosts persist lazily after session_start (#109).
   if (!probe) {
+    if (session._resourceLoader?.noExtensions === true) return undefined;
     try {
       if (typeof sm.isPersisted === "function") {
         if (!sm.isPersisted()) return undefined;
