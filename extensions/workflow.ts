@@ -3,6 +3,7 @@
 // fall through the host's prefix aliases as invalid file-system paths.
 const host = await import("@earendil-works/pi-coding-agent");
 const extension = await import("../dist/pi-extension.js");
+extension.installHostCreateAgentSession(host.createAgentSession);
 extension.installHostSessionCapture(host.AgentSession);
 export const sessionFileCwd = extension.sessionFileCwd;
 export default extension.default;
