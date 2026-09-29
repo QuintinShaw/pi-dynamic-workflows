@@ -2262,6 +2262,43 @@ describe("installResultDelivery", () => {
     assert.ok(piCalls(pi)[0].content.includes("delivered"));
   });
 
+  it("explicit-extension host: probe captures when automatic discovery is disabled", async () => {
+    const pi = createMockPi();
+    const manager = createMockManager(
+      makeRun({
+        sessionId: "sess-explicit",
+        runId: "run-explicit",
+        result: { result: { verdict: "delivered" }, agentCount: 1, durationMs: 1 },
+      }),
+    );
+    let probeCalls = 0;
+    (pi as unknown as { sendMessage: (m: unknown, o: unknown) => void }).sendMessage = () => {
+      probeCalls++;
+      invokePatchedSendCustomMessage(
+        {
+          sessionManager: {
+            getSessionId: () => "sess-explicit",
+            getSessionName: () => "host-explicit",
+            isSessionOnDisk: () => true,
+          },
+          _resourceLoader: { noExtensions: true },
+          sendCustomMessage: recordingStableSend(pi),
+        },
+        { customType: mod.DELIVERY_PROBE_CUSTOM_TYPE, content: "", display: false },
+      );
+    };
+
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    manager.setSessionId("sess-explicit");
+    mod.bindSessionDelivery("sess-explicit", pi as unknown as ExtensionAPI, { manager });
+    manager.emit("complete", { runId: "run-explicit" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    assert.equal(probeCalls, 1, "probe attempted");
+    assert.equal(piCalls(pi).length, 1, "explicitly loaded host receives its result");
+    assert.ok(piCalls(pi)[0].content.includes("delivered"));
+  });
+
   it("omp print-mode host: probe captures despite isSessionOnDisk false at session_start", async () => {
     const pi = createMockPi();
     const manager = createMockManager(
