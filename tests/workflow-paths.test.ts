@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, join, normalize } from "node:path";
 import { describe, it } from "node:test";
 import {
@@ -25,6 +25,28 @@ function withIsolatedHome(fn: (home: string, cwd: string) => void): void {
 }
 
 describe("workflow paths", () => {
+  for (const [label, agentDir, expected] of [
+    ["unset", undefined, join(homedir(), ".pi", "workflows")],
+    ["empty", "", join(homedir(), ".pi", "workflows")],
+    ["absolute", join(tmpdir(), "pi profile"), join(tmpdir(), "pi profile", "workflows")],
+    ["tilde", "~/custom-pi", join(homedir(), "custom-pi", "workflows")],
+    ["bare tilde", "~", join(homedir(), "workflows")],
+    ["relative", "custom-pi", join("custom-pi", "workflows")],
+  ] as const) {
+    it(`resolves PI_CODING_AGENT_DIR when ${label}`, (t) => {
+      const previous = process.env.PI_CODING_AGENT_DIR;
+      t.after(() => {
+        if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+        else process.env.PI_CODING_AGENT_DIR = previous;
+      });
+      if (agentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = agentDir;
+
+      assert.equal(workflowHomeDir(), expected);
+      assert.equal(workflowUserSavedDir(), join(expected, "saved"));
+    });
+  }
+
   it("resolves workflow home under the user home", () => {
     withIsolatedHome((home) => {
       assert.equal(workflowHomeDir(), join(home, WORKFLOW_HOME_RELATIVE_DIR));

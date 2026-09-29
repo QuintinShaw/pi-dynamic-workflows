@@ -91,7 +91,7 @@ export interface WorkflowSettingsOptions {
   scope?: "global" | "project";
 }
 
-/** Path to the user-level workflow settings JSON file (~/.pi/workflows/settings.json). */
+/** Path to the user-level workflow settings JSON file under the active workflow home. */
 export function getWorkflowSettingsPath(): string {
   return join(workflowHomeDir(), "settings.json");
 }
@@ -115,7 +115,7 @@ export function getProjectLocalWorkflowSettingsPath(cwd: string): string {
  * Load settings from disk. Missing, corrupt, or invalid files resolve to {}.
  * Precedence when a cwd is provided (later wins): global user settings, then
  * the project-local in-repo file (`<cwd>/.pi/workflows/settings.json`), then
- * the per-project override under `~/.pi/workflows/projects/<key>/` — so a
+ * the per-project override under the workflow home's `projects/<key>/` — so a
  * repo can ship defaults while a user's own project override still wins.
  */
 export function loadWorkflowSettings(settingsPathOrOptions?: string | WorkflowSettingsOptions): WorkflowSettings {

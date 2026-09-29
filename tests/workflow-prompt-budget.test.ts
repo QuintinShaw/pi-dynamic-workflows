@@ -104,11 +104,10 @@ async function withRenderedWorkflow(
   }) => Promise<void>,
 ): Promise<void> {
   const root = await mkdtemp(join(tmpdir(), "workflow-prompt-budget-"));
-  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
 
   try {
-    process.env.PI_CODING_AGENT_DIR = root;
     await withFakeHomeAsync(root, async () => {
+      process.env.PI_CODING_AGENT_DIR = root;
       const workflow = createWorkflowTool({ cwd: root });
       const loader = new DefaultResourceLoader({
         cwd: root,
@@ -144,8 +143,6 @@ async function withRenderedWorkflow(
       }
     });
   } finally {
-    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
-    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
     await rm(root, { recursive: true, force: true });
   }
 }

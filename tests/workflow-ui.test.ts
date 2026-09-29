@@ -839,6 +839,8 @@ test("renderNavigator shows saved detail view", () => {
   assert.match(text, /analyze/);
   assert.match(text, /Analyze deps/);
   assert.match(text, /Location:/);
+  assert.match(text, /Path:/);
+  assert.ok(text.includes("/y"));
   assert.match(text, /Script:/);
   assert.match(text, /Saved at:/);
   assert.match(text, /PgUp\/PgDn page/);

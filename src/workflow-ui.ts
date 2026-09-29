@@ -1571,7 +1571,8 @@ function renderNavigatorFrame(
     if (w) {
       const body: string[] = [];
       if (w.description) body.push(dim("Description: ") + asText(w.description));
-      body.push(dim("Location: ") + (w.location === "user" ? "user (~/.pi)" : "project (.pi)"));
+      body.push(dim("Location: ") + w.location);
+      body.push(dim("Path: ") + asText(w.path));
       body.push(dim("Saved at: ") + asText(w.savedAt));
       if (w.parameters) body.push(dim("Parameters: ") + JSON.stringify(w.parameters));
       body.push("", theme.fg("accent", theme.bold("Script:")));

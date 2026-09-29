@@ -14,11 +14,9 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { listAvailableModels } from "./agent.js";
-import { MODEL_TIERS_FILE } from "./config.js";
-import { workflowProjectPaths } from "./workflow-paths.js";
+import { workflowHomeDir, workflowProjectPaths } from "./workflow-paths.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -63,9 +61,9 @@ export interface RankableModel {
 // Configuration path
 // ---------------------------------------------------------------------------
 
-/** Path to the model tiers JSON config file (~/.pi/workflows/model-tiers.json). */
+/** Path to the model tiers JSON config file under the active workflow home. */
 export function getModelTierConfigPath(): string {
-  return join(homedir(), MODEL_TIERS_FILE);
+  return join(workflowHomeDir(), "model-tiers.json");
 }
 
 /** Path to this project's optional model-tiers overlay. */
@@ -275,8 +273,8 @@ function normalizeLoadOptions(configPathOrOptions?: string | ModelTierConfigOpti
  *
  * A string path (or `{ configPath }` without a project) reads that single
  * file — the historical global-only behavior.
- * `{ cwd }` overlays `~/.pi/workflows/projects/<key>/model-tiers.json` on the
- * global file; project keys win. Missing project file = global-only.
+ * `{ cwd }` overlays `projects/<key>/model-tiers.json` from the workflow home
+ * on the global file; project keys win. Missing project file = global-only.
  */
 export function loadModelTierConfig(configPathOrOptions?: string | ModelTierConfigOptions): ModelTierConfig | null {
   const options = normalizeLoadOptions(configPathOrOptions);

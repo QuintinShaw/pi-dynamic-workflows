@@ -222,6 +222,8 @@ The [full documentation](https://quintinshaw.github.io/pi-dynamic-workflows/) co
 <details>
 <summary><strong>Model tiers and run controls</strong></summary>
 
+Settings and model-tier paths below show the default workflow home; see [active workflow home](#active-workflow-home) for custom Pi profiles.
+
 Model tiers live at `~/.pi/workflows/model-tiers.json`. A project file at `~/.pi/workflows/projects/<project>/model-tiers.json` overlays the global map (project keys win). They accept Pi CLI-style thinking suffixes:
 
 ```json
@@ -252,15 +254,25 @@ Programmatic hosts can set `drainAbortGraceMs` on `runWorkflow` or manager execu
 
 </details>
 
+<a name="active-workflow-home"></a>
+
 <details>
 <summary><strong>Storage, resume, and persisted sessions</strong></summary>
 
-Extension state lives outside the repository under `~/.pi/workflows`:
+Extension state lives outside the repository under `~/.pi/workflows` by default:
 
 - global settings and tiers: `~/.pi/workflows/settings.json` and `model-tiers.json`
 - project runs, journals, locks, saved overrides, and optional tier overlay: `~/.pi/workflows/projects/<project>/`
 - older project-local `.pi/workflows/runs` and `.pi/workflows/saved` remain readable as fallbacks
 - repo-local `<cwd>/.pi/workflows/settings.json` is also read for shared defaults, between global settings and the existing external project override `~/.pi/workflows/projects/<project>/settings.json`. This path is relative to the supplied project cwd; it does not search parent directories. Missing, corrupt, or invalid files are ignored. Saving settings still targets global or external project settings, not the repo-local file.
+
+To use a custom Pi configuration directory, export Pi's `PI_CODING_AGENT_DIR` before starting Pi (for example, in `~/.bashrc`):
+
+```bash
+export PI_CODING_AGENT_DIR="$HOME/.config/pi"
+```
+
+When this variable is non-empty, the `~/.pi/workflows` paths documented here use `$PI_CODING_AGENT_DIR/workflows` instead, including settings, model tiers, saved workflows, and project run state. The directory is resolved by Pi's `getAgentDir()`, including `~` expansion. An unset or empty variable keeps the existing default. To keep existing workflow state after changing the directory, copy the contents of `~/.pi/workflows` into the new `workflows/` directory before restarting Pi; files are not moved automatically. Repo-local `.pi` paths remain unchanged, following Pi's separate project configuration convention.
 
 Subagents are in-memory by default. Set `persistAgentSessions: true` to retain full transcripts in Pi's standard session directory, with one file per unthreaded call or named thread. Persisted child session headers link back to the originating host session through `parentSession` when the parent has a persisted file. Workflow run JSON records the original parent session ID/file and each call's child session ID/file; those links and historical call timestamps survive journal replay on resume. Delivery may move to a replacement host session without rewriting the original parent lineage. In-memory children still have session IDs, but no session files for reconstructing historical per-message usage. Persisted transcripts may store sensitive material that an agent read, so enable them deliberately.
 
@@ -279,7 +291,7 @@ Finished runs (completed, failed, or aborted) are retained in full on disk, capp
 <details>
 <summary><strong>Keyword trigger</strong></summary>
 
-Set a literal, case-insensitive custom trigger in `~/.pi/workflows/settings.json`:
+Set a literal, case-insensitive custom trigger in `~/.pi/workflows/settings.json` (see [active workflow home](#active-workflow-home) for custom Pi profiles):
 
 ```json
 {

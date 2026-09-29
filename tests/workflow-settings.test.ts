@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, normalize, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { describe, it } from "node:test";
 import { WORKFLOW_SETTINGS_FILE } from "../src/config.js";
 import {
@@ -25,7 +25,11 @@ function withSettingsPath(fn: (settingsPath: string) => void): void {
 
 describe("workflow settings", () => {
   it("resolves the user-level settings path", () => {
-    assert.ok(getWorkflowSettingsPath().endsWith(normalize(WORKFLOW_SETTINGS_FILE)));
+    withSettingsPath((settingsPath) => {
+      withFakeHome(dirname(settingsPath), () => {
+        assert.equal(getWorkflowSettingsPath(), join(dirname(settingsPath), WORKFLOW_SETTINGS_FILE));
+      });
+    });
   });
 
   it("returns empty settings when the file is missing", () => {

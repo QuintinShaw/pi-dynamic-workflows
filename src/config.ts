@@ -23,13 +23,13 @@ export const WORKFLOW_RUNS_DIR = ".pi/workflows/runs";
 /** Legacy project-relative directory for saved workflow commands. New writes use workflowProjectPaths(). */
 export const WORKFLOW_SAVED_DIR = ".pi/workflows/saved";
 
-/** User-level saved workflows directory. */
+/** Default user-level saved workflows directory. Use workflowUserSavedDir() for the active path. */
 export const USER_WORKFLOW_SAVED_DIR = "~/.pi/workflows/saved";
 
-/** User-level model tiers config file, relative to the home directory. */
+/** Default user-level model tiers file, relative to home. Use getModelTierConfigPath() for the active path. */
 export const MODEL_TIERS_FILE = ".pi/workflows/model-tiers.json";
 
-/** User-level workflow extension settings file, relative to the home directory. */
+/** Project-relative settings file; also the default user-level file relative to home. */
 export const WORKFLOW_SETTINGS_FILE = ".pi/workflows/settings.json";
 
 /** Default keyword that arms workflows mode from interactive input. */
