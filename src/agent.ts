@@ -54,10 +54,16 @@ const LIVE_USAGE_EMIT_INTERVAL_MS = 250;
 
 type AgentSessionFactory = typeof createAgentSession;
 let agentSessionFactory: AgentSessionFactory = createAgentSession;
+const localSessionDependencies = { SessionManager, SettingsManager, DefaultResourceLoader };
+let sessionDependencies = localSessionDependencies;
 
 /** Use the host Pi SDK to create children so its ModelRuntime protocol matches. */
-export function installHostCreateAgentSession(factory: AgentSessionFactory): void {
+export function installHostCreateAgentSession(
+  factory: AgentSessionFactory,
+  dependencies = localSessionDependencies,
+): void {
   agentSessionFactory = factory;
+  sessionDependencies = dependencies;
 }
 
 /**
@@ -889,7 +895,8 @@ export class WorkflowAgent {
   private buildSharedResourceLoader(agentDir: string, cwd: string, key: string): Promise<DefaultResourceLoader> {
     const shared = this.providerMiddlewareExtensions.length === 0;
     const pending = (async () => {
-      const settingsManager = this.sessionOptions.settingsManager ?? SettingsManager.create(cwd, agentDir);
+      const settingsManager =
+        this.sessionOptions.settingsManager ?? sessionDependencies.SettingsManager.create(cwd, agentDir);
       let middlewarePaths: string[] = [];
       const packageSources = new Map<string, string>();
       if (this.providerMiddlewareExtensions.length > 0) {
@@ -905,7 +912,7 @@ export class WorkflowAgent {
           })
           .map((extension) => extension.path);
       }
-      const loader = new DefaultResourceLoader({
+      const loader = new sessionDependencies.DefaultResourceLoader({
         cwd,
         agentDir,
         settingsManager,
@@ -1021,10 +1028,10 @@ export class WorkflowAgent {
 
     let manager: SessionManager;
     if (!this.persistAgentSessions) {
-      manager = SessionManager.inMemory();
+      manager = sessionDependencies.SessionManager.inMemory();
     } else {
       try {
-        manager = SessionManager.create(this.cwd);
+        manager = sessionDependencies.SessionManager.create(this.cwd);
         // SessionManager.create() starts a fresh session without lineage. Reset
         // it before createAgentSession() so the child header records the host
         // session, while retaining the default behavior for ephemeral parents.
@@ -1039,7 +1046,7 @@ export class WorkflowAgent {
             error instanceof Error ? error.message : String(error)
           }); continuing with an in-memory session`,
         );
-        manager = SessionManager.inMemory();
+        manager = sessionDependencies.SessionManager.inMemory();
       }
     }
     return manager;
@@ -1276,7 +1283,7 @@ export class WorkflowAgent {
         // SettingsManager.inMemory() doesn't load ~/.pi/settings.json, so subagents
         // would fall back to the first available model (e.g. openai-codex) which may
         // not have valid auth, causing silent empty responses.
-        settingsManager: SettingsManager.create(runCwd, agentDir),
+        settingsManager: sessionDependencies.SettingsManager.create(runCwd, agentDir),
         customTools,
         // Shared per-run loader with opt-in provider middleware (#109) — see
         // getSharedResourceLoader. An injected resourceLoader (tests / embedders)

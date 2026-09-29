@@ -21,7 +21,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createFauxCore, fauxAssistantMessage } from "@earendil-works/pi-ai";
-import { createAgentSession, ModelRegistry, ModelRuntime } from "@earendil-works/pi-coding-agent";
+import {
+  createAgentSession,
+  DefaultResourceLoader,
+  ModelRegistry,
+  ModelRuntime,
+  SessionManager,
+  SettingsManager,
+} from "@earendil-works/pi-coding-agent";
 import { installHostCreateAgentSession, runtimeOf, WorkflowAgent } from "../src/agent.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
@@ -51,10 +58,47 @@ test("a shared host ModelRegistry routes subagents to extension-registered provi
   const home = mkdtempSync(join(tmpdir(), "pi-dw-routing-home-"));
   const cwd = mkdtempSync(join(tmpdir(), "pi-dw-routing-cwd-"));
   let hostFactoryCalls = 0;
+  const hostManagers = new WeakSet<object>();
+  const hostSettings = new WeakSet<object>();
+  const hostLoaders = new WeakSet<object>();
+  const dependencies = {
+    SessionManager: new Proxy(SessionManager, {
+      get(target, property, receiver) {
+        if (property === "inMemory" || property === "create")
+          return (...args: unknown[]) => {
+            const manager = Reflect.apply(Reflect.get(target, property), target, args);
+            hostManagers.add(manager);
+            return manager;
+          };
+        return Reflect.get(target, property, receiver);
+      },
+    }),
+    SettingsManager: new Proxy(SettingsManager, {
+      get(target, property, receiver) {
+        if (property === "create")
+          return (...args: unknown[]) => {
+            const settings = Reflect.apply(target.create, target, args);
+            hostSettings.add(settings);
+            return settings;
+          };
+        return Reflect.get(target, property, receiver);
+      },
+    }),
+    DefaultResourceLoader: new Proxy(DefaultResourceLoader, {
+      construct(target, args) {
+        const loader = Reflect.construct(target, args);
+        hostLoaders.add(loader);
+        return loader;
+      },
+    }),
+  };
   installHostCreateAgentSession((options) => {
     hostFactoryCalls++;
+    assert.ok(options?.sessionManager && hostManagers.has(options.sessionManager));
+    assert.ok(options?.settingsManager && hostSettings.has(options.settingsManager));
+    assert.ok(options?.resourceLoader && hostLoaders.has(options.resourceLoader));
     return createAgentSession(options);
-  });
+  }, dependencies);
   const core = createFauxCore({
     provider: "fauxtest",
     models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 4096 }],
@@ -92,6 +136,10 @@ test("a shared host ModelRegistry routes subagents to extension-registered provi
         `subagent did not stream through the extension-registered provider (got: ${String(text).slice(0, 120)})`,
       );
       assert.equal(hostFactoryCalls, 1, "subagent creation must use the factory installed by the host SDK");
+      core.setResponses([fauxAssistantMessage("persisted-host-session", { stopReason: "stop" })]);
+      const persisted = new WorkflowAgent({ cwd, modelRegistry: registry, persistAgentSessions: true });
+      assert.equal(await persisted.run("persisted task", { model: "fauxtest/faux-model" }), "persisted-host-session");
+      assert.equal(hostFactoryCalls, 2, "persisted sessions use the same host dependencies");
     });
   } finally {
     installHostCreateAgentSession(createAgentSession);
