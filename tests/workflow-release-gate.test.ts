@@ -29,7 +29,7 @@ test("the published Pi extension forwards the host SDK to the compiled payload",
   assert.ok(publishableFiles().includes("dist/pi-extension.js"));
   const source = readFileSync(new URL(`../${extensionPath}`, import.meta.url), "utf8");
   assert.match(source, /import\("\.\.\/dist\/pi-extension\.js"\)/);
-  assert.match(source, /installHostCreateAgentSession\(host\.createAgentSession\)/);
+  assert.match(source, /installHostCreateAgentSession\(host\.createAgentSession, host\)/);
 });
 
 test("normal tests and publishing share the model-free release gate", () => {
