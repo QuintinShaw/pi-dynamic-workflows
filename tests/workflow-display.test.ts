@@ -84,6 +84,15 @@ describe("renderWorkflowText", () => {
     assert.ok(text.includes("completed"), "should say completed");
   });
 
+  it("renders an explicit run status in the header", async () => {
+    const { createWorkflowSnapshot, renderWorkflowText } = await loadDisplay();
+    const snapshot = createWorkflowSnapshot(fakeMeta());
+    for (const status of ["completed", "failed", "aborted", "paused"] as const) {
+      const text = renderWorkflowText(snapshot, status);
+      assert.match(text, new RegExp(`^Workflow ${status}\\n`));
+    }
+  });
+
   it("includes workflow name in output", async () => {
     const { createWorkflowSnapshot, renderWorkflowText } = await loadDisplay();
     const text = renderWorkflowText(createWorkflowSnapshot(fakeMeta("audit-all")));

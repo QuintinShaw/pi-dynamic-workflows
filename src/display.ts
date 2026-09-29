@@ -2,6 +2,7 @@ import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import type { AgentUsage } from "./agent.js";
 import type { AgentHistoryEntry } from "./agent-history.js";
 import type { WorkflowErrorCode } from "./errors.js";
+import type { RunStatus } from "./run-persistence.js";
 import type { WorkflowMeta } from "./workflow.js";
 
 export type WorkflowAgentStatus = "queued" | "running" | "done" | "error" | "skipped";
@@ -420,8 +421,13 @@ export function renderWorkflowLines(
   return lines;
 }
 
-export function renderWorkflowText(snapshot: WorkflowSnapshot, completed = false): string {
-  const header = completed ? "Workflow completed" : "Workflow running";
+export function renderWorkflowText(snapshot: WorkflowSnapshot, completedOrStatus: boolean | RunStatus = false): string {
+  const header =
+    typeof completedOrStatus === "string"
+      ? `Workflow ${completedOrStatus}`
+      : completedOrStatus
+        ? "Workflow completed"
+        : "Workflow running";
   return [header, ...renderWorkflowLines(snapshot)].join("\n");
 }
 

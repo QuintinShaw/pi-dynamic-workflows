@@ -205,6 +205,31 @@ test("/workflows status <id> renders a persisted run", async () => {
   assert.match(h.printed[0], /scan files/);
 });
 
+for (const status of ["completed", "failed", "aborted", "paused"] as const) {
+  test(`/workflows status <id> labels a retained live snapshot as ${status}`, async () => {
+    const snapshot = {
+      name: "audit",
+      phases: ["Scan"],
+      currentPhase: "Scan",
+      logs: [],
+      agents: [{ id: 1, label: "scan files", status: "done", prompt: "x" }],
+      agentCount: 1,
+      runningCount: 0,
+      doneCount: 1,
+      errorCount: 0,
+    };
+    const h = harness({
+      getRun: () => ({ runId: "run-7", status, snapshot }),
+      getSnapshot: () => snapshot,
+    });
+
+    await h.run("status run-7");
+
+    assert.match(h.printed[0], new RegExp(`^Workflow ${status}\\n`));
+    assert.doesNotMatch(h.printed[0], /Workflow running/);
+  });
+}
+
 test("/workflows status without id warns", async () => {
   const h = harness();
   await h.run("status");
@@ -268,6 +293,52 @@ test("/workflows status watches a running run: live status bar + prints on compl
   assert.equal(printed.length, 1, "prints final snapshot on completion");
   assert.ok(statusLine.includes(undefined), "clears the status line");
 });
+
+for (const [status, event] of [
+  ["completed", "complete"],
+  ["failed", "error"],
+  ["aborted", "stopped"],
+  ["paused", "paused"],
+] as const) {
+  test(`/workflows watch prints the final ${status} status`, async () => {
+    const snapshot = {
+      name: "demo",
+      phases: ["Run"],
+      currentPhase: "Run",
+      logs: [],
+      agents: [{ id: 1, label: "a", status: "running", prompt: "x" }],
+      agentCount: 1,
+      runningCount: 1,
+      doneCount: 0,
+      errorCount: 0,
+    };
+    const manager: any = new EventEmitter();
+    let currentStatus: string = "running";
+    manager.getRun = (id: string) =>
+      id === "run-watch" ? { runId: "run-watch", status: currentStatus, snapshot } : undefined;
+    manager.getSnapshot = () => null;
+    manager.listRuns = () => [];
+
+    const printed: string[] = [];
+    let handler: ((a: string, c: any) => Promise<void>) | undefined;
+    const pi: any = {
+      getCommands: () => [],
+      registerCommand: (_n: string, o: any) => {
+        handler = o.handler;
+      },
+      sendMessage: async (m: any) => printed.push(m.content),
+    };
+    registerWorkflowCommands(pi as unknown as ExtensionAPI, manager as unknown as WorkflowManager);
+    const ctx = { ui: { notify: () => {}, setStatus: () => {} } };
+
+    assert.ok(handler, "handler should exist");
+    await handler("watch run-watch", ctx);
+    currentStatus = status;
+    manager.emit(event, { runId: "run-watch" });
+
+    assert.match(printed[0], new RegExp(`^Workflow ${status}\\n`));
+  });
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // pause — calls manager.pause, shows notify
