@@ -27,6 +27,7 @@ import { registerWorkflowCommands } from "./workflow-commands.js";
 import { createWorkflowControlTool } from "./workflow-control-tool.js";
 import { installWorkflowKeywordArming } from "./workflow-editor.js";
 import { WorkflowManager } from "./workflow-manager.js";
+import { installWorkflowProgress } from "./workflow-progress.js";
 import { createWorkflowStorage, type WorkflowStorage } from "./workflow-saved.js";
 import { loadWorkflowSettings, saveWorkflowSettingsForCwd } from "./workflow-settings.js";
 import { createWorkflowTool } from "./workflow-tool.js";
@@ -179,6 +180,7 @@ export default function extension(pi: ExtensionAPI) {
   pi.registerTool(workflowControlTool);
 
   let usageLimitScheduler = new UsageLimitScheduler(manager);
+  let disposeProgress: ReturnType<typeof installWorkflowProgress> | undefined;
 
   pi.on("session_shutdown", (event?: { reason?: string; targetSessionFile?: string }) => {
     usageLimitScheduler.dispose();
@@ -198,42 +200,23 @@ export default function extension(pi: ExtensionAPI) {
       effort,
     };
 
-    if (reason && SESSION_REPLACEMENT_REASONS.has(reason)) {
-      // Destination checks differ by reason:
-      // - resume: fail-closed. Only hand off when the target session header
-      //   positively reads as this same project. Missing/corrupt/unreadable
-      //   headers must not smuggle a source-project manager across.
-      // - fork: Pi forks stay in the same project; the new session file may
-      //   not exist yet so a missing header is not a cross-project signal.
-      //   Only refuse when we positively read a different cwd.
-      // - reload/new: same project; always hand off.
-      if (reason === "resume") {
-        const targetCwd = sessionFileCwd(event?.targetSessionFile);
-        if (targetCwd !== cwd) {
-          pauseStrandedWorkflowRuntime(runtime);
-          discardWorkflowRuntime(cwd, runtime);
-          dropSessionDelivery(outgoingSessionId);
-          return;
-        }
-        handoffWorkflowRuntime(runtime);
-        return;
-      }
-      if (reason === "fork") {
-        const targetCwd = sessionFileCwd(event?.targetSessionFile);
-        if (targetCwd && targetCwd !== cwd) {
-          pauseStrandedWorkflowRuntime(runtime);
-          discardWorkflowRuntime(cwd, runtime);
-          dropSessionDelivery(outgoingSessionId);
-          return;
-        }
-        handoffWorkflowRuntime(runtime);
-        return;
-      }
+    let canHandoff = !!reason && SESSION_REPLACEMENT_REASONS.has(reason);
+    if (reason === "resume" || reason === "fork") {
+      const targetCwd = sessionFileCwd(event?.targetSessionFile);
+      // Resume requires a same-project header. A fork's new file may not yet
+      // exist; only a positively different project prevents its handoff.
+      canHandoff = reason === "resume" ? targetCwd === cwd : !targetCwd || targetCwd === cwd;
+    }
+    if (canHandoff) {
+      disposeProgress?.("handoff");
+      disposeProgress = undefined;
       handoffWorkflowRuntime(runtime);
       return;
     }
 
     pauseStrandedWorkflowRuntime(runtime);
+    disposeProgress?.("shutdown");
+    disposeProgress = undefined;
     discardWorkflowRuntime(cwd, runtime);
     dropSessionDelivery(outgoingSessionId);
   });
@@ -255,6 +238,8 @@ export default function extension(pi: ExtensionAPI) {
   let armingInstalled = false;
 
   pi.on("session_start", (_event: unknown, ctx: ExtensionContext) => {
+    disposeProgress?.();
+    disposeProgress = undefined;
     // True project cwd for this session. Pi keeps process.cwd() on the
     // launching directory across /resume into another project; ctx.cwd is
     // the session header's project path.
@@ -336,6 +321,9 @@ export default function extension(pi: ExtensionAPI) {
     const previousSessionId = manager.getSessionId();
     manager.adoptLiveRunsToSession(sessionId, previousSessionId);
     manager.setSessionId(sessionId, sessionFile);
+    if (ctx.mode === "rpc" && sessionId) {
+      disposeProgress = installWorkflowProgress(pi, manager, sessionId);
+    }
 
     // Runtime is bound now (session_start fires after bindCore). Register a
     // session-stable delivery endpoint for THIS session only, then flush any

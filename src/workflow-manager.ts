@@ -812,6 +812,7 @@ export class WorkflowManager extends EventEmitter {
     // Persist the initial state immediately so listRuns()/the task panel can see
     // the run the moment it starts, not only after the first agent journals.
     this.persistRun(managed);
+    this.emit("started", { runId: managed.runId });
     const execution = this.executeRun(managed, script, args, exec);
     this.executions.set(managed, execution);
     return execution;
@@ -1134,6 +1135,7 @@ export class WorkflowManager extends EventEmitter {
           // Session identity is available before the first prompt. Flush it so
           // an immediate pause or process failure still leaves the child link.
           this.persistRun(managed);
+          this.emitLive(managed, "agentSession", { runId: managed.runId, agentId: agent.id, ...event });
           progress();
         },
         onAgentEnd: (event) => {

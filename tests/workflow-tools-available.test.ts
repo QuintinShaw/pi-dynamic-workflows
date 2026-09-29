@@ -18,15 +18,18 @@ import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { describe, it, mock } from "node:test";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, SessionManager } from "@earendil-works/pi-coding-agent";
 import {
   claimWorkflowRuntime,
   discardWorkflowRuntime,
   handoffWorkflowRuntime,
   takeWorkflowRuntime,
+  WORKFLOW_EXTENSION_VERSION,
 } from "../src/extension-reload.js";
 import { _registerBoundSessionSendForTests, _resetDeliveryRegistriesForTests } from "../src/task-panel.js";
 import { buildArmedWorkflowPrompt, WORKFLOW_TOOL_NAME, type WorkflowModeState } from "../src/workflow-editor.js";
+import { WorkflowManager } from "../src/workflow-manager.js";
+import type { WorkflowProgress } from "../src/workflow-progress.js";
 import { saveWorkflowSettings } from "../src/workflow-settings.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
@@ -361,6 +364,267 @@ describe("installWorkflowKeywordArming - tool availability", () => {
 });
 
 describe("workflow extension - control tool availability", () => {
+  function progressSession(install: (pi: ExtensionAPI) => void, cwd: string, sessionFile?: string) {
+    let session = sessionFile ? SessionManager.open(sessionFile) : SessionManager.create(cwd, join(cwd, "sessions"));
+    const file = session.getSessionFile();
+    assert.ok(file);
+    if (!sessionFile) {
+      // Open a persisted native session so custom entries are written even
+      // before an assistant turn (a new Pi session normally defers that write).
+      writeFileSync(file, `${JSON.stringify(session.getHeader())}\n`);
+      session = SessionManager.open(file);
+    }
+    const handlers: Record<string, Array<(...args: any[]) => any>> = {};
+    let writable = true;
+    let lateWrites = 0;
+    const pi = {
+      registerTool: () => {},
+      registerCommand: () => {},
+      getCommands: () => [],
+      getActiveTools: () => ["workflow", "workflow_control"],
+      setActiveTools: () => {},
+      sendMessage: () => {},
+      appendEntry: (customType: string, data: unknown) => {
+        if (!writable) {
+          lateWrites++;
+          throw new Error("Session is no longer writable");
+        }
+        session.appendCustomEntry(customType, data);
+      },
+      on: (name: string, handler: (...args: any[]) => any) => {
+        handlers[name] ??= [];
+        handlers[name].push(handler);
+      },
+    } as unknown as ExtensionAPI;
+    install(pi);
+    handlers.session_start[0](
+      {},
+      {
+        cwd,
+        mode: "rpc",
+        modelRegistry: {},
+        sessionManager: session,
+        ui: { setWidget: () => {}, notify: () => {} },
+      },
+    );
+    return {
+      file,
+      id: session.getSessionId(),
+      get lateWrites() {
+        return lateWrites;
+      },
+      shutdown(event?: { reason?: string; targetSessionFile?: string }) {
+        handlers.session_shutdown[0](event);
+        writable = false;
+      },
+      replay() {
+        const runs = new Map<string, WorkflowProgress>();
+        const entries = SessionManager.open(file).getEntries();
+        for (const entry of entries) {
+          if (entry.type !== "custom" || entry.customType !== "pi-dynamic-workflows:progress") continue;
+          const packet = entry.data as WorkflowProgress | { version: 1; runId: string; deleted: true };
+          if ("deleted" in packet) runs.delete(packet.runId);
+          else runs.set(packet.runId, packet);
+        }
+        return runs;
+      },
+    };
+  }
+
+  it("retires outgoing progress before replacement and replays the adopted completion only in its owner", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-dw-progress-handoff-"));
+    try {
+      await withFakeHomeAsync(root, async () => {
+        const { default: installExtension } = await import("../src/pi-extension.js");
+        for (const reason of ["new", "resume", "fork", "reload"] as const) {
+          discardWorkflowRuntime();
+          const cwd = join(root, reason);
+          let release!: (value: string) => void;
+          let started!: () => void;
+          const result = new Promise<string>((resolve) => (release = resolve));
+          const ready = new Promise<void>((resolve) => (started = resolve));
+          const manager = new WorkflowManager({
+            cwd,
+            agent: {
+              async run() {
+                started();
+                return result;
+              },
+            },
+          });
+          handoffWorkflowRuntime({
+            cwd,
+            extensionVersion: WORKFLOW_EXTENSION_VERSION,
+            manager,
+            effort: { level: "off" },
+          });
+          const outgoing = progressSession(installExtension, cwd);
+          const running = manager.startInBackground(
+            'export const meta = { name: "handoff", description: "handoff" }; return await agent("check");',
+          );
+          await ready;
+          assert.equal(outgoing.replay().get(running.runId)?.status, "running");
+          // A valid same-project destination lets resume use its native header probe.
+          const destination = SessionManager.create(cwd, join(cwd, "sessions"));
+          const destinationFile = destination.getSessionFile();
+          assert.ok(destinationFile);
+          writeFileSync(destinationFile, `${JSON.stringify(destination.getHeader())}\n`);
+          outgoing.shutdown({ reason, targetSessionFile: destinationFile });
+          assert.equal(outgoing.replay().has(running.runId), false, "retirement is durable before shutdown returns");
+          assert.equal(manager.getRun(running.runId)?.status, "running", "handoff keeps the execution alive");
+
+          const incoming = progressSession(
+            installExtension,
+            cwd,
+            reason === "reload" ? outgoing.file : destinationFile,
+          );
+          assert.equal(manager.getRun(running.runId)?.sessionId, incoming.id);
+          await Promise.resolve();
+          const adopted = incoming.replay().get(running.runId);
+          assert.equal(adopted?.status, "running");
+          assert.equal(adopted?.agents.length, 1, "the new observer restores the complete child snapshot");
+          assert.equal(adopted?.agents[0].status, "running");
+          release("adopted result");
+          await running.promise;
+          await Promise.resolve();
+          const completed = incoming.replay().get(running.runId);
+          assert.equal(completed?.status, "completed");
+          assert.equal(completed?.doneCount, 1);
+          assert.equal(completed?.resultPreview, "adopted result");
+          if (reason !== "reload") assert.equal(outgoing.replay().size, 0, "original session replay has no stale run");
+          else
+            assert.equal(outgoing.replay().get(running.runId)?.status, "completed", "reload updates the same history");
+          assert.equal(outgoing.lateWrites, 0);
+          incoming.shutdown({ reason: "quit" });
+        }
+      });
+    } finally {
+      discardWorkflowRuntime();
+      _resetDeliveryRegistriesForTests();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("persists paused progress before quit, unknown shutdown, and cross-project replacement return", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-dw-progress-pause-"));
+    try {
+      await withFakeHomeAsync(root, async () => {
+        const { default: installExtension } = await import("../src/pi-extension.js");
+        for (const reason of ["quit", undefined, "resume"] as const) {
+          discardWorkflowRuntime();
+          const cwd = join(root, reason ?? "unknown");
+          let release!: (value: string) => void;
+          let started!: () => void;
+          const result = new Promise<string>((resolve) => (release = resolve));
+          const ready = new Promise<void>((resolve) => (started = resolve));
+          const manager = new WorkflowManager({
+            cwd,
+            agent: {
+              async run() {
+                started();
+                return result;
+              },
+            },
+          });
+          handoffWorkflowRuntime({
+            cwd,
+            extensionVersion: WORKFLOW_EXTENSION_VERSION,
+            manager,
+            effort: { level: "off" },
+          });
+          const outgoing = progressSession(installExtension, cwd);
+          const running = manager.startInBackground(
+            'export const meta = { name: "pause", description: "pause" }; return await agent("check");',
+          );
+          await ready;
+          assert.equal(outgoing.replay().get(running.runId)?.status, "running");
+          const foreign = join(root, "foreign.jsonl");
+          writeFileSync(foreign, `${JSON.stringify({ type: "session", cwd: root })}\n`);
+          outgoing.shutdown(reason ? { reason, targetSessionFile: foreign } : undefined);
+          assert.equal(outgoing.replay().get(running.runId)?.status, "paused", "pause must be durable synchronously");
+          assert.equal(takeWorkflowRuntime(), undefined, "paused runs are not handed off");
+          release("settled after shutdown");
+          await running.promise.catch(() => {});
+          await Promise.resolve();
+          assert.equal(outgoing.replay().get(running.runId)?.status, "paused");
+          assert.equal(outgoing.lateWrites, 0);
+        }
+      });
+    } finally {
+      discardWorkflowRuntime();
+      _resetDeliveryRegistriesForTests();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("publishes progress in RPC sessions and detaches it on replacement", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-dw-rpc-progress-"));
+    try {
+      await withFakeHomeAsync(root, async () => {
+        for (const mode of ["tui", "rpc"] as const) {
+          discardWorkflowRuntime();
+          const cwd = join(root, mode);
+          const manager = new WorkflowManager({ cwd, agent: { run: async () => "verified" } });
+          handoffWorkflowRuntime({
+            cwd,
+            extensionVersion: WORKFLOW_EXTENSION_VERSION,
+            manager,
+            effort: { level: "off" },
+          });
+          const entries: Array<{ customType: string; data: any }> = [];
+          const handlers: Record<string, Array<(...args: any[]) => any>> = {};
+          const pi = {
+            registerTool: () => {},
+            registerCommand: () => {},
+            getCommands: () => [],
+            getActiveTools: () => ["workflow", "workflow_control"],
+            setActiveTools: () => {},
+            sendMessage: () => {},
+            appendEntry: (customType: string, data: unknown) => entries.push({ customType, data }),
+            on: (name: string, handler: (...args: any[]) => any) => {
+              handlers[name] ??= [];
+              handlers[name].push(handler);
+            },
+          } as unknown as ExtensionAPI;
+          const { default: installExtension } = await import("../src/pi-extension.js");
+          installExtension(pi);
+          const context = {
+            cwd,
+            mode,
+            modelRegistry: {},
+            sessionManager: { getSessionId: () => `progress-${mode}` },
+            ui: { setWidget: () => {}, notify: () => {} },
+          };
+          handlers.session_start[0]({}, context);
+          handlers.session_start[0]({}, context);
+          const script = `export const meta = {name: "progress", description: "progress"};
+return await agent("verify", {label: "check"});`;
+          await manager.runSync(script);
+          await Promise.resolve();
+
+          if (mode === "rpc") {
+            const completed = entries.filter((entry) => entry.data.status === "completed");
+            assert.equal(completed.length, 1, "repeated session_start must not duplicate observers");
+            assert.equal(completed[0].customType, "pi-dynamic-workflows:progress");
+            assert.equal(completed[0].data.doneCount, 1);
+          } else {
+            assert.deepEqual(entries, [], "TUI sessions retain their existing progress panel");
+          }
+
+          handlers.session_shutdown[0]({ reason: "reload" });
+          const countAtShutdown = entries.length;
+          await manager.runSync(script);
+          await Promise.resolve();
+          assert.equal(entries.length, countAtShutdown, "the outgoing session must receive no late progress");
+          discardWorkflowRuntime();
+        }
+      });
+    } finally {
+      discardWorkflowRuntime();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("registers both control tools and hands the live runtime across reload", async () => {
     const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-control-extension-"));
     try {
