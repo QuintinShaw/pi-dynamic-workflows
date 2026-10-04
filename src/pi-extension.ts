@@ -27,6 +27,7 @@ import { registerWorkflowCommands } from "./workflow-commands.js";
 import { createWorkflowControlTool } from "./workflow-control-tool.js";
 import { installWorkflowKeywordArming } from "./workflow-editor.js";
 import { WorkflowManager } from "./workflow-manager.js";
+import { renderWorkflowResult } from "./workflow-result-renderer.js";
 import { createWorkflowStorage, type WorkflowStorage } from "./workflow-saved.js";
 import { loadWorkflowSettings, saveWorkflowSettingsForCwd } from "./workflow-settings.js";
 import { createWorkflowTool } from "./workflow-tool.js";
@@ -109,6 +110,8 @@ function buildManagerOptions(cwd: string, storage: WorkflowStorage) {
 }
 
 export default function extension(pi: ExtensionAPI) {
+  pi.registerMessageRenderer?.("workflow-result", renderWorkflowResult);
+
   // Mutable host state. Tools/commands resolve through getters so a
   // session_start that discovers a cross-project cwd can replace the manager
   // without leaving closed-over references pointing at the source project.
