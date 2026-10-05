@@ -198,7 +198,8 @@ Agent details use a compact summary by default: completed agents show their fina
 | `label` / `phase` | Display label and phase override |
 | `timeoutMs` / `retries` | Optional per-agent timeout and recoverable-failure retries |
 
-Host setting / SDK option (not an `agent()` call option): `providerMiddlewareExtensions: string[]` opts child sessions into trusted provider/auth extensions; default `[]`.
+Host setting / SDK option (not an `agent()` call option): `providerMiddlewareExtensions: string[]` opts child sessions into trusted file extensions or supported Pi builtin extensions; default `[]`.
+Builtin entries use `builtin:<name>`; currently only `builtin:codemode` is supported.
 
 `agent()` resolves to plain text unless `schema` is set — a prompt that merely asks the model to "return JSON" does not change that, and reading a field off unparsed text fails silently (`undefined`, not an error), which can make a whole `parallel()` fleet look "successful" while every result is unusable. Parse and validate defensively when a schema isn't set, and flag what doesn't parse instead of dropping it:
 
@@ -242,7 +243,28 @@ Untagged `agent()` calls (no `model`, no `tier`, and no agentType/phase routing)
 
 Omitted `tokenBudget` and `agentTimeoutMs` values use configured `defaultTokenBudget` and `defaultAgentTimeoutMs` settings; without them, runs are unlimited and have no hard per-agent timeout. Add per-run or per-agent values when you need explicit gates. `concurrency` is clamped to 16; `agentRetries` retries only recoverable failures. Programmatic runs can tune the retry pacing via `agentRetryBackoffMs?: (failedAttempt: number) => number` (default `min(250*2^(N-1), 2000)` ms; the retry holds its concurrency slot during the wait). Settings load in order (later wins): global `~/.pi/workflows/settings.json` → repo-local `<cwd>/.pi/workflows/settings.json` → the existing external project override `~/.pi/workflows/projects/<project>/settings.json`. Repo-local defaults can be version-controlled and shared as common repository configuration; external project overrides remain user-specific. `defaultTokenBudget` is a soft pre-call gate, and a project-level override of `null` cancels a global budget.
 
-Child sessions intentionally disable host extensions to avoid per-child factory churn and recursive orchestration. Some providers require extension request/auth hooks in addition to a shared model registry. To opt in, set `"providerMiddlewareExtensions": ["example-provider-adapter"]` in `~/.pi/workflows/settings.json` (also available on `WorkflowAgent`, `runWorkflow`, and `WorkflowManager` SDK options). Omitted or `[]` keeps all host extensions disabled. Names match an extension filename without its JS/TS suffix, an exact npm package identity, or a resolved local/Git package source name, case-insensitively; ancestor directory names do not authorize descendants; only enabled resources are considered, and project resources still require Pi project trust. `pi-dynamic-workflows`, `workflow`, and `pi-subagents` are always excluded, even if allowlisted. Only allow trusted, child-safe middleware: the allowlist enables whole extensions, not a hook-only sandbox, and opted-in factories and runtimes are isolated per child session and receive session_shutdown before disposal. Extension-free resource loaders remain shared. Explicit SDK resource-loader injection remains authoritative and bypasses this discovery filter.
+Child sessions intentionally disable host extensions to avoid per-child factory churn and recursive orchestration.
+Some providers require extension request/auth hooks in addition to a shared model registry.
+To opt in, set `"providerMiddlewareExtensions": ["example-provider-adapter"]` in `~/.pi/workflows/settings.json`, also available on `WorkflowAgent`, `runWorkflow`, and `WorkflowManager` SDK options.
+Omitted or `[]` keeps all host extensions disabled, regardless of parent registration or Pi `defaultTools`.
+File names match an extension filename without its JS/TS suffix, an exact npm package identity, or a resolved local/Git package source name, case-insensitively; ancestor directory names do not authorize descendants; only enabled resources are considered, and project resources still require Pi project trust.
+`pi-dynamic-workflows`, `workflow`, and `pi-subagents` are always excluded, even if allowlisted.
+Only allow trusted, child-safe extensions: the allowlist enables whole extensions, not a hook-only or operating-system sandbox.
+Opted-in factories and runtimes are isolated per child session and receive `session_shutdown` before disposal.
+Extension-free resource loaders remain shared.
+Explicit SDK resource-loader injection remains authoritative and bypasses this discovery filter.
+
+Use `builtin:<name>` entries in `providerMiddlewareExtensions` to load supported Pi builtin extensions and activate their tools in each child's own runtime, independently of parent registration.
+Entries are trimmed, matched case-insensitively, and deduplicated; the full identifier is required, while bare names retain file-extension matching.
+No Pi `defaultTools` change is needed; the parent's settings and active tools are unchanged.
+Explicit child exclusions and SDK tool restrictions still win; parent-only, recursive orchestration, and denied child tools remain unavailable.
+File extensions retain their normal Pi activation behavior.
+The running host must provide the requested builtin factory and native builtin loading.
+Unsupported identifiers or hosts, failed builtin loads, and conflicting tool registrations fail nonrecoverably before the first model request.
+Remove conflicting registrations or the builtin opt-in to resolve these errors; older hosts remain supported without the opt-in.
+
+Currently, only `builtin:codemode` is supported, on Pi 0.99.0 and 1.x.
+It runs with `models: false`, exposing child tools but no model catalog, classifier, or image APIs.
 
 Set `"defaultEffort": "high"` or `"ultra"` in that settings file to opt a fresh session into the corresponding orchestration effort (`"off"` is the default). Project settings overlay the global value. This is an initial in-memory value only: `/effort` and `/ultracode` change the current session without writing settings, and reload/new/fork/session switches retain their existing in-process effort.
 
