@@ -1,9 +1,10 @@
 /**
- * "Workflows mode" keyword trigger: while the submitted message contains the
- * bounded word `workflow`/`workflows` (or a configured custom trigger word),
- * the message is transformed at submit time to instruct Pi to actually run the
- * workflow tool. Detection is purely textual (`event.text` on the `input`
- * hook) — it does not depend on, or own, the host's editor component.
+ * "Workflows mode" keyword trigger: while the submitted interactive message
+ * contains the bounded word `workflow`/`workflows` (or a configured custom
+ * trigger word), the following agent turn receives a one-shot system-prompt
+ * directive authorizing the workflow tool. The user's message is left intact.
+ * Detection is purely textual (`event.text` on the `input` hook) — it does not
+ * depend on, or own, the host's editor component.
  */
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
@@ -117,10 +118,17 @@ export function buildArmedWorkflowPrompt(
   text: string,
   opts: { reason?: ArmReason; extraDirective?: string } = {},
 ): string {
+  return `${text}\n\n${buildArmedWorkflowDirective(opts)}`;
+}
+
+/**
+ * The system-prompt-only directive for a heuristic arming path. Keep the
+ * original user message out of this text: `before_agent_start` adds it to the
+ * current system prompt after the input hook has associated the exact prompt.
+ */
+export function buildArmedWorkflowDirective(opts: { reason?: ArmReason; extraDirective?: string } = {}): string {
   const reason = opts.reason ?? "keyword";
   const lines = [
-    text,
-    "",
     "---",
     "[workflows mode armed. Decide first: if this message is a question, a trivial task, or",
     "just talk (about workflows, this repo, or the tool itself), answer it directly and stay",
@@ -296,9 +304,9 @@ export function registerWorkflowProgressCommands(
 }
 
 /**
- * Install the keyword-trigger arming hook (submit-time detection + prompt
- * rewrite) and the related trigger/progress commands. Call once (e.g. in
- * `session_start`).
+ * Install the keyword-trigger arming hook (submit-time detection plus a
+ * one-shot `before_agent_start` system-prompt injection) and the related
+ * trigger/progress commands. Call once (e.g. in `session_start`).
  */
 export function installWorkflowKeywordArming(
   pi: ExtensionAPI,
@@ -319,25 +327,43 @@ export function installWorkflowKeywordArming(
   // Active tools saved while a turn is restricted to `workflow`; restored on turn_end.
   let savedTools: string[] | undefined;
 
-  // When armed at submit time, rewrite the user's message to force a workflow AND
-  // ensure the `workflow` tool is in the active tool set, so the model can call it.
+  // When keyword-armed at submit time, remember a one-shot directive for the
+  // matching prompt and ensure the `workflow` tool is in the active tool set,
+  // so the model can call it. The keyword input itself is never rewritten:
+  // putting this directive in the user message would persist it in the
+  // conversation and could influence later turns.
   // We keep all existing tools (bash, read, edit, write, web_search, etc.) because
   // the model often needs them BEFORE writing the workflow script (e.g. exploring
   // the codebase, reading files, searching for context). This only ADDS the
   // workflow tool to the active set; no tools are removed (the original set is
   // saved in `savedTools` and restored elsewhere).
   //
+  let pendingDirective:
+    | {
+        prompt: string;
+        directive: string;
+      }
+    | undefined;
+
   // NOTE: we check event.text directly (hasTrigger) rather than state.active from
   // the editor, because the editor's state is reset synchronously by submitValue()
   // BEFORE the input event fires (the actual prompt processing is async).
-  pi.on("input", (event: { source?: string; text?: string }) => {
+  pi.on("input", (event, ctx) => {
+    // Every input starts a new association. This prevents a trigger that never
+    // reaches before_agent_start from leaking into a later prompt.
+    pendingDirective = undefined;
     if (event.source !== "interactive" || !event.text) return { action: "continue" } as const;
     // Arm either when the user typed the "workflow(s)" trigger, or when standing
     // effort mode is on and the message is a substantive request.
     const normalizedText = event.text.trim();
     const suppressed = state.suppressedKeywordText === normalizedText;
     if (suppressed) state.suppressedKeywordText = undefined;
-    const triggered = state.keywordTriggerEnabled && !suppressed && hasTrigger(event.text, state.keywordTriggerWord);
+    const triggered =
+      ctx.hasUI &&
+      event.streamingBehavior === undefined &&
+      state.keywordTriggerEnabled &&
+      !suppressed &&
+      hasTrigger(event.text, state.keywordTriggerWord);
     const byEffort = !triggered && !!effort && effort.level !== "off" && isSubstantive(event.text);
     if (!triggered && !byEffort) return { action: "continue" } as const;
     try {
@@ -362,11 +388,46 @@ export function installWorkflowKeywordArming(
         ? [effortDirective(effort.level), EFFORT_CONVERSATIONAL_ESCAPE].filter(Boolean).join(" ")
         : undefined;
     const reason: ArmReason = byEffort ? "effort" : "keyword";
-    return {
-      action: "transform",
-      text: buildArmedWorkflowPrompt(event.text, { reason, extraDirective: extra }),
-    } as const;
+    if (byEffort) {
+      // Preserve standing /effort's existing input transform semantics. Its
+      // directive remains part of this user turn rather than the transient
+      // keyword-only system-prompt association below.
+      return {
+        action: "transform",
+        text: buildArmedWorkflowPrompt(event.text, { reason, extraDirective: extra }),
+      } as const;
+    }
+    pendingDirective = {
+      prompt: event.text,
+      directive: buildArmedWorkflowDirective({ reason, extraDirective: extra }),
+    };
+    return { action: "continue" } as const;
   });
+
+  // Inject only into the system prompt for the exact input that armed this
+  // turn. A mismatch is fail-closed and consumes the pending state, so the
+  // directive cannot be carried into a different message.
+  pi.on("before_agent_start", (event) => {
+    const pending = pendingDirective;
+    pendingDirective = undefined;
+    if (!pending || pending.prompt !== event.prompt) return;
+    return { systemPrompt: `${event.systemPrompt}\n\n${pending.directive}` };
+  });
+
+  const clearSessionArming = () => {
+    pendingDirective = undefined;
+    if (savedTools === undefined) return;
+    const restore = savedTools;
+    savedTools = undefined;
+    try {
+      pi.setActiveTools?.(restore);
+    } catch {
+      // ignore — session teardown/replacement may already have invalidated the host
+    }
+  };
+
+  pi.on("session_start", clearSessionArming);
+  pi.on("session_shutdown", clearSessionArming);
 
   // Restore the user's full tool set once the forced turn completes.
   pi.on("turn_end", () => {

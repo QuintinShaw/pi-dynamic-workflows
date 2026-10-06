@@ -372,7 +372,7 @@ describe("buildForcedWorkflowPrompt (/workflows run)", () => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 describe("installWorkflowKeywordArming", () => {
-  it("registers input and turn_end event hooks", async () => {
+  it("registers input, prompt, turn, and session lifecycle hooks", async () => {
     const mod = await load();
     const registered: Array<{ event: string }> = [];
     const pi = {
@@ -387,7 +387,10 @@ describe("installWorkflowKeywordArming", () => {
 
     const events = registered.map((r) => r.event);
     assert.ok(events.includes("input"), 'should register "input" hook');
+    assert.ok(events.includes("before_agent_start"), 'should register "before_agent_start" hook');
     assert.ok(events.includes("turn_end"), 'should register "turn_end" hook');
+    assert.ok(events.includes("session_start"), 'should register "session_start" hook');
+    assert.ok(events.includes("session_shutdown"), 'should register "session_shutdown" hook');
   });
 
   it("registers /workflows-trigger and toggles the keyword trigger", async () => {
@@ -539,10 +542,13 @@ describe("installWorkflowKeywordArming", () => {
 
     const inputHandler = captured.find((h) => h.event === "input")?.handler;
     assert.ok(inputHandler, "input handler should be registered");
-    const result = inputHandler({
-      source: "interactive",
-      text: "Please discuss workflows as a normal topic.",
-    });
+    const result = inputHandler(
+      {
+        source: "interactive",
+        text: "Please discuss workflows as a normal topic.",
+      },
+      { hasUI: true },
+    );
 
     assert.deepEqual(result, { action: "continue" });
     assert.equal(setActiveToolsCalls, 0);
@@ -569,13 +575,16 @@ describe("installWorkflowKeywordArming", () => {
 
     const inputHandler = captured.find((h) => h.event === "input")?.handler;
     assert.ok(inputHandler, "input handler should be registered");
-    assert.deepEqual(inputHandler({ source: "interactive", text: "Please discuss workflows normally." }), {
-      action: "continue",
-    });
+    assert.deepEqual(
+      inputHandler({ source: "interactive", text: "Please discuss workflows normally." }, { hasUI: true }),
+      {
+        action: "continue",
+      },
+    );
     assert.equal(setActiveToolsCalls, 0);
 
-    const result = inputHandler({ source: "interactive", text: "Please run pi-workflow now." });
-    assert.equal((result as { action?: string }).action, "transform");
+    const result = inputHandler({ source: "interactive", text: "Please run pi-workflow now." }, { hasUI: true });
+    assert.deepEqual(result, { action: "continue" });
     assert.equal(setActiveToolsCalls, 1);
   });
 
@@ -650,24 +659,19 @@ describe("installWorkflowKeywordArming", () => {
     mod.installWorkflowKeywordArming(pi2, undefined, testSettingsOptions());
 
     const inputHandler = captured.find((c) => c.event === "input")?.handler as
-      | ((event: { source?: string; text?: string }) => { action: string; text?: string })
+      | ((event: { source?: string; text?: string }, ctx?: { hasUI?: boolean }) => { action: string; text?: string })
       | undefined;
     assert.notEqual(inputHandler, undefined, "input handler should be registered");
 
     // Invoke with non-trigger text — should NOT save tools
-    const resultNonTrigger = inputHandler?.({ source: "interactive", text: "hello world" });
+    const resultNonTrigger = inputHandler?.({ source: "interactive", text: "hello world" }, { hasUI: true });
     assert.deepEqual(resultNonTrigger, { action: "continue" }, "non-trigger input should return continue");
     assert.deepEqual(savedTools, [], "tools should not change for non-trigger input");
 
     // Invoke with trigger text — should save and add WORKFLOW_TOOL_NAME
-    const resultTrigger = inputHandler?.({ source: "interactive", text: "run a workflow test" });
+    const resultTrigger = inputHandler?.({ source: "interactive", text: "run a workflow test" }, { hasUI: true });
     assert.ok(typeof resultTrigger === "object" && resultTrigger !== null, "should return a result object");
-    assert.equal(resultTrigger.action, "transform", "should return transform action");
-    assert.ok(
-      typeof resultTrigger.text === "string" && resultTrigger.text.length > 0,
-      "should return transformed text",
-    );
-    assert.ok(resultTrigger.text?.includes("run a workflow test"), "transformed text should include original prompt");
+    assert.equal(resultTrigger.action, "continue", "input should remain unchanged");
     assert.ok(savedTools.includes("workflow"), `saved tools (${savedTools.join(", ")}) should include "workflow"`);
   });
 
@@ -695,10 +699,13 @@ describe("installWorkflowKeywordArming", () => {
 
     const inputHandler = captured.find((h) => h.event === "input")?.handler;
     assert.ok(inputHandler, "input handler should be registered");
-    const result = inputHandler({
-      source: "interactive",
-      text: "Please discuss workflows as a normal topic.",
-    });
+    const result = inputHandler(
+      {
+        source: "interactive",
+        text: "Please discuss workflows as a normal topic.",
+      },
+      { hasUI: true },
+    );
 
     assert.deepEqual(result, { action: "continue" });
     assert.equal(setActiveToolsCalls, 0);
@@ -725,17 +732,20 @@ describe("installWorkflowKeywordArming", () => {
 
     const inputHandler = captured.find((h) => h.event === "input")?.handler;
     assert.ok(inputHandler, "input handler should be registered");
-    const result = inputHandler({
-      source: "interactive",
-      text: "Please discuss workflows as a normal topic.",
-    });
+    const result = inputHandler(
+      {
+        source: "interactive",
+        text: "Please discuss workflows as a normal topic.",
+      },
+      { hasUI: true },
+    );
 
     assert.deepEqual(result, { action: "continue" });
     assert.equal(setActiveToolsCalls, 0);
     assert.equal(state.suppressedKeywordText, undefined, "suppression should be consumed after one submit");
   });
 
-  it("transforms the same keyword input later when it was not just suppressed", async () => {
+  it("injects a directive for the same keyword input after suppression is consumed", async () => {
     const mod = await load();
     const captured: Array<{ event: string; handler: (...args: unknown[]) => unknown }> = [];
     const pi = {
@@ -753,12 +763,15 @@ describe("installWorkflowKeywordArming", () => {
     const text = "Please discuss workflows as a normal topic.";
     const inputHandler = captured.find((h) => h.event === "input")?.handler;
     assert.ok(inputHandler, "input handler should be registered");
-    const result = inputHandler({ source: "interactive", text });
+    const result = inputHandler({ source: "interactive", text }, { hasUI: true });
 
-    assert.deepEqual(result, {
-      action: "transform",
-      text: mod.buildArmedWorkflowPrompt(text),
-    });
+    assert.deepEqual(result, { action: "continue" });
+    const beforeHandler = captured.find((h) => h.event === "before_agent_start")?.handler;
+    const beforeResult = beforeHandler?.({ prompt: text, systemPrompt: "BASE" });
+    assert.equal(
+      (beforeResult as { systemPrompt?: string }).systemPrompt,
+      `BASE\n\n${mod.buildArmedWorkflowDirective()}`,
+    );
   });
 
   it("still transforms effort-armed input when the keyword trigger is off", async () => {
@@ -789,7 +802,7 @@ describe("installWorkflowKeywordArming", () => {
     const text = "Please discuss workflows as a normal topic.";
     const inputHandler = captured.find((h) => h.event === "input")?.handler;
     assert.ok(inputHandler, "input handler should be registered");
-    const result = inputHandler({ source: "interactive", text });
+    const result = inputHandler({ source: "interactive", text }, { hasUI: true });
 
     // The effort path arms on ANY substantive message, so its directive also
     // carries the conversational-escape (skip the workflow on trivial turns) and
@@ -835,7 +848,7 @@ describe("installWorkflowKeywordArming", () => {
     const initialTools = ["bash", "read", "edit", "write"];
 
     // First trigger: save tools and add "workflow"
-    inputHandler?.({ source: "interactive", text: "trigger workflow test" });
+    inputHandler?.({ source: "interactive", text: "trigger workflow test" }, { hasUI: true });
     assert.ok(currentTools.includes("workflow"), "workflow tool should be added");
     assert.ok(currentTools.length > initialTools.length, "tool set should be expanded");
 
@@ -864,9 +877,111 @@ describe("installWorkflowKeywordArming", () => {
     const inputHandler = captured.find((c) => c.event === "input")?.handler;
     assert.notEqual(inputHandler, undefined);
 
-    inputHandler?.({ source: "interactive", text: "run workflow" });
+    inputHandler?.({ source: "interactive", text: "run workflow" }, { hasUI: true });
     // "workflow" was already present, so tool count should not increase beyond duplicates
     assert.equal(currentTools.filter((t) => t === "workflow").length, 1, "workflow should appear exactly once");
+  });
+
+  it("requires an interactive UI context for keyword arming", async () => {
+    const mod = await load();
+    const captured: Array<{ event: string; handler: (...args: unknown[]) => unknown }> = [];
+    let setActiveToolsCalls = 0;
+    const pi = {
+      on: (event: string, handler: (...args: unknown[]) => unknown) => {
+        captured.push({ event, handler });
+      },
+      registerCommand: () => {},
+      getActiveTools: () => ["bash"],
+      setActiveTools: () => {
+        setActiveToolsCalls++;
+      },
+    } as unknown as ExtensionAPI;
+
+    mod.installWorkflowKeywordArming(pi, undefined, testSettingsOptions());
+    const inputHandler = captured.find((entry) => entry.event === "input")?.handler;
+    assert.ok(inputHandler);
+
+    assert.deepEqual(inputHandler({ source: "interactive", text: "run a workflow" }, { hasUI: false }), {
+      action: "continue",
+    });
+    assert.equal(setActiveToolsCalls, 0);
+  });
+
+  it("fails closed for queued keyword steer/follow-up input", async () => {
+    const mod = await load();
+    const captured: Array<{ event: string; handler: (...args: unknown[]) => unknown }> = [];
+    let setActiveToolsCalls = 0;
+    const pi = {
+      on: (event: string, handler: (...args: unknown[]) => unknown) => {
+        captured.push({ event, handler });
+      },
+      registerCommand: () => {},
+      getActiveTools: () => ["bash"],
+      setActiveTools: () => {
+        setActiveToolsCalls++;
+      },
+    } as unknown as ExtensionAPI;
+
+    mod.installWorkflowKeywordArming(pi, undefined, testSettingsOptions());
+    const inputHandler = captured.find((entry) => entry.event === "input")?.handler;
+    const beforeHandler = captured.find((entry) => entry.event === "before_agent_start")?.handler;
+    assert.ok(inputHandler && beforeHandler);
+
+    for (const streamingBehavior of ["steer", "followUp"] as const) {
+      const prompt = `run a workflow via ${streamingBehavior}`;
+      assert.deepEqual(inputHandler({ source: "interactive", text: prompt, streamingBehavior }, { hasUI: true }), {
+        action: "continue",
+      });
+      assert.equal(
+        beforeHandler({ prompt, systemPrompt: "BASE" }),
+        undefined,
+        `${streamingBehavior} must not leave a pending keyword directive`,
+      );
+    }
+    assert.equal(setActiveToolsCalls, 0);
+  });
+
+  it("consumes a keyword directive only for the matching prompt and clears it on session boundaries", async () => {
+    const mod = await load();
+    const captured: Array<{ event: string; handler: (...args: unknown[]) => unknown }> = [];
+    const pi = {
+      on: (event: string, handler: (...args: unknown[]) => unknown) => {
+        captured.push({ event, handler });
+      },
+      registerCommand: () => {},
+      getActiveTools: () => ["bash"],
+      setActiveTools: () => {},
+    } as unknown as ExtensionAPI;
+
+    mod.installWorkflowKeywordArming(pi, undefined, testSettingsOptions());
+    const inputHandler = captured.find((entry) => entry.event === "input")?.handler;
+    const beforeHandler = captured.find((entry) => entry.event === "before_agent_start")?.handler;
+    const sessionStartHandler = captured.find((entry) => entry.event === "session_start")?.handler;
+    const shutdownHandler = captured.find((entry) => entry.event === "session_shutdown")?.handler;
+    assert.ok(inputHandler && beforeHandler && sessionStartHandler && shutdownHandler);
+
+    const prompt = "run a workflow now";
+    assert.deepEqual(inputHandler({ source: "interactive", text: prompt }, { hasUI: true }), {
+      action: "continue",
+    });
+    assert.equal(beforeHandler({ prompt: "different prompt", systemPrompt: "BASE" }), undefined);
+    assert.equal(
+      beforeHandler({ prompt, systemPrompt: "BASE" }),
+      undefined,
+      "mismatch must consume the pending directive",
+    );
+
+    assert.deepEqual(inputHandler({ source: "interactive", text: prompt }, { hasUI: true }), {
+      action: "continue",
+    });
+    sessionStartHandler({ type: "session_start" });
+    assert.equal(beforeHandler({ prompt, systemPrompt: "BASE" }), undefined, "session_start clears pending state");
+
+    assert.deepEqual(inputHandler({ source: "interactive", text: prompt }, { hasUI: true }), {
+      action: "continue",
+    });
+    shutdownHandler({ type: "session_shutdown" });
+    assert.equal(beforeHandler({ prompt, systemPrompt: "BASE" }), undefined, "session_shutdown clears pending state");
   });
 
   it("input handler ignores non-interactive sources", async () => {

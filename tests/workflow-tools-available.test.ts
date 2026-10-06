@@ -2,7 +2,7 @@
  * Tests for tools availability when workflows mode is triggered.
  *
  * The bug: when a user message contains "workflow" (trigger keyword),
- * installWorkflowKeywordArming's input handler calls:
+ * installWorkflowKeywordArming's arming path calls:
  *   pi.setActiveTools?.([WORKFLOW_TOOL_NAME]);
  * which restricts ALL tools to ONLY the workflow tool.
  * The model then cannot use read, bash, edit, write, web_search, etc.
@@ -10,7 +10,7 @@
  *
  * The fix: preserve default Pi tools alongside the workflow tool.
  * These tests verify that default tools remain available after the
- * workflows-mode trigger fires.
+ * workflows-mode trigger fires, while the user message remains unchanged.
  */
 
 import assert from "node:assert/strict";
@@ -27,7 +27,7 @@ import {
   WORKFLOW_EXTENSION_VERSION,
 } from "../src/extension-reload.js";
 import { _registerBoundSessionSendForTests, _resetDeliveryRegistriesForTests } from "../src/task-panel.js";
-import { buildArmedWorkflowPrompt, WORKFLOW_TOOL_NAME, type WorkflowModeState } from "../src/workflow-editor.js";
+import { buildArmedWorkflowDirective, WORKFLOW_TOOL_NAME, type WorkflowModeState } from "../src/workflow-editor.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import type { WorkflowProgress } from "../src/workflow-progress.js";
 import { saveWorkflowSettings } from "../src/workflow-settings.js";
@@ -106,16 +106,20 @@ describe("installWorkflowKeywordArming - tool availability", () => {
     assert.ok(inputHandlers, "input handler should be registered");
     assert.equal(inputHandlers.length, 1);
 
-    const result = inputHandlers[0]({
-      source: "interactive",
-      text: "przetestuj to workflow zadanie",
-    });
+    const prompt = "przetestuj to workflow zadanie";
+    const result = inputHandlers[0]({ source: "interactive", text: prompt }, { hasUI: true });
 
-    // Verify transform result
-    assert.deepEqual(result, {
-      action: "transform",
-      text: buildArmedWorkflowPrompt("przetestuj to workflow zadanie"),
-    });
+    // Keyword input remains unchanged; its directive is injected into the
+    // matching agent turn's system prompt.
+    assert.deepEqual(result, { action: "continue" });
+    const beforeHandlers = mockPi.handlers.before_agent_start;
+    assert.ok(beforeHandlers, "before_agent_start handler should be registered");
+    const beforeResult = beforeHandlers[0]({ prompt, systemPrompt: "BASE" });
+    assert.equal(
+      beforeResult.systemPrompt,
+      `BASE\n\n${buildArmedWorkflowDirective()}`,
+      "keyword directive should be transient system-prompt state",
+    );
 
     // Verify getActiveTools was called
     assert.equal(mockPi.getActiveTools.mock.callCount(), 1);
@@ -155,10 +159,13 @@ describe("installWorkflowKeywordArming - tool availability", () => {
 
     // Trigger input with "workflows"
     const inputHandlers = mockPi.handlers.input;
-    inputHandlers[0]({
-      source: "interactive",
-      text: "run workflows",
-    });
+    inputHandlers[0](
+      {
+        source: "interactive",
+        text: "run workflows",
+      },
+      { hasUI: true },
+    );
 
     // Verify tools were set (with default tools preserved)
     const toolsWhenActive = mockPi.setActiveTools.mock.calls[0].arguments[0];
@@ -189,11 +196,13 @@ describe("installWorkflowKeywordArming - tool availability", () => {
     );
 
     const inputHandlers = mockPi.handlers.input;
-    assert.deepEqual(inputHandlers[0]({ source: "interactive", text: "run workflow" }), { action: "continue" });
+    assert.deepEqual(inputHandlers[0]({ source: "interactive", text: "run workflow" }, { hasUI: true }), {
+      action: "continue",
+    });
     assert.equal(mockPi.setActiveTools.mock.callCount(), 0);
 
-    const result = inputHandlers[0]({ source: "interactive", text: "run pi-workflow" });
-    assert.equal(result.action, "transform");
+    const result = inputHandlers[0]({ source: "interactive", text: "run pi-workflow" }, { hasUI: true });
+    assert.equal(result.action, "continue");
     assert.equal(mockPi.setActiveTools.mock.callCount(), 1);
   });
 
@@ -206,10 +215,13 @@ describe("installWorkflowKeywordArming - tool availability", () => {
 
     // Simulate user submitting a slash command
     const inputHandlers = mockPi.handlers.input;
-    const result = inputHandlers[0]({
-      source: "interactive",
-      text: "/workflows list",
-    });
+    const result = inputHandlers[0](
+      {
+        source: "interactive",
+        text: "/workflows list",
+      },
+      { hasUI: true },
+    );
 
     // Should not transform (slash commands are not triggers)
     assert.deepEqual(result, { action: "continue" });
@@ -263,10 +275,13 @@ describe("installWorkflowKeywordArming - tool availability", () => {
 
     const inputHandlers = mockPi.handlers.input;
     assert.doesNotThrow(() => {
-      inputHandlers[0]({
-        source: "interactive",
-        text: "test workflow",
-      });
+      inputHandlers[0](
+        {
+          source: "interactive",
+          text: "test workflow",
+        },
+        { hasUI: true },
+      );
     });
   });
 
@@ -282,13 +297,17 @@ describe("installWorkflowKeywordArming - tool availability", () => {
 
     const inputHandlers = mockPi.handlers.input;
     // Should not throw — the catch block handles it
-    const result = inputHandlers[0]({
-      source: "interactive",
-      text: "test workflow",
-    });
+    const result = inputHandlers[0](
+      {
+        source: "interactive",
+        text: "test workflow",
+      },
+      { hasUI: true },
+    );
 
-    // Should still return the transform action even if setActiveTools failed
-    assert.equal(result.action, "transform");
+    // The input remains unchanged even if setActiveTools failed; the
+    // transient directive is still staged for before_agent_start.
+    assert.equal(result.action, "continue");
   });
 
   it("should handle multiple trigger events and restore correctly", async () => {
@@ -301,16 +320,22 @@ describe("installWorkflowKeywordArming - tool availability", () => {
 
     // First trigger
     const inputHandlers = mockPi.handlers.input;
-    inputHandlers[0]({
-      source: "interactive",
-      text: "test workflow 1",
-    });
+    inputHandlers[0](
+      {
+        source: "interactive",
+        text: "test workflow 1",
+      },
+      { hasUI: true },
+    );
 
     // Second trigger (before turn_end)
-    inputHandlers[0]({
-      source: "interactive",
-      text: "test workflow 2",
-    });
+    inputHandlers[0](
+      {
+        source: "interactive",
+        text: "test workflow 2",
+      },
+      { hasUI: true },
+    );
 
     // setActiveTools should only have been called once (savedTools is already set)
     assert.equal(mockPi.setActiveTools.mock.callCount(), 1);
@@ -335,10 +360,13 @@ describe("installWorkflowKeywordArming - tool availability", () => {
       mockPi.setActiveTools.mock.resetCalls();
 
       const inputHandlers = mockPi.handlers.input;
-      inputHandlers[0]({
-        source: "interactive",
-        text: `run ${keyword} test`,
-      });
+      inputHandlers[0](
+        {
+          source: "interactive",
+          text: `run ${keyword} test`,
+        },
+        { hasUI: true },
+      );
 
       const tools = mockPi.setActiveTools.mock.calls[0]?.arguments[0];
       assert.ok(tools?.includes("bash"), `bash should be available for keyword "${keyword}"`);
