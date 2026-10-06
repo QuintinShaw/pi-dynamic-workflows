@@ -38,4 +38,5 @@ See [Workflow prompt guidance rationale](workflow-prompt-guidance-rationale.md) 
 | agentTimeoutMs | workflow-tool-input | `agentTimeoutMs?: number = configured default or unbounded` | — |
 | tokenBudget | workflow-tool-input | `tokenBudget?: number = configured default or unlimited` | — |
 | resumeFromRunId | workflow-tool-input | `resumeFromRunId?: string` | — |
+| resumeMode | workflow-tool-input | `resumeMode?: "prefix" \| "replay-completed" = "prefix"` | — |
 <!-- END GENERATED SUPPORTED WORKFLOW CAPABILITIES -->

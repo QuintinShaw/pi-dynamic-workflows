@@ -23,7 +23,7 @@ export {
   settleInterruptedPersistedAgents,
 } from "./run-agent-settlement.js";
 
-import type { WorkflowCheckpoint } from "./workflow.js";
+import type { WorkflowCheckpoint, WorkflowResumeMode } from "./workflow.js";
 import { workflowProjectPaths } from "./workflow-paths.js";
 
 export type RunStatus = "pending" | "running" | "paused" | "completed" | "failed" | "aborted";
@@ -76,6 +76,10 @@ export interface PersistedJournalEntry {
  */
 export function sanitizeAutoResumeAttempts(value: unknown): number | undefined {
   return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : undefined;
+}
+
+export function sanitizeResumeMode(value: unknown): WorkflowResumeMode | undefined {
+  return value === "prefix" || value === "replay-completed" ? value : undefined;
 }
 
 export interface PersistedRunState {
@@ -198,6 +202,14 @@ export interface PersistedRunState {
    * Absent/0 means no auto-resume attempt has been recorded yet.
    */
   autoResumeAttempts?: number;
+  /**
+   * Journal replay policy chosen for this run's resumes (see
+   * WorkflowRunOptions.resumeMode in workflow.ts). Declared at start or by
+   * the first resume() that passes one, and carried forward so later resumes
+   * — including cold-start workflow_control resumes — keep it unless they
+   * explicitly override. Absent means "prefix" (the default).
+   */
+  resumeMode?: WorkflowResumeMode;
   /**
    * Undelivered background-result payload waiting for the originating session's
    * delivery endpoint. Written before the send attempt (fail-closed); cleared

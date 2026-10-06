@@ -58,7 +58,28 @@ const RENDERED_PROMPT_BUDGET_BYTES = 800;
 // instead. The exact wording increases the measured definition from 4,276
 // to 4,392 bytes (+116), and the accepted ceiling moves with it, from
 // 4,283 to 4,392.
-const TOOL_DEFINITION_BUDGET_BYTES = 4_392;
+//
+// #231 adds the optional resumeMode parameter (the replay-completed
+// journal policy for runs paused mid-fan-out), increasing the measured
+// definition from 4,392 to 4,751 bytes (+359); the ceiling moves with it.
+// #231 review hardening added same-batch scoping and the store/file
+// staleness caveat to that description, increasing the measured definition
+// from 4,751 to 4,863 bytes (+112); the ceiling moves with it.
+// #231 R2 cross-referenced resumeMode from the resumeFromRunId description,
+// increasing the measured definition from 4,863 to 4,880 bytes (+17); the
+// ceiling moves with it.
+// #231 R3 replaced the superseded "same fan-out batch" wording with the
+// concurrent-dispatch rule, increasing the measured definition from 4,880
+// to 4,902 bytes (+22); the ceiling moves with it.
+// #231 R6 added the sequential-relative-to-the-gap rule (post-await calls,
+// nested frames) and the persists-on-the-run sentence to the resumeMode
+// description, increasing the measured definition from 4,902 to 5,093
+// bytes (+191); the ceiling moves with it.
+// #231 R7 corrected that rule: a workflow() call dispatched in the gap's
+// own window is a same-window sibling whose child journal replays — only
+// post-await workflow() calls are sequential — increasing the measured
+// definition from 5,093 to 5,135 bytes (+42); the ceiling moves with it.
+const TOOL_DEFINITION_BUDGET_BYTES = 5_135;
 
 test("rendered workflow prompt contribution stays within its accepted size", async () => {
   await withRenderedWorkflow(async ({ systemPrompt, promptLines }) => {

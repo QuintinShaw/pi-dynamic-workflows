@@ -225,6 +225,21 @@ test(
 );
 
 test(
+  "updateMetadata patches preserve an unrelated resumeMode field (#231)",
+  withFixture((cwd) => {
+    const rp = createRunPersistence(cwd);
+    const runId = "metadata-resume-mode";
+    rp.save({ ...state(runId), resumeMode: "replay-completed" });
+    assert.equal(rp.updateMetadata?.(runId, { autoResumeAttempts: 2 }), true);
+    assert.equal(rp.updateMetadata?.(runId, { sessionId: "s-1" }), true);
+    const loaded = rp.load(runId);
+    assert.equal(loaded?.resumeMode, "replay-completed", "small metadata patches must not clobber resumeMode");
+    assert.equal(loaded?.autoResumeAttempts, 2);
+    assert.equal(loaded?.sessionId, "s-1");
+  }),
+);
+
+test(
   "delete removes the head, backup, tmp, and event log and then load returns null",
   withFixture((cwd) => {
     const rp = createRunPersistence(cwd);

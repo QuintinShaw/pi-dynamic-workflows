@@ -42,6 +42,7 @@ const EXPECTED_TOOL_INPUTS = [
   "maxAgents",
   "name",
   "resumeFromRunId",
+  "resumeMode",
   "script",
   "tokenBudget",
 ] as const;
