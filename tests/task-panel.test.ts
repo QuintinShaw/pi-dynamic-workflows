@@ -2272,6 +2272,80 @@ describe("installResultDelivery", () => {
     assert.ok(piCalls(pi)[0].content.includes("delivered"));
   });
 
+  it("explicit-extension host: probe captures when automatic discovery is disabled", async () => {
+    const pi = createMockPi();
+    const manager = createMockManager(
+      makeRun({
+        sessionId: "sess-explicit",
+        runId: "run-explicit",
+        result: { result: { verdict: "delivered" }, agentCount: 1, durationMs: 1 },
+      }),
+    );
+    let probeCalls = 0;
+    (pi as unknown as { sendMessage: (m: unknown, o: unknown) => void }).sendMessage = () => {
+      probeCalls++;
+      invokePatchedSendCustomMessage(
+        {
+          sessionManager: {
+            getSessionId: () => "sess-explicit",
+            getSessionName: () => "host-explicit",
+            isSessionOnDisk: () => true,
+          },
+          _resourceLoader: { noExtensions: true },
+          sendCustomMessage: recordingStableSend(pi),
+        },
+        { customType: mod.DELIVERY_PROBE_CUSTOM_TYPE, content: "", display: false },
+      );
+    };
+
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    manager.setSessionId("sess-explicit");
+    mod.bindSessionDelivery("sess-explicit", pi as unknown as ExtensionAPI, { manager });
+    manager.emit("complete", { runId: "run-explicit" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    assert.equal(probeCalls, 1, "probe attempted");
+    assert.equal(piCalls(pi).length, 1, "explicitly loaded host receives its result");
+    assert.ok(piCalls(pi)[0].content.includes("delivered"));
+  });
+
+  for (const persistence of [
+    { isPersisted: () => false },
+    { persist: false },
+    {
+      isPersisted: () => {
+        throw new Error("unavailable");
+      },
+    },
+  ]) {
+    it("explicit-extension probe rejects disabled or unreadable persistence", async () => {
+      const pi = createMockPi();
+      const manager = createMockManager(makeRun({ sessionId: "sess-no-disk", runId: "run-no-disk" }));
+      (pi as unknown as { sendMessage: (m: unknown, o: unknown) => void }).sendMessage = () => {
+        invokePatchedSendCustomMessage(
+          {
+            sessionManager: {
+              getSessionId: () => "sess-no-disk",
+              getSessionName: () => "host-explicit",
+              isSessionOnDisk: () => false,
+              ...persistence,
+            },
+            _resourceLoader: { noExtensions: true },
+            sendCustomMessage: recordingStableSend(pi),
+          },
+          { customType: mod.DELIVERY_PROBE_CUSTOM_TYPE, content: "", display: false },
+        );
+      };
+      mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+      manager.setSessionId("sess-no-disk");
+      mod.bindSessionDelivery("sess-no-disk", pi as unknown as ExtensionAPI, { manager });
+      manager.emit("complete", { runId: "run-no-disk" });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(piCalls(pi).length, 0, "no unacknowledgeable result may enter the host");
+      assert.ok(manager.getPersistence?.().load("run-no-disk")?.pendingDelivery);
+    });
+  }
+
   it("omp print-mode host: probe captures despite isSessionOnDisk false at session_start", async () => {
     const pi = createMockPi();
     const manager = createMockManager(
