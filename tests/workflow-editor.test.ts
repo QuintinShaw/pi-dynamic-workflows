@@ -964,6 +964,20 @@ describe("installWorkflowKeywordArming", () => {
     assert.deepEqual(inputHandler({ source: "interactive", text: prompt }, { hasUI: true }), {
       action: "continue",
     });
+    assert.equal(
+      beforeHandler({ systemPrompt: "BASE" }),
+      undefined,
+      "a Pi 1.4 custom before_agent_start event without prompt must fail closed",
+    );
+    assert.equal(
+      beforeHandler({ prompt, systemPrompt: "BASE" }),
+      undefined,
+      "the custom event consumes the pending directive before the next prompt",
+    );
+
+    assert.deepEqual(inputHandler({ source: "interactive", text: prompt }, { hasUI: true }), {
+      action: "continue",
+    });
     assert.equal(beforeHandler({ prompt: "different prompt", systemPrompt: "BASE" }), undefined);
     assert.equal(
       beforeHandler({ prompt, systemPrompt: "BASE" }),
