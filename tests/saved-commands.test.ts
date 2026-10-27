@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
+import { PI_RESERVED_COMMAND_NAMES } from "../src/command-registry.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
 import { makeCommandRegistryPi, makeNotifyCtx } from "./helpers/mock-pi.js";
 
@@ -73,6 +74,26 @@ describe("parseCommandArgs", () => {
 });
 
 describe("registerSavedWorkflow", () => {
+  it("rejects every Pi 1.4.0 host-reserved command name, including stale saved ownership", async () => {
+    const { savedWorkflowCommandAvailability } = await load();
+    const { pi } = makeCommandRegistryPi();
+    const owners = new Map([["model", "saved"]]);
+    Object.defineProperty(pi, Symbol.for("pi-dynamic-workflows.command-owners"), {
+      configurable: false,
+      enumerable: false,
+      value: owners,
+      writable: false,
+    });
+
+    assert.equal(PI_RESERVED_COMMAND_NAMES.size, 27);
+    for (const name of PI_RESERVED_COMMAND_NAMES) {
+      const availability = savedWorkflowCommandAvailability(pi, name);
+      assert.equal(availability.ok, false, `/${name} must remain unavailable to saved workflows`);
+      if (availability.ok) assert.fail(`/${name} unexpectedly remained available`);
+      assert.match(availability.message, new RegExp(`/${name}.*reserved by Pi`));
+    }
+  });
+
   it("registers a command with the workflow name", async () => {
     const { registerSavedWorkflow } = await load();
     const { pi, commands } = makeCommandRegistryPi();

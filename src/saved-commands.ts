@@ -4,7 +4,7 @@
  */
 
 import { createCodingTools, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { claimCommand, commandOwner, isCommandRegistered } from "./command-registry.js";
+import { claimCommand, commandOwner, isCommandRegistered, isPiReservedCommandName } from "./command-registry.js";
 import { backgroundStartNotice } from "./display.js";
 import { runWorkflow, type WorkflowRunResult } from "./workflow.js";
 import type { WorkflowManager } from "./workflow-manager.js";
@@ -23,6 +23,9 @@ export function savedWorkflowCommandAvailability(
   pi: ExtensionAPI,
   name: string,
 ): { ok: true } | { ok: false; message: string } {
+  if (isPiReservedCommandName(name)) {
+    return { ok: false, message: `/${name} is reserved by Pi and cannot be used as a saved workflow name.` };
+  }
   if (!isCommandRegistered(pi, name) || savedCommandOwnedByExtension(pi, name)) return { ok: true };
   return { ok: false, message: `/${name} is already provided by Pi or another extension.` };
 }

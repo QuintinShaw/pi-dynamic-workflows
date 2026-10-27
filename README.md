@@ -152,6 +152,8 @@ Do a deep-research on whether Bun's test runner is production-ready.
 
 is equivalent to `/deep-research "..."`. A saved workflow always wins over a built-in of the same name, on both the slash-command and natural-language paths — so saving your own `code-review` shadows the built-in one everywhere.
 
+Pi's built-in slash-command names (such as `model`, `compact`, `trust`, and the interactive-only `debug`) and names already provided by another extension are reserved; save and rename report a conflict before changing the saved workflow library.
+
 ## Commands and run control
 
 Pi can manage background runs directly with the `workflow_control` tool instead of asking you to type a command. It supports `list`, `status`, `pause`, `resume`, and `stop`; run-specific actions use the canonical run ID returned when the workflow starts. Status output includes the run state, current phase, agent counts, active labels, and recorded token total.
