@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { createFauxCore, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
+import * as piSdk from "@earendil-works/pi-coding-agent";
 import {
   DefaultResourceLoader,
   defineTool,
@@ -17,6 +18,7 @@ import type { AgentRunOptions, AgentUsage } from "../src/agent.js";
 import {
   DEFAULT_EXCLUDED_SUBAGENT_TOOLS,
   DEFAULT_PROVIDER_MIDDLEWARE_EXTENSIONS,
+  installHostCreateAgentSession,
   isProviderMiddlewareExtensionPath,
   listAvailableModelSpecs,
   resolveAgentModelSpec,
@@ -2023,6 +2025,185 @@ test("the subagent resource loader is built once per directory and shared across
   assert.equal(first, second, "same promise — the loader is built once and shared, not rebuilt per subagent");
   // reload() may reject in a bare temp dir; we only assert memoization here.
   await Promise.allSettled([first, second]);
+});
+
+test("builtin permissions match only complete identifiers, not file identities", () => {
+  assert.equal(isProviderMiddlewareExtensionPath("builtin:codemode", [" BUILTIN:CODEMODE "]), true);
+  for (const allowed of [[], ["codemode"], ["builtin:code"], ["builtin:codemode-extra"]]) {
+    assert.equal(isProviderMiddlewareExtensionPath("builtin:codemode", allowed), false);
+  }
+  for (const path of [
+    "/extensions/codemode.ts",
+    "/extensions/builtin:codemode.ts",
+    "builtin:workflow",
+    "builtin:tool-search",
+  ]) {
+    assert.equal(
+      isProviderMiddlewareExtensionPath(path, ["builtin:codemode", "builtin:workflow", "builtin:tool-search"]),
+      false,
+    );
+  }
+});
+
+test("missing host builtin support fails without local fallback or workflow retries", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-builtin-old-host-"));
+  const core = createFauxCore({ provider: "faux-builtin", models: [{ id: "model" }] });
+  let sessions = 0;
+  installHostCreateAgentSession(
+    (options) => {
+      sessions++;
+      return piSdk.createAgentSession(options);
+    },
+    { SessionManager, SettingsManager, DefaultResourceLoader },
+  );
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const registry = await fauxRegistry(home, "faux-builtin", core);
+      for (const identifier of [
+        "builtin:codemode",
+        "builtin:tool-search",
+        "builtin:mcp",
+        "builtin:workflow",
+        "builtin:codemode-extra",
+      ]) {
+        let attempts = 0;
+        const agent = new WorkflowAgent({
+          cwd: home,
+          modelRegistry: registry,
+          providerMiddlewareExtensions: [identifier],
+        });
+        await assert.rejects(
+          runWorkflow(
+            'export const meta = { name: "builtin_failure", description: "configuration errors are fatal" }; await agent("task", { model: "faux-builtin/model" });',
+            {
+              cwd: home,
+              persistLogs: false,
+              agentRetries: 3,
+              agent: {
+                run: (prompt, options) => {
+                  attempts++;
+                  return agent.run(prompt, options);
+                },
+              },
+            },
+          ),
+          (error: unknown) => {
+            assert.ok(error instanceof WorkflowError);
+            assert.equal(error.code, WorkflowErrorCode.AGENT_EXECUTION_ERROR);
+            assert.equal(error.recoverable, false);
+            assert.ok(error.message.includes(identifier));
+            assert.match(error.message, /compatible Pi host.*remove/);
+            return true;
+          },
+        );
+        assert.equal(attempts, 1);
+      }
+      assert.equal(sessions, 0, "configuration failure must precede session creation and model requests");
+      for (const allowlist of [undefined, [], ["codemode"]]) {
+        core.setResponses([fauxAssistantMessage("old host still works")]);
+        const agent = new WorkflowAgent({
+          cwd: home,
+          modelRegistry: registry,
+          providerMiddlewareExtensions: allowlist,
+        });
+        assert.equal(await agent.run("task", { model: "faux-builtin/model" }), "old host still works");
+      }
+      // SDK injection bypasses automatic builtin discovery, including unknown identifiers.
+      const resourceLoader = new DefaultResourceLoader({ cwd: home, agentDir: home, noExtensions: true });
+      await resourceLoader.reload();
+      core.setResponses([fauxAssistantMessage("injected")]);
+      assert.equal(
+        await new WorkflowAgent({
+          cwd: home,
+          modelRegistry: registry,
+          providerMiddlewareExtensions: ["builtin:unknown"],
+          session: { resourceLoader },
+        }).run("task", { model: "faux-builtin/model" }),
+        "injected",
+      );
+    });
+  } finally {
+    installHostCreateAgentSession(piSdk.createAgentSession);
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("factory-shaped hosts must actually load the requested builtin without diagnostics", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-builtin-incompatible-"));
+  try {
+    for (const diagnostic of [undefined, "factory failed"]) {
+      let factories = 0;
+      class IncompatibleLoader extends DefaultResourceLoader {
+        constructor(options: ConstructorParameters<typeof DefaultResourceLoader>[0]) {
+          assert.deepEqual(options.additionalExtensionPaths, ["builtin:codemode"]);
+          assert.equal(options.extensionFactories?.length, 1);
+          super({ ...options, extensionFactories: [], additionalExtensionPaths: [] });
+        }
+        override getExtensions() {
+          const result = super.getExtensions();
+          return { ...result, errors: diagnostic ? [{ path: "builtin:codemode", error: diagnostic }] : [] };
+        }
+      }
+      installHostCreateAgentSession(piSdk.createAgentSession, {
+        SessionManager,
+        SettingsManager,
+        DefaultResourceLoader: IncompatibleLoader,
+        createCodemodeExtension: (options) => {
+          factories++;
+          assert.deepEqual(options, { models: false });
+          return () => {};
+        },
+      });
+      const agent = new WorkflowAgent({
+        cwd: home,
+        providerMiddlewareExtensions: [" BUILTIN:CODEMODE ", "builtin:codemode"],
+      });
+      await assert.rejects(
+        (agent as unknown as WorkflowAgentPrivates).getSharedResourceLoader(home),
+        (error: unknown) => {
+          assert.ok(error instanceof WorkflowError);
+          assert.equal(error.recoverable, false);
+          assert.match(error.message, /builtin:codemode/);
+          assert.ok(error.message.includes(diagnostic ?? "host did not load"));
+          return true;
+        },
+      );
+      assert.equal(factories, 1);
+    }
+  } finally {
+    installHostCreateAgentSession(piSdk.createAgentSession);
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("builtin codemode rejects conflicting effective custom tools before prompting", async () => {
+  const tool = defineTool({
+    name: "codemode",
+    label: "conflict",
+    description: "conflict",
+    parameters: Type.Object({}),
+    execute: async () => ({ content: [{ type: "text", text: "wrong tool" }], details: {} }),
+  });
+  for (const source of ["constructor", "call", "system", "session"]) {
+    const agent = new WorkflowAgent({
+      providerMiddlewareExtensions: ["builtin:codemode"],
+      tools: source === "constructor" ? [tool] : [],
+      session: source === "session" ? { customTools: [tool] } : {},
+    });
+    await assert.rejects(
+      agent.run("task", {
+        tools: source === "call" ? [tool] : [],
+        systemTools: source === "system" ? [tool] : [],
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof WorkflowError);
+        assert.equal(error.recoverable, false);
+        assert.match(error.message, /builtin:codemode.*conflicting tool/);
+        assert.doesNotMatch(error.message, /legacy|wrapper/);
+        return true;
+      },
+    );
+  }
 });
 
 test("provider middleware approval does not inherit from unrelated ancestor directories", () => {

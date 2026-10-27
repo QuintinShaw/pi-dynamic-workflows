@@ -66,9 +66,10 @@ export interface WorkflowSettings {
    */
   excludeSubagentTools?: string[];
   /**
-   * Trusted provider/auth middleware extension names allowed in child sessions.
-   * Omitted or [] loads no host extensions. Recursive workflow/subagent
-   * extensions are always excluded.
+   * Trusted provider/auth middleware extensions and supported Pi builtin extensions allowed in child sessions.
+   * Omitted or [] loads none. Codemode loads and activates only in children,
+   * using child tools (models: false). Explicit exclusions/SDK restrictions win.
+   * Unsupported hosts/builtins and conflicting tools fail. Recursion stays excluded.
    */
   providerMiddlewareExtensions?: string[];
 }

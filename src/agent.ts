@@ -2,19 +2,20 @@ import { randomUUID } from "node:crypto";
 import { realpathSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { AssistantMessage, Model, TextContent } from "@earendil-works/pi-ai";
+import * as localSdk from "@earendil-works/pi-coding-agent";
 import {
   type AgentSessionEvent,
   type CreateAgentSessionOptions,
   createAgentSession,
   createCodingTools,
   DefaultPackageManager,
-  DefaultResourceLoader,
+  type DefaultResourceLoader,
+  type ExtensionFactory,
   getAgentDir,
   type LoadExtensionsResult,
   ModelRegistry,
   type ModelRuntime,
-  SessionManager,
-  SettingsManager,
+  type SessionManager,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import type { Static, TSchema } from "typebox";
@@ -54,7 +55,10 @@ const LIVE_USAGE_EMIT_INTERVAL_MS = 250;
 
 type AgentSessionFactory = typeof createAgentSession;
 let agentSessionFactory: AgentSessionFactory = createAgentSession;
-const localSessionDependencies = { SessionManager, SettingsManager, DefaultResourceLoader };
+type SessionDependencies = Pick<typeof localSdk, "SessionManager" | "SettingsManager" | "DefaultResourceLoader"> & {
+  createCodemodeExtension?: (options: { models: false }) => ExtensionFactory;
+};
+const localSessionDependencies: SessionDependencies = localSdk;
 let sessionDependencies = localSessionDependencies;
 
 /** Use the host Pi SDK to create children so its ModelRuntime protocol matches. */
@@ -276,6 +280,11 @@ export function isProviderMiddlewareExtensionPath(
   packageSource?: string,
 ): boolean {
   const allowed = new Set(allowlist.map((name) => name.trim().toLowerCase()).filter(Boolean));
+  if (extensionPath.startsWith("builtin:")) {
+    return extensionPath === "builtin:codemode" && allowed.has(extensionPath);
+  }
+  // Builtin permission must not approve a similarly named file or package.
+  for (const name of allowed) if (name.startsWith("builtin:")) allowed.delete(name);
   const segments = extensionPath
     .replaceAll("\\", "/")
     .split("/")
@@ -333,8 +342,11 @@ export interface WorkflowAgentOptions {
    */
   excludeTools?: string[];
   /**
-   * Trusted provider/auth middleware extension names allowed in child sessions.
-   * Defaults to [] (no host extensions). Recursive orchestration stays excluded.
+   * Trusted provider/auth middleware extensions and supported Pi builtin extensions allowed in child sessions.
+   * Default [].
+   * Codemode loads and activates only in children, using child tools (models: false).
+   * Explicit exclusions/SDK restrictions still win. Unsupported hosts/builtins and conflicts fail.
+   * Recursive orchestration stays excluded; injected resourceLoader remains authoritative.
    */
   providerMiddlewareExtensions?: string[];
   /**
@@ -789,6 +801,14 @@ export function subagentExcludedTools(extra?: string[], sessionExclude?: string[
   return [...DEFAULT_EXCLUDED_SUBAGENT_TOOLS, ...(sessionExclude ?? []), ...(extra ?? [])];
 }
 
+function builtinExtensionError(identifier: string, reason: string): WorkflowError {
+  return new WorkflowError(
+    `${identifier}: ${reason}. Use a compatible Pi host or remove the ${identifier} opt-in from providerMiddlewareExtensions.`,
+    WorkflowErrorCode.AGENT_EXECUTION_ERROR,
+    { recoverable: false },
+  );
+}
+
 export class WorkflowAgent {
   private readonly cwd: string;
   private readonly baseTools: ToolDefinition[];
@@ -844,7 +864,11 @@ export class WorkflowAgent {
     this.baseTools = options.tools ?? createCodingTools(this.cwd);
     this.excludeTools = options.excludeTools ?? [];
     this.providerMiddlewareExtensions = [
-      ...(options.providerMiddlewareExtensions ?? DEFAULT_PROVIDER_MIDDLEWARE_EXTENSIONS),
+      ...new Set(
+        (options.providerMiddlewareExtensions ?? DEFAULT_PROVIDER_MIDDLEWARE_EXTENSIONS)
+          .map((name) => name.trim().toLowerCase())
+          .filter(Boolean),
+      ),
     ];
     this.sessionOptions = options.session ?? {};
     this.persistAgentSessions = options.persistAgentSessions ?? false;
@@ -873,7 +897,11 @@ export class WorkflowAgent {
    * loaders are session-local: the SDK binds session actions into their runtime,
    * so sharing one would send a child's extension actions into another child.
    */
-  private getSharedResourceLoader(agentDir: string, cwd = this.cwd): Promise<DefaultResourceLoader> {
+  private getSharedResourceLoader(
+    agentDir: string,
+    cwd = this.cwd,
+    permitsTool?: (name: string) => boolean,
+  ): Promise<DefaultResourceLoader> {
     const key = JSON.stringify([agentDir, cwd]);
     const shared = this.providerMiddlewareExtensions.length === 0;
     const existing = shared ? this.resourceLoaders.get(key) : undefined;
@@ -884,7 +912,7 @@ export class WorkflowAgent {
       this.resourceLoaders.set(key, existing);
       return existing;
     }
-    return this.buildSharedResourceLoader(agentDir, cwd, key);
+    return this.buildSharedResourceLoader(agentDir, cwd, key, permitsTool);
   }
 
   /**
@@ -904,14 +932,26 @@ export class WorkflowAgent {
     }
   }
 
-  private buildSharedResourceLoader(agentDir: string, cwd: string, key: string): Promise<DefaultResourceLoader> {
+  private buildSharedResourceLoader(
+    agentDir: string,
+    cwd: string,
+    key: string,
+    permitsTool?: (name: string) => boolean,
+  ): Promise<DefaultResourceLoader> {
     const shared = this.providerMiddlewareExtensions.length === 0;
     const pending = (async () => {
       const settingsManager =
         this.sessionOptions.settingsManager ?? sessionDependencies.SettingsManager.create(cwd, agentDir);
+      const builtins = this.providerMiddlewareExtensions.filter((name) => name.startsWith("builtin:"));
+      for (const name of builtins) {
+        if (name !== "builtin:codemode" || !sessionDependencies.createCodemodeExtension) {
+          throw builtinExtensionError(name, "unsupported builtin on this host");
+        }
+      }
+      const codemode = builtins.includes("builtin:codemode");
       let middlewarePaths: string[] = [];
       const packageSources = new Map<string, string>();
-      if (this.providerMiddlewareExtensions.length > 0) {
+      if (this.providerMiddlewareExtensions.some((name) => !name.startsWith("builtin:"))) {
         await settingsManager.reload();
         const packageManager = new DefaultPackageManager({ cwd, agentDir, settingsManager });
         const configured = await packageManager.resolve();
@@ -924,17 +964,57 @@ export class WorkflowAgent {
           })
           .map((extension) => extension.path);
       }
-      const loader = new sessionDependencies.DefaultResourceLoader({
-        cwd,
-        agentDir,
-        settingsManager,
-        noExtensions: true,
-        additionalExtensionPaths: middlewarePaths,
-        extensionsOverride: (base) =>
-          filterProviderMiddlewareExtensions(base, this.providerMiddlewareExtensions, packageSources),
-      });
-      await loader.reload();
-      return loader;
+      try {
+        const codemodeFactory = codemode ? sessionDependencies.createCodemodeExtension?.({ models: false }) : undefined;
+        const extensionFactories = codemodeFactory
+          ? [
+              {
+                name: "codemode",
+                builtin: true,
+                factory: ((pi) => {
+                  // Registered tools are filtered before session creation below.
+                  // The execution guard also covers tools registered later by
+                  // a child extension, including calls nested inside codemode.
+                  pi.on("tool_call", (event) => {
+                    if (permitsTool && !permitsTool(event.toolName)) {
+                      return { block: true, reason: `Tool "${event.toolName}" is denied by the child tool policy.` };
+                    }
+                  });
+                  return codemodeFactory(pi);
+                }) satisfies ExtensionFactory,
+              },
+            ]
+          : [];
+        const loader = new sessionDependencies.DefaultResourceLoader({
+          cwd,
+          agentDir,
+          settingsManager,
+          noExtensions: true,
+          additionalExtensionPaths: [...builtins, ...middlewarePaths],
+          extensionFactories,
+          extensionsOverride: (base) =>
+            filterProviderMiddlewareExtensions(base, this.providerMiddlewareExtensions, packageSources),
+        });
+        await loader.reload();
+        if (codemode) {
+          const result = loader.getExtensions();
+          if (result.extensions.some((entry) => entry.path !== "builtin:codemode" && entry.tools.has("codemode"))) {
+            throw builtinExtensionError("builtin:codemode", 'conflicting tool "codemode"; remove the conflicting tool');
+          }
+          const diagnostic = result.errors.find((entry) => entry.path === "builtin:codemode");
+          const loaded = result.extensions.filter((entry) => entry.path === "builtin:codemode");
+          if (diagnostic || loaded.length !== 1 || !loaded[0]?.tools.has("codemode")) {
+            throw builtinExtensionError(
+              "builtin:codemode",
+              diagnostic?.error ?? "host did not load the requested builtin",
+            );
+          }
+        }
+        return loader;
+      } catch (error) {
+        if (!codemode || error instanceof WorkflowError) throw error;
+        throw builtinExtensionError("builtin:codemode", String(error));
+      }
     })().catch((err) => {
       // Don't let a transient build failure (e.g. EMFILE during reload's disk
       // I/O) poison every subagent AND every retry of this run — clear the memo
@@ -1154,6 +1234,34 @@ export class WorkflowAgent {
       customTools.push(createStructuredOutputTool({ schema: options.schema, capture }) as unknown as ToolDefinition);
     }
 
+    const excludedTools = subagentExcludedTools(this.excludeTools, this.sessionOptions.excludeTools);
+    const childCodemode =
+      !this.sessionOptions.resourceLoader && this.providerMiddlewareExtensions.includes("builtin:codemode");
+    const systemToolNames = new Set((options.systemTools ?? []).map((tool) => tool.name));
+    if (options.schema) systemToolNames.add("structured_output");
+    const allowedToolNames = options.toolNames?.length ? new Set(options.toolNames) : undefined;
+    const deniedToolNames = new Set(options.disallowedToolNames ?? []);
+    const permitsChildTool = (name: string): boolean =>
+      systemToolNames.has(name) ||
+      (!deniedToolNames.has(name) && (name === "codemode" || !allowedToolNames || allowedToolNames.has(name)));
+    if (childCodemode) {
+      const effectiveCustomTools = this.sessionOptions.customTools ?? customTools;
+      if (effectiveCustomTools.some((tool) => tool.name === "codemode")) {
+        throw builtinExtensionError("builtin:codemode", 'conflicting tool "codemode"; remove the conflicting tool');
+      }
+      // Pi creates core tools independently of customTools. Deny policy-filtered
+      // names at its registry boundary so codemode cannot rediscover them.
+      const policyTools = [
+        ...["read", "bash", "powershell", "edit", "write", "grep", "find", "ls"].map((name) => ({ name })),
+        ...baseTools,
+        ...(options.tools ?? []),
+        ...effectiveCustomTools,
+      ];
+      excludedTools.push(...policyTools.filter((tool) => !permitsChildTool(tool.name)).map((tool) => tool.name));
+      // Include denied names even when they have not registered yet.
+      excludedTools.push(...[...deniedToolNames].filter((name) => !systemToolNames.has(name)));
+    }
+
     // Per-run modelRegistry wins over the constructor's shared registry, then
     // the lazily-built disk fallback. Used for tier diagnostics, model
     // resolution, and the subagent session's runtime below.
@@ -1287,6 +1395,16 @@ export class WorkflowAgent {
     const modelRuntime = runtimeOf(modelRegistry) as ModelRuntime | undefined;
     let session: Awaited<ReturnType<typeof createAgentSession>>["session"];
     try {
+      const resourceLoader =
+        this.sessionOptions.resourceLoader ??
+        (await this.getSharedResourceLoader(agentDir, runCwd, childCodemode ? permitsChildTool : undefined));
+      if (childCodemode) {
+        for (const extension of resourceLoader.getExtensions().extensions) {
+          for (const { definition } of extension.tools.values()) {
+            if (!permitsChildTool(definition.name)) excludedTools.push(definition.name);
+          }
+        }
+      }
       ({ session } = await agentSessionFactory({
         cwd: runCwd,
         agentDir,
@@ -1301,7 +1419,7 @@ export class WorkflowAgent {
         // getSharedResourceLoader. An injected resourceLoader (tests / embedders)
         // wins and skips the shared build entirely; the ...this.sessionOptions
         // spread below re-applies the same injected value harmlessly.
-        resourceLoader: this.sessionOptions.resourceLoader ?? (await this.getSharedResourceLoader(agentDir, runCwd)),
+        resourceLoader,
         // Host split (see modelRuntime above): stock pi takes modelRuntime;
         // omp's fork takes modelRegistry. Spread-cast keeps the runtime value
         // while satisfying the upstream CreateAgentSessionOptions type.
@@ -1327,7 +1445,7 @@ export class WorkflowAgent {
         // Deny recursive-orchestration tools in the subagent (#107). Placed after
         // the sessionOptions spread so it always applies; folds in any denylist
         // the caller set on sessionOptions rather than dropping it.
-        excludeTools: subagentExcludedTools(this.excludeTools, this.sessionOptions.excludeTools),
+        excludeTools: excludedTools,
       }));
     } catch (error) {
       if (options.thread) this.restoreThreadLeaf(sessionManager, threadLeaf);
@@ -1349,6 +1467,10 @@ export class WorkflowAgent {
     // before the first provider request (also supports injected resource loaders).
     try {
       await session.bindExtensions({});
+      if (childCodemode) {
+        // Activate only in this child; the SDK registry still enforces tools/noTools/excludeTools.
+        session.setActiveToolsByName([...session.getActiveToolNames(), "codemode"]);
+      }
     } catch (error) {
       await disposeSession();
       if (options.thread) this.restoreThreadLeaf(sessionManager, threadLeaf);

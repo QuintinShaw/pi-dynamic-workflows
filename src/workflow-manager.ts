@@ -403,7 +403,13 @@ export interface WorkflowManagerOptions {
    * other recursive-orchestration tools (#107).
    */
   excludeSubagentTools?: string[];
-  /** Trusted provider/auth middleware extension names allowed in children. Default []. */
+  /**
+   * Trusted provider/auth middleware extensions and supported Pi builtin extensions allowed in child sessions.
+   * Default [].
+   * Codemode loads and activates only in children, with model APIs disabled.
+   * Explicit child exclusions and SDK tool restrictions still win.
+   * Unsupported hosts/identifiers and conflicting tools fail before prompting.
+   */
   providerMiddlewareExtensions?: string[];
   /**
    * Persist each subagent transcript as a real pi session file under the
