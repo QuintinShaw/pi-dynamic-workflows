@@ -86,6 +86,7 @@ test("builtin activation is opt-in, exclusion wins, and file conflicts fail", { 
         allowlist?: string[];
         defaultTools?: string[];
         excluded?: boolean;
+        disallowed?: string[];
         session?: Partial<pi.CreateAgentSessionOptions>;
         active: boolean;
       }[] = [
@@ -103,8 +104,9 @@ test("builtin activation is opt-in, exclusion wins, and file conflicts fail", { 
         { allowlist: builtin, session: { tools: ["read"] }, active: false },
         { allowlist: builtin, session: { tools: ["read", "codemode"] }, active: true },
         { allowlist: builtin, session: { resourceLoader: injectedLoader }, active: false },
+        { allowlist: builtin, disallowed: ["codemode"], active: false },
       ];
-      for (const { allowlist, defaultTools, excluded, session, active } of cases) {
+      for (const { allowlist, defaultTools, excluded, disallowed, session, active } of cases) {
         let requests = 0;
         core.setResponses([
           (context) => {
@@ -122,7 +124,10 @@ test("builtin activation is opt-in, exclusion wins, and file conflicts fail", { 
           excludeTools: excluded ? ["codemode"] : [],
           session: { settingsManager: pi.SettingsManager.inMemory({ defaultTools }), ...session },
         });
-        assert.equal(await agent.run("task", { model: "faux-activation/model" }), "checked");
+        assert.equal(
+          await agent.run("task", { model: "faux-activation/model", disallowedToolNames: disallowed }),
+          "checked",
+        );
         assert.equal(requests, 1);
         assert.deepEqual(
           resourceLoaders
@@ -504,6 +509,94 @@ test("codemode coding policy preserves store/schema exemptions but not explicit 
     });
   } finally {
     store.dispose();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("codemode gates extension tools registered at session_start and before_agent_start", {
+  skip: !capable,
+  timeout: 30_000,
+}, async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-builtin-dynamic-policy-"));
+  const marker = join(home, "dynamic-tool-executions.log");
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const core = createFauxCore({ provider: "faux-dynamic-policy", models: [{ id: "model" }] });
+      const registry = await fauxRegistryFor(home, [["faux-dynamic-policy", core]]);
+      const extensionDir = join(home, ".pi", "agent", "extensions");
+      mkdirSync(extensionDir, { recursive: true });
+      writeFileSync(
+        join(extensionDir, "dynamic-policy.js"),
+        `import { appendFileSync } from "node:fs";
+const marker = ${JSON.stringify(marker)};
+const tool = (name, exposure, text) => ({
+  name, label: name, description: name,
+  parameters: { type: "object", properties: {} }, exposure,
+  execute: async () => { appendFileSync(marker, name + "\\n"); return { content: [{ type: "text", text }], details: {} }; }
+});
+export default pi => {
+  pi.registerTool(tool("static_allowed", "codemode", "ALLOWED"));
+  pi.registerTool(tool("static_codemode_denied", "codemode", "STATIC_CODEMODE_DENIED"));
+  pi.registerTool(tool("static_deferred_denied", "deferred", "STATIC_DEFERRED_DENIED"));
+  pi.on("session_start", () => {
+    pi.registerTool(tool("dynamic_session_denied", "codemode", "SESSION_DENIED"));
+  });
+  pi.on("before_agent_start", () => {
+    pi.registerTool(tool("dynamic_prompt_denied", "deferred", "PROMPT_DENIED"));
+  });
+};`,
+      );
+
+      const source = `
+        const allowed = await tools.static_allowed({});
+        if (allowed !== "ALLOWED") throw new Error("explicitly allowed extension tool failed");
+        for (const name of ["static_codemode_denied", "static_deferred_denied"]) {
+          if (ALL_TOOLS.some(t => t.name === name) || await describeTool(name)) {
+            throw new Error("statically denied extension tool was exposed: " + name);
+          }
+        }
+        for (const name of ["dynamic_session_denied", "dynamic_prompt_denied"]) {
+          let blocked = false;
+          try {
+            await tools[name]({});
+          } catch (error) {
+            if (!String(error).includes("denied by the child tool policy")) {
+              throw new Error("dynamic extension tool failed for the wrong reason: " + String(error));
+            }
+            blocked = true;
+          }
+          if (!blocked) throw new Error("dynamic extension tool bypassed policy: " + name);
+        }
+        text("policy checked");
+      `;
+      core.setResponses([
+        (context) => {
+          assert.ok(requestToolNames(context).includes("codemode"), "builtin codemode must remain opt-in active");
+          return code(source);
+        },
+        (context) => {
+          assert.match(toolOutputs(context), /policy checked/);
+          return fauxAssistantMessage("dynamic policy checked");
+        },
+      ]);
+
+      const agent = new WorkflowAgent({
+        cwd: home,
+        modelRegistry: registry,
+        providerMiddlewareExtensions: ["builtin:codemode", "dynamic-policy"],
+      });
+      assert.equal(
+        await agent.run("task", {
+          model: "faux-dynamic-policy/model",
+          toolNames: ["static_allowed", "static_deferred_denied"],
+          disallowedToolNames: ["static_deferred_denied"],
+        }),
+        "dynamic policy checked",
+      );
+      assert.equal(readFileSync(marker, "utf8"), "static_allowed\n", "denied extension tools never execute");
+    });
+  } finally {
+    installHostCreateAgentSession(pi.createAgentSession);
     rmSync(home, { recursive: true, force: true });
   }
 });

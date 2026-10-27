@@ -897,7 +897,11 @@ export class WorkflowAgent {
    * loaders are session-local: the SDK binds session actions into their runtime,
    * so sharing one would send a child's extension actions into another child.
    */
-  private getSharedResourceLoader(agentDir: string, cwd = this.cwd): Promise<DefaultResourceLoader> {
+  private getSharedResourceLoader(
+    agentDir: string,
+    cwd = this.cwd,
+    permitsTool?: (name: string) => boolean,
+  ): Promise<DefaultResourceLoader> {
     const key = JSON.stringify([agentDir, cwd]);
     const shared = this.providerMiddlewareExtensions.length === 0;
     const existing = shared ? this.resourceLoaders.get(key) : undefined;
@@ -908,7 +912,7 @@ export class WorkflowAgent {
       this.resourceLoaders.set(key, existing);
       return existing;
     }
-    return this.buildSharedResourceLoader(agentDir, cwd, key);
+    return this.buildSharedResourceLoader(agentDir, cwd, key, permitsTool);
   }
 
   /**
@@ -928,7 +932,12 @@ export class WorkflowAgent {
     }
   }
 
-  private buildSharedResourceLoader(agentDir: string, cwd: string, key: string): Promise<DefaultResourceLoader> {
+  private buildSharedResourceLoader(
+    agentDir: string,
+    cwd: string,
+    key: string,
+    permitsTool?: (name: string) => boolean,
+  ): Promise<DefaultResourceLoader> {
     const shared = this.providerMiddlewareExtensions.length === 0;
     const pending = (async () => {
       const settingsManager =
@@ -956,16 +965,26 @@ export class WorkflowAgent {
           .map((extension) => extension.path);
       }
       try {
-        const extensionFactories =
-          codemode && sessionDependencies.createCodemodeExtension
-            ? [
-                {
-                  name: "codemode",
-                  builtin: true,
-                  factory: sessionDependencies.createCodemodeExtension({ models: false }),
-                },
-              ]
-            : [];
+        const codemodeFactory = codemode ? sessionDependencies.createCodemodeExtension?.({ models: false }) : undefined;
+        const extensionFactories = codemodeFactory
+          ? [
+              {
+                name: "codemode",
+                builtin: true,
+                factory: ((pi) => {
+                  // Registered tools are filtered before session creation below.
+                  // The execution guard also covers tools registered later by
+                  // a child extension, including calls nested inside codemode.
+                  pi.on("tool_call", (event) => {
+                    if (permitsTool && !permitsTool(event.toolName)) {
+                      return { block: true, reason: `Tool "${event.toolName}" is denied by the child tool policy.` };
+                    }
+                  });
+                  return codemodeFactory(pi);
+                }) satisfies ExtensionFactory,
+              },
+            ]
+          : [];
         const loader = new sessionDependencies.DefaultResourceLoader({
           cwd,
           agentDir,
@@ -1218,6 +1237,13 @@ export class WorkflowAgent {
     const excludedTools = subagentExcludedTools(this.excludeTools, this.sessionOptions.excludeTools);
     const childCodemode =
       !this.sessionOptions.resourceLoader && this.providerMiddlewareExtensions.includes("builtin:codemode");
+    const systemToolNames = new Set((options.systemTools ?? []).map((tool) => tool.name));
+    if (options.schema) systemToolNames.add("structured_output");
+    const allowedToolNames = options.toolNames?.length ? new Set(options.toolNames) : undefined;
+    const deniedToolNames = new Set(options.disallowedToolNames ?? []);
+    const permitsChildTool = (name: string): boolean =>
+      systemToolNames.has(name) ||
+      (!deniedToolNames.has(name) && (name === "codemode" || !allowedToolNames || allowedToolNames.has(name)));
     if (childCodemode) {
       const effectiveCustomTools = this.sessionOptions.customTools ?? customTools;
       if (effectiveCustomTools.some((tool) => tool.name === "codemode")) {
@@ -1231,12 +1257,9 @@ export class WorkflowAgent {
         ...(options.tools ?? []),
         ...effectiveCustomTools,
       ];
-      const permitted = new Set(
-        applyToolPolicy(policyTools, options.toolNames, options.disallowedToolNames).map((tool) => tool.name),
-      );
-      for (const tool of options.systemTools ?? []) permitted.add(tool.name);
-      if (options.schema) permitted.add("structured_output");
-      excludedTools.push(...policyTools.filter((tool) => !permitted.has(tool.name)).map((tool) => tool.name));
+      excludedTools.push(...policyTools.filter((tool) => !permitsChildTool(tool.name)).map((tool) => tool.name));
+      // Include denied names even when they have not registered yet.
+      excludedTools.push(...[...deniedToolNames].filter((name) => !systemToolNames.has(name)));
     }
 
     // Per-run modelRegistry wins over the constructor's shared registry, then
@@ -1372,6 +1395,16 @@ export class WorkflowAgent {
     const modelRuntime = runtimeOf(modelRegistry) as ModelRuntime | undefined;
     let session: Awaited<ReturnType<typeof createAgentSession>>["session"];
     try {
+      const resourceLoader =
+        this.sessionOptions.resourceLoader ??
+        (await this.getSharedResourceLoader(agentDir, runCwd, childCodemode ? permitsChildTool : undefined));
+      if (childCodemode) {
+        for (const extension of resourceLoader.getExtensions().extensions) {
+          for (const { definition } of extension.tools.values()) {
+            if (!permitsChildTool(definition.name)) excludedTools.push(definition.name);
+          }
+        }
+      }
       ({ session } = await agentSessionFactory({
         cwd: runCwd,
         agentDir,
@@ -1386,7 +1419,7 @@ export class WorkflowAgent {
         // getSharedResourceLoader. An injected resourceLoader (tests / embedders)
         // wins and skips the shared build entirely; the ...this.sessionOptions
         // spread below re-applies the same injected value harmlessly.
-        resourceLoader: this.sessionOptions.resourceLoader ?? (await this.getSharedResourceLoader(agentDir, runCwd)),
+        resourceLoader,
         // Host split (see modelRuntime above): stock pi takes modelRuntime;
         // omp's fork takes modelRegistry. Spread-cast keeps the runtime value
         // while satisfying the upstream CreateAgentSessionOptions type.

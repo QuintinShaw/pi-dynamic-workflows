@@ -268,6 +268,12 @@ Remove conflicting registrations or the builtin opt-in to resolve these errors; 
 
 Currently, only `builtin:codemode` is supported, on Pi 0.99.0 and 1.x.
 It runs with `models: false`, exposing child tools but no model catalog, classifier, or image APIs.
+When Dynamic Workflows creates the codemode child loader (without an injected SDK `resourceLoader`),
+`disallowedToolNames` is a denylist that wins even for the builtin `codemode` tool itself;
+`toolNames` and the denylist also govern statically exposed `codemode`/`deferred` extension tools and are enforced
+again when an extension registers a tool during `session_start` or `before_agent_start`. System tools and
+`structured_output` remain the documented schema/system exemptions. This is an in-process tool-policy gate, not an
+operating-system sandbox; only opt in trusted, child-safe extensions.
 
 Set `"defaultEffort": "high"` or `"ultra"` in that settings file to opt a fresh session into the corresponding orchestration effort (`"off"` is the default). Project settings overlay the global value. This is an initial in-memory value only: `/effort` and `/ultracode` change the current session without writing settings, and reload/new/fork/session switches retain their existing in-process effort.
 
