@@ -410,7 +410,7 @@ export function installWorkflowKeywordArming(
   pi.on("before_agent_start", (event) => {
     const pending = pendingDirective;
     pendingDirective = undefined;
-    if (!pending || pending.prompt !== event.prompt) return;
+    if (!pending || !("prompt" in event) || pending.prompt !== event.prompt) return;
     return { systemPrompt: `${event.systemPrompt}\n\n${pending.directive}` };
   });
 

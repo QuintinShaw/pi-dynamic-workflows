@@ -4,11 +4,21 @@ import { appendFileSync, mkdtempSync, renameSync, rmSync, truncateSync, writeFil
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, beforeEach, describe, it } from "node:test";
-import { AgentSession, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { createFauxCore, fauxAssistantMessage } from "@earendil-works/pi-ai";
+import {
+  AgentSession,
+  createAgentSession,
+  type ExtensionAPI,
+  type ModelRuntime,
+  SessionManager,
+} from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
+import { runtimeOf } from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { UsageLimitScheduler } from "../src/usage-limit-scheduler.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
+import { withFakeHomeAsync } from "./helpers/fake-home.js";
+import { fauxRegistry } from "./helpers/faux-registry.js";
 
 type DeliveryCall = { content: string; customType?: string; triggerTurn?: boolean };
 type StableSend = (
@@ -185,6 +195,7 @@ function lateErrorAgent() {
 type TaskPanelModule = {
   WORKFLOW_LIFECYCLE_EVENT: string;
   installResultDelivery: (pi: ExtensionAPI, manager: unknown, opts?: unknown) => void;
+  installHostSessionCapture: (sessionClass: typeof AgentSession) => void;
   bindSessionDelivery: (
     sessionId: string,
     pi: ExtensionAPI,
@@ -2706,90 +2717,118 @@ describe("installResultDelivery", () => {
     );
   });
 
-  it("triggerTurn non-streaming routes through _runAgentPrompt (T4)", async () => {
-    const pi = createMockPi();
-    const manager = createMockManager(makeRun());
-    const prompted: unknown[] = [];
-    const settled: string[] = [];
-    const history = createPersistedDeliveryHistory();
+  it("triggerTurn non-streaming starts a real faux-provider host turn (T4)", { timeout: 10_000 }, async () => {
+    const home = mkdtempSync(join(tmpdir(), "pi-delivery-host-home-"));
+    const cwd = mkdtempSync(join(tmpdir(), "pi-delivery-host-cwd-"));
+    let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
+    let releaseFauxResponse = () => {};
 
-    // An IDLE host session: isStreaming=false, so the real sendCustomMessage
-    // with triggerTurn:true takes the _runAgentPrompt branch — the branch real
-    // host deliveries actually hit. The fake supplies the internals that path
-    // touches; agent.prompt is a stub so no real LLM call is made.
-    const idleSession = Object.create(AgentSession.prototype) as object & {
-      agent: unknown;
-      sessionManager: unknown;
-      _resourceLoader: unknown;
-      _isAgentRunActive: boolean;
-      _pendingBashMessages: unknown[];
-      _pendingNextTurnMessages: unknown[];
-      _pendingCustomMessages: unknown[];
-      _pendingToolNames: Set<string>;
-      _extensionRunner: unknown;
-      _emit: () => void;
-    };
-    idleSession.agent = {
-      state: { messages: [] },
-      prompt: async (messages: unknown) => {
-        prompted.push(messages);
-        const message = messages as { customType?: string; details?: unknown };
-        if (message.customType === "workflow-result") {
-          history.append({
-            id: `entry-${history.branch.length}`,
-            type: "custom_message",
-            customType: message.customType,
-            details: message.details,
-          });
-        }
-        return { stopReason: "end_turn" };
-      },
-      continue: async () => {},
-    };
-    idleSession.sessionManager = {
-      persist: true,
-      getSessionId: () => SESSION,
-      getSessionName: () => "chat",
-      isPersisted: () => true,
-      getBranch: () => history.branch,
-      getSessionFile: () => history.sessionFile,
-      appendCustomMessageEntry: (customType: string, _content: unknown, _display: boolean, details?: unknown) => {
-        history.append({ id: `entry-${history.branch.length}`, type: "custom_message", customType, details });
-        return "";
-      },
-      // Pi 1.0's _appendCustomMessage refreshes agent.state.messages through a
-      // projection; empty like the fake host's real state.
-      buildSessionProjection: () => ({ entries: [], messages: [], thinkingLevel: "medium", model: null }),
-    };
-    idleSession._resourceLoader = { noExtensions: false };
-    idleSession._isAgentRunActive = false;
-    idleSession._pendingBashMessages = [];
-    idleSession._pendingNextTurnMessages = [];
-    idleSession._pendingCustomMessages = [];
-    // Pi 1.0's _runAgentPrompt clears the pending loadout set before prompting.
-    idleSession._pendingToolNames = new Set();
-    Object.assign(idleSession, { subscribe: () => () => {} });
-    idleSession._extensionRunner = {
-      emit: async (e: { type: string }) => {
-        settled.push(e.type);
-      },
-    };
-    idleSession._emit = () => {};
-    mod._registerHostSessionForTests(idleSession as never);
+    try {
+      await withFakeHomeAsync(home, async () => {
+        let resolveStarted!: () => void;
+        const started = new Promise<void>((resolve) => {
+          resolveStarted = resolve;
+        });
+        const released = new Promise<void>((resolve) => {
+          releaseFauxResponse = resolve;
+        });
+        const core = createFauxCore({
+          provider: "fauxtest-host-delivery",
+          models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 4096 }],
+        });
+        core.setResponses([
+          async () => {
+            resolveStarted();
+            await released;
+            return fauxAssistantMessage("deterministic host response", { stopReason: "stop" });
+          },
+        ]);
+        const registry = await fauxRegistry(home, "fauxtest-host-delivery", core);
+        const model = registry.find("fauxtest-host-delivery", "faux-model");
+        assert.ok(model, "the faux registry must expose the deterministic model");
+        const modelRuntime = runtimeOf(registry) as ModelRuntime;
 
-    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
-    manager.setSessionId(SESSION);
-    mod.bindSessionDelivery(SESSION, pi as unknown as ExtensionAPI, { manager });
-    manager.emit("complete", { runId: "test-run-1" });
+        // Install the same prototype capture used by extensions/workflow.ts
+        // before constructing the persistent host session. The test helper below
+        // also registers the live object explicitly, keeping this test robust if
+        // a host SDK moves capture earlier or later in session construction.
+        mod.installHostSessionCapture(AgentSession);
+        const sessionManager = SessionManager.create(cwd, join(home, "sessions"));
+        session = (
+          await createAgentSession({
+            cwd,
+            agentDir: home,
+            model,
+            modelRuntime,
+            sessionManager,
+            tools: [],
+          })
+        ).session;
 
-    // The thenable ACK resolves only after _runAgentPrompt settles.
-    for (let i = 0; i < 20; i++) await Promise.resolve();
-    assert.equal(prompted.length, 1, "triggerTurn delivery must start an agent prompt");
-    const appMessage = prompted[0] as { customType?: string; content?: unknown; display?: boolean };
-    assert.equal(appMessage.customType, "workflow-result", "the prompt receives the delivered app message");
-    assert.equal(appMessage.display, true);
-    assert.ok(settled.includes("agent_settled"), "the run settles after the prompt");
-    assert.equal(manager.getPersistence?.().load("test-run-1")?.pendingDelivery, undefined, "cleared after prompt ACK");
+        const settled: string[] = [];
+        session.subscribe((event) => {
+          if (event.type === "agent_settled") settled.push(event.type);
+        });
+        const sendCalls: Array<{
+          message: { customType?: string; display?: boolean };
+          options?: { triggerTurn?: boolean; deliverAs?: string };
+        }> = [];
+        let realSendCompletion: Promise<void> | undefined;
+        const realSend = session.sendCustomMessage.bind(session);
+        session.sendCustomMessage = ((message, options) => {
+          sendCalls.push({ message: { customType: message.customType, display: message.display }, options });
+          realSendCompletion = realSend(message, options);
+          return realSendCompletion;
+        }) as typeof session.sendCustomMessage;
+
+        const pi = createMockPi();
+        const manager = createMockManager(makeRun({ sessionId: session.sessionId }));
+        mod._registerHostSessionForTests(session);
+        mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+        manager.setSessionId(session.sessionId);
+        mod.bindSessionDelivery(session.sessionId, pi as unknown as ExtensionAPI, { manager });
+        manager.emit("complete", { runId: "test-run-1" });
+
+        await started;
+        assert.ok(manager.getPersistence?.().load("test-run-1")?.pendingDelivery, "pendingDelivery stays before ACK");
+        assert.ok(realSendCompletion, "delivery must have entered the real sendCustomMessage");
+        releaseFauxResponse();
+        await realSendCompletion;
+        await session.waitForIdle();
+        await Promise.resolve();
+        await Promise.resolve();
+
+        assert.equal(core.state.callCount, 1, "delivery must start exactly one deterministic faux-provider turn");
+        assert.equal(sendCalls.length, 1, "delivery must invoke the live host sendCustomMessage once");
+        assert.equal(sendCalls[0].message.customType, "workflow-result");
+        assert.equal(sendCalls[0].message.display, true);
+        assert.equal(sendCalls[0].options?.triggerTurn, true, "delivery must trigger a new host turn");
+        assert.equal(sendCalls[0].options?.deliverAs, "followUp");
+        const resultEntry = session.sessionManager
+          .getBranch()
+          .find((entry) => entry.type === "custom_message" && entry.customType === "workflow-result") as
+          | { content?: unknown }
+          | undefined;
+        assert.ok(resultEntry, "the workflow-result must be persisted by the real SessionManager");
+        assert.equal(typeof resultEntry.content, "string");
+        assert.match(String(resultEntry.content), /All tests passed/);
+        assert.ok(settled.includes("agent_settled"), "the real host turn must settle");
+        assert.equal(
+          manager.getPersistence?.().load("test-run-1")?.pendingDelivery,
+          undefined,
+          "pendingDelivery clears only after the real send ACK",
+        );
+        assert.ok(
+          session.sessionFile?.startsWith(join(home, "sessions")),
+          "host persistence stays in the isolated home",
+        );
+      });
+    } finally {
+      releaseFauxResponse();
+      session?.dispose();
+      rmSync(home, { recursive: true, force: true });
+      rmSync(cwd, { recursive: true, force: true });
+    }
   });
 
   it("child session sendCustomMessage is not captured and never delivers", () => {
