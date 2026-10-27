@@ -44,6 +44,17 @@ Every exact fact below is projected from the installed extension's capability co
 - Constraint: keepWorktree defaults true (worktree kept for merge); false deletes after the call
 - Constraint: each live execution creates a uniquely owned worktree; retries or resume never reuse or overwrite a retained worktree
 
+<a id="readlocalfile"></a>
+## readLocalFile
+
+- Classification: `runtime-global`
+- Support: `supported`
+- Signature: `readLocalFile(path, { maxBytes }) => string`
+- Constraint: serves the target file's raw utf-8 bytes directly into the vm realm with no LLM transport; zero agent() calls
+- Constraint: an oversized read (byte size over maxBytes) throws instead of returning bytes; maxBytes must be a positive finite integer
+- Constraint: file-capture consumers verify the shell-side capture marker (e.g. WROTE=<bytes>) before calling; agents stay WRITES-only
+- Constraint: replay-stable only against captured-and-immutable shell files; the runtime does not journal the bytes
+
 <a id="parallel"></a>
 ## parallel
 
