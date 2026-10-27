@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
-import { realpathSync, statSync } from "node:fs";
+import { readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import vm from "node:vm";
@@ -627,6 +627,29 @@ type AnyNode = Node & { [key: string]: any; start: number; end: number };
 
 // Parse-time author hint (fast feedback). The real enforcement is DETERMINISM_PRELUDE.
 const DETERMINISM_BLOCKLIST = /\bDate\s*\.\s*now\b|\bMath\s*\.\s*random\b|\bnew\s+Date\s*\(\s*\)/;
+
+/**
+ * The trusted machine→VM channel: serve a local file's RAW bytes (utf-8) directly
+ * into the vm realm with NO LLM transport. Reads a file from the host filesystem
+ * so a workflow can do file-capture reads — an orchestrating shell writes exact
+ * command output to a file (with a byte-size marker), and the workflow reads the
+ * captured bytes back here instead of parsing the agent's prose reply.
+ */
+function readLocalFileRuntimeGlobal(filePath: string, options: { maxBytes?: number } = {}): string {
+  if (typeof filePath !== "string" || filePath.length === 0) {
+    throw new Error("readLocalFile(path, { maxBytes }): path must be a non-empty string");
+  }
+  if (options.maxBytes !== undefined) {
+    if (typeof options.maxBytes !== "number" || !Number.isFinite(options.maxBytes) || options.maxBytes < 1) {
+      throw new Error("readLocalFile: maxBytes must be a positive finite integer");
+    }
+  }
+  const byteSize = statSync(filePath).size;
+  if (options.maxBytes !== undefined && byteSize > options.maxBytes) {
+    throw new Error(`readLocalFile: ${filePath} is ${byteSize} bytes — exceeds maxBytes ${options.maxBytes}`);
+  }
+  return readFileSync(filePath, "utf8");
+}
 
 /**
  * Runtime determinism hardening, run inside the vm realm BEFORE the user script.
@@ -2158,6 +2181,7 @@ export async function runWorkflow<T = unknown>(
 
   const runtimeImplementations = {
     agent,
+    readLocalFile: readLocalFileRuntimeGlobal,
     parallel,
     pipeline,
     workflow: workflowFn,
