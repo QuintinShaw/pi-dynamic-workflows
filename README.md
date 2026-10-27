@@ -34,7 +34,7 @@ Run a workflow to audit every route under src/routes/ for missing auth checks.
 
 Pi writes and starts the workflow in the background. A live panel tracks progress while you keep working, and the final result is delivered back into the conversation automatically.
 
-Keyword triggering is on by default: use the bounded word **workflow** or **workflows** in a message to arm workflow mode — the assistant then handles a request by fanning it out across agents, but still answers plainly if you're only asking *about* workflows (the trigger authorizes the tool, it doesn't force it). Or run `/workflows run <prompt>` explicitly. Identifier-like text and paths such as `myworkflow`, `workflow_name`, and `src/workflow-editor.ts` do not trigger. You can change the keyword with `/workflows-trigger set pi-workflow` or disable it with `/workflows-trigger off`.
+Keyword triggering is on by default: use the bounded word **workflow** or **workflows** in an idle interactive editor submission to arm workflow mode — the assistant then handles a request by fanning it out across agents, but still answers plainly if you're only asking *about* workflows (the trigger authorizes the tool, it doesn't force it). The directive applies only to that request; the original user message stays unchanged. Print/JSON/RPC inputs and queued steering/follow-up inputs do not keyword-arm. Or run `/workflows run <prompt>` explicitly. Identifier-like text and paths such as `myworkflow`, `workflow_name`, and `src/workflow-editor.ts` do not trigger. You can change the keyword with `/workflows-trigger set pi-workflow` or disable it with `/workflows-trigger off`.
 
 ## How it works
 
@@ -77,7 +77,7 @@ return await agent(
 
 - **Real parallel orchestration** — fan out up to 16 concurrent and 1000 total subagents from one orchestration script.
 - **Per-agent model routing** — use `small`, `medium`, or `big` tiers, or choose an exact provider/model and thinking level.
-- **Journaled resume** — replay completed agents after interruption without rerunning them or spending their tokens again. The orchestrator can also resume with an **edited script** (`resumeFromRunId`): unchanged `agent()` calls replay from cache and only edited/new ones re-run — so a single bad prompt no longer means paying to re-run the whole workflow.
+- **Journaled resume** — replay completed agents after interruption instead of spending their tokens again. Replay follows the longest-unchanged-prefix rule: the first call that never journaled (or whose script changed) and everything after it re-run live; pass `resumeMode: "replay-completed"` when resuming to also replay completed calls dispatched concurrently with a never-completed gap in the same fan-out (e.g. a `parallel()` fan-out paused mid-flight). The orchestrator can also resume with an **edited script** (`resumeFromRunId`): unchanged `agent()` calls replay from cache and only edited/new ones re-run — so a single bad prompt no longer means paying to re-run the whole workflow.
 - **Git worktree isolation** — parallel agents edit on separate branches with `isolation: "worktree"`. Kept by default for merge; pass `keepWorktree: false` to delete (tests).
 - **Measured usage** — report real tokens and cost from each subagent session; add run, phase, or agent budgets only when you want them. When a provider session ends without reporting usage, the affected totals are heuristic character estimates and UI token surfaces render them with a `~` prefix (e.g. `~640 tok`) — never silently as metered figures. (Script-facing `budget.spent()/remaining()` are raw numbers and cannot carry the marker.)
 - **Visible background runs** — track phases, agents, models, fresh/cache tokens, cost, and live tok/s from the progress panel or `/workflows` navigator.
@@ -118,6 +118,7 @@ The installed extension generates this compact index from its executable capabil
 | agentTimeoutMs | workflow-tool-input | `agentTimeoutMs?: number = configured default or unbounded` | — |
 | tokenBudget | workflow-tool-input | `tokenBudget?: number = configured default or unlimited` | — |
 | resumeFromRunId | workflow-tool-input | `resumeFromRunId?: string` | — |
+| resumeMode | workflow-tool-input | `resumeMode?: "prefix" \| "replay-completed" = "prefix"` | — |
 <!-- END GENERATED SUPPORTED WORKFLOW CAPABILITIES -->
 
 ## Built-in workflows
@@ -150,6 +151,8 @@ Do a deep-research on whether Bun's test runner is production-ready.
 ```
 
 is equivalent to `/deep-research "..."`. A saved workflow always wins over a built-in of the same name, on both the slash-command and natural-language paths — so saving your own `code-review` shadows the built-in one everywhere.
+
+Pi's built-in slash-command names (such as `model`, `compact`, `trust`, and the interactive-only `debug`) and names already provided by another extension are reserved; save and rename report a conflict before changing the saved workflow library.
 
 ## Commands and run control
 
@@ -272,7 +275,7 @@ A schema-less agent call that comes back as whitespace-only text is a recoverabl
 
 Pausing and resuming a run keeps the limits it started with — `maxAgents`, `agentTimeoutMs`, `concurrency`, and `agentRetries` carry over instead of falling back to defaults, and `tokenBudget` tracking is cumulative across the pause, so a run can't reset its spend by pausing and resuming.
 
-Programmatic hosts can set `drainAbortGraceMs` on `runWorkflow` or manager execution options to bound the final wait for agents that ignore cancellation. The default is 10,000 ms; `Infinity` waits without a bound. Finite values from 1 through 2,147,483,647 are rounded down; other values use the default. This is a host-only option, not a `workflow` tool input or persisted setting. It does not limit a successful run's final wait or a checkpoint suspension unless the run is also cancelled. After abandonment, already-reported terminal usage is retained, provisional usage is rolled back, and late agent callbacks cannot modify the settled run.
+Programmatic hosts can set `drainAbortGraceMs` on `runWorkflow` or manager execution options to bound the final wait for agents that ignore cancellation. The default is 10,000 ms; `Infinity` waits without a bound. Finite values from 1 through 2,147,483,647 are rounded down; other values use the default. This is a host-only option, not a `workflow` tool input or persisted setting. It does not limit a successful run's final wait or a checkpoint suspension unless the run is also cancelled. One exception: under `resumeMode: "replay-completed"`, a nested frame's replay-quiescence drain is bounded by this grace for its whole lifetime, cancelled or not. In replay-completed mode, an already-dispatched live gap or edit is recorded before provider execution and forces subsequent parent calls live when the child returns. Finite nested grace may let those calls dispatch before the child's side effects finish. The drain does not guarantee observation of independently deferred work whose first gap/edit occurs after the child returns. Top-level successful completion still waits for outstanding agents and may remain blocked. `Infinity` removes the drain's time bound, but does not extend tracking to arbitrary deferred work. After a top-level abort-drain abandonment, already-reported terminal usage is retained, provisional usage is rolled back, and late agent callbacks cannot modify the settled run; a nested abandonment is not a rollback — the call keeps running and its usage commits when it settles.
 
 </details>
 
@@ -300,7 +303,7 @@ Subagents are in-memory by default. Set `persistAgentSessions: true` to retain f
 
 `PI_WORKFLOW_AGENT_CACHE_RETENTION` sets the prompt-cache retention tier for agent sessions, overriding `PI_CACHE_RETENTION` for them only. Anthropic charges more per cache write on the 1h tier than the 5m one; a long-lived parent conversation earns that back by surviving idle gaps, but agent sessions are short-lived and rarely idle long enough to claim the longer window, so a wide fan-out pays the higher write price without the benefit. Set `PI_CACHE_RETENTION=long PI_WORKFLOW_AGENT_CACHE_RETENTION=short` to keep the longer window for your own conversation only. Unset by default, so agents inherit the parent's retention and behaviour is unchanged unless you opt in. The override is applied to each agent session's own stream function rather than to `process.env`, so a background run cannot change retention for a parent turn streaming at the same time.
 
-Run storage uses a small versioned `<runId>.json` index head plus an append-only `<runId>.json.events.jsonl` change log. Only bytes committed by the head participate in replay. Existing full-JSON run files remain readable and migrate on their next write; read-only scans never migrate them. Older releases cannot read the new format, so retain a pre-upgrade backup if you need to downgrade. See [the storage protocol](docs/run-storage.md) for recovery and compatibility details.
+Run storage uses a small versioned `<runId>.json` index head plus an append-only `<runId>.json.events.jsonl` change log. Only bytes committed by the head participate in replay. Existing full-JSON run files remain readable and migrate on their next write; read-only scans never migrate them. Older releases cannot read the new format, so retain a pre-upgrade backup if you need to downgrade. See [the storage protocol](docs/run-storage.md) for recovery and compatibility details and [the Pi Durable alignment note](docs/durable-alignment.md) for why run storage stays extension-owned.
 
 Completed background runs retain their full result in run storage. Conversation delivery also creates an immutable JSON result artifact (`<runId>.json.result-<content-hash>`) and links to it, so a shortened summary still has a directly readable full result. These artifacts are removed with the run. Other Pi extensions can subscribe to the exported `WORKFLOW_LIFECYCLE_EVENT` through `pi.events`. Background workflows emit `{ status, runId, name }` and include `sessionId` when the originating Pi session is known, where `status` is `started`, `resumed`, `paused`, `completed`, `failed`, or `stopped`.
 
@@ -336,7 +339,7 @@ The default `workflow` also matches `workflows`; a custom word matches exactly. 
 | Isolated subagent contexts | Fresh in-memory Pi sessions; results remain in variables |
 | Structured outputs | JSON Schema validation with bounded repair |
 | Background runs | Non-blocking run, live panel, and automatic result delivery |
-| Resume | Journaled replay of the unchanged completed prefix, including edit-and-resume with a revised script (`resumeFromRunId`) |
+| Resume | Journaled replay of the unchanged completed prefix, including edit-and-resume with a revised script (`resumeFromRunId`) and an opt-in `replay-completed` mode for fan-outs paused mid-flight |
 | Model selection | Per-agent and per-phase routing across authenticated providers |
 | Ultracode | `/ultracode` or `/effort ultra` |
 | Additional Pi features | Worktree isolation, real cost accounting, deep research, and quality-pattern helpers |
@@ -349,7 +352,9 @@ Workflow scripts run in a Node `vm` sandbox. `Date.now()`, `Math.random()`, `new
 
 Journal replay — including edit-and-resume via `resumeFromRunId` — matches cached agent results by **positional call index** (the order in which `agent()` calls execute), the same contract Claude Code uses. Editing an `agent()` prompt in place reuses the cache up to that call and re-runs it and everything after. Inserting, removing, or reordering an `agent()` call before others shifts their positions and invalidates the cache from that point on (mismatched calls simply re-run — no crash). To preserve the cached prefix, keep the earlier still-good `agent()` calls unchanged and in the same order.
 
-Only a call that finishes with a real result is journaled — a call whose every attempt ended in a recoverable failure (including one that only ever produced `AGENT_EMPTY_OUTPUT`) is never cached. Resuming such a run with `resumeFromRunId` therefore replays every earlier, already-succeeded call from cache and re-runs only that one call and everything lexically after it — cheap and exactly targeted, not a full re-run of the fleet.
+Only a call that finishes with a real result is journaled — a call whose every attempt ended in a recoverable failure (including one that only ever produced `AGENT_EMPTY_OUTPUT`) is never cached. Resuming such a run with `resumeFromRunId` under the default prefix policy therefore replays every earlier, already-succeeded call from cache and re-runs only that one call and everything lexically after it — cheap and exactly targeted, not a full re-run of the fleet.
+
+A call interrupted before it could journal (a pause mid-`parallel()`, a usage-limit stop) is a **gap**: under the default prefix rule it ends the replayable prefix, so its completed later siblings re-run live on resume. For fan-outs where that re-spend is unacceptable, resume with `resumeMode: "replay-completed"` (on `workflow`'s `resumeFromRunId` call or `workflow_control`'s `resume` action): a completed call replays across a gap only when it was dispatched concurrently with the gap inside one fan-out — any synchronous dispatch of a `parallel()`/`pipeline()` thunk (a thunk may dispatch several calls before its first `await`; all of them are in the window). Calls made after an `await` (including inside a fan-out thunk) count as sequential and still re-run; the `workflow()` call that opens a nested frame follows the same dispatch-timing rule as any other call — dispatched in the gap's own window it replays with its child journal, dispatched later it re-executes live — a gap inside the child follows the same same-window rule within that frame, and a gap or edit inside a nested frame also re-runs the parent calls dispatched after that frame returns; a changed call always re-runs its whole suffix. The chosen mode persists on the run, so later resumes keep it unless overridden. Results that flowed through the shared store or the filesystem rather than prompts can replay stale values across a re-run gap — no hash observes those channels — so keep the default when agents coordinate through the store or files across the gap.
 
 ## Upgrading to 3.0
 

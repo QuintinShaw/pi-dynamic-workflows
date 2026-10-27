@@ -1481,6 +1481,58 @@ test("component rename strips astral format characters and keeps the same safe n
   assert.ok(notifications.every((notice) => !notice.message.includes("invalid")));
 });
 
+test("component rename rejects Pi interactive-only command names before storage", async () => {
+  const { ui, notifications, getComponent } = fakeUiCapturingComponent();
+  const workflow = {
+    name: "safe",
+    description: "safe workflow",
+    script: "export SAFE",
+    location: "project" as const,
+    source: "project" as const,
+    path: "/safe.json",
+    savedAt: "2025-01-01",
+  } as SavedWorkflow;
+  let renameCalls = 0;
+  const storage = {
+    list: () => [workflow],
+    rename: () => {
+      renameCalls++;
+      return { ok: true as const, workflow };
+    },
+    delete: () => true,
+  };
+  const manager = {
+    on: () => {},
+    off: () => {},
+    listRuns: () => [] as PersistedRunState[],
+    getRun: () => undefined,
+  } as unknown as WorkflowManager;
+
+  openWorkflowNavigator({} as ExtensionAPI, manager, ui, { storage: storage as unknown as WorkflowStorage }).catch(
+    () => {},
+  );
+  await Promise.resolve();
+  await Promise.resolve();
+  const component = getComponent();
+  assert.ok(component);
+
+  for (const name of ["debug", "arminsayshi", "dementedelves"]) {
+    component.handleInput("r");
+    for (let index = 0; index < workflow.name.length; index++) component.handleInput("\b");
+    component.handleInput(name);
+    component.handleInput("\r");
+  }
+
+  assert.equal(renameCalls, 0, "host-reserved renames must not reach storage");
+  for (const name of ["debug", "arminsayshi", "dementedelves"]) {
+    assert.ok(
+      notifications.some(
+        (notice) => notice.type === "error" && new RegExp(`${name}.*reserved by Pi`).test(notice.message),
+      ),
+    );
+  }
+});
+
 test("component manager refresh invalidates a stale confirmation instead of acting on the new row", async () => {
   const { ui, getComponent } = fakeUiCapturingComponent();
   const run = {

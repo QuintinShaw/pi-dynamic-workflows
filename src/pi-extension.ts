@@ -176,13 +176,47 @@ export default function extension(pi: ExtensionAPI) {
     },
   });
   const workflowControlTool = createWorkflowControlTool({ getManager });
-  pi.registerTool(workflowTool);
-  pi.registerTool(workflowControlTool);
+  // `exposure: "deferred"` (pi >= 0.99) keeps both tools out of the declared
+  // tool set — and its prompt bytes out of the system prompt — until the
+  // built-in tool_search loads them. Older hosts never read the field, so the
+  // tools register active exactly as before; the session_start handler below
+  // force-activates them whenever no ACTIVE tool_search could discover them.
+  const DEFERRED_EXPOSURE = { exposure: "deferred" } as const;
+  pi.registerTool({ ...workflowTool, ...DEFERRED_EXPOSURE });
+  pi.registerTool({ ...workflowControlTool, ...DEFERRED_EXPOSURE });
+
+  // While a run is in flight the model may need to steer it: keep the control
+  // tool reachable without a tool_search round-trip. No-op once active (the
+  // common case — force-activated at session_start, or already loaded by a
+  // search). Best-effort: a host rejecting the loadout change must not break
+  // the run that emitted the event.
+  const activateControlToolOnRunStart = (target: WorkflowManager) => {
+    const ensureActive = () => {
+      try {
+        const current = pi.getActiveTools();
+        if (!current.includes(workflowControlTool.name)) {
+          pi.setActiveTools([...current, workflowControlTool.name]);
+        }
+      } catch {
+        // Host without a working active-tool set — the tool stays as registered.
+      }
+    };
+    target.on("started", ensureActive);
+    target.on("resumed", ensureActive);
+    return () => {
+      target.off("started", ensureActive);
+      target.off("resumed", ensureActive);
+    };
+  };
+  let disposeControlToolActivation = activateControlToolOnRunStart(manager);
 
   let usageLimitScheduler = new UsageLimitScheduler(manager);
   let disposeProgress: ReturnType<typeof installWorkflowProgress> | undefined;
 
   pi.on("session_shutdown", (event?: { reason?: string; targetSessionFile?: string }) => {
+    // These listeners own this generation's host. Detach before a manager can
+    // be handed off or paused, so late events cannot mutate the outgoing host.
+    disposeControlToolActivation();
     usageLimitScheduler.dispose();
     // Always stop live sends first so a completion racing teardown cannot
     // deliver into the outgoing session (or throw on a just-stale ctx and be
@@ -248,6 +282,7 @@ export default function extension(pi: ExtensionAPI) {
     if (sessionCwd !== resolve(manager.getCwd())) {
       // Cross-project: the live manager is for the wrong tree. Pause anything
       // still on it, then rebuild against the real session project.
+      disposeControlToolActivation();
       const stranded: WorkflowReloadRuntime = {
         cwd: manager.getCwd(),
         extensionVersion: WORKFLOW_EXTENSION_VERSION,
@@ -262,6 +297,7 @@ export default function extension(pi: ExtensionAPI) {
       managerOptions = buildManagerOptions(cwd, storage);
       manager = new WorkflowManager({ cwd, ...managerOptions });
       installResultDelivery(pi, manager, { loadSettings: () => loadWorkflowSettings({ cwd: getCwd() }) });
+      disposeControlToolActivation = activateControlToolOnRunStart(manager);
       usageLimitScheduler.dispose();
       usageLimitScheduler = new UsageLimitScheduler(manager);
     } else if (cwd !== sessionCwd) {
@@ -300,8 +336,15 @@ export default function extension(pi: ExtensionAPI) {
 
     const active = pi.getActiveTools();
     const workflowTools = [workflowTool.name, workflowControlTool.name];
-    const missing = workflowTools.filter((name) => !active.includes(name));
-    if (missing.length) pi.setActiveTools([...active, ...missing]);
+    // An ACTIVE tool_search (pi >= 0.99) can discover the deferred tools on
+    // demand — leave them undeclared and keep the prompt relief. Without one
+    // nothing could ever reach them, so force-activate as before. The name is
+    // hardcoded: the floor pi version's types do not export it.
+    const TOOL_SEARCH_TOOL_NAME = "tool_search";
+    if (!active.includes(TOOL_SEARCH_TOOL_NAME)) {
+      const missing = workflowTools.filter((name) => !active.includes(name));
+      if (missing.length) pi.setActiveTools([...active, ...missing]);
+    }
 
     // Bind + adopt before binding delivery so a flushed completion is tagged
     // with this session and visible in its panel. Capture the previous id first

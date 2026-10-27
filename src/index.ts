@@ -125,6 +125,7 @@ export type {
   WorkflowCheckpointInput,
   WorkflowMeta,
   WorkflowMetaPhase,
+  WorkflowResumeMode,
   WorkflowRunOptions,
   WorkflowRunResult,
 } from "./workflow.js";

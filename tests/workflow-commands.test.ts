@@ -822,8 +822,116 @@ test("/workflows save <name> warns (not false-success) when the name is host-own
   await workflowsHandler("save host-owned", {
     ui: { notify: (m: string, t?: string) => notified.push({ message: m, type: t }) },
   });
-  assert.equal(saved.length, 1, "the file persisted");
+  assert.equal(saved.length, 0, "a host-owned name is rejected before persistence");
   assert.equal(notified.length, 1);
   assert.equal(notified[0].type, "warning", "a refused registration is a warning, not a success");
-  assert.match(notified[0].message, /cannot be registered/);
+  assert.match(notified[0].message, /already provided/);
+});
+
+test("/workflows save rejects Pi built-in command names before persistence", async () => {
+  const saved: Array<{ name: string; script: string }> = [];
+  const storage = {
+    save: (workflow: { name: string; script: string }) => {
+      saved.push(workflow);
+      return { ...workflow, description: workflow.name, location: "project" as const };
+    },
+    load: () => null,
+    list: () => saved,
+  };
+  const manager = {
+    listRuns: () => [
+      {
+        runId: "recent",
+        workflowName: "model",
+        status: "completed",
+        script: "return 1",
+        agents: [],
+        logs: [],
+      },
+    ],
+    getSnapshot: () => null,
+    getRun: () => undefined,
+    pause: () => false,
+    resume: async () => false,
+    stop: () => false,
+    deleteRun: () => false,
+  } as unknown as WorkflowManager;
+
+  let workflowsHandler: Handler | undefined;
+  registerWorkflowCommands(
+    {
+      getCommands: () => [],
+      registerCommand: (name: string, opts: { handler: Handler }) => {
+        if (name === "workflows") workflowsHandler = opts.handler;
+      },
+      sendMessage: async () => {},
+    } as unknown as ExtensionAPI,
+    manager,
+    { storage, cwd: "/cwd" },
+  );
+  const notified: Array<{ message: string; type?: string }> = [];
+  assert.ok(workflowsHandler);
+  await workflowsHandler("save model", {
+    ui: { notify: (m: string, t?: string) => notified.push({ message: m, type: t }) },
+  });
+
+  assert.equal(saved.length, 0);
+  assert.equal(notified.length, 1);
+  assert.equal(notified[0].type, "warning");
+  assert.match(notified[0].message, /reserved by Pi/);
+});
+
+test("/workflows save rejects Pi interactive-only command names before persistence", async () => {
+  for (const name of ["debug", "arminsayshi", "dementedelves"]) {
+    const saved: Array<{ name: string; script: string }> = [];
+    const storage = {
+      save: (workflow: { name: string; script: string }) => {
+        saved.push(workflow);
+        return { ...workflow, description: workflow.name, location: "project" as const };
+      },
+      load: () => null,
+      list: () => saved,
+    };
+    const manager = {
+      listRuns: () => [
+        {
+          runId: "recent",
+          workflowName: name,
+          status: "completed",
+          script: "return 1",
+          agents: [],
+          logs: [],
+        },
+      ],
+      getSnapshot: () => null,
+      getRun: () => undefined,
+      pause: () => false,
+      resume: async () => false,
+      stop: () => false,
+      deleteRun: () => false,
+    } as unknown as WorkflowManager;
+
+    let workflowsHandler: Handler | undefined;
+    registerWorkflowCommands(
+      {
+        getCommands: () => [],
+        registerCommand: (commandName: string, opts: { handler: Handler }) => {
+          if (commandName === "workflows") workflowsHandler = opts.handler;
+        },
+        sendMessage: async () => {},
+      } as unknown as ExtensionAPI,
+      manager,
+      { storage, cwd: "/cwd" },
+    );
+    const notified: Array<{ message: string; type?: string }> = [];
+    assert.ok(workflowsHandler);
+    await workflowsHandler(`save ${name}`, {
+      ui: { notify: (message: string, type?: string) => notified.push({ message, type }) },
+    });
+
+    assert.equal(saved.length, 0, `/${name} must not be persisted`);
+    assert.equal(notified.length, 1);
+    assert.equal(notified[0].type, "warning");
+    assert.match(notified[0].message, new RegExp(`/${name}.*reserved by Pi`));
+  }
 });

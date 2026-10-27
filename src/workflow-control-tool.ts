@@ -3,7 +3,7 @@ import { type Static, Type } from "typebox";
 import { aggregateAgentUsage, tokenFigures, type WorkflowAgentSnapshot, type WorkflowSnapshot } from "./display.js";
 import type { PersistedRunState, RunStatus } from "./run-persistence.js";
 import { runSummary } from "./run-record-store.js";
-import type { WorkflowManager } from "./workflow-manager.js";
+import type { WorkflowManager, WorkflowResumeOptions } from "./workflow-manager.js";
 
 // A tool's top-level parameter schema must be a JSON Schema object (`type:
 // "object"`). A discriminated Type.Union of two objects serializes to a
@@ -35,6 +35,12 @@ const workflowControlSchema = Type.Object(
       Type.String({
         minLength: 1,
         description: "Exact durable checkpoint ID with an attached controller response. For resume only.",
+      }),
+    ),
+    resumeMode: Type.Optional(
+      Type.Union([Type.Literal("prefix"), Type.Literal("replay-completed")], {
+        description:
+          "Journal replay policy. For resume only. prefix (default): the first changed/new/never-completed call and everything after it re-run live. replay-completed: completed calls also replay across a never-completed gap when dispatched concurrently with it in one fan-out (e.g. a parallel fan-out paused mid-flight); calls made after an await (workflow() children included) are sequential and still re-run — a workflow() call in the gap's own window keeps its child journal; a changed call still re-runs its whole suffix. An explicit choice persists on the run: later resumes keep it. Store/file-passed results are not hash-checked and can replay stale across a gap.",
       }),
     ),
   },
@@ -130,8 +136,12 @@ export function createWorkflowControlTool(
             if (!manager.pause(run.runId)) return invalidTransition("pause", run);
             return actionSuccess("pause", "paused", currentSummary(manager, run));
           case "resume": {
-            const resumeOptions = params.checkpointId === undefined ? undefined : { checkpointId: params.checkpointId };
-            if (!(await manager.resume(run.runId, resumeOptions))) return invalidTransition("resume", run);
+            const resumeOptions: WorkflowResumeOptions = {};
+            if (params.checkpointId !== undefined) resumeOptions.checkpointId = params.checkpointId;
+            if (params.resumeMode !== undefined) resumeOptions.resumeMode = params.resumeMode;
+            const hasResumeOptions = params.checkpointId !== undefined || params.resumeMode !== undefined;
+            if (!(await manager.resume(run.runId, hasResumeOptions ? resumeOptions : undefined)))
+              return invalidTransition("resume", run);
             return actionSuccess("resume", "resumed", currentSummary(manager, run));
           }
           case "stop":
@@ -163,7 +173,7 @@ function normalizeInput(value: unknown): WorkflowControlInput {
     input.action === "list"
       ? new Set(["action"])
       : input.action === "resume"
-        ? new Set(["action", "runId", "checkpointId"])
+        ? new Set(["action", "runId", "checkpointId", "resumeMode"])
         : new Set(["action", "runId"]);
   const extraKey = Object.keys(input).find((key) => !allowedKeys.has(key));
   if (extraKey) throw new Error(`workflow_control action "${input.action}" does not accept ${extraKey}`);

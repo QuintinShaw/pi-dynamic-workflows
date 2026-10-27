@@ -28,6 +28,7 @@ import {
   type RunPersistence,
   type RunStatus,
   sanitizeAutoResumeAttempts,
+  sanitizeResumeMode,
   settleInterruptedPersistedAgents,
   settleNonTerminalPersistedAgents,
   terminalRunInterruptCause,
@@ -40,6 +41,7 @@ import {
   parseWorkflowScript,
   runWorkflow,
   type WorkflowCheckpoint,
+  type WorkflowResumeMode,
   type WorkflowRunResult,
 } from "./workflow.js";
 
@@ -135,6 +137,14 @@ export interface ManagedRun {
    * recordAutoResumeAttempts(); read on cold start by the scheduler.
    */
   autoResumeAttempts?: number;
+  /**
+   * Journal replay policy for this run's resumes (see ExecOptions.resumeMode).
+   * Frozen at start from ExecOptions.resumeMode and re-resolved by resume()
+   * from the explicit option or the persisted record; re-persisted on every
+   * write, so later resumes keep the chosen policy unless they override it.
+   * Undefined means "prefix" (default).
+   */
+  resumeMode?: WorkflowResumeMode;
   /**
    * A user-requested lifecycle transition that aborted this exact execution.
    *
@@ -258,6 +268,16 @@ export interface ExecOptions {
   resumeJournal?: Map<string, JournalEntry>;
   /** Durable checkpoint response being replayed by this execution. */
   resumeCheckpoint?: WorkflowCheckpoint;
+  /**
+   * Journal replay policy — see WorkflowRunOptions.resumeMode in workflow.ts.
+   * resume() passes one for that execution; a start call may pass one as the
+   * policy declaration for the run's FUTURE resumes (a start execution has no
+   * journal to replay). An explicit valid choice is persisted on the run
+   * record so subsequent resumes keep it; an invalid one is treated as absent
+   * (the persisted policy stands). Omit to keep the run's persisted policy
+   * (default "prefix").
+   */
+  resumeMode?: WorkflowResumeMode;
 
   /** Cap on total agents for this run. */
   maxAgents?: number;
@@ -266,9 +286,11 @@ export interface ExecOptions {
   /** Host signal (e.g. tool/Esc) that should abort this run when fired. */
   externalSignal?: AbortSignal;
   /**
-   * Grace (ms) for the terminal drain once this run's abort has fired
-   * (default 10_000; Infinity = unbounded). Not frozen/persisted — a host
-   * reliability knob, not run semantics. See WorkflowRunOptions.drainAbortGraceMs.
+   * Grace (ms) bounding this run's drains (default 10_000; Infinity =
+   * unbounded): the top-level terminal drain once the run's abort has fired,
+   * and a nested frame's replay quiescence drain for its whole lifetime. Not
+   * frozen/persisted — a host reliability knob, not run semantics. See
+   * WorkflowRunOptions.drainAbortGraceMs.
    */
   drainAbortGraceMs?: number;
   /** Called with the live snapshot on every progress event. */
@@ -318,6 +340,22 @@ export interface WorkflowResumeOptions {
   args?: unknown;
   maxAgents?: number;
   checkpointId?: string;
+  /**
+   * "replay-completed" opts this resume into replaying completed journaled
+   * calls across never-completed gaps (e.g. a parallel() fan-out paused
+   * mid-flight), instead of re-running every call after the first gap. A
+   * changed call still re-runs its whole suffix. An explicit choice is
+   * persisted on the run and kept by later resumes; omit to keep the run's
+   * persisted policy (default "prefix"). See WorkflowRunOptions.resumeMode in
+   * workflow.ts for the batch scoping and store-staleness caveat.
+   */
+  resumeMode?: WorkflowResumeMode;
+  /**
+   * Grace (ms) bounding this execution's drains (default 10_000; Infinity =
+   * unbounded). The same per-execution host reliability knob as
+   * ExecOptions.drainAbortGraceMs — not persisted.
+   */
+  drainAbortGraceMs?: number;
 }
 
 export interface WorkflowManagerOptions {
@@ -728,6 +766,10 @@ export class WorkflowManager extends EventEmitter {
       parentSessionFile: this.sessionFile,
       lease,
       autoResume: exec.autoResume,
+      // A start-time resumeMode is a policy declaration for this run's FUTURE
+      // resumes (the start execution itself has no journal to replay): freeze
+      // and persist it like tokenBudget so resume() honors it (#231 R6).
+      resumeMode: sanitizeResumeMode(exec.resumeMode),
       // Resolve the budget once at start and freeze it on the run (see
       // ManagedRun.tokenBudget) so resume keeps start-time semantics.
       tokenBudget: exec.tokenBudget !== undefined ? exec.tokenBudget : this.defaultTokenBudget,
@@ -766,6 +808,10 @@ export class WorkflowManager extends EventEmitter {
         startedAt: managed.startedAt.toISOString(),
         updatedAt: managed.startedAt.toISOString(),
         autoResume: managed.autoResume,
+        // The start-declared replay policy (see ManagedRun.resumeMode) — the
+        // hand-built initial save must include it or the first persistRun has
+        // already lost it to a crash in between.
+        resumeMode: managed.resumeMode,
         // autoResumeAttempts deliberately omitted: the scheduler's counter
         // cannot exist before the run starts (ids are minted here).
         tokenBudget: managed.tokenBudget,
@@ -807,6 +853,8 @@ export class WorkflowManager extends EventEmitter {
     if (!lease) throw new Error(`Could not acquire workflow run lease for ${managed.runId}`);
     managed.lease = lease;
     managed.autoResume = exec.autoResume;
+    // Same freeze-at-start as startInBackground (see ManagedRun.resumeMode).
+    managed.resumeMode = sanitizeResumeMode(exec.resumeMode);
     managed.tokenBudget = exec.tokenBudget !== undefined ? exec.tokenBudget : this.defaultTokenBudget;
     managed.toolset = exec.toolset;
     // Same freeze-at-start pattern as tokenBudget (see startInBackground/ManagedRun).
@@ -876,6 +924,7 @@ export class WorkflowManager extends EventEmitter {
     const {
       resumeJournal,
       resumeCheckpoint,
+      resumeMode,
       maxAgents,
       agentTimeoutMs,
       externalSignal,
@@ -977,6 +1026,7 @@ export class WorkflowManager extends EventEmitter {
         loadSavedWorkflow: this.loadSavedWorkflow,
         resumeJournal,
         resumeFromRunId: resumeJournal ? managed.runId : undefined,
+        resumeMode,
         resumeCheckpoint,
         onWorkflowCheckpoint: (checkpoint) => {
           const previousCheckpoint = managed.checkpoint;
@@ -1662,6 +1712,9 @@ export class WorkflowManager extends EventEmitter {
         // The scheduler's backoff counter — must round-trip or restarts reset
         // the give-up cap (#207).
         autoResumeAttempts: managed.autoResumeAttempts,
+        // The resume-chosen journal replay policy — must round-trip or a cold
+        // resume silently falls back to "prefix" and re-spends the gap suffix.
+        resumeMode: managed.resumeMode,
         // Start-time execution context, re-read by resume() (see ManagedRun).
         tokenBudget: managed.tokenBudget,
         toolset: managed.toolset,
@@ -2077,6 +2130,15 @@ export class WorkflowManager extends EventEmitter {
       // Same for the usage-limit backoff counter — it must survive manager
       // persists and process restarts or the give-up cap resets (#207).
       autoResumeAttempts: sanitizeAutoResumeAttempts(persisted.autoResumeAttempts),
+      // Journal replay policy: an explicit choice wins and persistRun() writes
+      // it below; otherwise the run keeps its previously chosen policy so a
+      // cold resume (e.g. workflow_control after a restart) replays the same
+      // way the resume that picked the policy did. Sanitize BOTH sides — and
+      // treat an out-of-schema explicit value as ABSENT (fall through to the
+      // persisted policy), never as "prefix": silently downgrading a valid
+      // persisted policy would mis-replay this resume and re-persist the
+      // downgrade (#231 R6).
+      resumeMode: sanitizeResumeMode(opts?.resumeMode) ?? sanitizeResumeMode(persisted.resumeMode),
       // Restore start-time execution context: the budget the run started with
       // (legacy runs without one resume unbudgeted — never re-apply the current
       // default to a run that predates it) and the toolset tag executeRun
@@ -2145,9 +2207,10 @@ export class WorkflowManager extends EventEmitter {
     // above and like SharedStore's deltaKey — see JournalEntry.runId. A
     // legacy entry persisted before namespacing existed has no `runId`; it is
     // assumed to belong to this run's own top-level runId (the only frame
-    // that existed before nested workflow() journaling was namespaced), so it
-    // still resume-hits for a top-level call and safely cache-misses (re-runs
-    // live, does not misapply) for what was actually a nested-run entry.
+    // that existed before nested workflow() journaling was namespaced). If it
+    // REALLY belonged to a nested frame, it collides with the top-level entry
+    // at the same index (last write wins) and the call hash is the only guard
+    // — an identical top-level call can replay the nested frame's result.
     const resumeJournal = new Map(persistedJournal.map((e) => [`${e.runId ?? runId}:${e.index}`, e] as const));
     this.emit("resumed", { runId });
     // Run in the background; executeRun records status/errors on the managed run.
@@ -2166,6 +2229,10 @@ export class WorkflowManager extends EventEmitter {
     const execution = this.executeRun(managed, script, args, {
       resumeJournal,
       resumeCheckpoint: resumeCheckpoint?.status === "resuming" ? resumeCheckpoint : undefined,
+      resumeMode: managed.resumeMode,
+      // Per-execution host knob (see WorkflowResumeOptions); undefined falls
+      // back to runWorkflow's default grace.
+      drainAbortGraceMs: opts?.drainAbortGraceMs,
       initialTokenUsage: priorTokenUsage,
       // Adopt the persisted phase sub-budget baselines so a phase ceiling
       // holds cumulatively across this resume (audit2 #4).

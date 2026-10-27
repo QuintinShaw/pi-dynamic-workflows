@@ -44,8 +44,15 @@ import { createWorktree, removeWorktree, type Worktree } from "./worktree.js";
  * a nested inner fan-out is mid-flight, that other batch is NOT cancelled and
  * finishes its already-reserved agents (still capped at maxAgents total). Only
  * the breaching fan-out's own queue is short-circuited.
+ *
+ * The store doubles as the resume replay generation marker via `dispatchOpen`
+ * and `frame` (see parallel()/pipeline()): the ALS context is inherited
+ * transitively (nested workflow() frames, awaits inside a thunk), but only
+ * calls dispatched by the SAME frame while the flag is still true were
+ * genuinely concurrent fan-out siblings — the distinction replay-completed
+ * gap-shadowing relies on.
  */
-const fanoutScope = new AsyncLocalStorage<{ cancelled: boolean }>();
+const fanoutScope = new AsyncLocalStorage<{ cancelled: boolean; dispatchOpen: boolean; frame: string }>();
 const workflowNestingScope = new AsyncLocalStorage<number>();
 
 export interface WorkflowMetaPhase {
@@ -62,6 +69,9 @@ export interface WorkflowMeta {
   model?: string;
 }
 
+/** Journal replay policy for a resumed run — see WorkflowRunOptions.resumeMode. */
+export type WorkflowResumeMode = "prefix" | "replay-completed";
+
 /** One cached agent/checkpoint result, keyed by its deterministic workflow call identity. */
 export interface JournalEntry {
   index: number;
@@ -73,9 +83,12 @@ export interface JournalEntry {
    * on this the same way SharedStore's deltaKey already does. Absent on
    * journal entries persisted before this field existed; such legacy entries
    * are treated as belonging to the run's own top-level runId (see
-   * WorkflowManager.resume()) — a legacy entry that actually belonged to a
-   * nested frame simply cache-misses on resume (safe degradation: it re-runs
-   * live, it does not apply to the wrong call).
+   * WorkflowManager.resume()). A legacy entry that ACTUALLY belonged to a
+   * nested frame therefore collides with the top-level entry at the same
+   * index (the resume-journal map is last-write-wins); the call hash is the
+   * only guard against misapplication, so an identical parent call can
+   * replay what was really the nested frame's result (bounded-impact
+   * collision, pre-existing since namespacing was introduced).
    */
   runId?: string;
   /** sha256 of the call's identity (prompt + model + phase + agentType + schema). */
@@ -219,19 +232,30 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   /** Timeout per agent in milliseconds. null/omitted means no hard timeout. */
   agentTimeoutMs?: number | null;
   /**
-   * Grace period (ms) for the terminal drain once this run is ABORT-SIGNALED
-   * (external abort or the run-fatal seal). A durable checkpoint suspension
-   * alone does not abort its paid siblings. Agents are signaled at abort,
-   * but the signal is cooperative — a signal-ignoring runner would otherwise
-   * wedge the drain, and with it the run's terminal transition, forever
-   * (audit2 #3). After the grace expires the drain stops waiting: the store is
-   * disposed below (late writes re-populate a store nobody reads), no journal
-   * can follow (the completion path's abort check precedes journaling), and
-   * the manager's persist/emit paths are staleness-gated.
+   * Grace period (ms) bounding two different waits:
    *
-   * Does NOT apply to the SUCCESS drain, which waits unbounded — those results
-   * are still wanted. Default 10_000; Infinity restores unbounded waiting for
-   * aborted runs too. Finite values in [1, 2^31-1] are rounded down; invalid
+   * - The TOP-LEVEL terminal drain, once this run is ABORT-SIGNALED (external
+   *   abort or the run-fatal seal). A durable checkpoint suspension alone
+   *   does not abort its paid siblings. Agents are signaled at abort,
+   *   but the signal is cooperative — a signal-ignoring runner would otherwise
+   *   wedge the drain, and with it the run's terminal transition, forever
+   *   (audit2 #3). After the grace expires the drain stops waiting: the store is
+   *   disposed below (late writes re-populate a store nobody reads), no journal
+   *   can follow (the completion path's abort check precedes journaling), and
+   *   the manager's persist/emit paths are staleness-gated.
+   * - A NESTED frame's replay quiescence drain, for its whole lifetime —
+   *   success path included, abort or not (#231 R8). That drain's only other
+   *   release seals downstream of whatever error the drain could be blocking,
+   *   so an unbounded wait could wedge the run. In replay-completed mode,
+   *   an already-dispatched live gap/edit is recorded before provider
+   *   execution and still forces post-child parent calls live. Grace expiry
+   *   can let those calls run before the child's side effects finish. Work
+   *   whose first miss is dispatched only after the child returns (such as
+   *   independently deferred timer/I/O work) is outside this drain's guarantee.
+   *
+   * The top-level SUCCESS drain is NOT bounded — those results are still
+   * wanted. Default 10_000; Infinity removes the time bound on tracked-agent drains.
+   * Finite values in [1, 2^31-1] are rounded down; invalid
    * values (including NaN, 0, negatives, and overflow) use the default.
    */
   drainAbortGraceMs?: number;
@@ -246,12 +270,64 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
    * collide with the parent's own callIndex-0 entry. A legacy entry with no
    * `runId` (persisted before namespacing existed) is looked up under the
    * run's own top-level runId only; see `JournalEntry.runId`.
+   *
+   * The map is read both once at run start (the nested-frame reachability
+   * scan) and live at every call dispatch; do not mutate it while a run is
+   * active — an entry injected mid-run is honored by dispatches but invisible
+   * to the start-time scan (#231 R22).
    */
   resumeJournal?: Map<string, JournalEntry>;
   /** Resume: the run being resumed (informational; enables resume mode). */
   resumeFromRunId?: string;
+  /**
+   * Journal replay policy for a resumed run. "prefix" (default): longest-
+   * unchanged-prefix — the first call that misses the journal (changed, new,
+   * or never completed) and every later call run live. "replay-completed":
+   * an EXISTING-but-unusable entry (changed hash, empty cached result) still
+   * ends replay for its whole suffix, but a never-completed gap (no journal
+   * entry — e.g. a call paused mid-flight inside a parallel() fan-out) only
+   * ends replay for its SEQUENTIAL downstream: completed calls dispatched in
+   * the same fan-out's synchronous dispatch window as the gap still replay,
+   * because those siblings were concurrent with the gap — their prompts were
+   * fixed at dispatch, before the gap call could have produced anything.
+   * Calls dispatched after an await in a thunk are NOT in that window and
+   * count as sequential. A nested workflow() frame's calls are likewise
+   * sequential relative to the PARENT frame's windows — the inherited batch
+   * carries the parent's frame tag — except the child's OWN fan-out, whose
+   * same-window cohort replays across a gap internal to that child. The
+   * workflow() call itself follows the same dispatch-timing rule as any
+   * other call: dispatched in the gap's own window it replays with its
+   * child journal; dispatched later it re-executes live. The gap
+   * position also hides prompt edits (no journaled hash to compare against),
+   * which is exactly why downstream-of-gap calls must re-run live. A nested
+   * frame's internal gap or edit likewise ends replay for the parent frame's
+   * calls dispatched after that child returns. Caveat:
+   * siblings that coordinated with the gap call through the shared store or
+   * the filesystem can replay stale values — no hash observes those channels.
+   */
+  resumeMode?: WorkflowResumeMode;
   /** Called after each live agent completes so the caller can persist the journal. */
   onAgentJournal?: (entry: JournalEntry) => void;
+  /**
+   * Internal nested-frame plumbing (workflowFn): fired once per journal miss
+   * (gap or edit) recorded by THIS frame's replay scan, replay-completed mode
+   * only. A parent frame uses it to scope the outward gap/edit propagation to
+   * the child's own misses — see workflowFn's post-child boundary advance.
+   */
+  onJournalMiss?: () => void;
+  /**
+   * Internal nested-frame plumbing (workflowFn): a live probe the zero-entry
+   * sweep evaluates IN THIS CHILD'S FINALLY, answering "could a deferred miss
+   * here still change a replay decision downstream of its return" — a later
+   * journaled call of the parent frame, or another nested frame's entries.
+   * Must be lazy: the parent's firstEdit, gaps and callSeq keep changing
+   * between the workflow() call and this frame's settlement, and an eager
+   * snapshot engages the hold for misses that can no longer matter. A plain
+   * boolean is tolerated as a constant (the field's previous type), and hosts
+   * can still reach the gate with one via the exported internals. Never set
+   * by hosts directly.
+   */
+  replaySweepRelevant?: boolean | (() => boolean);
   /** Active durable checkpoint response supplied by WorkflowManager.resume(). */
   resumeCheckpoint?: WorkflowCheckpoint;
   /** Persist a durable checkpoint transition before it becomes externally observable. */
@@ -501,11 +577,50 @@ interface RuntimeState {
   /** Monotonic, assigned at lexical agent() call time — the stable resume key. */
   callSeq: number;
   /**
-   * Index of the first call that missed the resume journal (changed or new).
-   * Longest-unchanged-prefix resume: a cached result is replayed only while
-   * callIndex < firstMiss; once a call misses, it AND everything after run live.
+   * Index of the first call that missed the resume journal (changed, new, or
+   * never completed). Longest-unchanged-prefix resume: a cached result is
+   * replayed only while callIndex < firstMiss; once a call misses, it AND
+   * everything after run live.
    */
   firstMiss: number;
+  /**
+   * Index of the first call whose journal entry EXISTS but is unusable (hash
+   * changed, or an unusable cached result such as empty output) — the edit
+   * boundary. Differs from firstMiss at a gap (no journal entry at all: the
+   * call never completed), which pins firstMiss but not firstEdit, and at the
+   * nested-frame outward advance (a child's internal gap/edit moves this
+   * frame's edit boundary to the child's callSeq position without touching
+   * firstMiss — see workflowFn). Only "replay-completed" resume mode reads
+   * this field: there, replay ends at the first edit everywhere, while gaps
+   * are handled per-call via `gaps` below. A positional script edit
+   * (insert/remove/reorder) still surfaces as an EXISTING entry with a
+   * mismatched hash at the shifted indexes, i.e. as an edit.
+   */
+  firstEdit: number;
+  /**
+   * Never-completed gaps seen so far this execution (no journal entry at that
+   * position), each with the replay generation that dispatched it: the
+   * parallel()/pipeline() batch object, but ONLY when the call was dispatched
+   * inside that fan-out's synchronous dispatch window (before any sibling
+   * could have settled); undefined otherwise (top-level calls, calls after an
+   * await in a thunk, and calls that sampled an ANCESTOR frame's window — a
+   * nested workflow() frame's call outside the child's own fan-out sees the
+   * inherited batch but its foreign frame tag; the child's own
+   * parallel()/pipeline() opens a fresh window tagged with the child's
+   * runId). Only
+   * "replay-completed" mode reads this: a gap shadows every later call EXCEPT
+   * same-generation siblings — see journalReplayAllowed for the rationale.
+   */
+  gaps: Array<{ index: number; gen: object | undefined }>;
+  /**
+   * This frame's own outstanding agent() calls — the frame-scoped subset of
+   * SharedRuntime.inFlight (which tracks the whole run tree for the top-level
+   * teardown drain). Read only by the nested-frame finally in "replay-completed"
+   * mode: workflow() must not resolve while the child still has calls in
+   * flight, because a journal miss noted after resolution would arrive too
+   * late for the parent's post-child boundary advance (#231 R6).
+   */
+  inFlight: Set<Promise<unknown>>;
 }
 
 type AnyNode = Node & { [key: string]: any; start: number; end: number };
@@ -607,6 +722,132 @@ export async function runWorkflow<T = unknown>(
     ),
     callSeq: 0,
     firstMiss: Number.POSITIVE_INFINITY,
+    firstEdit: Number.POSITIVE_INFINITY,
+    gaps: [],
+    inFlight: new Set<Promise<unknown>>(),
+  };
+
+  // This frame created `shared` fresh (rather than inheriting a parent
+  // workflow()'s) — i.e. it's the true top-level run, the only frame allowed
+  // to declare the run's fate sealed (see SharedRuntime.runFatalController) or
+  // drain/dispose the SharedStore. A nested workflow() call always passes both
+  // sharedRuntime and sharedStore together (see workflowFn below), so this is
+  // equivalent to `!options.sharedStore` — used at both choke points below.
+  const isTopLevelRun = !options.sharedRuntime;
+
+  // An out-of-schema caller (plain JS, or a typo like "replay_completed")
+  // must not silently get prefix semantics — warn once, then fall back.
+  const requestedResumeMode = options.resumeMode as string | undefined;
+  const resolvedResumeMode: WorkflowResumeMode =
+    requestedResumeMode === "replay-completed" || requestedResumeMode === "prefix" ? requestedResumeMode : "prefix";
+  if (isTopLevelRun && requestedResumeMode !== undefined && requestedResumeMode !== resolvedResumeMode) {
+    // Warn at the run-tree root only: nested frames spread the same raw option
+    // and re-resolve it, and each would otherwise repeat the identical line.
+    options.onLog?.(`ignoring invalid resumeMode (${JSON.stringify(requestedResumeMode)}); using "prefix"`);
+  }
+
+  // The nested-frame quiescence machinery (frame-scoped in-flight registration
+  // + the drain in the finally below) exists only for an actual REPLAY: a
+  // fresh run has no journal, notes no misses, and draining would merely
+  // serialize nested frames — an observable live-execution change that a
+  // start-time policy declaration must not cause (#231 R8 F3). Nested frames
+  // inherit the journal only while replay is intact (see workflowFn), which is
+  // exactly when their late misses need the drain. The same holds per frame:
+  // with zero journaled entries of its own (a run paused before this frame
+  // journaled anything), every call notes its gap at dispatch, so the frame's
+  // FIRST dispatch already advances the parent's post-child boundary and
+  // draining could only ever serialize the fan-out (#231 R9 F1).
+  const replayQuiescenceEnabled = (() => {
+    if (resolvedResumeMode !== "replay-completed" || options.resumeJournal === undefined) return false;
+    const framePrefix = `${runId}:`;
+    for (const key of options.resumeJournal.keys()) if (key.startsWith(framePrefix)) return true;
+    return false;
+  })();
+
+  // Per-run journal reachability, consumed by workflowFn to gate the
+  // zero-entry sweep: the sweep's one-macrotask hold only buys anything when
+  // a deferred miss in the child could still change a replay decision
+  // DOWNSTREAM — a later journaled call of this frame, or another nested
+  // frame's entries (whose journal inheritance depends on this frame's
+  // boundary at ITS dispatch). Scanned once here rather than per workflow()
+  // call; only the top frame ever runs workflowFn (nesting is one level).
+  const journalReach = isTopLevelRun
+    ? (() => {
+        if (options.resumeJournal === undefined) return undefined;
+        let maxOwnIndex = -1;
+        const nestedFrames = new Set<string>();
+        for (const key of options.resumeJournal.keys()) {
+          const sep = key.lastIndexOf(":");
+          if (sep < 0) continue;
+          const indexText = key.slice(sep + 1);
+          // Canonical decimal only: Number("") === 0, Number(" 1 ") === 1,
+          // and Number("0x10") === 16 would all slip past Number.isInteger
+          // and let a malformed key engage the sweep's hold (#231 R18).
+          if (!/^\d+$/.test(indexText)) continue;
+          const index = Number(indexText);
+          const frame = key.slice(0, sep);
+          if (frame === runId) {
+            if (index > maxOwnIndex) maxOwnIndex = index;
+          } else if (frame.startsWith(`${runId}-nested`)) {
+            nestedFrames.add(frame);
+          }
+        }
+        return { maxOwnIndex, nestedFrames };
+      })()
+    : undefined;
+
+  // Replay eligibility + miss bookkeeping, shared by the agent() and
+  // checkpoint() replay sites below so both modes stay consistent across the
+  // two. "prefix" (default): replay while index < firstMiss — the first miss
+  // of ANY kind ends replay. "replay-completed": replay while index <
+  // firstEdit (a changed/unusable EXISTING entry ends replay everywhere) AND
+  // the call is not in a gap's shadow. A gap shadows every later call EXCEPT
+  // same-generation siblings: calls dispatched inside the SAME fan-out's
+  // synchronous dispatch window (see parallel()/pipeline()) ran concurrently
+  // with the gap call in the original run — their prompts were fixed at
+  // dispatch, before the gap call could have produced anything — so replaying
+  // them cannot serve a result derived from the gap call's (re-run) output.
+  // Everything else carries no such proof: top-level calls, calls dispatched
+  // after an await inside a thunk, and calls that sampled an ancestor
+  // frame's window (a nested frame's call outside its own fan-out — the
+  // child's own parallel()/pipeline() opens a fresh window tagged with the
+  // child's runId, so the child's own same-window siblings DO replay across
+  // its internal gap). Only dispatch inside the gap's own window proves a
+  // prompt was fixed before the gap call could have produced anything; for
+  // every other call the runtime cannot rule out dependence (a prompt built
+  // after an await may incorporate the gap's output, a cross-frame result
+  // may incorporate store state the gap's re-run changes) — and the gap
+  // position also hides prompt EDITS (there is no journaled hash to compare
+  // against) — so they must re-run live. Those calls all carry generation
+  // `undefined`, and a batch-less gap therefore shadows everything after it.
+  const isGapShadowed = (index: number, gen: object | undefined) =>
+    state.gaps.some((gap) => gap.index < index && (gap.gen === undefined || gap.gen !== gen));
+  const journalReplayAllowed = (index: number, gen: object | undefined) =>
+    resolvedResumeMode === "replay-completed"
+      ? index < state.firstEdit && !isGapShadowed(index, gen)
+      : index < state.firstMiss;
+  const noteJournalMiss = (missedIndex: number, entry: JournalEntry | null | undefined, gen: object | undefined) => {
+    state.firstMiss = Math.min(state.firstMiss, missedIndex);
+    // An entry that EXISTS but is unusable (changed hash, empty cached result)
+    // is an edit: its whole suffix runs live in every mode. A gap (no entry —
+    // the call never completed) ends the unchanged prefix and shadows its
+    // sequential downstream; same-generation siblings may still replay across
+    // it.
+    if (entry != null) state.firstEdit = Math.min(state.firstEdit, missedIndex);
+    else if (resolvedResumeMode === "replay-completed") state.gaps.push({ index: missedIndex, gen });
+    // Per-FRAME hook (not a run-tree counter — a sibling frame's miss must not
+    // advance this frame's parent's boundary, #231 R5): lets an awaiting
+    // parent learn THIS child re-ran calls live across an internal gap/edit.
+    // Replay-completed only: prefix reads neither state.gaps nor the hook, so
+    // both stay unallocated/unfired there (base allocated nothing).
+    if (resolvedResumeMode === "replay-completed") {
+      try {
+        options.onJournalMiss?.();
+      } catch {
+        // Instrumentation must never abort the call the miss belongs to — the
+        // bookkeeping above is already committed by design.
+      }
+    }
   };
 
   const agentRunner = options.agent ?? new WorkflowAgent(options);
@@ -653,13 +894,6 @@ export async function runWorkflow<T = unknown>(
   const pendingUsageFinalizers = shared.pendingUsageFinalizers;
   shared.agentCallbacksClosed ??= false;
   const limiter = shared.limiter;
-  // This frame created `shared` fresh (rather than inheriting a parent
-  // workflow()'s) — i.e. it's the true top-level run, the only frame allowed
-  // to declare the run's fate sealed (see SharedRuntime.runFatalController) or
-  // drain/dispose the SharedStore. A nested workflow() call always passes both
-  // sharedRuntime and sharedStore together (see workflowFn below), so this is
-  // equivalent to `!options.sharedStore` — used at both choke points below.
-  const isTopLevelRun = !options.sharedRuntime;
 
   // One store instance per run; nested workflow() calls inherit the parent's store
   // so all agents across nesting levels share the same key-value space.
@@ -812,12 +1046,21 @@ export async function runWorkflow<T = unknown>(
     // Track every call (awaited or not) so the top-level run can drain
     // outstanding calls before completing (see SharedRuntime.inFlight and the
     // drain in the finally below) — this is what stops a forgotten `await`
-    // from letting an agent mutate state after the run is torn down.
+    // from letting an agent mutate state after the run is torn down. The
+    // frame-scoped set additionally lets a NESTED frame reach quiescence
+    // before resolving (actual replays only — see replayQuiescenceEnabled and
+    // the finally below).
     shared.inFlight.add(call);
+    if (replayQuiescenceEnabled) state.inFlight.add(call);
     // Attaching a handler here (independent of whatever the script itself does
     // with the returned promise) also means an un-awaited call's eventual
     // rejection never becomes a process-crashing unhandled rejection.
-    call.catch(() => {}).finally(() => shared.inFlight.delete(call));
+    call
+      .catch(() => {})
+      .finally(() => {
+        shared.inFlight.delete(call);
+        state.inFlight.delete(call);
+      });
     return call;
   };
 
@@ -846,6 +1089,15 @@ export async function runWorkflow<T = unknown>(
     // closes over this so a still-queued agent can bail once its OWN fan-out
     // breaches the cap, without affecting sibling or outer fan-outs.
     const batch = fanoutScope.getStore();
+    // Replay generation for resume gap-shadowing: the batch ONLY while its
+    // synchronous dispatch window is still open AND it belongs to THIS frame
+    // (see parallel()/pipeline()). The ALS store is inherited transitively
+    // into nested workflow() frames and across awaits inside a thunk — a
+    // nested frame's synchronous prefix executes before the ancestor's window
+    // closes — but the frame tag is not inherited as a generation: foreign
+    // and post-window calls get `undefined` here and are treated as
+    // sequential downstream.
+    const replayGen = batch?.dispatchOpen === true && batch.frame === runId ? batch : undefined;
 
     // Check agent limit. A fan-out that overshoots the cap has already reserved
     // and queued up to `maxAgents` agents; the breaching call throws here, and
@@ -924,11 +1176,15 @@ export async function runWorkflow<T = unknown>(
     // calls throw.)
     shared.agentCount++;
     const label = requestedLabel || defaultAgentLabel(assignedPhase, shared.agentCount);
-    // Longest-unchanged-prefix resume: replay a cached result only while the
-    // prefix is still intact — this call's index is before the first changed/new
-    // call. Once any call misses, it AND everything after it run live (matching
-    // Claude Code's contract), so an edited upstream call never leaves stale
-    // downstream results served from the journal.
+    // Resume replay: a cached result replays only while journalReplayAllowed
+    // holds for this call. "prefix" mode (default): replay ends at the first
+    // miss of ANY kind — once a call misses, it AND everything after run live
+    // (matching Claude Code's contract), so an edited upstream call never
+    // leaves stale downstream results served from the journal.
+    // "replay-completed" mode: replay ends at the first EDIT everywhere, and
+    // a never-completed gap ends it only for the gap's sequential downstream
+    // — completed siblings dispatched in the gap's own fan-out dispatch
+    // window still replay.
     // Namespaced the same way as SharedStore's deltaKey (deltaKey IS this
     // exact `${runId}:${callIndex}` string) so a nested workflow()'s
     // callIndex-0 can never accidentally replay the parent's callIndex-0
@@ -937,7 +1193,12 @@ export async function runWorkflow<T = unknown>(
     const cached = agentOptions.thread ? undefined : options.resumeJournal?.get(deltaKey);
     const hashMatches = cached != null && cached.hash === callHash;
     const cachedEmptyOutput = hashMatches && isEmptyTextAgentResult(cached.result, agentOptions.schema);
-    if (!shared.resumeBarrierReached && hashMatches && !cachedEmptyOutput && callIndex < state.firstMiss) {
+    if (
+      !shared.resumeBarrierReached &&
+      hashMatches &&
+      !cachedEmptyOutput &&
+      journalReplayAllowed(callIndex, replayGen)
+    ) {
       // Replay preserves the journaled model and historical session identity.
       const replayModel = cached.model ?? displayModel;
       options.onAgentStart?.({
@@ -962,10 +1223,11 @@ export async function runWorkflow<T = unknown>(
       if (cached.storeDelta) store.applyDelta(cached.storeDelta);
       return cached.result;
     }
-    // A genuine miss (no journal entry, or the hash changed) marks where the
-    // unchanged prefix ends; this call and every later one then run live.
+    // A genuine miss (no journal entry, or the hash changed, or an unusable
+    // cached result) marks where replay ends for this call's successors — see
+    // noteJournalMiss for the gap-vs-edit distinction.
     if (!hashMatches || cachedEmptyOutput) {
-      state.firstMiss = Math.min(state.firstMiss, callIndex);
+      noteJournalMiss(callIndex, cached, replayGen);
     }
 
     // Budget gates, deliberately AFTER the replay lookup: a journaled cache hit
@@ -1320,33 +1582,46 @@ export async function runWorkflow<T = unknown>(
     // from these thunks see this store via fanoutScope.getStore(). A breach in
     // THIS fan-out flips `cancelled` so its own still-queued agents bail, without
     // touching a sibling fan-out running concurrently or an enclosing one.
-    const batch = { cancelled: false };
-    return fanoutScope.run(batch, () =>
-      Promise.all(
-        thunks.map(async (thunk, index) => {
-          try {
-            return await thunk();
-          } catch (error) {
-            if (error instanceof WorkflowCheckpointSuspensionError) throw error;
-            if (isAborted()) throw error;
-            const workflowError = wrapError(error);
-            // Non-recoverable failures (token budget / agent limit exhausted) must
-            // halt the whole run, exactly like a directly-awaited agent() — not be
-            // swallowed into a null in the result array.
-            if (!workflowError.recoverable) {
-              // Only a breached agent cap cancels the rest of this batch; the
-              // token budget stays a soft gate by design (in-flight agents may
-              // finish past it), and other non-recoverable errors don't imply
-              // the rest of the batch is doomed.
-              if (workflowError.code === WorkflowErrorCode.AGENT_LIMIT_EXCEEDED) batch.cancelled = true;
-              throw workflowError;
+    // `dispatchOpen` additionally marks the synchronous dispatch window: it
+    // stays true only while the thunks below are being INVOKED (each runs its
+    // synchronous prefix, so every call dispatched in that prefix is genuinely
+    // concurrent with the others — none could have observed a sibling
+    // settling). Calls dispatched later (after an await in a thunk, or inside
+    // a nested workflow frame — the ALS store is inherited transitively, but
+    // the window and the `frame` tag are not) sample a closed window or a
+    // foreign frame and are treated as sequential for resume gap-shadowing
+    // (see journalReplayAllowed).
+    const batch = { cancelled: false, dispatchOpen: true, frame: runId };
+    try {
+      return fanoutScope.run(batch, () =>
+        Promise.all(
+          thunks.map(async (thunk, index) => {
+            try {
+              return await thunk();
+            } catch (error) {
+              if (error instanceof WorkflowCheckpointSuspensionError) throw error;
+              if (isAborted()) throw error;
+              const workflowError = wrapError(error);
+              // Non-recoverable failures (token budget / agent limit exhausted) must
+              // halt the whole run, exactly like a directly-awaited agent() — not be
+              // swallowed into a null in the result array.
+              if (!workflowError.recoverable) {
+                // Only a breached agent cap cancels the rest of this batch; the
+                // token budget stays a soft gate by design (in-flight agents may
+                // finish past it), and other non-recoverable errors don't imply
+                // the rest of the batch is doomed.
+                if (workflowError.code === WorkflowErrorCode.AGENT_LIMIT_EXCEEDED) batch.cancelled = true;
+                throw workflowError;
+              }
+              log(`parallel[${index}] failed: ${workflowError.message}`);
+              return null;
             }
-            log(`parallel[${index}] failed: ${workflowError.message}`);
-            return null;
-          }
-        }),
-      ),
-    );
+          }),
+        ),
+      );
+    } finally {
+      batch.dispatchOpen = false;
+    }
   };
 
   const pipeline = async (
@@ -1358,34 +1633,41 @@ export async function runWorkflow<T = unknown>(
     if (stages.some((stage) => typeof stage !== "function")) {
       throw new TypeError("pipeline() stages must be functions: pipeline(items, item => ..., result => ...)");
     }
-    // Batch-scoped cancellation — see parallel() for the rationale.
-    const batch = { cancelled: false };
-    return fanoutScope.run(batch, () =>
-      Promise.all(
-        items.map(async (item, index) => {
-          let value: unknown = item;
-          for (const stage of stages) {
-            try {
-              throwIfAborted();
-              value = await stage(value, item, index);
-              throwIfAborted();
-            } catch (error) {
-              if (error instanceof WorkflowCheckpointSuspensionError) throw error;
-              if (isAborted()) throw error;
-              const workflowError = wrapError(error);
-              // Non-recoverable failures halt the whole run (see parallel()).
-              if (!workflowError.recoverable) {
-                if (workflowError.code === WorkflowErrorCode.AGENT_LIMIT_EXCEEDED) batch.cancelled = true;
-                throw workflowError;
+    // Batch-scoped cancellation and the synchronous dispatch window — see
+    // parallel() for the rationale. Only each item's FIRST stage dispatches
+    // inside the window; later stages run after that item's stage settled, so
+    // they correctly sample a closed window (sequential for gap-shadow).
+    const batch = { cancelled: false, dispatchOpen: true, frame: runId };
+    try {
+      return fanoutScope.run(batch, () =>
+        Promise.all(
+          items.map(async (item, index) => {
+            let value: unknown = item;
+            for (const stage of stages) {
+              try {
+                throwIfAborted();
+                value = await stage(value, item, index);
+                throwIfAborted();
+              } catch (error) {
+                if (error instanceof WorkflowCheckpointSuspensionError) throw error;
+                if (isAborted()) throw error;
+                const workflowError = wrapError(error);
+                // Non-recoverable failures halt the whole run (see parallel()).
+                if (!workflowError.recoverable) {
+                  if (workflowError.code === WorkflowErrorCode.AGENT_LIMIT_EXCEEDED) batch.cancelled = true;
+                  throw workflowError;
+                }
+                log(`pipeline[${index}] failed: ${workflowError.message}`);
+                return null;
               }
-              log(`pipeline[${index}] failed: ${workflowError.message}`);
-              return null;
             }
-          }
-          return value;
-        }),
-      ),
-    );
+            return value;
+          }),
+        ),
+      );
+    } finally {
+      batch.dispatchOpen = false;
+    }
   };
 
   // Nested workflow(): run a saved workflow (or a raw script) inline, sharing this
@@ -1406,28 +1688,95 @@ export async function runWorkflow<T = unknown>(
     const childScript = resolved ?? String(nameOrScript);
     const workflowName = String(nameOrScript);
     options.onRuntimeEvent?.({ type: "workflow", stage: "start", name: workflowName, args: childArgs });
+    const workflowBatch = fanoutScope.getStore();
+    // Same dispatch-window rule as agent(): this workflow() call counts as a
+    // concurrent fan-out sibling ONLY when dispatched inside the batch's
+    // synchronous window by THIS frame. Launched after an await in a thunk
+    // (e.g. after a caught gap call settled), it is sequential downstream and
+    // must not inherit the journal across that gap.
+    const replayGen = workflowBatch?.dispatchOpen === true && workflowBatch.frame === runId ? workflowBatch : undefined;
     try {
-      // Propagate the resumeJournal into the child frame ONLY while the
-      // parent's own longest-unchanged-prefix is still intact at the moment
-      // of this workflow() call (state.firstMiss === Infinity, i.e. every
-      // parent agent()/checkpoint() call BEFORE this one was a cache hit).
-      // This is namespacing-safe (see JournalEntry.runId) but namespacing
-      // alone is NOT sufficient: SharedStore content itself is not part of
-      // any call's hash, so a cached child result was computed against
-      // whatever store state the UPSTREAM parent calls had written at the
-      // time it originally ran live. If an upstream parent call misses
-      // (edited script) and re-runs live, it may write different store
-      // values than it did originally — a child cached under the OLD store
-      // state would then be replaying a result that's stale with respect to
-      // the NEW live state, even though the child's own hash still matches.
-      // The prefix contract already treats "this call sits after a miss" as
-      // "must run live" for calls within one frame; a nested workflow() is
-      // no exception; once anything upstream in the parent has missed, cut
-      // the child off from the journal entirely so it runs fully live.
-      const prefixIntact = state.firstMiss === Number.POSITIVE_INFINITY;
-      const child = await workflowNestingScope.run(nestingDepth + 1, () =>
+      // Propagate the resumeJournal into the child frame ONLY while replay is
+      // still open at the moment of this workflow() call — the same rule the
+      // frame's own calls use: in "prefix" mode, no miss of any kind yet
+      // (state.firstMiss === Infinity); in "replay-completed" mode, no EDIT
+      // yet (state.firstEdit === Infinity) and no gap shadowing this call.
+      // Namespacing alone (see JournalEntry.runId) is NOT sufficient:
+      // SharedStore content itself is not part of any call's hash, so a
+      // cached child result was computed against whatever store state the
+      // UPSTREAM parent calls had written at the time it originally ran
+      // live. A parent call that re-runs live (an edit — or a gap whose
+      // re-run this child would follow sequentially) may write different
+      // store values than it did originally, and a child cached under the
+      // OLD store state would then replay a result stale with respect to the
+      // NEW live state, even though the child's own hash still matches. A
+      // gap in the SAME dispatch window as this workflow() call is the one
+      // safe case: the child originally ran concurrently with it, before the
+      // gap call could have produced anything (same argument as same-window
+      // sibling replay — see journalReplayAllowed). Note the child's OWN
+      // internal calls never inherit this generation — the batch is tagged
+      // with the ancestor's frame, so they sample generation undefined in
+      // their own frame (even though the child's synchronous prefix executes
+      // before the ancestor's window closes), and a gap inside the child
+      // still shadows the child's sequential downstream.
+      const prefixIntact =
+        resolvedResumeMode === "replay-completed"
+          ? state.firstEdit === Number.POSITIVE_INFINITY && !isGapShadowed(state.callSeq, replayGen)
+          : state.firstMiss === Number.POSITIVE_INFINITY;
+      // Count THIS child's own journal misses via the per-frame hook: the
+      // child is replay-isolated (own RuntimeState), and a run-tree-wide
+      // signal would also fire for a concurrent SIBLING frame's misses,
+      // forcing this child's clean post-return calls live (#231 R5 F1).
+      let childOwnMisses = 0;
+      // Whether a deferred miss in THIS child could still change a replay
+      // decision downstream of its return: this frame has a journaled call
+      // at a later index, or a nested frame has entries (its journal
+      // inheritance is decided by this frame's boundary at ITS dispatch).
+      // The child's zero-entry sweep holds one macrotask for exactly this;
+      // when nothing downstream can replay, the hold is pure, observable
+      // cost (it flips the parent's post-child ordering vs a prefix resume).
+      // The probe is a CLOSURE evaluated in the child's finally (#231 R19/
+      // R20): firstEdit, gaps and callSeq all change between here and the
+      // child's settlement — a gap or edit dispatched in this window AFTER
+      // the workflow() call, a post-window gap from a concurrent thunk, a
+      // sibling frame's advance — and a snapshot of any of them (including
+      // prefixIntact, whose firstEdit clause goes stale on a post-call
+      // edit, which pushes no gap) wrongly engages the hold. Read lazily,
+      // each conjunct is exact:
+      // - firstEdit > callSeq ⟺ the edit boundary has not yet blocked the
+      //   next dispatched call: a finite firstEdit is <= callSeq, so every
+      //   future index is >= firstEdit and must run live regardless of this
+      //   child.
+      // - Any gap present at the finally shadows every future call (its
+      //   index is below every later call's; no later call can sample a
+      //   window open at that gap's dispatch).
+      // - maxOwnIndex >= callSeq with the live callSeq counts only genuinely
+      //   FUTURE journaled calls (in-window siblings are past decisions).
+      // Conservative by construction: an EARLIER sibling frame's entries
+      // also engage it (at worst re-adding the hold), and a miss that lands
+      // only after the child resolves is unknowable here — the probe stays
+      // engaged, the safe direction.
+      // shared.nestedCallSeq, not shared.depth — see its doc comment: depth
+      // returns to 0 between sequential sibling calls, which would otherwise
+      // mint the same child runId (and hence colliding deltaKeys/event ids)
+      // for two different children.
+      const childRunId = `${runId}-nested${++shared.nestedCallSeq}`;
+      const replaySweepRelevant = () =>
+        state.firstEdit > state.callSeq &&
+        state.gaps.length === 0 &&
+        journalReach !== undefined &&
+        (journalReach.maxOwnIndex >= state.callSeq || journalReach.nestedFrames.size > 0);
+      const childRun = workflowNestingScope.run(nestingDepth + 1, () =>
         runWorkflow(childScript, {
           ...options,
+          // After ...options so this frame's count is exact: the hook is
+          // scoped to the frame it is passed to, so the wrapper REPLACES any
+          // outer hook rather than chaining into it (a top-level hook must
+          // not fire for child-frame misses, #231 R6).
+          onJournalMiss: () => {
+            childOwnMisses++;
+          },
+          replaySweepRelevant,
           args: childArgs,
           sharedRuntime: shared,
           // Propagate the parent's store so nested agents share the same key-value space.
@@ -1437,11 +1786,7 @@ export async function runWorkflow<T = unknown>(
           // Reuse the same runner so named threads span parent/child frames but
           // still die with this one top-level runWorkflow invocation.
           agent: agentRunner,
-          // shared.nestedCallSeq, not shared.depth — see its doc comment: depth
-          // returns to 0 between sequential sibling calls, which would otherwise
-          // mint the same child runId (and hence colliding deltaKeys/event ids)
-          // for two different children.
-          runId: `${runId}-nested${++shared.nestedCallSeq}`,
+          runId: childRunId,
           // The registry is snapshotted ONCE per run (:500): forward the
           // already-loaded registry so a mid-run .md edit can't change
           // agentDefinitionKey for nested-frame calls only (those journal
@@ -1450,6 +1795,42 @@ export async function runWorkflow<T = unknown>(
           persistLogs: false,
         }),
       );
+      // A child that re-ran ANY call live across an internal gap or edit may
+      // have changed the store/return values the rest of THIS frame depends
+      // on, and this frame's own boundary never saw the child's per-frame
+      // misses. Calls dispatched after the child returns are its sequential
+      // downstream — advancing this frame's edit boundary forces them live
+      // instead of replaying results computed against the old child state.
+      // Same-window siblings already made their replay decision synchronously
+      // at dispatch, before the child could have produced anything, so they
+      // are unaffected. The advance must run on BOTH settle paths: a child
+      // that re-ran calls live and then THREW still invalidates this frame's
+      // journaled downstream (#231 R13 F2).
+      //
+      // It runs in a try/finally, never a .then/.finally on the child
+      // promise: any wrapper adds a microtask tick between the child settling
+      // and this frame resuming, and that tick is itself observable — it
+      // flips the race between a microtask-deferred dispatch inside the
+      // child and this frame's post-child call (#231 R12 F1). No mode
+      // predicate is needed: in prefix the miss hook never fires (it is
+      // replay-completed-gated at noteJournalMiss), so the advance is a
+      // no-op there; in a fresh start that merely DECLARED replay-completed
+      // the hook DOES fire and the advance does write firstEdit, but with
+      // no journal the write is dead in effect — the reads that can change
+      // behavior are gated by a cached entry, and the propagation read's
+      // false branch (prefixIntact) yields the same undefined journal
+      // either way — so the live execution stays observably identical to
+      // prefix (invariant: a start-time declaration must not change the live
+      // execution).
+      const advanceForChildMisses = () => {
+        if (childOwnMisses > 0) state.firstEdit = Math.min(state.firstEdit, state.callSeq);
+      };
+      let child: Awaited<typeof childRun>;
+      try {
+        child = await childRun;
+      } finally {
+        advanceForChildMisses();
+      }
       return child.result;
     } finally {
       options.onRuntimeEvent?.({ type: "workflow", stage: "end", name: workflowName, args: childArgs });
@@ -1673,6 +2054,10 @@ export async function runWorkflow<T = unknown>(
       shared.seenCheckpointIds.add(durableInput.checkpointId);
     }
     const activeResumeCheckpoint = shared.activeCheckpointResponse;
+    // Replay generation — same dispatch-window + frame rule as agent() (see
+    // there).
+    const batch = fanoutScope.getStore();
+    const replayGen = batch?.dispatchOpen === true && batch.frame === runId ? batch : undefined;
     const callHash =
       promptText === null
         ? hashWorkflowCheckpoint(durableInput as WorkflowCheckpointInput)
@@ -1685,14 +2070,14 @@ export async function runWorkflow<T = unknown>(
       !shared.resumeBarrierReached &&
       cached != null &&
       cached.hash === callHash &&
-      callIndex < state.firstMiss &&
+      journalReplayAllowed(callIndex, replayGen) &&
       !replayingActiveCheckpoint
     ) {
       shared.agentCount++;
       return cached.result;
     }
     if (cached == null || cached.hash !== callHash) {
-      state.firstMiss = Math.min(state.firstMiss, callIndex);
+      noteJournalMiss(callIndex, cached, replayGen);
     }
     shared.agentCount++;
 
@@ -1886,6 +2271,136 @@ export async function runWorkflow<T = unknown>(
     }
     throw error;
   } finally {
+    // Grace applied by BOTH drains below (the nested quiescence drain and the
+    // top-level terminal drain). Normalized once: NaN/0/negative/overflow →
+    // the 10s default; Infinity = unbounded.
+    const graceOption = options.drainAbortGraceMs;
+    const drainAbortGraceMs =
+      graceOption === undefined
+        ? 10_000
+        : graceOption === Number.POSITIVE_INFINITY
+          ? Number.POSITIVE_INFINITY
+          : typeof graceOption === "number" && graceOption >= 1 && graceOption <= 2_147_483_647
+            ? Math.floor(graceOption)
+            : 10_000;
+    // Replay only (see replayQuiescenceEnabled): a nested frame must reach
+    // quiescence before resolving, so every journal miss its in-flight agent()
+    // calls — and the replay continuations they unblock — will ever note is
+    // committed BEFORE workflowFn's post-child finally reads the frame's miss
+    // count. An un-awaited fan-out in the child can otherwise dispatch a call
+    // after the child script returned, note its gap/edit too late, and leave
+    // the parent's post-return calls replaying stale results (#231 R6). Loop
+    // because a settling call can schedule further work.
+    //
+    // Two independent bounds keep the wait from wedging the run. (1) The abort
+    // wake (R7): allSettled on a signal-ignoring call never settles, and
+    // isAborted() is only re-read between iterations — the race makes
+    // pause/stop unwind the frame promptly (no nested grace period: once
+    // aborted no further dispatches happen, and the top-level drain still
+    // gives the same calls its grace). (2) The drain-lifetime grace (R8): the
+    // only OTHER release is shared.runFatalController, and it seals in the
+    // top-level catch — DOWNSTREAM of whatever error this drain could be
+    // blocking (a usage limit thrown by a sibling of the hung call, a later
+    // parent failure). An unbounded wait would hold that error path hostage
+    // forever: run never settles, manager keeps it "running", resume()
+    // refuses. Grace expiry abandons only the nested wait, not the live call.
+    // A live gap/edit was already recorded at dispatch and still invalidates
+    // the parent's post-child replay boundary, but the parent can run before
+    // that call's side effects finish. Independently deferred work whose FIRST
+    // miss occurs after the child returns is outside the guarantee. Infinity
+    // removes the time bound; it cannot track arbitrary future timer/I/O work.
+    // Prefix mode deliberately never waits: its one-way frame boundary is
+    // byte-for-byte base behavior.
+    if (!isTopLevelRun && replayQuiescenceEnabled) {
+      let wakeAbort: () => void = () => {};
+      const abortWake = new Promise<"aborted">((resolve) => {
+        wakeAbort = () => resolve("aborted");
+      });
+      const externalWake = () => wakeAbort();
+      const fatalWake = () => wakeAbort();
+      options.signal?.addEventListener("abort", externalWake, { once: true });
+      shared.runFatalController.signal.addEventListener("abort", fatalWake, { once: true });
+      // Deliberately ref'd (no unref), like the top-level drain's grace timer:
+      // when the only pending work is this drain and a hung, handle-less call,
+      // the timer is what keeps the process alive to fire.
+      let graceTimer: ReturnType<typeof setTimeout> | undefined;
+      const graceWake =
+        drainAbortGraceMs === Number.POSITIVE_INFINITY
+          ? new Promise<"grace">(() => {})
+          : new Promise<"grace">((resolve) => {
+              graceTimer = setTimeout(() => resolve("grace"), drainAbortGraceMs);
+            });
+      try {
+        while (!isAborted()) {
+          if (state.inFlight.size > 0) {
+            // Safe to race unconditionally: the loop guard keeps an
+            // already-aborted drain from spinning on a resolved abortWake.
+            const winner = await Promise.race([
+              Promise.allSettled(Array.from(state.inFlight)).then(() => "settled" as const),
+              abortWake,
+              graceWake,
+            ]);
+            if (winner === "grace") {
+              log(
+                `nested frame drain abandoned ${state.inFlight.size} in-flight agent() call(s) after ${drainAbortGraceMs}ms; recorded misses still invalidate parent replay, but child side effects may finish after the parent continues`,
+              );
+              break;
+            }
+            continue;
+          }
+          // The set is empty, but a replay chain can still be mid-microtask: a
+          // replayed call settles several hops before the script continuation
+          // it unblocks dispatches the frame's next call (possibly a gap/edit
+          // miss). One macrotask flushes every pending microtask-only chain;
+          // anything dispatched afterwards is registered and caught by the
+          // re-check. Work scheduled off a live call is covered because the
+          // call itself was awaited above. If the grace fires during the
+          // yield, the next iteration's race resolves it immediately.
+          await new Promise((resolve) => setTimeout(resolve, 0));
+          if (state.inFlight.size === 0) break;
+        }
+      } finally {
+        if (graceTimer) clearTimeout(graceTimer);
+        options.signal?.removeEventListener("abort", externalWake);
+        shared.runFatalController.signal.removeEventListener("abort", fatalWake);
+      }
+    } else if (
+      !isTopLevelRun &&
+      resolvedResumeMode === "replay-completed" &&
+      (typeof options.replaySweepRelevant === "function"
+        ? options.replaySweepRelevant()
+        : options.replaySweepRelevant === true)
+    ) {
+      // Zero-entry frame (replayQuiescenceEnabled is false because the journal
+      // has no keys for this frame): every call here is a gap noted
+      // SYNCHRONOUSLY at dispatch (noteJournalMiss precedes the limiter), so
+      // pre-existing in-flight calls already advanced the parent's post-child
+      // boundary and waiting for them would only serialize the fan-out (#231
+      // R9 F1). But the frame's FIRST dispatch can itself be deferred past
+      // this finally — an un-awaited `(async () => { await gate; await agent(...)
+      // })()` whose gate resolves on a microtask chain — and then nothing has
+      // noted a miss when the parent's post-child finally reads this frame's
+      // count: the parent's calls replay stale, the exact R6 defect (#231 R11
+      // F1). One macrotask flushes every pending microtask-only chain, so any
+      // such deferred first dispatch happens — and notes its gap — before the
+      // parent reads. A dispatch deferred behind a real timer/I-O is out of
+      // scope for any bounded drain, exactly as in the full drain above. And
+      // unlike an entry-having frame, nothing here can note a miss LATE (no
+      // call replays, so no replay continuation exists to dispatch a gap after
+      // its root settled) — a call reached within the sweep notes its gap at
+      // dispatch, so the sweep never waits for a settlement and needs no
+      // abort/grace race.
+      //
+      // The relevance probe gates the cost: when no deferred miss here could
+      // still change a downstream replay decision, the one macrotask is pure,
+      // observable cost — it delays this frame's settlement past a deferred
+      // dispatch and flips the parent's post-child ordering vs a prefix
+      // resume, so those shapes fall back to prefix timing (#231 R16/R17).
+      // The parent passes it as a closure evaluated HERE (the child frame
+      // cannot compute the parent's reachability from its own state) — see
+      // workflowFn for why every input must be read lazily.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
     // Only the top-level frame drains/disposes (see isTopLevelRun) — a nested
     // workflow()'s in-flight agents are still tracked in this SAME shared set
     // and get drained once, here, when the whole run finishes.
@@ -1911,15 +2426,6 @@ export async function runWorkflow<T = unknown>(
       if (shared.inFlight.size > 0) {
         log(`waiting for ${shared.inFlight.size} outstanding agent() call(s) to settle before this run completes`);
       }
-      const graceOption = options.drainAbortGraceMs;
-      const drainAbortGraceMs =
-        graceOption === undefined
-          ? 10_000
-          : graceOption === Number.POSITIVE_INFINITY
-            ? Number.POSITIVE_INFINITY
-            : typeof graceOption === "number" && graceOption >= 1 && graceOption <= 2_147_483_647
-              ? Math.floor(graceOption)
-              : 10_000; // NaN/0/negative/overflow → default
       // Wakes the drain loop the moment the run aborts (either source), so a
       // drain that started un-aborted re-enters promptly and the grace clock
       // starts instead of blocking on allSettled forever.

@@ -2,7 +2,7 @@
 # Exhaustive workflow capability facts
 
 Contract format: `1.0.0`<br>
-Contract content / skill / extension: `3.13.1`
+Contract content / skill / extension: `3.14.0`
 
 Every exact fact below is projected from the installed extension's capability contract. Explanatory judgment belongs in the hand-written references next to this file.
 
@@ -29,7 +29,7 @@ Every exact fact below is projected from the installed extension's capability co
 - Constraint: recoverable failures return null after retries; nonrecoverable failures throw
 - Constraint: schema noncompliance after bounded structured-output repair is nonrecoverable and bypasses agent retries
 - Constraint: per-agent retries override invocation retries; retries are floored and clamped to 0..3
-- Constraint: resume replays only the longest unchanged prefix; the first miss and every later call execute live
+- Constraint: under the default prefix resume policy, resume replays only the longest unchanged prefix; the first miss and every later call execute live (see the resumeMode tool input)
 - Constraint: a named thread retains its full Pi transcript and session identity only within one uninterrupted workflow invocation
 - Constraint: threaded calls are live-execution resume barriers and are never journaled
 - Constraint: same-thread calls must be sequential; threads cannot use worktree isolation
@@ -73,7 +73,7 @@ Every exact fact below is projected from the installed extension's capability co
 - Signature: `workflow(savedName, childArgs?) => Promise<unknown>`
 - Constraint: one nested level
 - Constraint: shares limiter, counters, token accounting, and store
-- Constraint: nested workflows do not reuse the parent resume journal
+- Constraint: a nested workflow journals under its own runId and replays those entries only while the parent's replay is still open at the workflow() call; a parent edit, or a parent gap shadowing the call, re-executes the child live, and a gap or edit inside the child re-runs the parent's calls dispatched after the child returns
 
 <a id="verify"></a>
 ## verify
@@ -323,8 +323,20 @@ Every exact fact below is projected from the installed extension's capability co
 - Support: `supported`
 - Signature: `resumeFromRunId?: string`
 - Constraint: resumes a prior incomplete run with an edited script
-- Constraint: unchanged positional agent calls replay from cache until the first changed or inserted call
+- Constraint: under the default prefix policy, unchanged positional agent calls replay from cache until the first changed, inserted, or never-completed call
 - Constraint: always runs in the background
+
+<a id="tool-input-resumemode"></a>
+## resumeMode
+
+- Classification: `workflow-tool-input`
+- Support: `supported`
+- Signature: `resumeMode?: "prefix" \| "replay-completed" = "prefix"`
+- Constraint: applies only together with resumeFromRunId
+- Constraint: prefix: the first changed, new, or never-completed call and every later call re-run live
+- Constraint: replay-completed: completed calls replay across a never-completed gap only when dispatched concurrently with the gap in one fan-out; a changed call still re-runs its whole suffix
+- Constraint: an explicit choice persists on the run; later resumes keep it unless overridden
+- Constraint: shared-store and filesystem results are not hash-checked and can replay stale across a gap
 
 <a id="metadata"></a>
 ## export const meta

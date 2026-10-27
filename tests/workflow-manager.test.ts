@@ -466,6 +466,614 @@ test(
   }),
 );
 
+/** Three parallel agents; p0 can be made to hang on its first attempt (the pause gap). */
+const threeParallelScript = `export const meta = { name: 'par_gap_demo', description: 'parallel gap resume' }
+const xs = await parallel(['p0','p1','p2'].map((p) => () => agent(p, { label: p })))
+return xs`;
+
+test(
+  "resume with resumeMode replay-completed replays completed parallel siblings across a gap (#231)",
+  withTempCwd(async (cwd) => {
+    const attempts = new Map<string, number>();
+    let markP0Started: () => void = () => {};
+    const p0Started = new Promise<void>((resolve) => {
+      markP0Started = resolve;
+    });
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt, options) {
+          options?.onUsage?.({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 });
+          const attempt = (attempts.get(prompt) ?? 0) + 1;
+          attempts.set(prompt, attempt);
+          if (prompt === "p0" && attempt === 1) {
+            markP0Started();
+            // Paused mid-flight: this attempt dies on the pause abort without
+            // completing, so its call is never journaled — the #231 part-3 gap.
+            await new Promise<void>((_resolve, reject) => {
+              options?.signal?.addEventListener("abort", () => reject(new Error("paused")), { once: true });
+            });
+          }
+          return `${prompt}-done`;
+        },
+      },
+    });
+    manager.on("error", () => {});
+
+    const { runId, promise } = manager.startInBackground(threeParallelScript);
+    promise.catch(() => {});
+    await p0Started;
+    // Both siblings must have completed and journaled before the pause.
+    for (let i = 0; i < 2000; i++) {
+      if ((manager.getPersistence().load(runId)?.journal?.length ?? 0) >= 2) break;
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assert.equal(manager.pause(runId), true);
+
+    const atPause = manager.getPersistence().load(runId);
+    assert.equal(atPause?.status, "paused");
+    assert.deepEqual(
+      (atPause?.journal ?? []).map((entry) => entry.index).sort((a, b) => a - b),
+      [1, 2],
+      "only the two completed siblings are journaled; the paused call is a gap at index 0",
+    );
+
+    assert.equal(await manager.resume(runId, { resumeMode: "replay-completed" }), true);
+    for (let i = 0; i < 2000 && manager.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+
+    const persisted = manager.getPersistence().load(runId);
+    assert.equal(persisted?.status, "completed");
+    assert.equal(attempts.get("p0"), 2, "the never-completed gap call re-runs live");
+    assert.equal(attempts.get("p1"), 1, "completed sibling p1 replays from the journal");
+    assert.equal(attempts.get("p2"), 1, "completed sibling p2 replays from the journal");
+  }),
+);
+
+test(
+  "resume without resumeMode keeps the prefix policy: a gap re-runs its completed siblings (#231)",
+  withTempCwd(async (cwd) => {
+    const attempts = new Map<string, number>();
+    let markP0Started: () => void = () => {};
+    const p0Started = new Promise<void>((resolve) => {
+      markP0Started = resolve;
+    });
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt, options) {
+          options?.onUsage?.({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 });
+          const attempt = (attempts.get(prompt) ?? 0) + 1;
+          attempts.set(prompt, attempt);
+          if (prompt === "p0" && attempt === 1) {
+            markP0Started();
+            await new Promise<void>((_resolve, reject) => {
+              options?.signal?.addEventListener("abort", () => reject(new Error("paused")), { once: true });
+            });
+          }
+          return `${prompt}-done`;
+        },
+      },
+    });
+    manager.on("error", () => {});
+
+    const { runId, promise } = manager.startInBackground(threeParallelScript);
+    promise.catch(() => {});
+    await p0Started;
+    for (let i = 0; i < 2000; i++) {
+      if ((manager.getPersistence().load(runId)?.journal?.length ?? 0) >= 2) break;
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assert.equal(manager.pause(runId), true);
+
+    assert.equal(await manager.resume(runId), true);
+    for (let i = 0; i < 2000 && manager.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+
+    const persisted = manager.getPersistence().load(runId);
+    assert.equal(persisted?.status, "completed");
+    assert.equal(attempts.get("p0"), 2, "the gap call re-runs live");
+    assert.equal(attempts.get("p1"), 2, "prefix policy: the gap also re-runs completed sibling p1");
+    assert.equal(attempts.get("p2"), 2, "prefix policy: the gap also re-runs completed sibling p2");
+  }),
+);
+
+test(
+  "a resumeMode choice persists on the run: a later resume keeps it without being told (#231)",
+  withTempCwd(async (cwd) => {
+    const attempts = new Map<string, number>();
+    let markFirstStarted: () => void = () => {};
+    const firstStarted = new Promise<void>((resolve) => {
+      markFirstStarted = resolve;
+    });
+    let markSecondStarted: () => void = () => {};
+    const secondStarted = new Promise<void>((resolve) => {
+      markSecondStarted = resolve;
+    });
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt, options) {
+          options?.onUsage?.({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 });
+          const attempt = (attempts.get(prompt) ?? 0) + 1;
+          attempts.set(prompt, attempt);
+          if (prompt === "p0" && attempt <= 2) {
+            // Attempts 1 and 2 die on a pause abort without journaling, so the
+            // gap survives the first resume; attempt 3 completes.
+            if (attempt === 1) markFirstStarted();
+            else markSecondStarted();
+            await new Promise<void>((_resolve, reject) => {
+              options?.signal?.addEventListener("abort", () => reject(new Error("paused")), { once: true });
+            });
+          }
+          return `${prompt}-done`;
+        },
+      },
+    });
+    manager.on("error", () => {});
+
+    const { runId, promise } = manager.startInBackground(threeParallelScript);
+    promise.catch(() => {});
+    await firstStarted;
+    for (let i = 0; i < 2000; i++) {
+      if ((manager.getPersistence().load(runId)?.journal?.length ?? 0) >= 2) break;
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assert.equal(manager.pause(runId), true);
+
+    // The first resume picks replay-completed, then pauses again mid-gap-retry.
+    assert.equal(await manager.resume(runId, { resumeMode: "replay-completed" }), true);
+    await secondStarted;
+    assert.equal(manager.pause(runId), true);
+    assert.equal(
+      manager.getPersistence().load(runId)?.resumeMode,
+      "replay-completed",
+      "the explicit choice is written to the run record",
+    );
+
+    // The second resume passes nothing: the persisted policy must apply, or
+    // the completed siblings would re-run under the prefix fallback.
+    assert.equal(await manager.resume(runId), true);
+    for (let i = 0; i < 2000 && manager.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+
+    const persisted = manager.getPersistence().load(runId);
+    assert.equal(persisted?.status, "completed");
+    assert.equal(attempts.get("p0"), 3, "the gap call re-ran on every resume");
+    assert.equal(attempts.get("p1"), 1, "the persisted replay-completed policy replays sibling p1 again");
+    assert.equal(attempts.get("p2"), 1, "the persisted replay-completed policy replays sibling p2 again");
+  }),
+);
+
+test(
+  "an explicit resumeMode overrides the run's persisted policy in both directions (#231)",
+  withTempCwd(async (cwd) => {
+    const attempts = new Map<string, number>();
+    let markFirstStarted: () => void = () => {};
+    const firstStarted = new Promise<void>((resolve) => {
+      markFirstStarted = resolve;
+    });
+    let markSecondStarted: () => void = () => {};
+    const secondStarted = new Promise<void>((resolve) => {
+      markSecondStarted = resolve;
+    });
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt, options) {
+          options?.onUsage?.({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 });
+          const attempt = (attempts.get(prompt) ?? 0) + 1;
+          attempts.set(prompt, attempt);
+          if (prompt === "p0" && attempt <= 2) {
+            if (attempt === 1) markFirstStarted();
+            else markSecondStarted();
+            await new Promise<void>((_resolve, reject) => {
+              options?.signal?.addEventListener("abort", () => reject(new Error("paused")), { once: true });
+            });
+          }
+          return `${prompt}-done`;
+        },
+      },
+    });
+    manager.on("error", () => {});
+
+    const { runId, promise } = manager.startInBackground(threeParallelScript);
+    promise.catch(() => {});
+    await firstStarted;
+    for (let i = 0; i < 2000; i++) {
+      if ((manager.getPersistence().load(runId)?.journal?.length ?? 0) >= 2) break;
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assert.equal(manager.pause(runId), true);
+
+    // Persist replay-completed via the first resume (paused again mid-retry).
+    assert.equal(await manager.resume(runId, { resumeMode: "replay-completed" }), true);
+    await secondStarted;
+    assert.equal(manager.pause(runId), true);
+    assert.equal(manager.getPersistence().load(runId)?.resumeMode, "replay-completed");
+
+    // An explicit "prefix" wins over the persisted policy AND re-persists.
+    assert.equal(await manager.resume(runId, { resumeMode: "prefix" }), true);
+    for (let i = 0; i < 2000 && manager.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+
+    const persisted = manager.getPersistence().load(runId);
+    assert.equal(persisted?.status, "completed");
+    assert.equal(persisted?.resumeMode, "prefix", "the explicit override replaces the persisted policy");
+    assert.equal(attempts.get("p0"), 3, "the gap call re-ran on every resume");
+    assert.equal(attempts.get("p1"), 2, "explicit prefix: the gap re-runs completed sibling p1");
+    assert.equal(attempts.get("p2"), 2, "explicit prefix: the gap re-runs completed sibling p2");
+  }),
+);
+
+test(
+  "an out-of-schema explicit resumeMode is treated as absent, not persisted as-is (#231 R5/R6)",
+  withTempCwd(async (cwd) => {
+    let markStarted: () => void = () => {};
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt, options) {
+          options?.onUsage?.({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 });
+          if (prompt === "p0") {
+            markStarted();
+            await new Promise<void>((_resolve, reject) => {
+              options?.signal?.addEventListener("abort", () => reject(new Error("paused")), { once: true });
+            });
+          }
+          return `${prompt}-done`;
+        },
+      },
+    });
+    manager.on("error", () => {});
+
+    const { runId, promise } = manager.startInBackground(threeParallelScript);
+    promise.catch(() => {});
+    await started;
+    for (let i = 0; i < 2000; i++) {
+      if ((manager.getPersistence().load(runId)?.journal?.length ?? 0) >= 2) break;
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assert.equal(manager.pause(runId), true);
+
+    // Both tool schemas restrict the literals, but a plain-JS caller can pass
+    // anything. This run has NO persisted policy: the invalid value is dropped
+    // like an omitted one, leaving the prefix default — never persisted.
+    assert.equal(await manager.resume(runId, { resumeMode: "replay_completed" as never }), true);
+    for (let i = 0; i < 2000 && manager.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assert.equal(manager.getRun(runId)?.resumeMode, undefined, "an invalid explicit mode is dropped, not stored");
+    assert.equal(
+      manager.getPersistence().load(runId)?.resumeMode,
+      undefined,
+      "the run record carries no policy the caller never validly chose",
+    );
+  }),
+);
+
+test(
+  "an out-of-schema explicit resumeMode does not downgrade the run's persisted replay policy (#231 R6)",
+  withTempCwd(async (cwd) => {
+    const attempts = new Map<string, number>();
+    let markFirstStarted: () => void = () => {};
+    const firstStarted = new Promise<void>((resolve) => {
+      markFirstStarted = resolve;
+    });
+    let markSecondStarted: () => void = () => {};
+    const secondStarted = new Promise<void>((resolve) => {
+      markSecondStarted = resolve;
+    });
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt, options) {
+          options?.onUsage?.({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 });
+          const attempt = (attempts.get(prompt) ?? 0) + 1;
+          attempts.set(prompt, attempt);
+          if (prompt === "p0" && attempt <= 2) {
+            if (attempt === 1) markFirstStarted();
+            else markSecondStarted();
+            await new Promise<void>((_resolve, reject) => {
+              options?.signal?.addEventListener("abort", () => reject(new Error("paused")), { once: true });
+            });
+          }
+          return `${prompt}-done`;
+        },
+      },
+    });
+    manager.on("error", () => {});
+
+    const { runId, promise } = manager.startInBackground(threeParallelScript);
+    promise.catch(() => {});
+    await firstStarted;
+    for (let i = 0; i < 2000; i++) {
+      if ((manager.getPersistence().load(runId)?.journal?.length ?? 0) >= 2) break;
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assert.equal(manager.pause(runId), true);
+
+    // Establish the persisted policy, then pause again mid-gap-retry.
+    assert.equal(await manager.resume(runId, { resumeMode: "replay-completed" }), true);
+    await secondStarted;
+    assert.equal(manager.pause(runId), true);
+    assert.equal(manager.getPersistence().load(runId)?.resumeMode, "replay-completed");
+
+    // A garbage explicit value must behave as ABSENT: the persisted
+    // replay-completed policy stands, so the completed siblings still replay
+    // (under the pre-R6 fallback to "prefix" they would have re-run).
+    assert.equal(await manager.resume(runId, { resumeMode: "replay_completed" as never }), true);
+    for (let i = 0; i < 2000 && manager.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+
+    const persisted = manager.getPersistence().load(runId);
+    assert.equal(persisted?.status, "completed");
+    assert.equal(persisted?.resumeMode, "replay-completed", "the persisted policy survives the invalid override");
+    assert.equal(manager.getRun(runId)?.resumeMode, "replay-completed");
+    assert.equal(attempts.get("p0"), 3, "the gap call re-ran on every resume");
+    assert.equal(attempts.get("p1"), 1, "the invalid explicit value did not downgrade the run to prefix");
+    assert.equal(attempts.get("p2"), 1, "the invalid explicit value did not downgrade the run to prefix");
+  }),
+);
+
+test(
+  "a start-time resumeMode declaration persists and drives later resumes (#231 R6)",
+  withTempCwd(async (cwd) => {
+    const attempts = new Map<string, number>();
+    let markStarted: () => void = () => {};
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt, options) {
+          options?.onUsage?.({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 });
+          const attempt = (attempts.get(prompt) ?? 0) + 1;
+          attempts.set(prompt, attempt);
+          if (prompt === "p0" && attempt === 1) {
+            markStarted();
+            await new Promise<void>((_resolve, reject) => {
+              options?.signal?.addEventListener("abort", () => reject(new Error("paused")), { once: true });
+            });
+          }
+          return `${prompt}-done`;
+        },
+      },
+    });
+    manager.on("error", () => {});
+
+    const { runId, promise } = manager.startInBackground(threeParallelScript, undefined, {
+      resumeMode: "replay-completed",
+    });
+    promise.catch(() => {});
+    // The hand-built initial save must carry the declared policy, not just the
+    // first persistRun after it.
+    assert.equal(
+      manager.getPersistence().load(runId)?.resumeMode,
+      "replay-completed",
+      "the start declaration is persisted with the initial save",
+    );
+    await started;
+    for (let i = 0; i < 2000; i++) {
+      if ((manager.getPersistence().load(runId)?.journal?.length ?? 0) >= 2) break;
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assert.equal(manager.pause(runId), true);
+
+    // The resume passes nothing: the start-declared policy must apply, or the
+    // completed siblings re-run under the prefix default.
+    assert.equal(await manager.resume(runId), true);
+    for (let i = 0; i < 2000 && manager.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+
+    assert.equal(manager.getPersistence().load(runId)?.status, "completed");
+    assert.equal(attempts.get("p0"), 2, "the gap call re-ran on resume");
+    assert.equal(attempts.get("p1"), 1, "the start-declared replay-completed policy replays sibling p1");
+    assert.equal(attempts.get("p2"), 1, "the start-declared replay-completed policy replays sibling p2");
+  }),
+);
+
+test(
+  "pause + resume recover a replay-completed run whose child frame has a signal-ignoring call in flight (#231 R7)",
+  withTempCwd(async (cwd) => {
+    // The nested quiescence drain must WAKE on abort: a child returning with
+    // an un-awaited, signal-ignoring call in flight otherwise holds executeRun
+    // pending forever — pause() reports "paused" but the execution never
+    // settles, and resume() then refuses at the settle guard: the run wedges.
+    //
+    // The drain only engages on an actual replay with something to replay
+    // (a fresh start has no journal — #231 R8; a frame with zero journaled
+    // entries of its own engages nothing — #231 R9), so the pause must land
+    // on a RESUMED execution: run 1 is paused with HANG in flight (never
+    // journaled — a gap) next to a journaled seed call, and the resume
+    // re-runs that gap live inside the replayed child frame.
+    const child = `export const meta = { name: 'kidHang', description: 'k' }
+const p = agent('HANG')
+const k = await agent('K-SEED')
+return 'kid-done'`;
+    const script = `export const meta = { name: 'parHang', description: 'p' }
+const n = await workflow('kidHang')
+return n`;
+    let hangAttempts = 0;
+    let secondHangStarted = false;
+    const manager = new WorkflowManager({
+      cwd,
+      loadSavedWorkflow: (name: string) => (name === "kidHang" ? child : undefined),
+      agent: {
+        async run(prompt, options) {
+          options?.onUsage?.({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 });
+          if (prompt === "HANG") {
+            const attempt = ++hangAttempts;
+            if (attempt === 2) secondHangStarted = true;
+            if (attempt <= 2) return await new Promise((_resolve, _reject) => {});
+          }
+          return `${prompt}-done`;
+        },
+      },
+    });
+    manager.on("error", () => {});
+    const logs: string[] = [];
+    manager.on("log", ({ message }: { message: string }) => logs.push(message));
+
+    // Run 1: the child script returns with HANG in flight; the top-level
+    // success drain holds the run "running" until the pause abandons it.
+    const { runId, promise } = manager.startInBackground(script, undefined, {
+      resumeMode: "replay-completed",
+      // Well above the 50ms pre-pause wait so a scheduling stall cannot let
+      // the grace win the race and trip the absence assertion below (#231
+      // R10); still far inside the 2s settle guard for a drain with no wake.
+      drainAbortGraceMs: 1_000,
+    });
+    promise.catch(() => {});
+    const seedJournaled = () => manager.getRun(runId)?.journal.some((e) => e.result === "K-SEED-done") ?? false;
+    for (let i = 0; i < 2000 && (hangAttempts < 1 || !seedJournaled()); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assert.ok(hangAttempts >= 1, "the first hung call is in flight before the pause");
+    // Pausing before K-SEED is journaled would leave the child frame with
+    // zero entries, disengaging the drain (#231 R9) and making the abort-wake
+    // assertion below vacuous — verify the entry, don't wait for it (#231 R10).
+    assert.ok(seedJournaled(), "the seed entry is journaled before the pause");
+    assert.equal(manager.pause(runId), true);
+    for (let i = 0; i < 2000 && manager.getPersistence().load(runId)?.status !== "paused"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assert.equal(manager.getPersistence().load(runId)?.status, "paused");
+
+    // Resume: the HANG gap re-runs live inside the replayed child frame, and
+    // the frame's quiescence drain blocks on it. Pausing THAT execution is
+    // what must wake the drain.
+    assert.equal(await manager.resume(runId, { drainAbortGraceMs: 1_000 }), true);
+    for (let i = 0; i < 2000 && !secondHangStarted; i++) await new Promise((resolve) => setTimeout(resolve, 1));
+    assert.ok(secondHangStarted, "the signal-ignoring call is in flight before the pause");
+    // Let the child frame reach its drain and block in it — pausing earlier
+    // would skip the drain loop entirely and prove nothing about the wake.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    assert.equal(manager.pause(runId), true);
+    // Pre-fix wedge signal: resume() times out the settle guard (10s in
+    // production; shrunk here) and returns false.
+    _setPausedExecutionSettleTimeoutForTests(2_000);
+    try {
+      assert.equal(
+        await manager.resume(runId, { drainAbortGraceMs: 1_000 }),
+        true,
+        "the aborted nested drain must let the execution settle so resume can proceed",
+      );
+    } finally {
+      _setPausedExecutionSettleTimeoutForTests(undefined);
+    }
+    for (let i = 0; i < 2000 && manager.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+
+    assert.equal(manager.getPersistence().load(runId)?.status, "completed");
+    assert.equal(hangAttempts, 3, "the never-journaled gap call re-ran on each resume and completed");
+    assert.equal(
+      logs.some((message) => message.includes("nested frame drain abandoned")),
+      false,
+      "the abort, not the grace, must release the nested drain (#231 R9: the grace alone would settle within the guard)",
+    );
+  }),
+);
+
+test(
+  "a non-recoverable error pauses a replay-completed resume despite a hung sibling in the child frame (#231 R8)",
+  withTempCwd(async (cwd) => {
+    // Manager-level view of the nested-drain grace bound: the resumed
+    // execution re-runs two gap calls — HANG (never settles) and LIMIT
+    // (throws a non-recoverable usage-limit error). Without a grace bound the
+    // child frame's quiescence drain waits on HANG BEHIND the error, the
+    // error never reaches the top-level catch that would abort HANG, the
+    // execution never settles, the run stays "running" forever, and resume()
+    // refuses — the usage-limit recovery path can never fire.
+    const child = `export const meta = { name: 'kidLimit', description: 'k' }
+const p = agent('HANG')
+const k = await agent('K-SEED')
+const c = await agent('LIMIT')
+return c`;
+    const script = `export const meta = { name: 'parLimit', description: 'p' }
+const n = await workflow('kidLimit')
+return n`;
+    let hangAttempts = 0;
+    let limitAttempts = 0;
+    const manager = new WorkflowManager({
+      cwd,
+      loadSavedWorkflow: (name: string) => (name === "kidLimit" ? child : undefined),
+      agent: {
+        async run(prompt, options) {
+          options?.onUsage?.({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 });
+          if (prompt === "HANG") {
+            if (++hangAttempts <= 2) return await new Promise((_resolve, _reject) => {});
+            return "HANG-done";
+          }
+          if (prompt === "LIMIT") {
+            if (++limitAttempts === 1) return ""; // unjournaled gap for the resume
+            if (limitAttempts === 2) {
+              throw new WorkflowError("upstream 429: usage limit reached", WorkflowErrorCode.PROVIDER_USAGE_LIMIT, {
+                recoverable: false,
+              });
+            }
+            return "LIMIT-done";
+          }
+          return `${prompt}-done`;
+        },
+      },
+    });
+    manager.on("error", () => {});
+
+    // Run 1: LIMIT completes empty (never journaled — a gap) next to a
+    // journaled seed call, HANG stays in flight; the top-level success drain
+    // holds the run "running" until the pause abandons it.
+    const { runId, promise } = manager.startInBackground(script, undefined, {
+      resumeMode: "replay-completed",
+      drainAbortGraceMs: 100,
+    });
+    promise.catch(() => {});
+    for (let i = 0; i < 2000 && (hangAttempts < 1 || limitAttempts < 1); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assert.ok(hangAttempts >= 1 && limitAttempts >= 1, "both gap calls dispatched before the pause");
+    assert.equal(manager.pause(runId), true);
+    for (let i = 0; i < 2000 && manager.getPersistence().load(runId)?.status !== "paused"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assert.equal(manager.getPersistence().load(runId)?.status, "paused");
+
+    // The resume re-runs both gaps live; LIMIT's usage-limit failure must
+    // settle the run (paused) instead of wedging behind the HANG drain.
+    assert.equal(await manager.resume(runId, { drainAbortGraceMs: 100 }), true);
+    for (let i = 0; i < 5_000; i++) {
+      const status = manager.getRun(runId)?.status ?? manager.getPersistence().load(runId)?.status;
+      if (status !== "running" && limitAttempts >= 2) break;
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    const settled = manager.getPersistence().load(runId)?.status;
+    assert.ok(limitAttempts >= 2, "the failing gap call re-ran on the resume");
+    assert.notEqual(settled, "running", "the grace-bound drain must let the usage-limit error settle the run");
+    assert.notEqual(settled, "completed", "the usage-limit failure must not be swallowed");
+
+    // Recovery: the next resume re-runs the gaps once more, both succeed.
+    assert.equal(await manager.resume(runId, { drainAbortGraceMs: 100 }), true, "the settled run resumes");
+    for (let i = 0; i < 5_000 && (manager.getRun(runId)?.status === "running" || limitAttempts < 3); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assert.equal(manager.getPersistence().load(runId)?.status, "completed");
+    assert.equal(hangAttempts, 3);
+    assert.equal(limitAttempts, 3);
+  }),
+);
+
 test(
   "resume keeps historical agent session metadata when the edited script fails to parse (#206)",
   withTempCwd(async (cwd) => {

@@ -57,6 +57,7 @@ const INDEX_KEYS = new Set([
   "resetHint",
   "autoResume",
   "autoResumeAttempts",
+  "resumeMode",
 ]);
 interface Head {
   format: "pi-workflow-run-v2";

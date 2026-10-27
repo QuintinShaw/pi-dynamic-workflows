@@ -15,7 +15,7 @@ import {
 import { type EffortState, effortDirective } from "./effort-command.js";
 import type { PersistedRunState } from "./run-persistence.js";
 import { runSummary } from "./run-record-store.js";
-import { registerSavedWorkflow } from "./saved-commands.js";
+import { registerSavedWorkflow, savedWorkflowCommandAvailability } from "./saved-commands.js";
 import { buildForcedWorkflowPrompt, WORKFLOW_TOOL_NAME } from "./workflow-editor.js";
 import type { WorkflowManager } from "./workflow-manager.js";
 import type { WorkflowStorage } from "./workflow-saved.js";
@@ -294,6 +294,11 @@ export function registerWorkflowCommands(
           if (!name) return ctx.ui.notify("Usage: /workflows save <name> [runId]", "warning");
           const storage = getStorage();
           if (!storage) return ctx.ui.notify("Saving is not available (no storage configured)", "error");
+          const availability = savedWorkflowCommandAvailability(pi, name);
+          if (!availability.ok) {
+            ctx.ui.notify(availability.message, "warning");
+            return;
+          }
           const runs = manager.listRuns();
           const runIdArg = parts[2];
           // Pick the named run, else the most recent run that still has its script.

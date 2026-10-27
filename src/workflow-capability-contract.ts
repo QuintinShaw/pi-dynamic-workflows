@@ -321,7 +321,7 @@ const capabilities: readonly CapabilityDescriptor[] = [
       "recoverable failures return null after retries; nonrecoverable failures throw",
       "schema noncompliance after bounded structured-output repair is nonrecoverable and bypasses agent retries",
       "per-agent retries override invocation retries; retries are floored and clamped to 0..3",
-      "resume replays only the longest unchanged prefix; the first miss and every later call execute live",
+      "under the default prefix resume policy, resume replays only the longest unchanged prefix; the first miss and every later call execute live (see the resumeMode tool input)",
       "a named thread retains its full Pi transcript and session identity only within one uninterrupted workflow invocation",
       "threaded calls are live-execution resume barriers and are never journaled",
       "same-thread calls must be sequential; threads cannot use worktree isolation",
@@ -360,7 +360,7 @@ const capabilities: readonly CapabilityDescriptor[] = [
     constraints: [
       "one nested level",
       "shares limiter, counters, token accounting, and store",
-      "nested workflows do not reuse the parent resume journal",
+      "a nested workflow journals under its own runId and replays those entries only while the parent's replay is still open at the workflow() call; a parent edit, or a parent gap shadowing the call, re-executes the child live, and a gap or edit inside the child re-runs the parent's calls dispatched after the child returns",
     ],
     evidence: ["tests/workflow-saved.test.ts", "tests/shared-store.test.ts"],
   }),
@@ -510,8 +510,15 @@ const capabilities: readonly CapabilityDescriptor[] = [
   ]),
   toolInput("resumeFromRunId", "resumeFromRunId?: string", [
     "resumes a prior incomplete run with an edited script",
-    "unchanged positional agent calls replay from cache until the first changed or inserted call",
+    "under the default prefix policy, unchanged positional agent calls replay from cache until the first changed, inserted, or never-completed call",
     "always runs in the background",
+  ]),
+  toolInput("resumeMode", 'resumeMode?: "prefix" | "replay-completed" = "prefix"', [
+    "applies only together with resumeFromRunId",
+    "prefix: the first changed, new, or never-completed call and every later call re-run live",
+    "replay-completed: completed calls replay across a never-completed gap only when dispatched concurrently with the gap in one fan-out; a changed call still re-runs its whole suffix",
+    "an explicit choice persists on the run; later resumes keep it unless overridden",
+    "shared-store and filesystem results are not hash-checked and can replay stale across a gap",
   ]),
   {
     id: "workflow.script.metadata",

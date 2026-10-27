@@ -1,0 +1,38 @@
+# Pi Durable alignment
+
+Position on `@earendil-works/pi-durable`, **re-evaluated on 2026-10-05 against version 1.0.2**: [release v1.0.2](https://github.com/earendil-works/pi/releases/tag/v1.0.2), pinned to commit [`cd32f7725fdbddbaecdff5b1e68491563394e0ca`](https://github.com/earendil-works/pi/commit/cd32f7725fdbddbaecdff5b1e68491563394e0ca) ([package manifest](https://github.com/earendil-works/pi/blob/cd32f7725fdbddbaecdff5b1e68491563394e0ca/packages/durable/package.json)). This replaces the earlier unpinned “1.0.x” comparison; it does not establish which patch version that earlier evaluation used. The API and capability comparisons below refer to this pinned source.
+
+It is marked **experimental** upstream ("the API changes without notice between releases") and is built on `pi-ai`/`chord` ([README](https://github.com/earendil-works/pi/blob/cd32f7725fdbddbaecdff5b1e68491563394e0ca/packages/durable/README.md#L1-L7)), rather than the coding-agent extension API. The extension's supported hosts start at pi-coding-agent 0.80.8 ([peer dependencies](../package.json)). Decision: **do not migrate**; re-evaluate on the triggers below. Migration is one option among several (others: platform-native run storage in the coding agent, session custom entries); this note exists so a future evaluation costs hours, not weeks.
+
+**Extension status:** prefix replay is existing behavior. The opt-in `resumeMode: "replay-completed"` and its fan-out gap-shadowing semantics are **proposed/pending in [#246](https://github.com/QuintinShaw/pi-dynamic-workflows/pull/246)**, which was still open at this evaluation. They are not current extension behavior and are not prerequisites for the existing non-migration rationale.
+
+## Primitive mapping
+
+These are conceptual comparisons, not interchangeable APIs.
+
+| Extension | pi-durable 1.0.2 |
+| --- | --- |
+| Journal replay on resume (unchanged prefix returns journaled results) | Task resume: `harness.resume()` starts the scheduler; interrupted work stays pending ([resume](https://github.com/earendil-works/pi/blob/cd32f7725fdbddbaecdff5b1e68491563394e0ca/packages/durable/README.md#persist-and-resume)) |
+| `agent()` content-hash call identity | No direct built-in equivalent in the evaluated API; see below |
+| Durable `checkpoint({ kind, checkpointId, payload })` suspension | Durable task phases/checkpoints, with `waiting` states that join task IDs ([task state](https://github.com/earendil-works/pi/blob/cd32f7725fdbddbaecdff5b1e68491563394e0ca/packages/durable/docs/spec.md#L1592-L1768)); application-specific response handling would need adaptation |
+| Run-record head + hash-chained JSONL event log ([storage protocol](run-storage.md)) | Atomic storage commits before publication ([concepts](https://github.com/earendil-works/pi/blob/cd32f7725fdbddbaecdff5b1e68491563394e0ca/packages/durable/README.md#concepts)) |
+| SharedStore per-agent write deltas, applied additively in callSeq order | `defineDoc` documents (chord) for user-owned state ([documents](https://github.com/earendil-works/pi/blob/cd32f7725fdbddbaecdff5b1e68491563394e0ca/packages/durable/README.md#your-own-state)) |
+| Delivery markers | `requestId`-idempotent submissions (a retried submission returns the existing one; [resume](https://github.com/earendil-works/pi/blob/cd32f7725fdbddbaecdff5b1e68491563394e0ca/packages/durable/README.md#persist-and-resume)) |
+| Run lease + writer mutex | One storage owner, without cross-process locking ([storage](https://github.com/earendil-works/pi/blob/cd32f7725fdbddbaecdff5b1e68491563394e0ca/packages/durable/README.md#storage)), plus conversation-busy submission rules ([busy conversations](https://github.com/earendil-works/pi/blob/cd32f7725fdbddbaecdff5b1e68491563394e0ca/packages/durable/README.md#busy-conversations)); not a replacement for the run lease |
+
+## Where the evaluated API does not supply the extension's semantics
+
+1. **Content-hash call identity with a replay cache.** On reopen, a tool call that died mid-execution re-runs only when both its stored intent and current declaration say `replay: "safe"`; otherwise the model receives `interrupted` ([tool recovery implementation](https://github.com/earendil-works/pi/blob/cd32f7725fdbddbaecdff5b1e68491563394e0ca/packages/durable/src/harness/tool.ts#L93-L111), [specification](https://github.com/earendil-works/pi/blob/cd32f7725fdbddbaecdff5b1e68491563394e0ca/packages/durable/docs/spec.md#L3002-L3008)). The evaluated API resumes persisted tasks; it does not directly provide the extension's deterministic script re-execution with identity-matching journal results (changed suffix re-runs live, unchanged prefix replays). Its task-local first-writer-wins memos disappear at terminal settlement, rather than forming that completed-call cache ([memo and terminal-task semantics](https://github.com/earendil-works/pi/blob/cd32f7725fdbddbaecdff5b1e68491563394e0ca/packages/durable/docs/spec.md#L1862-L1888)).
+2. **Proposed/pending: fan-out gap shadowing ([#246](https://github.com/QuintinShaw/pi-dynamic-workflows/pull/246)).** The proposed `prefix` vs `replay-completed` distinction would let a never-completed gap end replay for its sequential downstream without invalidating siblings dispatched concurrently in the same fan-out window. This requires the replay cache of item 1, not merely upstream's parallel task execution. A proposal for equivalent upstream script-replay semantics would therefore need to address content-addressed replay caching **plus** fan-out gap shadowing together. This item describes planned extension behavior, not a shipped capability.
+3. **Additive store deltas with undo-on-retry across replay** (a replayed call recommits nothing; a retried call's writes replace, not duplicate). Upstream's [transactional document API](https://github.com/earendil-works/pi/blob/cd32f7725fdbddbaecdff5b1e68491563394e0ca/packages/durable/README.md#your-own-state) provides durable state, but does not directly supply this callSeq/replay policy; a migration would still need to preserve it.
+4. **Cumulative budget re-seeding across pause/resume** (`initialTokenUsage`), so a workflow token ceiling holds across a cycle instead of resetting. Upstream already persists cumulative token and cost accounting in `pi.usage` ([usage](https://github.com/earendil-works/pi/blob/cd32f7725fdbddbaecdff5b1e68491563394e0ca/packages/durable/docs/spec.md#L3578-L3609)); the missing direct equivalent is this extension's budget-seeding and ceiling policy, not durable usage accounting. The evaluated [harness settings](https://github.com/earendil-works/pi/blob/cd32f7725fdbddbaecdff5b1e68491563394e0ca/packages/durable/docs/spec.md#L397-L418) do not expose that policy.
+
+The mismatch is also architectural: pi-durable is a separate harness with its own conversations/tasks/documents, not a drop-in storage backend for the in-process extension runtime ([concepts](https://github.com/earendil-works/pi/blob/cd32f7725fdbddbaecdff5b1e68491563394e0ca/packages/durable/README.md#concepts)). This is an assessment of the pinned built-in API, not a claim that an application could not implement equivalent semantics on top.
+
+## Re-evaluation triggers
+
+- pi-durable drops the experimental banner.
+- The extension's supported host floor reaches the Pi 1.x line.
+- Upstream gains a content-addressed replay cache (item 1), the precondition for evaluating equivalent gap-shadowing semantics if the proposal in #246 is adopted.
+
+The on-disk run store (the journal core and the persistence stack) is the candidate for replacement by future platform-native durable run storage. Any migration still needs to preserve the extension's orchestration and replay semantics.

@@ -15,7 +15,7 @@ import {
   type WorkflowSnapshot,
 } from "./display.js";
 import { WorkflowError, WorkflowErrorCode } from "./errors.js";
-import { parseWorkflowScript, type WorkflowRunResult } from "./workflow.js";
+import { parseWorkflowScript, type WorkflowResumeMode, type WorkflowRunResult } from "./workflow.js";
 import { WorkflowManager } from "./workflow-manager.js";
 import { createWorkflowStorage, type WorkflowStorage } from "./workflow-saved.js";
 import { loadWorkflowSettings } from "./workflow-settings.js";
@@ -130,9 +130,15 @@ const workflowToolSchema = Type.Object({
     Type.String({
       description: [
         "Resume a prior run (this ID) with an edited `script` instead of starting a new run.",
-        "Unchanged agent() calls replay from that run's cache; the first changed/new call onward re-runs.",
+        "Unchanged agent() calls replay from that run's cache; the first changed/new call onward re-runs (see resumeMode).",
         "Calls match by position: keep earlier good calls identical and in order. Always background.",
       ].join(" "),
+    }),
+  ),
+  resumeMode: Type.Optional(
+    Type.Union([Type.Literal("prefix"), Type.Literal("replay-completed")], {
+      description:
+        "Replay policy with resumeFromRunId. prefix (default): the first changed/new/never-completed call onward re-runs. replay-completed: completed calls also replay across a never-completed gap when dispatched concurrently with it in one fan-out (paused fan-out); calls made after an await (workflow() children included) are sequential and still re-run — a workflow() call in the gap's own window keeps its child journal; a changed call still re-runs its suffix. The choice persists on the run: later resumes keep it unless overridden. Store/file-passed results are not hash-checked and can replay stale across a gap.",
     }),
   ),
 });
@@ -148,6 +154,7 @@ export type WorkflowToolInput = {
   agentTimeoutMs?: number;
   tokenBudget?: number;
   resumeFromRunId?: string;
+  resumeMode?: WorkflowResumeMode;
 };
 
 export interface WorkflowToolOptions {
@@ -264,6 +271,9 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       // replay from the prior run's journal; the first edited/new call and
       // everything after it re-run live. Always background (the resumed run is
       // detached and its result is delivered back into the conversation).
+      if (params.resumeMode !== undefined && !params.resumeFromRunId) {
+        throw new Error("workflow: `resumeMode` only applies together with `resumeFromRunId`.");
+      }
       if (params.resumeFromRunId) {
         const runId = params.resumeFromRunId;
         const resumed = await manager.resume(runId, {
@@ -272,13 +282,23 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           // Explicit raise only — resume keeps the start-time cap unless the
           // caller passes a higher maxAgents (see WorkflowManager.resume, #146).
           maxAgents: params.maxAgents,
+          resumeMode: params.resumeMode,
         });
         if (!resumed) {
           throw new Error(resumeFailureText(manager, runId, params.maxAgents));
         }
         return withStructuredContent(
           {
-            content: [{ type: "text", text: resumedText(parsed.meta.name, runId) }],
+            content: [
+              {
+                type: "text",
+                // The EFFECTIVE policy decides the replay description: an omitted
+                // resumeMode falls back to the run's persisted mode (see
+                // WorkflowManager.resume), so params.resumeMode alone can
+                // misdescribe what the resumed run will actually do.
+                text: resumedText(parsed.meta.name, runId, manager.getRun(runId)?.resumeMode ?? params.resumeMode),
+              },
+            ],
             details: { runId, background: true, resumedFrom: runId },
           },
           { runId, status: "resumed" },
@@ -504,18 +524,31 @@ export function backgroundStartedText(name: string, runId: string): string {
  */
 export function reviseHint(runId: string | undefined): string {
   if (!runId) return "";
-  return `To revise without re-running everything: re-call workflow with resumeFromRunId="${runId}" and an edited script — unchanged agent() calls replay from cache, only edited/new ones re-run.`;
+  return `To revise without re-running everything: re-call workflow with resumeFromRunId="${runId}" and an edited script — unchanged agent() calls replay from cache, only edited/new ones re-run. For a run paused inside a fan-out, add resumeMode="replay-completed" to also replay completed fan-out siblings across the never-completed gap.`;
 }
 
 /**
  * The tool result returned when the model resumes a run with an edited script.
  * The resumed run is always background, so its result is delivered back later.
+ * The replay lines describe the policy actually chosen via resumeMode.
  */
-export function resumedText(name: string, runId: string): string {
+export function resumedText(name: string, runId: string, resumeMode?: WorkflowResumeMode): string {
+  const replay =
+    resumeMode === "replay-completed"
+      ? [
+          "Unchanged completed agent() calls replay from that run's journal (cache) — including",
+          "completed fan-out siblings across a never-completed gap; the gap still re-runs its",
+          "sequential downstream (calls after an await — workflow() children included, though",
+          "one dispatched in the gap's own window replays with its child journal), and the",
+          "first edited call — and everything after it — re-runs live.",
+        ]
+      : [
+          "Unchanged agent() calls replay from that run's journal (cache); the first",
+          "changed, new, or never-completed agent() call — and everything after it — re-runs live.",
+        ];
   return [
     `Workflow "${name}" resumed from run ${runId} with your edited script.`,
-    "Unchanged agent() calls replay from that run's journal (cache); the first",
-    "edited or newly inserted agent() call — and everything after it — re-runs live.",
+    ...replay,
     "It runs in the background; the result is delivered back here when it finishes,",
     "and the conversation continues automatically. The user can wait or keep working.",
     `Track or cancel it with /workflows status ${runId} or /workflows stop ${runId}.`,
