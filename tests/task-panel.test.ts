@@ -2770,13 +2770,16 @@ describe("installResultDelivery", () => {
           if (event.type === "agent_settled") settled.push(event.type);
         });
         const sendCalls: Array<{
-          message: { customType?: string; display?: boolean };
+          message: { customType?: string; content?: unknown; display?: boolean };
           options?: { triggerTurn?: boolean; deliverAs?: string };
         }> = [];
         let realSendCompletion: Promise<void> | undefined;
         const realSend = session.sendCustomMessage.bind(session);
         session.sendCustomMessage = ((message, options) => {
-          sendCalls.push({ message: { customType: message.customType, display: message.display }, options });
+          sendCalls.push({
+            message: { customType: message.customType, content: message.content, display: message.display },
+            options,
+          });
           realSendCompletion = realSend(message, options);
           return realSendCompletion;
         }) as typeof session.sendCustomMessage;
@@ -2807,10 +2810,12 @@ describe("installResultDelivery", () => {
         const resultEntry = session.sessionManager
           .getBranch()
           .find((entry) => entry.type === "custom_message" && entry.customType === "workflow-result") as
-          | { content?: unknown }
+          | { content?: unknown; display?: boolean }
           | undefined;
         assert.ok(resultEntry, "the workflow-result must be persisted by the real SessionManager");
         assert.equal(typeof resultEntry.content, "string");
+        assert.equal(resultEntry.content, sendCalls[0].message.content, "persist the exact delivered content");
+        assert.equal(resultEntry.display, true, "persist the display flag");
         assert.match(String(resultEntry.content), /All tests passed/);
         assert.ok(settled.includes("agent_settled"), "the real host turn must settle");
         assert.equal(
