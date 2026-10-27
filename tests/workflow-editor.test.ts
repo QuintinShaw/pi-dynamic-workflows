@@ -774,6 +774,58 @@ describe("installWorkflowKeywordArming", () => {
     );
   });
 
+  it("uses host section deltas without forcing the prompt and clears stale arming", async () => {
+    const mod = await load();
+    const handlers = new Map<string, (...args: any[]) => any>();
+    const pi = {
+      on: (name: string, handler: (...args: any[]) => any) => handlers.set(name, handler),
+      registerCommand: () => {},
+      getActiveTools: () => ["read"],
+      setActiveTools: () => {},
+    } as unknown as ExtensionAPI;
+    mod.installWorkflowKeywordArming(pi, undefined, testSettingsOptions());
+    const input = handlers.get("input");
+    const before = handlers.get("before_agent_start");
+    assert.ok(input);
+    assert.ok(before);
+    const prompt = "Explain workflows without calling tools.";
+    const sections: Record<string, string> = { earlier_extension: "KEEP_EARLIER" };
+    const event = {
+      prompt,
+      get systemPrompt(): string {
+        throw new Error("section-capable hosts must not read or force the rendered prompt");
+      },
+      systemPromptOptions: { sections },
+    };
+    assert.deepEqual(input({ source: "interactive", text: prompt }, { hasUI: true }), { action: "continue" });
+    assert.equal(before(event), undefined);
+    assert.equal(sections.pi_dynamic_workflows_armed, mod.buildArmedWorkflowDirective());
+    sections.later_extension = "KEEP_LATER";
+    assert.equal(
+      before({ prompt: "ordinary turn", systemPrompt: "BASE", systemPromptOptions: { sections } }),
+      undefined,
+    );
+    assert.deepEqual(sections, { earlier_extension: "KEEP_EARLIER", later_extension: "KEEP_LATER" });
+
+    input({ source: "interactive", text: prompt }, { hasUI: true });
+    before({ prompt: "mismatch", systemPromptOptions: { sections } });
+    before(event);
+    assert.equal(sections.pi_dynamic_workflows_armed, undefined, "mismatch consumes pending state");
+    for (const boundary of ["session_start", "session_shutdown"]) {
+      input({ source: "interactive", text: prompt }, { hasUI: true });
+      const handler = handlers.get(boundary);
+      assert.ok(handler);
+      handler({});
+      before(event);
+      assert.equal(sections.pi_dynamic_workflows_armed, undefined);
+    }
+    input({ source: "interactive", text: prompt }, { hasUI: true });
+    assert.equal(
+      before({ prompt, systemPrompt: "BASE", systemPromptOptions: { cwd: "/" } }).systemPrompt,
+      `BASE\n\n${mod.buildArmedWorkflowDirective()}`,
+    );
+  });
+
   it("still transforms effort-armed input when the keyword trigger is off", async () => {
     const mod = await load();
     const { createEffortState, effortDirective } = await import("../src/effort-command.js");
@@ -961,6 +1013,20 @@ describe("installWorkflowKeywordArming", () => {
     assert.ok(inputHandler && beforeHandler && sessionStartHandler && shutdownHandler);
 
     const prompt = "run a workflow now";
+    assert.deepEqual(inputHandler({ source: "interactive", text: prompt }, { hasUI: true }), {
+      action: "continue",
+    });
+    assert.equal(
+      beforeHandler({ systemPrompt: "BASE" }),
+      undefined,
+      "a Pi 1.4 custom before_agent_start event without prompt must fail closed",
+    );
+    assert.equal(
+      beforeHandler({ prompt, systemPrompt: "BASE" }),
+      undefined,
+      "the custom event consumes the pending directive before the next prompt",
+    );
+
     assert.deepEqual(inputHandler({ source: "interactive", text: prompt }, { hasUI: true }), {
       action: "continue",
     });

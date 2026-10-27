@@ -404,13 +404,20 @@ export function installWorkflowKeywordArming(
     return { action: "continue" } as const;
   });
 
-  // Inject only into the system prompt for the exact input that armed this
-  // turn. A mismatch is fail-closed and consumes the pending state, so the
-  // directive cannot be carried into a different message.
+  // Prefer the host's section deltas: a whole-prompt override collapses the
+  // leading prompt and hides sections added by later extensions (#257).
+  // Older hosts have systemPromptOptions too, but no sections support.
   pi.on("before_agent_start", (event) => {
     const pending = pendingDirective;
     pendingDirective = undefined;
-    if (!pending || pending.prompt !== event.prompt) return;
+    const matches = pending && "prompt" in event && pending.prompt === event.prompt;
+    const sections = (event.systemPromptOptions as { sections?: Record<string, string> } | undefined)?.sections;
+    if (sections) {
+      delete sections.pi_dynamic_workflows_armed;
+      if (matches && pending) sections.pi_dynamic_workflows_armed = pending.directive;
+      return;
+    }
+    if (!matches || !pending) return;
     return { systemPrompt: `${event.systemPrompt}\n\n${pending.directive}` };
   });
 
