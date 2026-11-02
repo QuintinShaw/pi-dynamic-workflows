@@ -6,6 +6,7 @@
   <a href="https://www.npmjs.com/package/@quintinshaw/pi-dynamic-workflows"><img src="https://img.shields.io/npm/v/@quintinshaw/pi-dynamic-workflows?color=cb3837&logo=npm" alt="npm version"></a>
   <a href="#license"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a>
   <a href="https://pi.dev"><img src="https://img.shields.io/badge/for-Pi-7c3aed" alt="Built for Pi"></a>
+  <a href="https://omppackages.com/packages/@quintinshaw/pi-dynamic-workflows"><img src="https://omppackages.com/badge/@quintinshaw/pi-dynamic-workflows.svg" alt="omp status"></a>
 </p>
 
 <p align="center">
