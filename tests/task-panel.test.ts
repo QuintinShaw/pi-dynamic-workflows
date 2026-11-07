@@ -740,6 +740,20 @@ describe("installResultDelivery", () => {
 
   // ── deliverText: fallback chain ──
 
+  it("includes run warnings (e.g. an all-failed fleet's errors) in the delivery", () => {
+    const pi = createMockPi();
+    const run = makeRun({
+      result: { result: null, warnings: ["⚠  Workflow produced no usable results\n   solo: prompt-capture: boom"] },
+    });
+    const manager = createMockManager(run);
+
+    setup(pi, manager);
+    manager.emit("complete", { runId: "test-run-1" });
+
+    const content = piCalls(pi)[0].content;
+    assert.ok(content.includes("solo: prompt-capture: boom"), `should surface the agent error; got: ${content}`);
+  });
+
   it("falls back to report when verdict is absent", () => {
     const pi = createMockPi();
     const run = makeRun({ result: { result: { report: "Report body", verdict: "" } } });

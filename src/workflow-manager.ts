@@ -1278,9 +1278,11 @@ export class WorkflowManager extends EventEmitter {
           fleet.emptyCount > fleet.emptyLabels.length ? ` (+${fleet.emptyCount - fleet.emptyLabels.length} more)` : "";
         const warning = [
           `⚠  Workflow produced no usable results: all ${fleet.emptyCount} agent(s) returned nothing (${labels}${overflow}).`,
+          ...fleet.emptyErrors.map((line) => `   - ${line}`),
           `   agent() resolves recoverable failures (e.g. an empty model response) to null once retries are exhausted, so the run reports "completed" even though nothing was produced.`,
           `   Common fixes: set agentRetries: 1-2 for models that occasionally return empty, check the model's max output tokens, and read the per-agent errors above.`,
         ].join("\n");
+        result.warnings = [...(result.warnings ?? []), warning];
         managed.snapshot.logs.push(warning);
         this.emitLive(managed, "log", { runId: managed.runId, message: warning });
         console.warn(`[workflow] ${warning.replace(/\n\s*/g, " ")}`);

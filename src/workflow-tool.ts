@@ -431,12 +431,14 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       const formattedResult =
         result.result !== undefined ? `\n\`\`\`json\n${JSON.stringify(result.result, null, 2)}\n\`\`\`` : "";
 
+      const warningInfo = result.warnings?.length ? `\n\n${result.warnings.join("\n\n")}` : "";
+
       return withStructuredContent(
         {
           content: [
             {
               type: "text",
-              text: `Workflow **${result.meta.name}** completed with **${result.agentCount}** agent(s).${tokenInfo}\n\n## Result${formattedResult}\n\n${reviseHint(result.runId)}`,
+              text: `Workflow **${result.meta.name}** completed with **${result.agentCount}** agent(s).${tokenInfo}\n\n## Result${formattedResult}${warningInfo}\n\n${reviseHint(result.runId)}`,
             },
           ],
           details: {

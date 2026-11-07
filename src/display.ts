@@ -195,7 +195,11 @@ export interface EmptyFleetSummary {
   doneCount: number;
   /** Labels of the empty agents, capped for a readable warning line. */
   emptyLabels: string[];
+  /** `label: error` for the same capped agents, each truncated, so the warning names the cause. */
+  emptyErrors: string[];
 }
+
+const MAX_EMPTY_ERROR_CHARS = 500;
 
 /**
  * Detect the "empty fleet" case: a run that spent on at least one agent yet got
@@ -215,6 +219,10 @@ export function emptyFleetSummary(agents: WorkflowAgentSnapshot[], maxLabels = 5
     emptyCount: empty.length,
     doneCount,
     emptyLabels: empty.slice(0, maxLabels).map((agent) => agent.label || `agent #${agent.id}`),
+    emptyErrors: empty.slice(0, maxLabels).map((agent) => {
+      const line = `${agent.label || `agent #${agent.id}`}: ${agent.error || "no error message recorded"}`;
+      return line.length > MAX_EMPTY_ERROR_CHARS ? `${line.slice(0, MAX_EMPTY_ERROR_CHARS - 1)}…` : line;
+    }),
   };
 }
 

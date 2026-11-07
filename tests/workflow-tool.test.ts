@@ -855,3 +855,30 @@ test("resumedText states the same-window workflow() caveat and no gap absolutes 
   const prefix = resumedText("wf", "run-1", "prefix");
   assert.ok(prefix.includes("re-runs live."), "the prefix variant still renders");
 });
+
+test(
+  "workflow tool: an all-failed fleet puts each agent's error in the tool result text",
+  withToolTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run() {
+          throw new WorkflowError(
+            "prompt-capture: no capture for this prompt",
+            WorkflowErrorCode.AGENT_EXECUTION_ERROR,
+            {
+              recoverable: true,
+            },
+          );
+        },
+      },
+    });
+    const tool = createWorkflowTool({ cwd, manager });
+    const script = `export const meta = { name: 'all_fail', description: 'all fail' }
+return await agent('x', { label: 'solo' })`;
+    const done = await tool.execute("af1", { script, background: false }, undefined, undefined, undefined);
+    const text = (done as { content: Array<{ text: string }> }).content[0].text;
+    assert.match(text, /no usable results/);
+    assert.match(text, /solo: prompt-capture: no capture for this prompt/);
+  }),
+);

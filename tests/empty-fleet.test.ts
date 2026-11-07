@@ -67,4 +67,22 @@ describe("emptyFleetSummary", () => {
     // Agent #4 had an empty label; fall back to its id.
     assert.ok(summary.emptyLabels.includes("agent #4"));
   });
+
+  it("carries each failed agent's error so the warning can quote the real cause", () => {
+    const summary = emptyFleetSummary([
+      agent({ id: 1, label: "ch2", status: "error", error: "prompt-capture: no capture for this prompt" }),
+      agent({ id: 2, label: "ch3", status: "error" }),
+    ]);
+    assert.deepEqual(summary.emptyErrors, [
+      "ch2: prompt-capture: no capture for this prompt",
+      "ch3: no error message recorded",
+    ]);
+  });
+
+  it("truncates a long agent error so one failure can't flood the warning", () => {
+    const summary = emptyFleetSummary([agent({ id: 1, label: "big", status: "error", error: "x".repeat(2000) })]);
+    const [line] = summary.emptyErrors;
+    assert.ok(line.length < 600, `expected a truncated line, got ${line.length} chars`);
+    assert.ok(line.endsWith("…"));
+  });
 });
