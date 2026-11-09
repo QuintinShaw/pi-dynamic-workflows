@@ -11,6 +11,18 @@ import { closeSync, fstatSync, openSync, readSync } from "node:fs";
 import { join } from "node:path";
 import { AgentSession, type ExtensionAPI, type ExtensionUIContext, type Theme } from "@earendil-works/pi-coding-agent";
 import { type Component, type TUI, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import packageJson from "../package.json" with { type: "json" };
+import {
+  type ActiveStreamingWaiter,
+  acquireDeliveryState,
+  type CaptureMethodRecord,
+  DEFAULT_STREAMING_ACK_TIMEOUT_MS,
+  type DeliveryRetry,
+  type DeliverySend,
+  type RecoveryContext,
+  type SessionDeliveryEndpoint,
+  type StealCandidate,
+} from "./delivery-state.js";
 import {
   aggregateAgentUsage,
   fmtCost,
@@ -166,44 +178,36 @@ function deliveredMaxChars(opts: { loadSettings?: () => WorkflowSettings }): num
  * and never ACK on a durable append (that writes history without triggerTurn).
  */
 
-type DeliveryMessage = {
-  customType: string;
-  content: string;
-  display: boolean;
-  details?: { deliveryId?: string };
-};
+// Acquire at evaluation time: an incompatible protocol must fail before manager claim.
+const deliveryState = acquireDeliveryState(AgentSession);
+const OWNER_VERSION = packageJson.version;
+const {
+  sessionEndpoints,
+  boundSessionSends,
+  inFlightDeliveries,
+  activeStreamingWaiters,
+  deliveryRetries,
+  deliveredAwaitingClear,
+  probedSessionIds,
+} = deliveryState;
 
-type DeliverySend = (message: DeliveryMessage, options: { triggerTurn: boolean; deliverAs: "followUp" }) => unknown;
-
-interface SessionDeliveryEndpoint {
-  sessionId: string;
-  reportWarning?: (message: string) => void;
-  warned?: boolean;
-  /**
-   * Session-stable send that MUST return a thenable for ACK. Captured from
-   * the host AgentSession.sendCustomMessage (not the void actions.sendMessage
-   * wrapper, and not a durable-only append).
-   */
-  send?: DeliverySend;
-  loadSettings?: () => WorkflowSettings;
-  /**
-   * When true, do not call send — leave disk pending. Set for the whole window
-   * between session_shutdown and the next bind for this sessionId so a
-   * completion cannot land on a dying session.
-   */
-  suspended: boolean;
-  /**
-   * Generation counter bumped on every bind. An in-flight send captures the
-   * generation it started under; on failure, if a newer generation has already
-   * bound, we re-flush disk pending onto it.
-   */
-  generation: number;
-  /** Owning manager used to recompute complete-text and clear pending markers. */
-  manager?: WorkflowManager;
+function ownsManager(manager: WorkflowManager): boolean {
+  return deliveryState.managerVersions.get(manager) === OWNER_VERSION;
 }
 
-/** Process-wide: one live endpoint per pi session id. */
-const sessionEndpoints = new Map<string, SessionDeliveryEndpoint>();
+function claimDeliveryManager(manager: WorkflowManager): void {
+  const owner = deliveryState.managerVersions.get(manager);
+  if (owner && owner !== OWNER_VERSION) {
+    throw new Error(
+      "Workflow delivery cannot adopt a manager from a different package version; restart or use journal recovery.",
+    );
+  }
+  deliveryState.managerVersions.set(manager, OWNER_VERSION);
+}
+
+function currentSender(sessionId: string): DeliverySend | undefined {
+  return deliveryState.senderVersions.get(sessionId) === OWNER_VERSION ? boundSessionSends.get(sessionId) : undefined;
+}
 
 function warnDelivery(sessionId: string | undefined, message: string): void {
   const endpoint = sessionId ? sessionEndpoints.get(sessionId) : undefined;
@@ -216,40 +220,7 @@ function warnDelivery(sessionId: string | undefined, message: string): void {
   }
 }
 
-/**
- * Session-stable thenable sends (host AgentSession.sendCustomMessage). Keyed
- * by host sessionId only — workflow children (in-memory, noExtensions, or
- * named `workflow:…`) must never enter this map (#109).
- */
-const boundSessionSends = new Map<string, DeliverySend>();
-
-type InFlightDelivery = { token: number; sessionId: string };
-
-/** Ownership-token locks prevent stale promise chains from releasing newer sends. */
-const inFlightDeliveries = new Map<string, InFlightDelivery>();
-let inFlightSeq = 0;
-
-const DEFAULT_STREAMING_ACK_TIMEOUT_MS = 60_000;
-let streamingAckTimeoutMs = DEFAULT_STREAMING_ACK_TIMEOUT_MS;
-
-interface ActiveStreamingWaiter {
-  sessionId: string;
-  deliveryId: string;
-  hasStarted: () => boolean;
-  cancel: (error: Error) => void;
-}
-const activeStreamingWaiters = new Set<ActiveStreamingWaiter>();
-
 const DELIVERY_RETRY_DELAYS_MS = [250, 1_000, 4_000] as const;
-type DeliveryRetry = {
-  attempt: number;
-  generation: number;
-  sessionId: string;
-  timer?: ReturnType<typeof setTimeout>;
-};
-const deliveryRetries = new Map<string, DeliveryRetry>();
-/** ACKed messages whose pending marker still needs to be cleared durably. */
-const deliveredAwaitingClear = new Map<string, { deliveryId: string; sessionId: string; generation: number }>();
 
 /**
  * Custom type for the session bind probe (see probeHostSessionSend). Sent
@@ -258,13 +229,6 @@ const deliveredAwaitingClear = new Map<string, { deliveryId: string; sessionId: 
  * swallows probe messages — nothing is appended, persisted, or turned.
  */
 export const DELIVERY_PROBE_CUSTOM_TYPE = "workflow-delivery-probe";
-
-/**
- * Session ids probed successfully. Marked only after a probe that captured a
- * send; a failed or missed probe stays unmarked and is retried on the next
- * bind.
- */
-const probedSessionIds = new Set<string>();
 
 /**
  * Quiet hosts (omp never sends custom messages itself) never trip the
@@ -280,7 +244,7 @@ const probedSessionIds = new Set<string>();
  * bindSessionDelivery probes again instead of being permanently silent.
  */
 function probeHostSessionSend(pi: ExtensionAPI, sessionId: string): void {
-  if (probedSessionIds.has(sessionId)) return;
+  if (probedSessionIds.has(sessionId) && currentSender(sessionId)) return;
   try {
     pi.sendMessage({ customType: DELIVERY_PROBE_CUSTOM_TYPE, content: "", display: false }, { triggerTurn: false });
   } catch {
@@ -288,46 +252,13 @@ function probeHostSessionSend(pi: ExtensionAPI, sessionId: string): void {
     // Not marked probed — the next bindSessionDelivery retries.
     return;
   }
-  if (boundSessionSends.has(sessionId)) probedSessionIds.add(sessionId);
+  if (currentSender(sessionId)) probedSessionIds.add(sessionId);
 }
-
-let hostAgentSession = AgentSession;
-const patchedSessionPrototypes = new WeakSet<object>();
 
 /** Bind delivery capture to the host loader's class, not a sibling SDK peer. */
 export function installHostSessionCapture(sessionClass: typeof AgentSession): void {
-  hostAgentSession = sessionClass;
+  deliveryState.hostAgentSession = sessionClass;
   patchAgentSessionCapture();
-}
-
-interface StealCandidate {
-  sendCustomMessage?: DeliverySend;
-  isStreaming?: boolean;
-  isIdle?: boolean;
-  waitForIdle?: () => Promise<void>;
-  agent?: {
-    hasQueuedMessages?: () => boolean;
-  };
-  subscribe?: (
-    listener: (event: {
-      type?: string;
-      message?: { role?: string; customType?: string; details?: unknown };
-      followUp?: readonly unknown[];
-      steering?: readonly unknown[];
-    }) => void,
-  ) => () => void;
-  sessionManager?: {
-    persist?: boolean;
-    getSessionId?: () => string;
-    getSessionName?: () => string | undefined;
-    getEntries?: () => Array<{ type?: string; customType?: string; details?: unknown }>;
-    getBranch?: () => Array<{ id?: string; type?: string; customType?: string; details?: unknown }>;
-    getSessionFile?: () => string | undefined;
-    isPersisted?: () => boolean;
-    isSessionOnDisk?: () => boolean;
-  };
-  _resourceLoader?: { noExtensions?: boolean };
-  _bindExtensionCore?: (...args: unknown[]) => unknown;
 }
 
 function hostSessionIdToSteal(session: StealCandidate, probe?: boolean): string | undefined {
@@ -473,6 +404,7 @@ function captureHostSessionSend(session: StealCandidate, probe?: boolean): void 
   const send = session.sendCustomMessage;
   if (!sid || typeof send !== "function") return;
 
+  deliveryState.senderVersions.set(sid, OWNER_VERSION);
   boundSessionSends.set(sid, (message, options) => {
     const deliveryId = deliveryIdFromDetails(message.details);
     if (deliveryId && sessionHasDelivery(session, deliveryId) === true) return Promise.resolve();
@@ -509,7 +441,7 @@ function captureHostSessionSend(session: StealCandidate, probe?: boolean): void 
       };
       activeStreamingWaiters.add(waiterRecord);
 
-      if (streamingAckTimeoutMs > 0) {
+      if (deliveryState.streamingAckTimeoutMs > 0) {
         timer = setTimeout(() => {
           queueMicrotask(() => {
             if (settled) return;
@@ -518,7 +450,7 @@ function captureHostSessionSend(session: StealCandidate, probe?: boolean): void 
             // started, never infer non-delivery from elapsed time.
             else if (!started) finish(new Error("timed out waiting for an idle host"));
           });
-        }, streamingAckTimeoutMs);
+        }, deliveryState.streamingAckTimeoutMs);
         timer.unref?.();
       }
 
@@ -600,56 +532,61 @@ function captureHostSessionSend(session: StealCandidate, probe?: boolean): void 
  */
 function patchAgentSessionCapture(): void {
   try {
-    const proto = hostAgentSession.prototype as unknown as StealCandidate;
-    if (patchedSessionPrototypes.has(proto)) return;
-    const original = proto.sendCustomMessage;
-    if (typeof original !== "function") {
-      // AgentSession shape changed — bind stays fail-closed without steal.
-      return;
+    const proto = deliveryState.hostAgentSession.prototype as unknown as StealCandidate;
+    let records = deliveryState.prototypePatches.get(proto);
+    if (!records) {
+      records = {};
+      deliveryState.prototypePatches.set(proto, records);
     }
-    patchedSessionPrototypes.add(proto);
-    // PRIMARY capture hook: `_bindExtensionCore` runs at session construction,
-    // before any extension code, so a stock pi host is captured without ever
-    // probing. The omp fork bundle does not expose the symbol — guard with
-    // typeof so the patch stays a no-op there and the probe fallback handles
-    // capture. Full original gates apply (persistence gate included,
-    // probe=false).
-    if (typeof proto._bindExtensionCore === "function") {
-      const bindCore = proto._bindExtensionCore;
-      proto._bindExtensionCore = function patchedBindExtensionCore(this: StealCandidate, ...args: unknown[]) {
-        try {
-          captureHostSessionSend(this, false);
-        } catch {
-          // never break session construction
-        }
-        return bindCore.apply(this, args);
-      };
-    }
-    // Invoke the original with the runtime's live session as receiver. A
-    // `.bind(proto)` forward would freeze the receiver to the prototype, and a
-    // bound function's receiver cannot be overridden by `.call(this, …)` — the
-    // original would run with `this.agent` undefined and every non-trigger
-    // send would reject, silently losing the delivery. Patch predates session
-    // construction: this here is the session that later calls sendCustomMessage.
-    proto.sendCustomMessage = function patchedSendCustomMessage(
-      this: StealCandidate,
-      message: { customType: string; content: string; display: boolean },
-      options: { triggerTurn: boolean; deliverAs: "followUp" },
-    ) {
-      const isProbe = message?.customType === DELIVERY_PROBE_CUSTOM_TYPE;
-      try {
-        captureHostSessionSend(this, isProbe);
-      } catch {
-        // never break the host send
+    for (const method of ["sendCustomMessage", "_bindExtensionCore"] as const) {
+      const original = proto[method];
+      if (typeof original !== "function") continue;
+      // Reuse owned inherited wrappers too. Never unwrap or overwrite a third-party patch.
+      const previous = records[method] ?? deliveryState.ownedWrappers.get(original);
+      if (previous) {
+        previous.ownerVersion = OWNER_VERSION;
+        previous.capture = captureHostSessionSend;
+        records[method] = previous;
+        continue;
       }
-      // Capture-only probe: the probe exists only to trip this capture patch.
-      // Never append to agent.state.messages, never write a session entry,
-      // never inject an LLM user turn — swallow it entirely.
-      if (isProbe) return Promise.resolve();
-      return original.call(this, message, options);
-    };
+      const record: CaptureMethodRecord = {
+        ownerVersion: OWNER_VERSION,
+        capture: captureHostSessionSend,
+        original,
+        wrapper: original,
+      };
+      if (method === "sendCustomMessage") {
+        const send = original as DeliverySend;
+        const wrapper: DeliverySend = function (this: StealCandidate, message, options) {
+          const isProbe = message?.customType === DELIVERY_PROBE_CUSTOM_TYPE;
+          try {
+            record.capture(this, isProbe);
+          } catch {
+            /* capture cannot break the host */
+          }
+          if (isProbe) return Promise.resolve();
+          return send.call(this, message, options);
+        };
+        record.wrapper = wrapper;
+        proto.sendCustomMessage = wrapper;
+      } else {
+        const bind = original as NonNullable<StealCandidate["_bindExtensionCore"]>;
+        const wrapper = function (this: StealCandidate, ...args: unknown[]) {
+          try {
+            record.capture(this, false);
+          } catch {
+            /* capture cannot break construction */
+          }
+          return bind.apply(this, args);
+        };
+        record.wrapper = wrapper;
+        proto._bindExtensionCore = wrapper;
+      }
+      records[method] = record;
+      deliveryState.ownedWrappers.set(record.wrapper, record);
+    }
   } catch {
-    // AgentSession unavailable or shape changed — bind stays fail-closed without steal
+    // An unavailable host capture seam must leave delivery fail-closed.
   }
 }
 
@@ -891,8 +828,9 @@ function cancelSessionDeliveryState(sessionId: string): void {
 
 function scheduleDeliveryRetry(manager: WorkflowManager, runId: string, sessionId: string, generation: number): void {
   const current = deliveryRetries.get(runId);
-  if (current?.timer && current.generation === generation) return;
-  const attempt = current?.generation === generation ? current.attempt : 0;
+  if (current?.timer && current.generation === generation && current.endpoint === sessionEndpoints.get(sessionId))
+    return;
+  const attempt = current && current.endpoint === sessionEndpoints.get(sessionId) ? current.attempt : 0;
   if (attempt >= DELIVERY_RETRY_DELAYS_MS.length) {
     warnDelivery(
       sessionId,
@@ -901,13 +839,15 @@ function scheduleDeliveryRetry(manager: WorkflowManager, runId: string, sessionI
     return;
   }
 
-  const retry: DeliveryRetry = { attempt: attempt + 1, generation, sessionId };
+  const endpoint = sessionEndpoints.get(sessionId);
+  if (!endpoint || endpoint.ownerVersion !== OWNER_VERSION || !ownsManager(manager)) return;
+  const retry: DeliveryRetry = { attempt: attempt + 1, generation, sessionId, endpoint, ownerVersion: OWNER_VERSION };
   retry.timer = setTimeout(() => {
     retry.timer = undefined;
     if (deliveryRetries.get(runId) !== retry) return;
     const endpoint = sessionEndpoints.get(sessionId);
-    if (!endpoint || endpoint.suspended || endpoint.generation !== generation) return;
-    flushSessionDiskPending(manager, sessionId, endpoint);
+    if (!endpoint || endpoint !== retry.endpoint || endpoint.suspended || endpoint.generation !== generation) return;
+    endpoint.flushPending(runId);
   }, DELIVERY_RETRY_DELAYS_MS[attempt]);
   retry.timer.unref?.();
   deliveryRetries.set(runId, retry);
@@ -933,6 +873,11 @@ function deliverAndAck(
   if (endpoint.suspended) {
     return;
   }
+  if (endpoint.ownerVersion !== OWNER_VERSION) {
+    queueMicrotask(() => sessionEndpoints.get(sessionId)?.flushPending(runId));
+    return;
+  }
+  if (!ownsManager(manager)) return;
   if (endpoint.sessionId !== sessionId) {
     warnDelivery(
       sessionId,
@@ -945,7 +890,8 @@ function deliverAndAck(
   if (
     delivered?.deliveryId === deliveryId &&
     delivered.sessionId === sessionId &&
-    delivered.generation === endpoint.generation
+    delivered.generation === endpoint.generation &&
+    delivered.endpoint === endpoint
   ) {
     const clear = clearRunPending(manager, runId, deliveryId, run ?? manager.getRun?.(runId));
     if (clear !== "failed") {
@@ -968,8 +914,8 @@ function deliverAndAck(
     return;
   }
 
-  const token = ++inFlightSeq;
-  inFlightDeliveries.set(runId, { token, sessionId });
+  const token = ++deliveryState.inFlightSeq;
+  inFlightDeliveries.set(runId, { token, sessionId, endpoint, ownerVersion: OWNER_VERSION });
   const startedGeneration = endpoint.generation;
   void tryDeliverEndpoint(endpoint, content, deliveryId)
     .then((ok) => {
@@ -981,7 +927,7 @@ function deliverAndAck(
         }
         const clear = clearRunPending(manager, runId, deliveryId, run ?? manager.getRun?.(runId));
         if (clear === "failed") {
-          deliveredAwaitingClear.set(runId, { deliveryId, sessionId, generation: startedGeneration });
+          deliveredAwaitingClear.set(runId, { deliveryId, sessionId, generation: startedGeneration, endpoint });
           scheduleDeliveryRetry(manager, runId, sessionId, startedGeneration);
         } else if (clear === "stale") {
           // This send belonged to an older marker. Release before flushing the
@@ -989,7 +935,7 @@ function deliverAndAck(
           releaseDelivery(runId, token);
           const active = sessionEndpoints.get(sessionId);
           if (active && !active.suspended && active.manager) {
-            flushSessionDiskPending(active.manager, sessionId, active);
+            active.flushPending(runId);
           }
         }
         return;
@@ -998,9 +944,9 @@ function deliverAndAck(
       releaseDelivery(runId, token);
       const current = sessionEndpoints.get(sessionId);
       if (!current || current.suspended || !current.manager) return;
-      if (current.generation !== startedGeneration) {
+      if (current !== endpoint) {
         cancelDeliveryRetry(runId);
-        flushSessionDiskPending(current.manager, sessionId, current);
+        current.flushPending(runId);
       } else {
         scheduleDeliveryRetry(manager, runId, sessionId, startedGeneration);
       }
@@ -1017,7 +963,7 @@ function deliverAndAck(
       // A rebind may have tried to flush while this send still owned the lock.
       // Hand off after either settlement, including a successful stale ACK.
       if (current && !current.suspended && current.manager && current !== endpoint) {
-        flushSessionDiskPending(current.manager, current.sessionId, current);
+        current.flushPending(runId);
       }
     });
 }
@@ -1037,6 +983,14 @@ function routeBackgroundDelivery(
 
   const sessionId = resolveDeliverySessionId(run, manager);
   if (!sessionId) {
+    return;
+  }
+
+  const current = sessionEndpoints.get(sessionId);
+  if (current && current.ownerVersion !== OWNER_VERSION) {
+    // Completion precedes the emitting manager's final synchronous persistence.
+    // Notify only after that write; never run this implementation on its manager.
+    queueMicrotask(() => sessionEndpoints.get(sessionId)?.flushPending(run.runId));
     return;
   }
 
@@ -1090,6 +1044,7 @@ export function bindSessionDelivery(
   } = {},
 ): void {
   if (!sessionId) return;
+  if (opts.manager) claimDeliveryManager(opts.manager);
   patchAgentSessionCapture();
 
   // Optional identity check — refuse to bind when sessionManager disagrees.
@@ -1102,14 +1057,14 @@ export function bindSessionDelivery(
     // getSessionId unavailable — continue
   }
 
-  let stolen = opts.stableSend ?? boundSessionSends.get(sessionId);
+  let stolen = opts.stableSend ?? currentSender(sessionId);
   if (!stolen) {
     // Quiet hosts never call sendCustomMessage themselves, so the prototype
     // patch never captured. One invisible no-turn probe forces the host's void
     // send wrapper through AgentSession.sendCustomMessage, populating the
     // steal map synchronously.
     probeHostSessionSend(pi, sessionId);
-    stolen = boundSessionSends.get(sessionId);
+    stolen = currentSender(sessionId);
   }
 
   const prev = sessionEndpoints.get(sessionId);
@@ -1122,16 +1077,28 @@ export function bindSessionDelivery(
   }
   const endpoint: SessionDeliveryEndpoint = {
     sessionId,
+    ownerVersion: OWNER_VERSION,
+    flushPending: (notifiedRunId) => {
+      if (
+        sessionEndpoints.get(sessionId) !== endpoint ||
+        endpoint.suspended ||
+        endpoint.ownerVersion !== OWNER_VERSION ||
+        !endpoint.manager ||
+        !ownsManager(endpoint.manager)
+      )
+        return;
+      flushSessionDiskPending(endpoint.manager, sessionId, endpoint, notifiedRunId);
+    },
     send: stolen,
     loadSettings: opts.loadSettings ?? prev?.loadSettings,
     suspended: false,
     generation: (prev?.generation ?? 0) + 1,
-    manager: opts.manager ?? prev?.manager,
+    manager: opts.manager ?? (prev?.ownerVersion === OWNER_VERSION ? prev.manager : undefined),
     reportWarning: opts.reportWarning ?? prev?.reportWarning,
   };
   sessionEndpoints.set(sessionId, endpoint);
 
-  if (endpoint.manager) flushSessionDiskPending(endpoint.manager, sessionId, endpoint);
+  endpoint.flushPending();
 }
 
 /**
@@ -1167,6 +1134,7 @@ export function dropSessionDelivery(sessionId: string | undefined): void {
   cancelSessionDeliveryState(sessionId);
   sessionEndpoints.delete(sessionId);
   boundSessionSends.delete(sessionId);
+  deliveryState.senderVersions.delete(sessionId);
   // A dropped session may be rebound fresh (e.g. replaced id): forget probe
   // bookkeeping so the next bindSessionDelivery probes again.
   probedSessionIds.delete(sessionId);
@@ -1179,14 +1147,28 @@ export function dropSessionDelivery(sessionId: string | undefined): void {
 export function resumeSessionDelivery(sessionId: string | undefined, manager?: WorkflowManager): void {
   if (!sessionId) return;
   const endpoint = sessionEndpoints.get(sessionId);
-  if (!endpoint) return;
+  if (!endpoint || endpoint.ownerVersion !== OWNER_VERSION) return;
+  if (manager) {
+    claimDeliveryManager(manager);
+    endpoint.manager = manager;
+  }
   endpoint.suspended = false;
-  if (manager) endpoint.manager = manager;
-  if (endpoint.manager) flushSessionDiskPending(endpoint.manager, sessionId, endpoint);
+  endpoint.flushPending();
 }
 
-function flushSessionDiskPending(manager: WorkflowManager, sessionId: string, endpoint: SessionDeliveryEndpoint): void {
-  if (endpoint.suspended) return;
+function flushSessionDiskPending(
+  manager: WorkflowManager,
+  sessionId: string,
+  endpoint: SessionDeliveryEndpoint,
+  notifiedRunId?: string,
+): void {
+  if (
+    endpoint.suspended ||
+    sessionEndpoints.get(sessionId) !== endpoint ||
+    endpoint.ownerVersion !== OWNER_VERSION ||
+    !ownsManager(manager)
+  )
+    return;
 
   const tryOne = (runId: string, marker: PendingDeliveryMarker, run?: ManagedRun, persisted?: PersistedRunState) => {
     if (inFlightDeliveries.has(runId)) return;
@@ -1218,6 +1200,36 @@ function flushSessionDiskPending(manager: WorkflowManager, sessionId: string, en
     if (content === undefined) return;
     deliverAndAck(manager, runId, sessionId, content, deliveryId, run);
   };
+
+  // A different manager may have written since this owner's cached list scan.
+  // A notification carries identity only; re-read that one record through this
+  // version's persistence API, without transferring manager objects or ACKs.
+  if (notifiedRunId) {
+    if (inFlightDeliveries.has(notifiedRunId)) return;
+    try {
+      const live = manager.getRun?.(notifiedRunId);
+      if (live?.pendingDelivery && (live.sessionId == null || live.sessionId === sessionId)) {
+        if (live.sessionId == null) live.sessionId = sessionId;
+        tryOne(notifiedRunId, live.pendingDelivery, live);
+      } else {
+        const persistence = manager.getPersistence?.();
+        if (!persistence) return;
+        const persisted = persistence.load(notifiedRunId);
+        // Null conflates absence with absorbed read failure: bounded reread only,
+        // never permission to synthesize pending state, send, save or ACK.
+        if (persisted === null) {
+          scheduleDeliveryRetry(manager, notifiedRunId, sessionId, endpoint.generation);
+          return;
+        }
+        if (persisted?.pendingDelivery && persisted.sessionId === sessionId) {
+          tryOne(notifiedRunId, persisted.pendingDelivery, live, persisted);
+        }
+      }
+    } catch {
+      scheduleDeliveryRetry(manager, notifiedRunId, sessionId, endpoint.generation);
+    }
+    return;
+  }
 
   // Live in-memory runs for this session. Null sessionId is claimable only for
   // THIS manager's live runs (pre-bind completions) — never from a foreign manager.
@@ -1290,13 +1302,12 @@ export function resumeResultDelivery(manager: WorkflowManager): void {
 // its own latest manager rather than a process-global one: multiple live pi
 // instances can interleave A/B/A installs, and each callback must stay scoped
 // to the instance that emitted it.
-let turnEndDeliveryManagers = new WeakMap<ExtensionAPI, { manager: WorkflowManager }>();
-
 export function installResultDelivery(
   pi: ExtensionAPI,
   manager: WorkflowManager,
   opts: { loadSettings?: () => WorkflowSettings } = {},
 ): void {
+  claimDeliveryManager(manager);
   const m = deliveryManager(manager);
   m.__deliveryLoadSettings = opts.loadSettings;
   patchAgentSessionCapture();
@@ -1339,41 +1350,36 @@ export function installResultDelivery(
   // per-manager registration would stack a handler per cross-project rebuild
   // (pi.on has no off()). Register once per pi, updating only that pi's latest
   // manager on repeat installs.
-  const existingTurnEnd = turnEndDeliveryManagers.get(pi);
+  const recover = (ctx?: RecoveryContext) => {
+    let sid: string | undefined;
+    try {
+      sid = ctx?.sessionManager?.getSessionId?.() ?? manager.getSessionId?.();
+    } catch {
+      sid = manager.getSessionId?.();
+    }
+    if (!sid) return;
+    let endpoint = sessionEndpoints.get(sid);
+    if (!endpoint || typeof endpoint.send !== "function") {
+      probeHostSessionSend(pi, sid);
+      if (currentSender(sid)) {
+        bindSessionDelivery(sid, pi, {
+          loadSettings: m.__deliveryLoadSettings,
+          manager,
+          sessionManager: ctx?.sessionManager,
+        });
+        endpoint = sessionEndpoints.get(sid);
+      }
+    }
+    endpoint?.flushPending();
+  };
+  const existingTurnEnd = deliveryState.recoveryCells.get(pi);
   if (existingTurnEnd) {
-    existingTurnEnd.manager = manager;
+    existingTurnEnd.ownerVersion = OWNER_VERSION;
+    existingTurnEnd.recover = recover;
   } else {
-    turnEndDeliveryManagers.set(pi, { manager });
-    pi.on?.("turn_end", (_event: unknown, ctx?: { sessionManager?: { getSessionId?: () => string } }) => {
-      const activeManager = turnEndDeliveryManagers.get(pi)?.manager;
-      if (!activeManager) return;
-      const active = deliveryManager(activeManager);
-      let sid: string | undefined;
-      try {
-        sid = ctx?.sessionManager?.getSessionId?.() ?? activeManager.getSessionId?.();
-      } catch {
-        sid = activeManager.getSessionId?.();
-      }
-      if (!sid) return;
-
-      let endpoint = sessionEndpoints.get(sid);
-      if (!endpoint || typeof endpoint.send !== "function") {
-        probeHostSessionSend(pi, sid);
-        const stolen = boundSessionSends.get(sid);
-        if (stolen) {
-          bindSessionDelivery(sid, pi, {
-            loadSettings: active.__deliveryLoadSettings,
-            manager: activeManager,
-            sessionManager: ctx?.sessionManager,
-          });
-          endpoint = sessionEndpoints.get(sid);
-        }
-      }
-
-      if (endpoint && !endpoint.suspended && endpoint.manager) {
-        flushSessionDiskPending(endpoint.manager, sid, endpoint);
-      }
-    });
+    const cell = { ownerVersion: OWNER_VERSION, recover };
+    deliveryState.recoveryCells.set(pi, cell);
+    pi.on?.("turn_end", (_event: unknown, ctx?: RecoveryContext) => cell.recover(ctx));
   }
 
   // A newly-created manager can replace the current project while this pi and
@@ -1382,7 +1388,7 @@ export function installResultDelivery(
   const sid = manager.getSessionId?.();
   if (sid) {
     const endpoint = sessionEndpoints.get(sid);
-    if (endpoint) {
+    if (endpoint?.ownerVersion === OWNER_VERSION) {
       endpoint.loadSettings = opts.loadSettings ?? endpoint.loadSettings;
       endpoint.manager = manager;
     }
@@ -1401,7 +1407,8 @@ export function installResultDelivery(
     const content = deliverText(run, {
       resultPath: persistedResultPath(manager, runId, run.result?.result),
       maxChars: deliveredMaxChars({
-        loadSettings: endpoint?.loadSettings ?? m.__deliveryLoadSettings,
+        loadSettings:
+          (endpoint?.ownerVersion === OWNER_VERSION ? endpoint.loadSettings : undefined) ?? m.__deliveryLoadSettings,
       }),
     });
     routeBackgroundDelivery(manager, run, { kind: "complete" }, content);
@@ -1450,24 +1457,26 @@ export function _resetDeliveryRegistriesForTests(): void {
     waiter.cancel(new Error("test reset"));
   }
   activeStreamingWaiters.clear();
-  streamingAckTimeoutMs = DEFAULT_STREAMING_ACK_TIMEOUT_MS;
+  deliveryState.streamingAckTimeoutMs = DEFAULT_STREAMING_ACK_TIMEOUT_MS;
   sessionEndpoints.clear();
   boundSessionSends.clear();
   inFlightDeliveries.clear();
   for (const retry of deliveryRetries.values()) if (retry.timer) clearTimeout(retry.timer);
   deliveryRetries.clear();
   deliveredAwaitingClear.clear();
-  inFlightSeq = 0;
+  // Never reuse tokens: old finalizers may still be draining after test cleanup.
   probedSessionIds.clear();
-  turnEndDeliveryManagers = new WeakMap<ExtensionAPI, { manager: WorkflowManager }>();
+  deliveryState.senderVersions.clear();
+  deliveryState.recoveryCells = new WeakMap();
 }
 
 export function _setStreamingAckTimeoutForTests(timeoutMs: number): void {
-  streamingAckTimeoutMs = timeoutMs;
+  deliveryState.streamingAckTimeoutMs = timeoutMs;
 }
 
 /** @internal test helper — register a thenable session-stable send (steal map). */
 export function _registerBoundSessionSendForTests(sessionId: string, send: DeliverySend): void {
+  deliveryState.senderVersions.set(sessionId, OWNER_VERSION);
   boundSessionSends.set(sessionId, send);
 }
 
