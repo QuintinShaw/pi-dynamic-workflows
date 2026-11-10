@@ -740,6 +740,20 @@ describe("installResultDelivery", () => {
 
   // ── deliverText: fallback chain ──
 
+  it("includes run warnings (e.g. an all-failed fleet's errors) in the delivery", () => {
+    const pi = createMockPi();
+    const run = makeRun({
+      result: { result: null, warnings: ["⚠  Workflow produced no usable results\n   solo: prompt-capture: boom"] },
+    });
+    const manager = createMockManager(run);
+
+    setup(pi, manager);
+    manager.emit("complete", { runId: "test-run-1" });
+
+    const content = piCalls(pi)[0].content;
+    assert.ok(content.includes("solo: prompt-capture: boom"), `should surface the agent error; got: ${content}`);
+  });
+
   it("falls back to report when verdict is absent", () => {
     const pi = createMockPi();
     const run = makeRun({ result: { result: { report: "Report body", verdict: "" } } });
@@ -3000,6 +3014,114 @@ describe("installResultDelivery", () => {
     await Promise.resolve();
     await Promise.resolve();
     assert.equal(manager.getPersistence?.().load("test-run-1")?.pendingDelivery, undefined, "cleared after flush");
+  });
+
+  const allFailScript = `export const meta = { name: 'all_fail_cold', description: 'all agents fail' }
+return await agent('x', { label: 'solo' })`;
+
+  const failingAgent = {
+    async run() {
+      throw new WorkflowError("prompt-capture: boom", WorkflowErrorCode.AGENT_EXECUTION_ERROR, { recoverable: true });
+    },
+  };
+
+  /** Complete an all-failed background run with no endpoint bound, leaving delivery pending on disk. */
+  async function completeAllFailedUndelivered(cwd: string): Promise<{ runId: string; manager: WorkflowManager }> {
+    const manager = new WorkflowManager({ cwd, agent: failingAgent });
+    mod.installResultDelivery(createMockPi(), manager);
+    manager.setSessionId(SESSION);
+    const { runId, promise } = manager.startInBackground(allFailScript);
+    await promise;
+    assert.ok(manager.getPersistence().load(runId)?.pendingDelivery, "delivery is left pending on disk");
+    return { runId, manager };
+  }
+
+  /** A fresh manager on the same cwd, as after a process restart, bound to SESSION. */
+  function deliverFromFreshManager(cwd: string): DeliveryCall[] {
+    const pi = createMockPi();
+    const fresh = new WorkflowManager({ cwd });
+    mod.installResultDelivery(pi, fresh);
+    fresh.setSessionId(SESSION);
+    mod.bindSessionDelivery(SESSION, pi, { manager: fresh, stableSend: recordingStableSend(pi) });
+    return piCalls(pi);
+  }
+
+  it("cold reload delivers the empty-fleet warning of a pending completed run", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pi-dw-cold-warning-"));
+    try {
+      await completeAllFailedUndelivered(cwd);
+      mod._resetDeliveryRegistriesForTests();
+
+      const calls = deliverFromFreshManager(cwd);
+      assert.equal(calls.length, 1, "the fresh manager flushes the pending delivery");
+      assert.match(calls[0].content, /no usable results/);
+      assert.match(calls[0].content, /solo: prompt-capture: boom/);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("cold reload never promotes log lines to completion warnings", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pi-dw-cold-logs-"));
+    try {
+      const { runId, manager } = await completeAllFailedUndelivered(cwd);
+      // A record written before warnings were persisted: the warning text survives
+      // only as a log line, which must not be re-read as a current warning.
+      const persistence = manager.getPersistence();
+      const state = persistence.load(runId);
+      assert.ok(state);
+      assert.ok(state.logs.some((line) => line.includes("no usable results")));
+      delete (state as { warnings?: unknown }).warnings;
+      persistence.save(state);
+      mod._resetDeliveryRegistriesForTests();
+
+      const calls = deliverFromFreshManager(cwd);
+      assert.equal(calls.length, 1);
+      assert.doesNotMatch(calls[0].content, /no usable results/);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("a resumed run that succeeds carries no warning from its failed earlier execution", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pi-dw-resume-warning-"));
+    const controlled = controlledAgent();
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt: string) {
+          if (prompt.includes("fail")) return failingAgent.run();
+          return controlled.runner.run();
+        },
+      },
+    });
+    manager.on("error", () => {});
+    try {
+      mod.installResultDelivery(createMockPi(), manager);
+      manager.setSessionId(SESSION);
+      const { runId, promise } = manager.startInBackground(`export const meta = { name: 'resume_ok', description: 'r' }
+const a = await agent('fail', { label: 'a' })
+const b = await agent('wait', { label: 'b' })
+return { a, b }`);
+      await controlled.waitForCalls(1);
+      assert.equal(manager.pause(runId), true);
+      controlled.resolve(0);
+      await promise.catch(() => {});
+
+      assert.equal(await manager.resume(runId), true);
+      await controlled.waitForCalls(2);
+      controlled.resolve(1, "ok");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(manager.getRun(runId)?.status, "completed");
+      assert.equal(manager.getPersistence().load(runId)?.warnings, undefined);
+      mod._resetDeliveryRegistriesForTests();
+
+      const calls = deliverFromFreshManager(cwd);
+      assert.equal(calls.length, 1);
+      assert.doesNotMatch(calls[0].content, /no usable results/);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
   });
 
   it("bind without stableSend stays fail-closed and keeps pending", () => {

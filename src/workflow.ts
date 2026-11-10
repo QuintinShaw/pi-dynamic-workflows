@@ -482,6 +482,8 @@ export interface WorkflowRunResult<T = unknown> {
   agentCount: number;
   durationMs: number;
   runId?: string;
+  /** Completion diagnostics the caller should show alongside the result (e.g. an all-failed fleet). */
+  warnings?: string[];
   tokenUsage?: {
     input: number;
     output: number;

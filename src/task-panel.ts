@@ -128,6 +128,7 @@ export function deliverText(run: ManagedRun, opts: { resultPath?: string; maxCha
     "",
     summary,
   ];
+  if (run.result?.warnings?.length) lines.push("", ...run.result.warnings);
   // Always point at the full persisted result so the tail is never lost — even when
   // the summary above is a complete verdict/summary field or an untruncated dump.
   if (opts.resultPath) lines.push("", `↳ Full result: ${opts.resultPath}`);
@@ -743,6 +744,7 @@ function contentForPending(
           tokenUsage: persisted.tokenUsage,
           agentCount: persisted.agents?.length ?? 0,
           durationMs: persisted.durationMs,
+          warnings: persisted.warnings,
         },
       } as ManagedRun,
       {
