@@ -447,6 +447,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
             phases: result.phases,
             logs: result.logs,
             result: result.result,
+            warnings: result.warnings,
             durationMs: result.durationMs,
             tokenUsage: result.tokenUsage,
             runId: result.runId,
@@ -463,9 +464,12 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       return new Text(theme.fg("toolTitle", theme.bold("workflow")), 0, 0);
     },
     renderResult(result, { isPartial }, theme) {
-      const snapshot = result.details as WorkflowSnapshot | undefined;
+      const snapshot = result.details as (WorkflowSnapshot & { warnings?: string[] }) | undefined;
       if (snapshot?.name) {
-        return new Text(renderWorkflowText(snapshot, !isPartial), 0, 0);
+        // Completion diagnostics (e.g. every agent's error in an all-failed fleet)
+        // exist only on the finished result; the agent tree alone shows just a count.
+        const warnings = !isPartial && snapshot.warnings?.length ? `\n\n${snapshot.warnings.join("\n\n")}` : "";
+        return new Text(`${renderWorkflowText(snapshot, !isPartial)}${warnings}`, 0, 0);
       }
       // Fallback: strip markdown syntax so the TUI doesn't display raw asterisks/hashes.
       // The `content` field is for the LLM (where markdown is preserved), but the TUI

@@ -882,3 +882,34 @@ return await agent('x', { label: 'solo' })`;
     assert.match(text, /solo: prompt-capture: no capture for this prompt/);
   }),
 );
+
+test(
+  "workflow tool: renderResult draws an all-failed fleet's cause in the TUI once the run is complete",
+  withToolTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run() {
+          throw new WorkflowError(
+            "prompt-capture: no capture for this prompt",
+            WorkflowErrorCode.AGENT_EXECUTION_ERROR,
+            { recoverable: true },
+          );
+        },
+      },
+    });
+    const tool = createWorkflowTool({ cwd, manager });
+    const script = `export const meta = { name: 'all_fail_tui', description: 'all fail' }
+return await agent('x', { label: 'solo' })`;
+    const done = await tool.execute("af2", { script, background: false }, undefined, undefined, undefined);
+    const theme = { fg: (_color: string, s: string) => s, bold: (s: string) => s };
+    const draw = (isPartial: boolean) =>
+      tool
+        .renderResult?.(done as never, { isPartial, expanded: false } as never, theme as never, {} as never)
+        .render(400)
+        .join("\n") ?? "";
+
+    assert.match(draw(false), /solo: prompt-capture: no capture for this prompt/);
+    assert.doesNotMatch(draw(true), /no usable results/, "a partial frame shows no completion diagnostics");
+  }),
+);
