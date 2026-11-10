@@ -125,6 +125,9 @@ export interface PersistedRunState {
   agents: PersistedAgentState[];
   logs: string[];
   result?: unknown;
+  /** Completion diagnostics of the run's last execution (WorkflowRunResult.warnings), kept
+   *  so a delivery rebuilt from disk after a restart still names the cause. */
+  warnings?: string[];
   startedAt: string;
   updatedAt: string;
   completedAt?: string;

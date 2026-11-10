@@ -807,6 +807,7 @@ function contentForPending(
           tokenUsage: persisted.tokenUsage,
           agentCount: persisted.agents?.length ?? 0,
           durationMs: persisted.durationMs,
+          warnings: persisted.warnings,
         },
       } as ManagedRun,
       {

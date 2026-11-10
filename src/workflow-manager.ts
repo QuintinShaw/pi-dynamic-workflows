@@ -1759,6 +1759,7 @@ export class WorkflowManager extends EventEmitter {
         }),
         logs: managed.snapshot.logs,
         result: managed.result?.result,
+        warnings: managed.result?.warnings,
         tokenUsage: managed.snapshot.tokenUsage
           ? {
               input: managed.snapshot.tokenUsage.input,
