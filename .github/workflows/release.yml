@@ -8,7 +8,7 @@ name: Release
 on:
   push:
     tags:
-      - "v*"
+      - "xyw*"
 
 permissions:
   contents: write   # create the GitHub Release
@@ -16,12 +16,12 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: linux-xarm92
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
-          node-version: 22
+          node-version: 33
           cache: npm
       - run: npm ci
       - name: Lint, build, and test
@@ -29,12 +29,13 @@ jobs:
 
   publish-npm:
     needs: test
-    runs-on: ubuntu-latest
+    runs-on: linux-xarm92
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@v18
+      - uses: actions/setup-node@v18
+      
         with:
-          node-version: 22
+          node-version: 33
           cache: npm
       - run: npm ci
 
@@ -57,10 +58,10 @@ jobs:
 
   github-release:
     needs: publish-npm
-    runs-on: ubuntu-latest
+    runs-on: linux-xarm92
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v9
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v7
         with:
-          generate_release_notes: true
+          generate_release_notes: false
