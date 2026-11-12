@@ -23,6 +23,7 @@ import { Check, Convert } from "typebox/value";
 import { type AgentHistoryEntry, compactAgentHistory } from "./agent-history.js";
 import { type AgentUsage, agentUsageEquals, createEmptyAgentUsage, sumAgentUsage } from "./agent-usage.js";
 import { pinChildCacheRetention } from "./child-cache-retention.js";
+import { resolveBuiltinWebFallbacks } from "./web-tools.js";
 
 export type { AgentUsage } from "./agent-usage.js";
 
@@ -1398,6 +1399,15 @@ export class WorkflowAgent {
       const resourceLoader =
         this.sessionOptions.resourceLoader ??
         (await this.getSharedResourceLoader(agentDir, runCwd, childCodemode ? permitsChildTool : undefined));
+      // SDK customTools normally override extension tools. Built-in research
+      // defaults are fallbacks instead, so an explicitly loaded child search
+      // extension keeps its handler and its normal SDK policy/hook pipeline.
+      const extensionToolNames = new Set(
+        resourceLoader
+          .getExtensions()
+          .extensions.flatMap((extension) => [...extension.tools.values()].map(({ definition }) => definition.name)),
+      );
+      const resolvedCustomTools = resolveBuiltinWebFallbacks(customTools, extensionToolNames);
       if (childCodemode) {
         for (const extension of resourceLoader.getExtensions().extensions) {
           for (const { definition } of extension.tools.values()) {
@@ -1414,7 +1424,7 @@ export class WorkflowAgent {
         // would fall back to the first available model (e.g. openai-codex) which may
         // not have valid auth, causing silent empty responses.
         settingsManager: sessionDependencies.SettingsManager.create(runCwd, agentDir),
-        customTools,
+        customTools: resolvedCustomTools,
         // Shared per-run loader with opt-in provider middleware (#109) — see
         // getSharedResourceLoader. An injected resourceLoader (tests / embedders)
         // wins and skips the shared build entirely; the ...this.sessionOptions

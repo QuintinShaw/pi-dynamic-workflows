@@ -22,7 +22,7 @@ import {
   suspendResultDelivery,
 } from "./task-panel.js";
 import { UsageLimitScheduler } from "./usage-limit-scheduler.js";
-import { createWebTools } from "./web-tools.js";
+import { createBuiltinWebTools } from "./web-tools.js";
 import { registerWorkflowCommands } from "./workflow-commands.js";
 import { createWorkflowControlTool } from "./workflow-control-tool.js";
 import { installWorkflowKeywordArming } from "./workflow-editor.js";
@@ -96,7 +96,7 @@ function buildManagerOptions(cwd: string, storage: WorkflowStorage) {
   return {
     loadSavedWorkflow: (name: string) => storage.load(name)?.script,
     toolsets: {
-      "web-research": () => [...createCodingTools(cwd), ...createWebTools()],
+      "web-research": () => [...createCodingTools(cwd), ...createBuiltinWebTools()],
     },
     excludeSubagentTools: settings.excludeSubagentTools,
     providerMiddlewareExtensions: settings.providerMiddlewareExtensions,
