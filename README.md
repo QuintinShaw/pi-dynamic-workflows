@@ -257,6 +257,8 @@ Opted-in factories and runtimes are isolated per child session and receive `sess
 Extension-free resource loaders remain shared.
 Explicit SDK resource-loader injection remains authoritative and bypasses this discovery filter.
 
+Built-in `/deep-research` (also `workflow` with `name: "deep-research"`) uses its own `web_search` and `web_fetch` as fallbacks. When an explicitly loaded child extension registers either name, that extension's implementation is used instead; the other built-in tool remains available if it has no replacement. This also applies when restoring the persisted `web-research` toolset. For example, an installed and enabled `pi-web-access` selected through `providerMiddlewareExtensions: ["pi-web-access"]` can supply `web_search` without a custom research script. Extension tools keep Pi's normal activation, exclusions, and permission hooks. Explicit SDK custom tools keep their normal precedence. This does not forward parent-session state or guarantee that every third-party tool supports child sessions.
+
 Use `builtin:<name>` entries in `providerMiddlewareExtensions` to load supported Pi builtin extensions and activate their tools in each child's own runtime, independently of parent registration.
 Entries are trimmed, matched case-insensitively, and deduplicated; the full identifier is required, while bare names retain file-extension matching.
 No Pi `defaultTools` change is needed; the parent's settings and active tools are unchanged.

@@ -156,3 +156,27 @@ export function createWebFetchTool(maxChars = 6000): ToolDefinition {
 export function createWebTools(): ToolDefinition[] {
   return [createWebSearchTool(), createWebFetchTool()];
 }
+
+// A definition marker, not a registry: independent module evaluations must
+// recognize the same built-in defaults without retaining tools or sessions.
+const BUILTIN_WEB_FALLBACK = Symbol.for("@quintinshaw/pi-dynamic-workflows/builtin-web-fallback");
+
+/** Built-in research defaults yield to explicitly loaded child extension tools. */
+export function createBuiltinWebTools(): ToolDefinition[] {
+  return createWebTools().map((tool) => {
+    Object.defineProperty(tool, BUILTIN_WEB_FALLBACK, { value: true });
+    return tool;
+  });
+}
+
+/** Explicit SDK tools keep normal precedence; only marked defaults may yield. */
+export function resolveBuiltinWebFallbacks(
+  tools: ToolDefinition[],
+  extensionToolNames: ReadonlySet<string>,
+): ToolDefinition[] {
+  return tools.filter(
+    (tool) =>
+      !extensionToolNames.has(tool.name) ||
+      !(tool as ToolDefinition & { [BUILTIN_WEB_FALLBACK]?: boolean })[BUILTIN_WEB_FALLBACK],
+  );
+}

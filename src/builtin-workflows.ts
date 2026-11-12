@@ -16,7 +16,7 @@ import { createCodingTools, type ToolDefinition } from "@earendil-works/pi-codin
 import { generateAdversarialReviewWorkflow, generateMultiPerspectiveWorkflow } from "./adversarial-review.js";
 import { generateCodeReviewWorkflow } from "./code-review.js";
 import { generateCodebaseAuditWorkflow, generateDeepResearchWorkflow } from "./deep-research.js";
-import { createWebTools } from "./web-tools.js";
+import { createBuiltinWebTools } from "./web-tools.js";
 import type { WorkflowStorage } from "./workflow-saved.js";
 
 /** Default perspective set used when a caller gives fewer than two. */
@@ -75,7 +75,7 @@ export const BUILTIN_WORKFLOWS: readonly BuiltinWorkflowDescriptor[] = [
         // Research agents need real web access on top of the coding tools; the
         // "web-research" tag is what a resumed run re-resolves (see
         // WorkflowManagerOptions.toolsets).
-        tools: [...createCodingTools(cwd), ...createWebTools()],
+        tools: [...createCodingTools(cwd), ...createBuiltinWebTools()],
         toolset: "web-research",
       };
     },
