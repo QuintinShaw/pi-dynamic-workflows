@@ -28,6 +28,7 @@ const EXPECTED_RUNTIME_GLOBALS = [
   "phase",
   "pipeline",
   "process",
+  "readLocalFile",
   "retry",
   "verify",
   "workflow",

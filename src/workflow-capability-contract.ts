@@ -112,6 +112,7 @@ export interface RuntimeBindingAssembly {
 /** Project-owned implementations required to assemble the workflow VM context. */
 export interface WorkflowRuntimeImplementations {
   agent: unknown;
+  readLocalFile: unknown;
   parallel: unknown;
   pipeline: unknown;
   workflow: unknown;
@@ -337,6 +338,15 @@ const capabilities: readonly CapabilityDescriptor[] = [
       "each live execution creates a uniquely owned worktree; retries or resume never reuse or overwrite a retained worktree",
     ],
     evidence: ["tests/workflow-runtime.test.ts", "tests/agent-registry.test.ts", "tests/structured-output.test.ts"],
+  }),
+  runtimeGlobal("readLocalFile", {
+    signature: "readLocalFile(path, { maxBytes }) => string",
+    constraints: [
+      "serves the target file's raw utf-8 bytes directly into the vm realm with no LLM transport; zero agent() calls",
+      "an oversized read (byte size over maxBytes) throws instead of returning bytes; maxBytes must be a positive finite integer",
+      "file-capture consumers verify the shell-side capture marker (e.g. WROTE=<bytes>) before calling; agents stay WRITES-only",
+      "replay-stable only against captured-and-immutable shell files; the runtime does not journal the bytes",
+    ],
   }),
   runtimeGlobal("parallel", {
     signature: "parallel(thunks) => Promise<Array<unknown | null>>",
