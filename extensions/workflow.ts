@@ -6,4 +6,5 @@ const extension = await import("../dist/pi-extension.js");
 extension.installHostCreateAgentSession(host.createAgentSession, host);
 extension.installHostSessionCapture(host.AgentSession);
 export const sessionFileCwd = extension.sessionFileCwd;
-export default extension.default;
+const renderer = extension.createWorkflowResultRenderer(host.keyHint, host.getMarkdownTheme);
+export default (pi: Parameters<typeof extension.default>[0]) => extension.default(pi, renderer);

@@ -1805,7 +1805,7 @@ function renderMarkdownLines(
   const key = `md:${renderWidth}:${safeText}`;
   const cached = renderCache?.get(key);
   if (cached) return cached;
-  const lines = new Markdown(safeText, 0, 0, markdownTheme).render(renderWidth);
+  const lines = [...new Markdown(safeText, 0, 0, markdownTheme).render(renderWidth)];
   return renderCache?.set(key, lines, key.length + lines.reduce((sum, line) => sum + line.length, 0)) ?? lines;
 }
 

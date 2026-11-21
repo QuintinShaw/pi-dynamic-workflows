@@ -20,6 +20,7 @@ import {
   installResultDelivery,
   installTaskPanel,
   suspendResultDelivery,
+  WORKFLOW_RESULT_TYPE,
 } from "./task-panel.js";
 import { UsageLimitScheduler } from "./usage-limit-scheduler.js";
 import { createBuiltinWebTools } from "./web-tools.js";
@@ -28,6 +29,7 @@ import { createWorkflowControlTool } from "./workflow-control-tool.js";
 import { installWorkflowKeywordArming } from "./workflow-editor.js";
 import { WorkflowManager } from "./workflow-manager.js";
 import { installWorkflowProgress } from "./workflow-progress.js";
+import { createWorkflowResultRenderer } from "./workflow-result-renderer.js";
 import { createWorkflowStorage, type WorkflowStorage } from "./workflow-saved.js";
 import { loadWorkflowSettings, saveWorkflowSettingsForCwd } from "./workflow-settings.js";
 import { createWorkflowTool } from "./workflow-tool.js";
@@ -109,7 +111,7 @@ function buildManagerOptions(cwd: string, storage: WorkflowStorage) {
   };
 }
 
-export default function extension(pi: ExtensionAPI) {
+export default function extension(pi: ExtensionAPI, renderWorkflowResult = createWorkflowResultRenderer()) {
   // Mutable host state. Tools/commands resolve through getters so a
   // session_start that discovers a cross-project cwd can replace the manager
   // without leaving closed-over references pointing at the source project.
@@ -160,6 +162,8 @@ export default function extension(pi: ExtensionAPI) {
   // session_start binds a per-session endpoint (no "latest pi wins"). Completions
   // that race before bind leave a disk pending marker and flush on bind.
   installResultDelivery(pi, manager, { loadSettings: () => loadWorkflowSettings({ cwd: getCwd() }) });
+  // Older hosts have no registerMessageRenderer.
+  pi.registerMessageRenderer?.(WORKFLOW_RESULT_TYPE, renderWorkflowResult);
 
   const workflowTool = createWorkflowTool({
     getManager,
@@ -407,3 +411,5 @@ export default function extension(pi: ExtensionAPI) {
     manager.setMainModel(m ? `${m.provider}/${m.id}` : undefined);
   });
 }
+
+export { createWorkflowResultRenderer };

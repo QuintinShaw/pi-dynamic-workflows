@@ -230,6 +230,7 @@ const DELIVERY_RETRY_DELAYS_MS = [250, 1_000, 4_000] as const;
  * swallows probe messages — nothing is appended, persisted, or turned.
  */
 export const DELIVERY_PROBE_CUSTOM_TYPE = "workflow-delivery-probe";
+export const WORKFLOW_RESULT_TYPE = "workflow-result";
 
 /**
  * Quiet hosts (omp never sends custom messages itself) never trip the
@@ -388,7 +389,7 @@ function sessionHasDelivery(session: StealCandidate, deliveryId: string): boolea
         (entry) =>
           typeof entry.id === "string" &&
           entry.type === "custom_message" &&
-          entry.customType === "workflow-result" &&
+          entry.customType === WORKFLOW_RESULT_TYPE &&
           deliveryIdFromDetails(entry.details) === deliveryId,
       );
     const file = sm.getSessionFile();
@@ -773,7 +774,7 @@ function tryDeliverEndpoint(endpoint: SessionDeliveryEndpoint, content: string, 
   if (typeof endpoint.send === "function") {
     try {
       const ret = endpoint.send(
-        { customType: "workflow-result", content, display: true, details: { deliveryId } },
+        { customType: WORKFLOW_RESULT_TYPE, content, display: true, details: { deliveryId } },
         { triggerTurn: true, deliverAs: "followUp" },
       );
       if (ret != null && typeof (ret as { then?: unknown }).then === "function") {
