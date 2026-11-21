@@ -4,9 +4,10 @@ import { stripVTControlCharacters as strip } from "node:util";
 import { CustomMessageComponent, initTheme, type MessageRenderer } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { WORKFLOW_RESULT_TYPE } from "../src/task-panel.ts";
-import { renderWorkflowResult } from "../src/workflow-result-renderer.ts";
+import { createWorkflowResultRenderer } from "../src/workflow-result-renderer.ts";
 
 initTheme("dark");
+const renderWorkflowResult = createWorkflowResultRenderer();
 
 const report = [
   '✓ Background workflow "demo" finished (2 agents · 1.2K tok · 3.4s).',
@@ -80,4 +81,11 @@ test("reads text blocks and falls back to a label for empty content", () => {
     /finished/,
   );
   assert.match(text(view("", false)), /\[workflow-result\] Workflow result/);
+});
+
+test("expand hint follows clipped preview text when the terminal resizes", () => {
+  const c = component("Done\nA summary with a hidden tail.");
+  assert.match(text(c.render(24)), /expand/);
+  assert.doesNotMatch(text(c.render(80)), /expand/);
+  assert.match(text(c.render(80)), /hidden tail/);
 });

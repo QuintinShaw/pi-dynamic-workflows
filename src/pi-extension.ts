@@ -29,7 +29,7 @@ import { createWorkflowControlTool } from "./workflow-control-tool.js";
 import { installWorkflowKeywordArming } from "./workflow-editor.js";
 import { WorkflowManager } from "./workflow-manager.js";
 import { installWorkflowProgress } from "./workflow-progress.js";
-import { renderWorkflowResult } from "./workflow-result-renderer.js";
+import { createWorkflowResultRenderer } from "./workflow-result-renderer.js";
 import { createWorkflowStorage, type WorkflowStorage } from "./workflow-saved.js";
 import { loadWorkflowSettings, saveWorkflowSettingsForCwd } from "./workflow-settings.js";
 import { createWorkflowTool } from "./workflow-tool.js";
@@ -111,7 +111,7 @@ function buildManagerOptions(cwd: string, storage: WorkflowStorage) {
   };
 }
 
-export default function extension(pi: ExtensionAPI) {
+export default function extension(pi: ExtensionAPI, renderWorkflowResult = createWorkflowResultRenderer()) {
   // Mutable host state. Tools/commands resolve through getters so a
   // session_start that discovers a cross-project cwd can replace the manager
   // without leaving closed-over references pointing at the source project.
@@ -411,3 +411,5 @@ export default function extension(pi: ExtensionAPI) {
     manager.setMainModel(m ? `${m.provider}/${m.id}` : undefined);
   });
 }
+
+export { createWorkflowResultRenderer };
