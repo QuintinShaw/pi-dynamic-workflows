@@ -33,7 +33,7 @@ export const WORKFLOW_COMPREHENSION_SCENARIO_IDS = COMPREHENSION_SCENARIOS.map((
 export const WORKFLOW_AUTHORING_FROZEN_FILES = [
   {
     path: "skills/workflow-authoring/SKILL.md",
-    sha256: "43d9bfb58eb06a9131fcc91c6e10b27a303fbb0dd4f780fbe932ccf710095783",
+    sha256: "fbc0e13d761433cab7eb2fe1e6b9472be190c83385305ab2848ec7b9c7725e63",
   },
   {
     path: "skills/workflow-authoring/references/runtime.md",
